@@ -46,10 +46,17 @@ Cost and flow:
 
 ## Reporting
 
-Publish raw per-task observations, the aggregate, failure cases, and confidence
-limits. Keep configuration/model changes separate from harness changes. AOI is
-supported only when variant C improves the chosen quality/cost frontier—not
+Publish consented, sanitized aggregates and bounded failure-case descriptions.
+Do not publish `.aoi/`, raw prompts, diffs, paths, commands, logs, commit IDs,
+private project material, or non-consenting per-participant records. Report
+denominators and missingness; never encode unavailable telemetry as zero or an
+estimate. Keep configuration/model changes separate from harness changes. AOI
+is supported only when variant C improves the chosen quality/cost frontier—not
 merely when it generates more records.
+
+For an initial 3–5 person feasibility study, use the exact A/C protocol in
+[PILOT.md](PILOT.md) and report descriptive paired differences only. A closed
+alpha cannot establish statistical significance or general superiority.
 
 The hardware project that motivated AOI can be one case study. It must not be
 the only workload used to claim generality.

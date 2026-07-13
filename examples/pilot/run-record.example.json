@@ -1,0 +1,72 @@
+{
+  "consent": {
+    "aggregate": true,
+    "share_with_coordinator": true
+  },
+  "ended_at": "2026-01-01T00:20:00+00:00",
+  "environment": {
+    "baseline_id": "baseexample",
+    "control_profile_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "model_label": "modelexample",
+    "package_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "runtime_label": "runtimeexample",
+    "time_limit_minutes": 30,
+    "tool_profile": "toolsexample"
+  },
+  "metrics": {
+    "baseline_mismatches": 0,
+    "contract_mismatches": 0,
+    "human_minutes": 2,
+    "interventions": 1,
+    "regressions": 0,
+    "retry_count": 1,
+    "rework_count": 0,
+    "unresolved_directives": 0,
+    "verification_omissions": 0,
+    "wall_seconds": 1200
+  },
+  "oracle": {
+    "oracle_id": "oracleexample",
+    "pre_registered": true,
+    "status": "pass"
+  },
+  "participant_id": "pilotexample",
+  "protocol_version": "closed-alpha-v1",
+  "questionnaire": {
+    "cognitive_load": 3,
+    "completion_confidence": 4,
+    "workflow_clarity": 4,
+    "would_use_again": 4
+  },
+  "run_id": "runexample",
+  "run_status": "completed",
+  "schema_version": 1,
+  "started_at": "2026-01-01T00:00:00+00:00",
+  "task_kind": "bugfix",
+  "task_order": 1,
+  "task_id": "taskexample",
+  "task_pair_id": "pairexample",
+  "telemetry": {
+    "high_capability_tokens": {
+      "missing_reason": "runtime_not_exposed",
+      "source": "unavailable",
+      "value": null
+    },
+    "input_tokens": {
+      "missing_reason": "",
+      "source": "provider_export",
+      "value": 12000
+    },
+    "output_tokens": {
+      "missing_reason": "",
+      "source": "provider_export",
+      "value": 3500
+    },
+    "provider_cost_usd": {
+      "missing_reason": "provider_not_exposed",
+      "source": "unavailable",
+      "value": null
+    }
+  },
+  "variant": "single"
+}

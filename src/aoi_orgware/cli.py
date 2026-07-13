@@ -23,7 +23,9 @@ import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from . import __version__
 from .config import ProjectConfig, default_config_text
+from .pilot import PilotError, initialize_kit, load_record, write_summary
 
 from .harnesslib import (
     ACCOUNTED_VERIFICATION_STATUSES,
@@ -1904,6 +1906,43 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         },
         args.json,
     )
+    return 0
+
+
+def cmd_pilot_init(args: argparse.Namespace, _paths: HarnessPaths | None) -> int:
+    result = initialize_kit(Path(args.output), force=args.force)
+    emit(result, args.json)
+    return 0
+
+
+def cmd_pilot_validate(args: argparse.Namespace, _paths: HarnessPaths | None) -> int:
+    record = load_record(Path(args.record))
+    emit(
+        {
+            "ok": True,
+            "protocol_version": record["protocol_version"],
+            "variant": record["variant"],
+            "run_status": record["run_status"],
+            "oracle_status": record["oracle"]["status"],
+            "aggregate_consent": record["consent"]["aggregate"],
+            "share_with_coordinator_consent": record["consent"][
+                "share_with_coordinator"
+            ],
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_pilot_summary(args: argparse.Namespace, _paths: HarnessPaths | None) -> int:
+    records = [load_record(Path(value)) for value in args.record]
+    result = write_summary(
+        records,
+        Path(args.output),
+        output_format=args.format,
+        force=args.force,
+    )
+    emit(result, args.json)
     return 0
 
 
@@ -7611,13 +7650,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="AOI governed multi-agent organization infrastructure"
     )
-    parser.add_argument("--version", action="version", version="AOI 0.1.0")
+    parser.add_argument("--version", action="version", version=f"AOI {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="initialize AOI in the current Git repository")
     p.add_argument("--project-name")
     add_json_argument(p)
     p.set_defaults(handler=cmd_init)
+
+    p = sub.add_parser(
+        "pilot-init",
+        help="create a self-contained closed-alpha tester kit",
+        description="create a self-contained closed-alpha tester kit",
+    )
+    p.add_argument("--output", required=True)
+    p.add_argument("--force", action="store_true")
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_pilot_init)
+
+    p = sub.add_parser(
+        "pilot-validate",
+        help="strictly validate one sanitized closed-alpha run record",
+        description="strictly validate one sanitized closed-alpha run record",
+    )
+    p.add_argument("--record", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_pilot_validate)
+
+    p = sub.add_parser(
+        "pilot-summary",
+        help="produce a deterministic, de-identified descriptive summary",
+        description="produce a deterministic, de-identified descriptive summary",
+    )
+    p.add_argument("--record", action="append", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--format", choices=("json", "csv"), default="json")
+    p.add_argument("--force", action="store_true")
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_pilot_summary)
 
     p = sub.add_parser("init-task")
     p.add_argument("--task-id", required=True)
@@ -8312,15 +8382,19 @@ def main(argv: list[str] | None = None) -> int:
             parser = build_parser()
             args = parser.parse_args(raw_argv)
             return int(args.handler(args, get_paths()))
-        paths = get_paths()
         command = next((item for item in raw_argv if not item.startswith("-")), "")
+        if command in {"pilot-init", "pilot-validate", "pilot-summary"}:
+            parser = build_parser()
+            args = parser.parse_args(raw_argv)
+            return int(args.handler(args, None))
+        paths = get_paths()
         if command not in {"init", ""} and not paths.config.is_file():
             raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
         apply_project_config(paths.project)
         parser = build_parser()
         args = parser.parse_args(raw_argv)
         return int(args.handler(args, paths))
-    except HarnessError as exc:
+    except (HarnessError, PilotError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

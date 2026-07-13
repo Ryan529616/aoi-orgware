@@ -9,7 +9,7 @@ It is not another chat router. It sits above an agent runtime and records what
 the organization is allowed to do, what it decided, what changed, and what was
 actually verified.
 
-> Status: **v0.1 alpha**. The core lifecycle is tested, but AOI has not yet been
+> Status: **v0.1.1 alpha**. The core lifecycle is tested, but AOI has not yet been
 > proven better than a simpler single-agent or supervisor topology. Benchmark it
 > on your own workload before relying on it.
 
@@ -149,6 +149,37 @@ configuration SHA-256; changing governance while a task is active fails closed.
 
 See [configuration](docs/configuration.md), [architecture](docs/architecture.md),
 and the [operating policy](docs/POLICY.md).
+
+## Run a small closed alpha
+
+AOI includes a self-contained kit for 3–5 classmates to test onboarding and
+feasibility before a larger evaluation:
+
+```bash
+aoi pilot-init --output ./aoi-pilot-kit --json
+cd ./aoi-pilot-kit
+```
+
+The kit contains a controlled A/C protocol (`single` versus `aoi`), Codex
+instructions, assignment and run-record templates, a private feedback form, and
+an intentionally broken onboarding sample. The pilot commands work outside an
+AOI-initialized project:
+
+```bash
+aoi pilot-validate --record records/run-001.json --json
+aoi pilot-summary \
+  --record records/run-001.json \
+  --record records/run-002.json \
+  --output summary.json \
+  --format json \
+  --json
+```
+
+The validator fails closed on unknown fields, missing measurement provenance,
+unregistered oracles, and common private-path/credential patterns. The summary
+includes only records with coordinator-sharing and aggregate consent and never
+emits participant IDs. Closed-alpha public reporting is aggregate-only.
+Read the complete [closed-alpha guide](docs/PILOT.md) before collecting data.
 
 ## Evaluate AOI instead of trusting the diagram
 

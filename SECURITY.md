@@ -14,6 +14,14 @@ AOI is a cooperative governance layer, not a sandbox.
   supports permissions and adds it to `.gitignore`; do not publish it.
 - `aoi.toml` is trusted project policy. Tasks bind its SHA-256 and fail closed
   on drift, but the file itself must still be code-reviewed.
+- Closed-alpha records are not execution traces. Do not put `.aoi/`, prompts,
+  diffs, absolute paths, commands, logs, commit IDs, credentials, identity, or
+  private project details in them. `aoi pilot-validate` rejects common leakage
+  patterns but cannot prove anonymity; human review is still required.
+- Pilot free-text feedback and withdrawal linkage are private by default.
+  Coordinator-sharing and aggregate consent are separate permissions. Closed-
+  alpha individual run records are never public; respect withdrawal before the
+  announced analysis freeze.
 
 AOI refuses filesystem root, the user's home directory, symlinked explicit
 roots, unsafe state directories, traversal in structured locks, and unknown

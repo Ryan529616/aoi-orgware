@@ -1,0 +1,5 @@
+participant_id,task_pair_id,task_order,task_id,variant,baseline_id,oracle_id
+pilot001,pair001,1,taskalpha,single,basealpha,oraclealpha
+pilot001,pair001,2,taskbeta,aoi,basebeta,oraclebeta
+pilot002,pair002,1,taskgamma,aoi,basegamma,oraclegamma
+pilot002,pair002,2,taskdelta,single,basedelta,oracledelta

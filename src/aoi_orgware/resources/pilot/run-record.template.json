@@ -1,0 +1,72 @@
+{
+  "consent": {
+    "aggregate": false,
+    "share_with_coordinator": false
+  },
+  "ended_at": "2026-01-01T00:00:00+00:00",
+  "environment": {
+    "baseline_id": "base001",
+    "control_profile_sha256": "<replace-with-control-profile-sha256>",
+    "model_label": "model001",
+    "package_sha256": "<replace-with-wheel-sha256>",
+    "runtime_label": "runtime001",
+    "time_limit_minutes": 30,
+    "tool_profile": "tools001"
+  },
+  "metrics": {
+    "baseline_mismatches": 0,
+    "contract_mismatches": 0,
+    "human_minutes": 0,
+    "interventions": 0,
+    "regressions": 0,
+    "retry_count": 0,
+    "rework_count": 0,
+    "unresolved_directives": 0,
+    "verification_omissions": 0,
+    "wall_seconds": 0
+  },
+  "oracle": {
+    "oracle_id": "oracle001",
+    "pre_registered": true,
+    "status": "not_run"
+  },
+  "participant_id": "pilot001",
+  "protocol_version": "closed-alpha-v1",
+  "questionnaire": {
+    "cognitive_load": 3,
+    "completion_confidence": 3,
+    "workflow_clarity": 3,
+    "would_use_again": 3
+  },
+  "run_id": "run001",
+  "run_status": "abandoned",
+  "schema_version": 1,
+  "started_at": "2026-01-01T00:00:00+00:00",
+  "task_kind": "other",
+  "task_order": 1,
+  "task_id": "task001",
+  "task_pair_id": "pair001",
+  "telemetry": {
+    "high_capability_tokens": {
+      "missing_reason": "runtime_not_exposed",
+      "source": "unavailable",
+      "value": null
+    },
+    "input_tokens": {
+      "missing_reason": "runtime_not_exposed",
+      "source": "unavailable",
+      "value": null
+    },
+    "output_tokens": {
+      "missing_reason": "runtime_not_exposed",
+      "source": "unavailable",
+      "value": null
+    },
+    "provider_cost_usd": {
+      "missing_reason": "provider_not_exposed",
+      "source": "unavailable",
+      "value": null
+    }
+  },
+  "variant": "single"
+}
