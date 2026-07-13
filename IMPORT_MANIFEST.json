@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "source_commit": "cf01a41aab511d0b14825708019959cd8824a46e",
+  "sanitization": "Only explicit allowlisted source files were copied. Personal absolute paths were replaced with fictional workspace paths; runtime state was excluded.",
+  "files": [
+    {"source": "scripts/harness/arise_harness.py", "source_sha256": "a412de36429b39e985f7c5e8abd72f7a8dc16fea9e2a8735bbce75346e603519", "destination": "scripts/harness/arise_harness.py", "destination_sha256": "cd113c8090566f073df6010a270e69a6ec4b60f7b5e45709a62ccc0fd796b2c9"},
+    {"source": "scripts/harness/harnesslib.py", "source_sha256": "b6b870a328642d4fe39df89853dc4bdcce9edb5b0a0f6c7b1dad7b1fd849d9d3", "destination": "scripts/harness/harnesslib.py", "destination_sha256": "b6b870a328642d4fe39df89853dc4bdcce9edb5b0a0f6c7b1dad7b1fd849d9d3"},
+    {"source": "scripts/harness/codex_hook.py", "source_sha256": "060ec142fb21275a3b9728a9b1c4416531339057ea0be3ef3eb7f4f29d9221c6", "destination": "scripts/harness/codex_hook.py", "destination_sha256": "d1484b594ab40d7406afccc9ece9687f0aa9a54f8c306e281a16bf28e214269c"},
+    {"source": "scripts/harness/test_arise_harness.py", "source_sha256": "ed536247bcc2b37771660c8fd52126c15f09cd82bc6477329fc443bbc52d65f0", "destination": "scripts/harness/test_arise_harness.py", "destination_sha256": "05719a2afb9da45734b7fc1b81ae949c9578c79f6cd4452895e4cf5fcecfbce7"},
+    {"source": "notes/harness/POLICY.md", "source_sha256": "e1d3d6f52b1b4cdb701b26fb638d23f46552e5c97c49b38202ba63bfe2fff289", "destination": "notes/harness/POLICY.md", "destination_sha256": "e1d3d6f52b1b4cdb701b26fb638d23f46552e5c97c49b38202ba63bfe2fff289"},
+    {"source": "notes/harness/templates/checkpoint.md", "source_sha256": "200c746d9262d407fd7cefa0d7f21ce3ac6254c33d251ce031e1a35cf3668286", "destination": "notes/harness/templates/checkpoint.md", "destination_sha256": "200c746d9262d407fd7cefa0d7f21ce3ac6254c33d251ce031e1a35cf3668286"},
+    {"source": "notes/harness/templates/packet.md", "source_sha256": "567ccca068b78dc779bd98e913e96d4cbb5d60e1b7883ed9ac3050b0263affa2", "destination": "notes/harness/templates/packet.md", "destination_sha256": "567ccca068b78dc779bd98e913e96d4cbb5d60e1b7883ed9ac3050b0263affa2"},
+    {"source": "notes/harness/templates/plan.md", "source_sha256": "cbe9db386d68711490415d4a5c317f9799bbe6a2768177fca646a7c588591b2c", "destination": "notes/harness/templates/plan.md", "destination_sha256": "cbe9db386d68711490415d4a5c317f9799bbe6a2768177fca646a7c588591b2c"},
+    {"source": "notes/harness/templates/source_receipt.example.json", "source_sha256": "0052cb327b14fad76e5639f258ea6ae20419147e358e64d71dd1ab6af31e7c91", "destination": "notes/harness/templates/source_receipt.example.json", "destination_sha256": "0052cb327b14fad76e5639f258ea6ae20419147e358e64d71dd1ab6af31e7c91"}
+  ]
+}
