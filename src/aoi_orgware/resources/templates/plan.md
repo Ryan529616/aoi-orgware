@@ -7,9 +7,9 @@
 
 ## Evidence to inspect first
 
-- `AGENTS.md`
-- `notes/harness/INDEX.md`
-- Relevant `docs/current/`, source, scripts, and latest real logs
+- `aoi.toml`
+- `.aoi/INDEX.md`
+- Relevant project instructions, source, scripts, and latest real logs
 
 ## Work breakdown
 
@@ -22,9 +22,9 @@
 
 ## Exclusions
 
-- No unclaimed file or EDA output mutation.
-- No whole-model, accuracy, timing, power, or signoff claim beyond evidence.
-- No legacy ledger cleanup mixed into the technical task.
+- No unclaimed file or external-output mutation.
+- No correctness, performance, safety, or release claim beyond evidence.
+- No unrelated control-plane migration mixed into the technical task.
 
 ## Planned verification
 

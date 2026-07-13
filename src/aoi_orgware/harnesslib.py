@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free state library for the ARISE Codex harness."""
+"""Small, dependency-free state library for AOI orgware."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator
 
+from .config import CONFIG_FILE, ProjectConfig, load_config
+
 
 SCHEMA_VERSION = 1
 TASK_STATUSES = {"active", "blocked", "done", "cancelled"}
@@ -24,7 +26,7 @@ TASK_PHASES = {
     "gathering",
     "diagnosing",
     "implementing",
-    "waiting_eda",
+    "waiting_external",
     "verifying",
     "reviewing",
     "closing",
@@ -52,6 +54,7 @@ COMPACT_FACT_HISTORY_THRESHOLD = 16
 COMPACT_FACT_RECENT_TAIL = 8
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
+EXTERNAL_LOCK_NAMESPACE = "external"
 
 
 class HarnessError(RuntimeError):
@@ -61,6 +64,8 @@ class HarnessError(RuntimeError):
 @dataclass(frozen=True)
 class HarnessPaths:
     root: Path
+    config: Path
+    project: ProjectConfig
     harness: Path
     tasks: Path
     claims: Path
@@ -74,15 +79,42 @@ class HarnessPaths:
     lock: Path
 
 
+def discover_root(start: Path | None = None) -> Path:
+    configured = os.environ.get("AOI_ROOT")
+    raw_candidate = Path(configured).expanduser() if configured else (start or Path.cwd())
+    explicit = configured is not None or start is not None
+    lexical = raw_candidate.absolute()
+    candidate = raw_candidate.resolve()
+    if explicit and lexical != candidate:
+        raise HarnessError("explicit AOI root may not traverse symlinks")
+    if explicit:
+        root = candidate
+    else:
+        search = (candidate, *candidate.parents)
+        root = next((item for item in search if (item / CONFIG_FILE).is_file()), None)
+        if root is None:
+            root = next((item for item in search if (item / ".git").exists()), candidate)
+    if root == Path(root.anchor) or root == Path.home().resolve():
+        raise HarnessError(f"refusing dangerous AOI project root: {root}")
+    return root
+
+
 def get_paths(root: Path | None = None) -> HarnessPaths:
-    if root is None:
-        configured = os.environ.get("ARISE_HARNESS_ROOT")
-        root = Path(configured) if configured else Path(__file__).resolve().parents[2]
-    root = root.resolve()
-    harness = root / "notes" / "harness"
+    global EXTERNAL_LOCK_NAMESPACE
+    root = discover_root(root)
+    try:
+        project = load_config(root, allow_missing=True)
+    except ValueError as exc:
+        raise HarnessError(str(exc)) from exc
+    EXTERNAL_LOCK_NAMESPACE = project.external_lock_namespace
+    harness = root / project.state_dir
+    if harness.absolute() != harness.resolve():
+        raise HarnessError("AOI state directory may not traverse symlinks")
     claims = harness / "claims"
     return HarnessPaths(
         root=root,
+        config=root / CONFIG_FILE,
+        project=project,
         harness=harness,
         tasks=harness / "tasks",
         claims=claims,
@@ -98,23 +130,32 @@ def get_paths(root: Path | None = None) -> HarnessPaths:
 
 
 def ensure_layout(paths: HarnessPaths) -> None:
-    for directory in (
+    directories = [
         paths.harness,
         paths.tasks,
         paths.claims_active,
         paths.claims_archive,
-        paths.legacy_pending,
-        paths.legacy_decisions,
         paths.sessions,
         paths.templates,
-    ):
+    ]
+    if paths.project.legacy_enabled:
+        directories.extend((paths.legacy_pending, paths.legacy_decisions))
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
 
 
 @contextlib.contextmanager
 def state_lock(paths: HarnessPaths) -> Iterator[None]:
     ensure_layout(paths)
     with paths.lock.open("a+", encoding="utf-8") as handle:
+        try:
+            paths.lock.chmod(0o600)
+        except OSError:
+            pass
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -181,6 +222,10 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
         temp_name = ""
         fsync_directory(path.parent)
     finally:
@@ -234,6 +279,14 @@ def task_state_path(paths: HarnessPaths, task_id: str) -> Path:
 def load_task(paths: HarnessPaths, task_id: str) -> dict[str, Any]:
     state = load_json(task_state_path(paths, task_id))
     validate_task_state(state, task_state_path(paths, task_id))
+    if state.get("profile_id") != paths.project.profile_id:
+        raise HarnessError(
+            f"task {task_id} profile differs from current AOI configuration"
+        )
+    if state.get("config_sha256") != paths.project.sha256:
+        raise HarnessError(
+            f"task {task_id} configuration changed; review and migrate it explicitly"
+        )
     return state
 
 
@@ -241,6 +294,10 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
     where = f" in {source}" if source else ""
     if state.get("schema_version") != SCHEMA_VERSION:
         raise HarnessError(f"unsupported task schema{where}")
+    if not isinstance(state.get("profile_id"), str) or not state.get("profile_id"):
+        raise HarnessError(f"task lacks profile identity{where}")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(state.get("config_sha256", ""))):
+        raise HarnessError(f"task lacks AOI configuration digest{where}")
     validate_id(str(state.get("task_id", "")), "task id")
     if state.get("status") not in TASK_STATUSES:
         raise HarnessError(f"invalid task status{where}: {state.get('status')!r}")
@@ -288,16 +345,16 @@ def _normalize_repo_path(raw: str) -> str:
     return normalized.rstrip("/")
 
 
-def _normalize_eda_path(raw: str) -> str:
+def _normalize_external_path(raw: str) -> str:
     if "\\" in raw:
-        raise HarnessError(f"EDA lock must use POSIX separators: {raw!r}")
+        raise HarnessError(f"external lock must use POSIX separators: {raw!r}")
     path = PurePosixPath(raw)
     if any(marker in raw for marker in ("*", "?", "[", "]", "{", "}")):
-        raise HarnessError(f"structured EDA locks may not contain glob syntax: {raw!r}")
+        raise HarnessError(f"structured external locks may not contain glob syntax: {raw!r}")
     if not path.is_absolute():
-        raise HarnessError(f"EDA lock path must be absolute: {raw!r}")
+        raise HarnessError(f"external lock path must be absolute: {raw!r}")
     if ".." in path.parts:
-        raise HarnessError(f"EDA lock path may not contain '..': {raw!r}")
+        raise HarnessError(f"external lock path may not contain '..': {raw!r}")
     return path.as_posix().rstrip("/") or "/"
 
 
@@ -326,22 +383,22 @@ def host_path_to_wsl(raw: str) -> Path:
     canonical = _normalize_host_path(raw)
     drive = canonical[0].lower()
     suffix = canonical[3:]
-    mount_root = Path(os.environ.get("ARISE_HARNESS_HOST_MOUNT_ROOT", "/mnt"))
+    mount_root = Path(os.environ.get("AOI_HOST_MOUNT_ROOT", "/mnt"))
     return mount_root / drive / suffix
 
 
 def normalize_lock(lock: str) -> str:
     parts = lock.strip().split(":", 2)
-    if len(parts) == 3 and parts[0] in {"repo", "eda", "host"}:
+    if len(parts) == 3 and parts[0] in {"repo", EXTERNAL_LOCK_NAMESPACE, "host"}:
         namespace, kind, raw_path = parts
         if kind not in {"file", "tree"}:
             raise HarnessError(f"invalid lock kind in {lock!r}")
         normalized = (
             _normalize_repo_path(raw_path)
             if namespace == "repo"
-            else _normalize_eda_path(raw_path)
-            if namespace == "eda"
             else _normalize_host_path(raw_path)
+            if namespace == "host"
+            else _normalize_external_path(raw_path)
         )
         return f"{namespace}:{kind}:{normalized}"
     if len(parts) == 2 and parts[0] == "contract":
@@ -1219,12 +1276,12 @@ def render_index(paths: HarnessPaths) -> str:
     expired = [claim for claim in active_claims if is_expired(claim.get("expires_at"))]
 
     lines = [
-        "# ARISE Harness Index",
+        f"# AOI Index — {paths.project.name}",
         "",
         f"Generated: `{now_iso()}`",
         "",
-        "Start with `AGENTS.md` and `notes/harness/POLICY.md`; do not scan the full "
-        "legacy ledger unless a warning below points to a specific token.",
+        f"Configuration: `{paths.config}` (`{paths.project.sha256}`); policy: "
+        f"`{paths.harness / 'POLICY.md'}`.",
         "",
         "## Active tasks",
         "",
@@ -1263,15 +1320,16 @@ def render_index(paths: HarnessPaths) -> str:
     else:
         lines.append("- None.")
 
-    lines.extend(["", "## Legacy quarantine", ""])
-    lines.append(
-        f"- Pending non-terminal legacy rows: **{len(legacy)}**; expired but unaudited: "
-        f"**{sum(1 for item in legacy if item.get('legacy_classification') == 'expired_unverified')}**."
-    )
-    ambiguous = sum(1 for item in legacy if item.get("scope_parse_warnings"))
-    lines.append(f"- Rows with ambiguous/unparsed scope text: **{ambiguous}**.")
-    if legacy:
-        lines.append("- Inspect with `python3 scripts/harness/arise_harness.py status --legacy`.")
+    if paths.project.legacy_enabled:
+        lines.extend(["", "## Legacy quarantine", ""])
+        lines.append(
+            f"- Pending non-terminal legacy rows: **{len(legacy)}**; expired but unaudited: "
+            f"**{sum(1 for item in legacy if item.get('legacy_classification') == 'expired_unverified')}**."
+        )
+        ambiguous = sum(1 for item in legacy if item.get("scope_parse_warnings"))
+        lines.append(f"- Rows with ambiguous/unparsed scope text: **{ambiguous}**.")
+        if legacy:
+            lines.append("- Inspect with `aoi status --legacy`.")
 
     lines.extend(["", "## Immediate warnings", ""])
     if expired:
@@ -1296,9 +1354,9 @@ def render_index(paths: HarnessPaths) -> str:
             "## Commands",
             "",
             "```bash",
-            "python3 scripts/harness/arise_harness.py status",
-            "python3 scripts/harness/arise_harness.py doctor",
-            "python3 scripts/harness/arise_harness.py resume --task <task-id>",
+            "aoi status",
+            "aoi doctor",
+            "aoi resume --task <task-id>",
             "```",
             "",
         ]
@@ -1331,11 +1389,15 @@ def legacy_is_terminal(raw_status: str) -> bool:
 LEGACY_REPO_ROOTS = {
     "AGENTS.md",
     ".codex",
+    "app",
+    "config",
     "constraints",
-    "rtl",
-    "rtl_canonical",
-    "rtl_shadow_fullmodel",
-    "tb",
+    "examples",
+    "infra",
+    "lib",
+    "packages",
+    "src",
+    "tests",
     "scripts",
     "docs",
     "notes",
@@ -1351,10 +1413,13 @@ def _infer_legacy_lock(paths: HarnessPaths, candidate: str) -> str | None:
     raw = candidate.strip().strip(".,;:")
     if not raw or " " in raw:
         return None
-    if raw == "notes/SESSION_CONTROL.md":
+    if raw == "LEGACY_CONTROL.md":
         return None
-    if raw.startswith("eda:/"):
-        raw = raw.removeprefix("eda:")
+    configured_prefix = f"{paths.project.external_lock_namespace}:/"
+    if raw.startswith(configured_prefix):
+        raw = raw.removeprefix(f"{paths.project.external_lock_namespace}:")
+    elif raw.startswith("external:/"):
+        raw = raw.removeprefix("external:")
     elif raw.startswith("~/"):
         raw = str(Path(raw).expanduser())
     glob_positions = [
@@ -1371,7 +1436,7 @@ def _infer_legacy_lock(paths: HarnessPaths, candidate: str) -> str | None:
             raw = PurePosixPath(prefix).parent.as_posix()
     raw = raw.rstrip("/")
     if not raw:
-        raw = "/" if candidate.strip().startswith(("/", "eda:/", "~/")) else "."
+        raw = "/" if candidate.strip().startswith(("/", configured_prefix, "external:/", "~/")) else "."
     # The historical table intentionally let every owner append its own row to
     # the shared coordination ledger. Treating that shared bookkeeping file as
     # an exclusive technical lock would make every legacy claim conflict with
@@ -1379,7 +1444,9 @@ def _infer_legacy_lock(paths: HarnessPaths, candidate: str) -> str | None:
     if raw.startswith("/"):
         kind = "tree" if had_glob or not PurePosixPath(raw).suffix else "file"
         try:
-            return normalize_lock(f"eda:{kind}:{raw}")
+            return normalize_lock(
+                f"{paths.project.external_lock_namespace}:{kind}:{raw}"
+            )
         except HarnessError:
             return None
     if raw.startswith(("./", "../")):
@@ -1432,13 +1499,13 @@ def extract_markdown_code_spans(text: str) -> list[str]:
 
 def _legacy_candidate_looks_pathlike(candidate: str) -> bool:
     raw = candidate.strip().strip(".,;:")
-    if not raw or raw == "notes/SESSION_CONTROL.md":
+    if not raw or raw == "LEGACY_CONTROL.md":
         return False
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?ns(?:/[0-9]+(?:\.[0-9]+)?ns)*", raw):
         return False
-    first = raw.removeprefix("eda:").removeprefix("~/").split("/", 1)[0]
+    first = raw.removeprefix("external:").removeprefix("~/").split("/", 1)[0]
     return (
-        raw.startswith(("/", "~/", "./", "../", "eda:/", "."))
+        raw.startswith(("/", "~/", "./", "../", "external:/", "."))
         or first in LEGACY_REPO_ROOTS
         or any(marker in raw for marker in ("*", "?", "[", "]", "{", "}"))
         or "/" in raw
@@ -1450,7 +1517,7 @@ def legacy_scope_locks(paths: HarnessPaths, scope: str) -> tuple[list[str], list
     locks: list[str] = []
     warnings: list[str] = []
     for candidate in candidates:
-        if candidate.strip().strip(".,;:") == "notes/SESSION_CONTROL.md":
+        if candidate.strip().strip(".,;:") == "LEGACY_CONTROL.md":
             continue
         lock = _infer_legacy_lock(paths, candidate)
         if lock:
@@ -1592,7 +1659,7 @@ def parse_legacy_table(paths: HarnessPaths, source: Path) -> list[dict[str, Any]
         row = {
                 "schema_version": SCHEMA_VERSION,
                 "legacy": True,
-                "source": "legacy_session_control",
+                "source": "legacy_control",
                 "source_file": str(source),
                 "source_line": line_number,
                 "token": token,

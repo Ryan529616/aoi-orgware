@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and integration tests for the dependency-free ARISE harness."""
+"""Unit and integration tests for dependency-free AOI orgware."""
 
 from __future__ import annotations
 
@@ -17,13 +17,15 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+REPO = HERE.parent
+SRC = REPO / "src"
+sys.path.insert(0, str(SRC))
 
-import harnesslib as h  # noqa: E402
+from aoi_orgware import harnesslib as h  # noqa: E402
 
 
-CLI = HERE / "arise_harness.py"
-HOOK = HERE / "codex_hook.py"
+CLI_MODULE = "aoi_orgware.cli"
+HOOK_MODULE = "aoi_orgware.codex_hook"
 
 
 class HarnessTestCase(unittest.TestCase):
@@ -31,22 +33,16 @@ class HarnessTestCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.backup_temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        (self.root / "notes").mkdir(parents=True)
-        shutil.copytree(
-            HERE.parent.parent / "notes" / "harness" / "templates",
-            self.root / "notes" / "harness" / "templates",
-        )
         self.env = os.environ.copy()
-        self.env["ARISE_HARNESS_ROOT"] = str(self.root)
+        self.env["AOI_ROOT"] = str(self.root)
+        self.env["PYTHONPATH"] = str(SRC)
         self.env["PYTHONDONTWRITEBYTECODE"] = "1"
         self.env["HOME"] = str(self.root / "home")
         self.env["CODEX_HOME"] = str(self.root / "codex-home")
         self.env["XDG_CONFIG_HOME"] = str(self.root / "xdg")
         self.env["TMPDIR"] = str(self.root / "tmp")
-        self.env["ARISE_HARNESS_RELAY_ROOT"] = str(self.root / "relay")
-        self.env["ARISE_HARNESS_SKILL_PATH"] = str(self.root / "skill" / "SKILL.md")
-        self.env["ARISE_HARNESS_HOST_MOUNT_ROOT"] = str(self.root / "host-mount")
-        self.env["ARISE_HARNESS_BACKUP_ROOT"] = self.backup_temp.name
+        self.env["AOI_HOST_MOUNT_ROOT"] = str(self.root / "host-mount")
+        self.env["AOI_BACKUP_ROOT"] = self.backup_temp.name
         (self.root / "tmp").mkdir()
         subprocess.run(
             ["git", "init", "-b", "main", str(self.root)],
@@ -72,6 +68,16 @@ class HarnessTestCase(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+        self.cli("init", "--project-name", "AOI Test Project")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "aoi.toml", ".gitignore"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "initialize AOI"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -79,7 +85,7 @@ class HarnessTestCase(unittest.TestCase):
 
     def cli(self, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, str(CLI), *args],
+            [sys.executable, "-m", CLI_MODULE, *args],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -175,18 +181,17 @@ class HarnessTestCase(unittest.TestCase):
                 "command": command,
             },
             "components": {
-                "rtl": {
+                "source": {
                     "status": "included",
-                    "files": [{"path": "/src/rtl/a.sv", "sha256": "1" * 64}],
+                    "files": [{"path": "/src/app/main.py", "sha256": "1" * 64}],
                 },
-                "tb": {"status": "not_applicable", "reason": "lifecycle-only test"},
-                "sram": {"status": "not_applicable", "reason": "no SRAM model"},
                 "runner": {
                     "status": "included",
                     "files": [{"path": "/src/scripts/run.sh", "sha256": "2" * 64}],
                 },
-                "golden": {"status": "not_applicable", "reason": "no numeric compare"},
-                "overlay": {"status": "not_applicable", "reason": "no overlay"},
+                "config": {"status": "not_applicable", "reason": "default config"},
+                "dependencies": {"status": "not_applicable", "reason": "none"},
+                "other": {"status": "not_applicable", "reason": "none"},
             },
         }
         receipt.write_text(
@@ -199,7 +204,7 @@ class HarnessTestCase(unittest.TestCase):
         if bom:
             raw = b"\xef\xbb\xbf" + raw
         result = subprocess.run(
-            [sys.executable, str(HOOK), "--hook-version", "5"],
+            [sys.executable, "-m", HOOK_MODULE, "--hook-version", "5"],
             cwd=self.root,
             env=self.env,
             input=raw,
@@ -211,9 +216,14 @@ class HarnessTestCase(unittest.TestCase):
         return json.loads(result.stdout.decode("utf-8"))
 
     def install_hook_layers(self) -> None:
-        dispatcher = self.root / "scripts" / "harness" / "codex_hook.py"
-        dispatcher.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(HOOK, dispatcher)
+        config = self.root / "aoi.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8").replace(
+                "[hooks.codex]\nenabled = false",
+                "[hooks.codex]\nenabled = true",
+            ),
+            encoding="utf-8",
+        )
         hooks: dict[str, list[dict]] = {}
         for event in ("SessionStart", "UserPromptSubmit", "SubagentStart", "Stop"):
             hooks[event] = [
@@ -221,22 +231,27 @@ class HarnessTestCase(unittest.TestCase):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "python3 -B scripts/harness/codex_hook.py --hook-version 5",
-                            "commandWindows": "wsl python3 -B scripts/harness/codex_hook.py --hook-version 5",
+                            "command": "aoi-codex-hook --hook-version 5",
+                            "commandWindows": "wsl aoi-codex-hook --hook-version 5",
                             "timeout": 30,
                         }
                     ]
                 }
             ]
         payload = json.dumps({"hooks": hooks}, indent=2) + "\n"
-        for root in (self.root, self.root / "relay"):
-            layer = root / ".codex"
-            layer.mkdir(parents=True, exist_ok=True)
-            (layer / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
-            (layer / "hooks.json").write_text(payload, encoding="utf-8")
-        skill = self.root / "skill" / "SKILL.md"
-        skill.parent.mkdir(parents=True, exist_ok=True)
-        skill.write_text("# Test harness skill\n", encoding="utf-8")
+        layer = self.root / ".codex"
+        layer.mkdir(parents=True, exist_ok=True)
+        (layer / "config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+        (layer / "hooks.json").write_text(payload, encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "aoi.toml", ".codex"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "enable AOI hook fixture"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 class LockTests(HarnessTestCase):
@@ -251,14 +266,14 @@ class LockTests(HarnessTestCase):
             h.locks_overlap("repo:file:rtl/a.sv", "repo:file:rtl/b.sv")
         )
         self.assertFalse(
-            h.locks_overlap("repo:file:rtl/a.sv", "eda:file:/tmp/rtl/a.sv")
+            h.locks_overlap("repo:file:rtl/a.sv", "external:file:/tmp/rtl/a.sv")
         )
         self.assertTrue(h.locks_overlap("contract:foo", "contract:foo"))
         self.assertFalse(h.locks_overlap("contract:foo", "contract:bar"))
         with self.assertRaises(h.HarnessError):
             h.normalize_lock("repo:file:../escape")
         with self.assertRaises(h.HarnessError):
-            h.normalize_lock("eda:tree:relative/path")
+            h.normalize_lock("external:tree:relative/path")
         with self.assertRaises(h.HarnessError):
             h.normalize_lock("repo:tree:rtl/*")
         locks, _ = h.legacy_scope_locks(
@@ -395,8 +410,7 @@ class LockTests(HarnessTestCase):
         claim = json.loads(
             (
                 self.root
-                / "notes"
-                / "harness"
+                / ".aoi"
                 / "claims"
                 / "active"
                 / "baseline-claim.json"
@@ -453,8 +467,7 @@ class LockTests(HarnessTestCase):
         )
         claim_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "claims"
             / "active"
             / "host-baseline-claim.json"
@@ -560,8 +573,7 @@ class LifecycleTests(HarnessTestCase):
         )
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "rollback-task"
             / "state.json"
@@ -617,8 +629,7 @@ class LifecycleTests(HarnessTestCase):
         self.init_task("small-checkpoint")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "small-checkpoint"
             / "state.json"
@@ -638,7 +649,7 @@ class LifecycleTests(HarnessTestCase):
         paths = h.get_paths(self.root)
         locks = [
             "repo:file:scripts/verify/z.py",
-            "contract:arise-z",
+            "contract:example-z",
             "repo:file:scripts/verify/a.py",
         ]
         active = {
@@ -686,8 +697,7 @@ class LifecycleTests(HarnessTestCase):
         paths = h.get_paths(self.root)
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "large-claim-history"
             / "state.json"
@@ -853,8 +863,7 @@ class LifecycleTests(HarnessTestCase):
         )
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "compact-checkpoint"
             / "state.json"
@@ -924,7 +933,7 @@ class LifecycleTests(HarnessTestCase):
                     "packet_id": f"terminal-packet-{index}",
                     "status": "done",
                     "agent_role": "reviewer",
-                    "model_tier": "sol-high",
+                    "model_tier": "expert",
                     "agent_id": f"agent-{index}",
                     "result_path": str(
                         task_results / f"terminal-packet-{index}.md"
@@ -938,7 +947,7 @@ class LifecycleTests(HarnessTestCase):
                 "packet_id": "active-packet",
                 "status": "dispatched",
                 "agent_role": "reviewer",
-                "model_tier": "sol-high",
+                "model_tier": "expert",
                 "agent_id": "ACTIVE-PACKET-AGENT",
                 "result_path": "",
                 "summary": "ACTIVE-PACKET-SUMMARY",
@@ -1017,8 +1026,7 @@ class LifecycleTests(HarnessTestCase):
         self.init_task("large-fact-history")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "large-fact-history"
             / "state.json"
@@ -1072,8 +1080,7 @@ class LifecycleTests(HarnessTestCase):
         self.init_task("large-verification-history")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "large-verification-history"
             / "state.json"
@@ -1160,8 +1167,7 @@ class LifecycleTests(HarnessTestCase):
         self.init_task("large-job-history")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "large-job-history"
             / "state.json"
@@ -1252,8 +1258,7 @@ class LifecycleTests(HarnessTestCase):
         self.init_task("large-packet-history")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "large-packet-history"
             / "state.json"
@@ -1266,7 +1271,7 @@ class LifecycleTests(HarnessTestCase):
                     "packet_id": f"terminal-packet-{index}",
                     "status": "done",
                     "agent_role": "reviewer",
-                    "model_tier": "sol-high",
+                    "model_tier": "expert",
                     "agent_id": f"agent-{index}",
                     "result_path": str(results / f"terminal-packet-{index}.md"),
                     "result_sha256": hashlib.sha256(
@@ -1280,7 +1285,7 @@ class LifecycleTests(HarnessTestCase):
                 "packet_id": "active-packet",
                 "status": "dispatched",
                 "agent_role": "reviewer",
-                "model_tier": "sol-high",
+                "model_tier": "expert",
                 "agent_id": "active-agent",
                 "result_path": "",
                 "summary": "ACTIVE-PACKET-SUMMARY",
@@ -1335,8 +1340,7 @@ class LifecycleTests(HarnessTestCase):
         self.init_task("active-oversized-checkpoint")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "active-oversized-checkpoint"
             / "state.json"
@@ -1476,8 +1480,7 @@ class LifecycleTests(HarnessTestCase):
         state = json.loads(
             (
                 self.root
-                / "notes"
-                / "harness"
+                / ".aoi"
                 / "tasks"
                 / "close-task"
                 / "state.json"
@@ -1549,7 +1552,7 @@ class LifecycleTests(HarnessTestCase):
             "--agent-role",
             "explorer",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Inspect source",
             "--scope",
@@ -1625,7 +1628,7 @@ class LifecycleTests(HarnessTestCase):
             "--actual-role",
             "explorer",
             "--actual-model-tier",
-            "terra-medium",
+            "standard",
             "--routing-evidence",
             "test dispatcher exposed exact custom role and tier",
         )
@@ -1657,7 +1660,7 @@ class LifecycleTests(HarnessTestCase):
             "Read-only packet and passing verification complete",
         )
 
-    def test_unknown_eda_job_blocks_close_and_terminal_needs_evidence(self) -> None:
+    def test_unknown_external_job_blocks_close_and_terminal_needs_evidence(self) -> None:
         self.init_task("eda-task")
         receipt, receipt_sha = self.write_source_receipt("source-receipt.json")
         self.cli(
@@ -1671,7 +1674,7 @@ class LifecycleTests(HarnessTestCase):
             "--kind",
             "EDA-RUN",
             "--lock",
-            "eda:tree:/tmp/arise-run",
+            "external:tree:/tmp/aoi-example-run",
             "--intent",
             "bounded EDA test",
             "--validation",
@@ -1690,11 +1693,11 @@ class LifecycleTests(HarnessTestCase):
             "--tool",
             "VCS",
             "--work-root",
-            "/tmp/arise-run",
+            "/tmp/aoi-example-run",
             "--status",
             "queued",
             "--log",
-            "/tmp/arise-run/driver.log",
+            "/tmp/aoi-example-run/driver.log",
             "--stop-condition",
             "PASS or first fatal",
             "--source-sha",
@@ -1730,7 +1733,7 @@ class LifecycleTests(HarnessTestCase):
             "--status",
             "pass",
             "--evidence",
-            "/tmp/arise-run/driver.log",
+            "/tmp/aoi-example-run/driver.log",
             ok=False,
         )
         self.assertIn("exit-code", missing_exit.stderr)
@@ -1784,7 +1787,7 @@ class LifecycleTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("unresolved queued/running/unknown jobs", unresolved.stderr)
-        terminal_log = Path("/tmp/arise-run/driver.log")
+        terminal_log = Path("/tmp/aoi-example-run/driver.log")
         terminal_log.parent.mkdir(parents=True, exist_ok=True)
         terminal_log.write_text("PASS exit=0\n", encoding="utf-8")
         self.cli(
@@ -1796,7 +1799,7 @@ class LifecycleTests(HarnessTestCase):
             "--status",
             "pass",
             "--evidence",
-            "/tmp/arise-run/driver.log exit=0 PASS",
+            "/tmp/aoi-example-run/driver.log exit=0 PASS",
             "--exit-code",
             "0",
         )
@@ -1825,7 +1828,7 @@ class LifecycleTests(HarnessTestCase):
         )
 
     def test_legacy_import_quarantines_expired_active_and_conflicts(self) -> None:
-        legacy = self.root / "notes" / "SESSION_CONTROL.md"
+        legacy = self.root / "LEGACY_CONTROL.md"
         original = (
             r"""# Legacy
 
@@ -1844,7 +1847,7 @@ class LifecycleTests(HarnessTestCase):
         self.cli("import-legacy")
         self.assertEqual(hashlib.sha256(legacy.read_bytes()).hexdigest(), before)
         pending = list(
-            (self.root / "notes" / "harness" / "claims" / "legacy_pending").glob(
+            (self.root / ".aoi" / "claims" / "legacy_pending").glob(
                 "*.json"
             )
         )
@@ -1877,7 +1880,7 @@ class LifecycleTests(HarnessTestCase):
         self.assertIn("old-active", conflict.stderr)
 
     def test_legacy_adoption_is_explicit_and_cannot_shrink_scope(self) -> None:
-        legacy = self.root / "notes" / "SESSION_CONTROL.md"
+        legacy = self.root / "LEGACY_CONTROL.md"
         legacy.write_text(
             """# Legacy
 
@@ -1933,7 +1936,7 @@ class LifecycleTests(HarnessTestCase):
         self.assertFalse(h.legacy_pending_path(h.get_paths(self.root), "old-adopt").exists())
 
     def test_malformed_legacy_row_fails_loudly(self) -> None:
-        legacy = self.root / "notes" / "SESSION_CONTROL.md"
+        legacy = self.root / "LEGACY_CONTROL.md"
         legacy.write_text(
             """# Legacy
 
@@ -1951,7 +1954,7 @@ class LifecycleTests(HarnessTestCase):
         self.assertIn("malformed rows", failed.stderr)
         self.assertFalse(
             any(
-                (self.root / "notes" / "harness" / "claims" / "legacy_pending").glob(
+                (self.root / ".aoi" / "claims" / "legacy_pending").glob(
                     "*.json"
                 )
             )
@@ -1960,7 +1963,7 @@ class LifecycleTests(HarnessTestCase):
 
 class HardeningTests(HarnessTestCase):
     def test_legacy_brace_duplicate_and_code_spans_fail_closed(self) -> None:
-        legacy = self.root / "notes" / "SESSION_CONTROL.md"
+        legacy = self.root / "LEGACY_CONTROL.md"
         legacy.write_text(
             """# Legacy
 
@@ -1968,7 +1971,7 @@ class HardeningTests(HarnessTestCase):
 
 | token | owner | kind | scope | intent | validation | started | expires | status |
 |---|---|---|---|---|---|---|---|---|
-| brace | old | RTL | `scripts/unrelated.py`, `rtl/adfp/{a,b}.sv` | own both | inspect | now | 2099-01-01T00:00:00+00:00 | active |
+| brace | old | CODE | `scripts/unrelated.py`, `src/modules/{a,b}.py` | own both | inspect | now | 2099-01-01T00:00:00+00:00 | active |
 
 ## End
 """,
@@ -1976,21 +1979,21 @@ class HardeningTests(HarnessTestCase):
         )
         self.cli("import-legacy")
         pending = list(
-            (self.root / "notes" / "harness" / "claims" / "legacy_pending").glob(
+            (self.root / ".aoi" / "claims" / "legacy_pending").glob(
                 "*.json"
             )
         )
         claim = json.loads(pending[0].read_text(encoding="utf-8"))
-        self.assertIn("repo:tree:rtl/adfp", claim["locks"])
+        self.assertIn("repo:tree:src/modules", claim["locks"])
         self.assertEqual(claim["scope_parse_warnings"], [])
 
         check = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "check-locks",
                 "--lock",
-                "repo:file:rtl/adfp/a.sv",
+                "repo:file:src/modules/a.py",
                 "--json",
             ],
             cwd=self.root,
@@ -2012,9 +2015,9 @@ class HardeningTests(HarnessTestCase):
             "--owner",
             "new",
             "--kind",
-            "RTL",
+            "CODE",
             "--lock",
-            "repo:file:rtl/adfp/b.sv",
+            "repo:file:src/modules/b.py",
             "--intent",
             "must conflict",
             "--validation",
@@ -2057,7 +2060,7 @@ class HardeningTests(HarnessTestCase):
             h.split_markdown_row("| a | `unterminated | c | d | e | f | g | h | i |")
 
     def test_partial_legacy_ambiguity_blocks_check_and_direct_claim(self) -> None:
-        legacy = self.root / "notes" / "SESSION_CONTROL.md"
+        legacy = self.root / "LEGACY_CONTROL.md"
         legacy.write_text(
             """# Legacy
 
@@ -2075,7 +2078,7 @@ class HardeningTests(HarnessTestCase):
         check = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "check-locks",
                 "--lock",
                 "repo:file:docs/new.md",
@@ -2136,7 +2139,7 @@ class HardeningTests(HarnessTestCase):
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
         )
-        self.cli(
+        packet = self.cli(
             "create-packet",
             "--task",
             "packet-lock-task",
@@ -2145,7 +2148,7 @@ class HardeningTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "terra-high",
+            "advanced",
             "--objective",
             "Inspect the claimed script",
             "--scope",
@@ -2217,7 +2220,7 @@ class HardeningTests(HarnessTestCase):
             "--kind",
             "EDA-RUN",
             "--lock",
-            "eda:tree:/tmp/receipt-run",
+            "external:tree:/tmp/receipt-run",
             "--intent",
             "test source receipt integrity",
             "--validation",
@@ -2251,7 +2254,7 @@ class HardeningTests(HarnessTestCase):
             "timeout 1m run.sh",
         ]
         state_path = (
-            self.root / "notes" / "harness" / "tasks" / "receipt-task" / "state.json"
+            self.root / ".aoi" / "tasks" / "receipt-task" / "state.json"
         )
         before = state_path.read_bytes()
         self.cli(
@@ -2363,7 +2366,7 @@ class HardeningTests(HarnessTestCase):
             "--agent-role",
             "explorer",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Read bounded state",
             "--scope",
@@ -2416,8 +2419,7 @@ class HardeningTests(HarnessTestCase):
         )
         result_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "packet-tamper"
             / "results"
@@ -2434,7 +2436,7 @@ class HardeningTests(HarnessTestCase):
         )
         self.assertIn("result SHA-256 mismatch", close.stderr)
         doctor = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -2456,7 +2458,7 @@ class HardeningTests(HarnessTestCase):
             "--agent-role",
             "explorer",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Produce an integrity-protected result",
             "--scope",
@@ -2516,8 +2518,7 @@ class HardeningTests(HarnessTestCase):
         )
         result_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "post-close-tamper"
             / "results"
@@ -2525,7 +2526,7 @@ class HardeningTests(HarnessTestCase):
         )
         result_path.write_text("modified after close\n", encoding="utf-8")
         doctor = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -2795,7 +2796,7 @@ class HardeningTests(HarnessTestCase):
             capture_output=True,
         )
         rewound = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--task", task_id, "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -2811,11 +2812,11 @@ class HardeningTests(HarnessTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = self.env.copy()
-            env["ARISE_HARNESS_ROOT"] = str(root)
+            env["AOI_ROOT"] = str(root)
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(CLI),
+                    "-m", CLI_MODULE,
                     "init-task",
                     "--task-id",
                     "not-git",
@@ -2836,15 +2837,14 @@ class HardeningTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("not a git repository", result.stderr)
-            self.assertFalse((root / "notes" / "harness" / "tasks").exists())
+            self.assertIn("AOI is not initialized", result.stderr)
+            self.assertFalse((root / ".aoi" / "tasks").exists())
 
     def test_verification_schema_and_inference_close_boundary(self) -> None:
         self.init_task("verification-task")
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "verification-task"
             / "state.json"
@@ -2969,15 +2969,14 @@ class HardeningTests(HarnessTestCase):
         )
         checkpoint = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "checkpoint-integrity"
             / "checkpoint.md"
         )
         checkpoint.write_text("corrupt\n", encoding="utf-8")
         doctor = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -3002,8 +3001,7 @@ class HardeningTests(HarnessTestCase):
         )
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "bind-idempotent"
             / "state.json"
@@ -3049,8 +3047,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         return json.loads(
             (
                 self.root
-                / "notes"
-                / "harness"
+                / ".aoi"
                 / "tasks"
                 / task_id
                 / "state.json"
@@ -3064,7 +3061,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         return next(lane for lane in lanes if lane["lane_id"] == lane_id)
 
     def tree_bytes(self) -> dict[str, bytes]:
-        harness_root = self.root / "notes" / "harness"
+        harness_root = self.root / ".aoi"
         return {
             path.relative_to(harness_root).as_posix(): path.read_bytes()
             for path in sorted(harness_root.rglob("*"))
@@ -3161,22 +3158,22 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         rtl = self.create_lane(
             "lane-critical",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         golden = self.create_lane(
             "lane-critical",
             "golden",
-            kind="numeric",
-            role="numeric_debugger",
+            kind="analysis",
+            role="analysis_specialist",
             authority_commit=commit,
         )
         pd = self.create_lane(
             "lane-critical",
             "pd",
             kind="physical",
-            role="eda_operator",
+            role="external_operator",
             authority_commit=commit,
         )
         self.assertEqual(
@@ -3210,15 +3207,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "hard-gate",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=initial,
         )
         self.create_lane(
             "hard-gate",
             "pd",
             kind="physical",
-            role="eda_operator",
+            role="external_operator",
             authority_commit=initial,
         )
         self.cli(
@@ -3273,15 +3270,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "nonblocking-deps",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=nonblocking_commit,
         )
         self.create_lane(
             "nonblocking-deps",
             "pd",
             kind="physical",
-            role="eda_operator",
+            role="external_operator",
             authority_commit=nonblocking_commit,
         )
         for dep_id, kind in (("soft", "soft_dependency"), ("info", "informational")):
@@ -3330,15 +3327,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "coordination",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         self.create_lane(
             "coordination",
             "pd",
             kind="physical",
-            role="eda_operator",
+            role="external_operator",
             authority_commit=commit,
         )
         no_steward = self.cli(
@@ -3540,15 +3537,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "golden-policy",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=initial,
         )
         self.create_lane(
             "golden-policy",
             "golden",
-            kind="numeric",
-            role="numeric_debugger",
+            kind="analysis",
+            role="analysis_specialist",
             authority_commit=initial,
         )
         self.create_lane(
@@ -3698,15 +3695,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "baseline-snapshot",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=initial,
         )
         self.create_lane(
             "baseline-snapshot",
             "golden",
-            kind="numeric",
-            role="numeric_debugger",
+            kind="analysis",
+            role="analysis_specialist",
             authority_commit=initial,
         )
         frozen = json.loads(
@@ -3775,8 +3772,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "reconcile-read-only",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         before = self.tree_bytes()
@@ -3818,8 +3815,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "packet-command-authority"
             / "state.json"
@@ -3832,9 +3828,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--packet-id",
             "bad-command",
             "--agent-role",
-            "eda_operator",
+            "external_operator",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Run only the exact command",
             "--scope",
@@ -3864,9 +3860,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--packet-id",
             "symlink-command",
             "--agent-role",
-            "eda_operator",
+            "external_operator",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Must reject symlink authority",
             "--scope",
@@ -3895,9 +3891,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "--packet-id",
                 "exact-command",
                 "--agent-role",
-                "eda_operator",
+                "external_operator",
                 "--model-tier",
-                "terra-medium",
+                "standard",
                 "--objective",
                 "Run only the exact command",
                 "--scope",
@@ -3941,7 +3937,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         doctor_result = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "doctor",
                 "--task",
                 "packet-command-authority",
@@ -3967,15 +3963,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "steward-control-plane",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         self.create_lane(
             "steward-control-plane",
             "pd",
             kind="physical",
-            role="eda_operator",
+            role="external_operator",
             authority_commit=commit,
         )
         self.create_lane(
@@ -4228,8 +4224,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "steward-control-plane"
             / "state.json"
@@ -4286,8 +4281,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "reconcile-observed",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         self.cli(
@@ -4297,9 +4292,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--packet-id",
             "rtl-owner",
             "--agent-role",
-            "rtl_engineer",
+            "implementation_specialist",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Own bounded RTL work",
             "--scope",
@@ -4338,8 +4333,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         observation_sha = hashlib.sha256(observations.read_bytes()).hexdigest()
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "reconcile-observed"
             / "state.json"
@@ -4366,7 +4360,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.init_task("capacity-flow", session_id="chief-capacity")
         commit = self.git_commit("capacity-flow")
         self.create_lane(
-            "capacity-flow", "rtl", kind="rtl", role="rtl_engineer", authority_commit=commit
+            "capacity-flow", "rtl", kind="implementation", role="implementation_specialist", authority_commit=commit
         )
         self.create_lane(
             "capacity-flow",
@@ -4479,7 +4473,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 f"Canonical result for {packet_id} records the terminal outcome",
             )
 
-        terminal_packet("rtl-history", "rtl", "worker", "terra-high", "pipeline-refactor")
+        terminal_packet("rtl-history", "rtl", "worker", "advanced", "pipeline-refactor")
         self.cli(
             "create-packet",
             "--task",
@@ -4487,9 +4481,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--packet-id",
             "rtl-parent",
             "--agent-role",
-            "rtl_engineer",
+            "implementation_specialist",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Own the RTL department assignment",
             "--scope",
@@ -4545,7 +4539,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "capacity-analysis",
             "capacity",
             "architect",
-            "sol-max",
+            "frontier",
             "capacity-analysis",
             "--capacity-review-source-id",
             "rtl-refactor-capacity",
@@ -4584,7 +4578,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Must not bypass Chief",
             "--scope",
@@ -4720,7 +4714,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Must not widen the approved task type",
             "--scope",
@@ -4756,7 +4750,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Must not consume tampered capacity data",
             "--scope",
@@ -4790,7 +4784,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Execute one bounded refactor leaf assignment",
             "--scope",
@@ -4825,7 +4819,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Must not reuse a consumed decision",
             "--scope",
@@ -4874,13 +4868,13 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.init_task("topology-governance", session_id="chief-topology")
         commit = self.git_commit("topology-governance")
         self.create_lane(
-            "topology-governance", "rtl", kind="rtl", role="rtl_engineer", authority_commit=commit
+            "topology-governance", "rtl", kind="implementation", role="implementation_specialist", authority_commit=commit
         )
         self.create_lane(
             "topology-governance",
             "num",
-            kind="numeric",
-            role="numeric_debugger",
+            kind="analysis",
+            role="analysis_specialist",
             authority_commit=commit,
         )
         self.create_lane(
@@ -5010,7 +5004,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--evidence",
             "RTL and numeric traces disagree at the same bounded layer output",
             "--closure-category",
-            "numeric_runtime",
+            "runtime_test",
         )
         self.cli(
             "coordination-update",
@@ -5159,7 +5153,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "explorer",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Inspect the exact RTL side of the bounded rounding mismatch",
             "--scope",
@@ -5182,7 +5176,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "explorer",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "Inspect the exact RTL side of the bounded rounding mismatch",
             "--scope",
@@ -5266,8 +5260,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
 
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "topology-governance"
             / "state.json"
@@ -5475,15 +5468,15 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "topology-transition",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         self.create_lane(
             "topology-transition",
             "num",
-            kind="numeric",
-            role="numeric_debugger",
+            kind="analysis",
+            role="analysis_specialist",
             authority_commit=commit,
         )
         self.create_lane(
@@ -5543,7 +5536,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--evidence",
             "Both lanes expose exact current authority snapshots",
             "--closure-category",
-            "numeric_runtime",
+            "runtime_test",
         )
         self.cli(
             "coordination-update",
@@ -5622,8 +5615,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
 
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "topology-transition"
             / "state.json"
@@ -5669,7 +5661,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         doctor_result = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "doctor",
                 "--task",
                 "topology-transition",
@@ -5743,7 +5735,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--kind",
             "EDA-RUN",
             "--lock",
-            "eda:tree:/tmp/topology-transition-run",
+            "external:tree:/tmp/topology-transition-run",
             "--intent",
             "Test queued job topology revalidation without launching EDA",
             "--validation",
@@ -5854,7 +5846,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         doctor_result = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "doctor",
                 "--task",
                 "topology-transition",
@@ -5910,8 +5902,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.create_lane(
             "unknown-launch",
             "rtl",
-            kind="rtl",
-            role="rtl_engineer",
+            kind="implementation",
+            role="implementation_specialist",
             authority_commit=commit,
         )
         self.cli(
@@ -5954,7 +5946,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--kind",
             "EDA-RUN",
             "--lock",
-            "eda:tree:/tmp/unknown-launch-run",
+            "external:tree:/tmp/unknown-launch-run",
             "--intent",
             "Exercise launch-authority state only",
             "--validation",
@@ -6087,7 +6079,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.init_task("improvement-parent", session_id="chief-improvement")
         commit = self.git_commit("improvement-parent")
         self.create_lane(
-            "improvement-parent", "rtl", kind="rtl", role="rtl_engineer", authority_commit=commit
+            "improvement-parent", "rtl", kind="implementation", role="implementation_specialist", authority_commit=commit
         )
         self.create_lane(
             "improvement-parent",
@@ -6106,7 +6098,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "--agent-role",
                 "worker",
                 "--model-tier",
-                "terra-high",
+                "advanced",
                 "--objective",
                 "Repeat a manual waveform classification task",
                 "--scope",
@@ -6342,8 +6334,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         project_results = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "waveform-skill-project"
             / "results"
@@ -6369,7 +6360,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                     "structural_pass": True,
                     "agents_metadata_consistent": True,
                     "bundled_scripts_tested": True,
-                    "representative_arise_fixtures": ["rtl-wave-a", "rtl-wave-b"],
+                    "representative_project_fixtures": ["rtl-wave-a", "rtl-wave-b"],
                     "adversarial_fixtures": ["missing-signal", "stale-log", "false-pass"],
                     "blind_forward_tests": ["fresh-wave-c", "fresh-wave-d"],
                     "independent_review": {
@@ -6447,7 +6438,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "reviewer",
             "--model-tier",
-            "sol-high",
+            "expert",
             "--objective",
             "Independently review the exact immutable waveform skill candidate",
             "--scope",
@@ -6584,7 +6575,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--agent-role",
             "worker",
             "--model-tier",
-            "terra-high",
+            "advanced",
             "--objective",
             "Reject a one-sided skill canary declaration",
             "--scope",
@@ -6617,7 +6608,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "--agent-role",
                 "worker",
                 "--model-tier",
-                "terra-high",
+                "advanced",
                 "--objective",
                 "Exercise one exact waveform skill canary work unit",
                 "--scope",
@@ -6882,8 +6873,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertNotIn("installed_path", state["skill_releases"][0])
         state_path = (
             self.root
-            / "notes"
-            / "harness"
+            / ".aoi"
             / "tasks"
             / "improvement-parent"
             / "state.json"
@@ -6899,7 +6889,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         semantic_doctor = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "doctor",
                 "--task",
                 "improvement-parent",
@@ -6924,7 +6914,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         doctor = subprocess.run(
             [
                 sys.executable,
-                str(CLI),
+                "-m", CLI_MODULE,
                 "doctor",
                 "--task",
                 "improvement-parent",
@@ -7008,7 +6998,7 @@ class V5FeatureTests(HarnessTestCase):
             "--agent-role",
             "explorer",
             "--model-tier",
-            "terra-medium",
+            "standard",
             "--objective",
             "reject",
             "--scope",
@@ -7024,21 +7014,21 @@ class V5FeatureTests(HarnessTestCase):
         rejected = self.cli(
             "start-mini",
             "--task-id",
-            "mini-rtl",
+            "mini-high-risk",
             "--title",
             "Invalid mini",
             "--objective",
-            "Must reject RTL",
+            "Must reject high-risk path",
             "--owner",
             "root",
             "--completion-boundary",
             "Rejected atomically",
             "--session-id",
-            "mini-rtl-session",
+            "mini-high-risk-session",
             "--token",
-            "mini-rtl-claim",
+            "mini-high-risk-claim",
             "--lock",
-            "repo:file:rtl/adfp/a.sv",
+            "repo:file:infra/deploy/a.py",
             "--intent",
             "invalid",
             "--validation",
@@ -7048,8 +7038,8 @@ class V5FeatureTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("high-risk", rejected.stderr)
-        self.assertFalse(h.task_state_path(h.get_paths(self.root), "mini-rtl").exists())
-        self.assertFalse(h.session_path(h.get_paths(self.root), "mini-rtl-session").exists())
+        self.assertFalse(h.task_state_path(h.get_paths(self.root), "mini-high-risk").exists())
+        self.assertFalse(h.session_path(h.get_paths(self.root), "mini-high-risk-session").exists())
 
     def test_guarded_branch_adoption_records_ancestry_and_claim(self) -> None:
         self.init_task("branch-task")
@@ -7114,10 +7104,10 @@ class V5FeatureTests(HarnessTestCase):
         self.install_hook_layers()
         self.init_task("doctor-a")
         self.init_task("doctor-b")
-        plan_b = self.root / "notes" / "harness" / "tasks" / "doctor-b" / "plan.md"
+        plan_b = self.root / ".aoi" / "tasks" / "doctor-b" / "plan.md"
         plan_b.write_text(plan_b.read_text(encoding="utf-8") + "\ncorrupt\n", encoding="utf-8")
         global_result = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -7184,7 +7174,7 @@ class V5FeatureTests(HarnessTestCase):
             },
         )
         stale = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--task", task_id, "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -7207,7 +7197,7 @@ class V5FeatureTests(HarnessTestCase):
         rebound_mapping["session_id"] = "forged-rebound-session"
         h.atomic_write_json(mapping_path, rebound_mapping)
         forged = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--task", task_id, "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -7227,7 +7217,7 @@ class V5FeatureTests(HarnessTestCase):
         h.session_path(paths, session_id).unlink()
 
         scoped = subprocess.run(
-            [sys.executable, str(CLI), "doctor", "--task", task_id, "--json"],
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
             cwd=self.root,
             env=self.env,
             text=True,
@@ -7284,21 +7274,243 @@ class V5FeatureTests(HarnessTestCase):
         self.assertIn("SHA-256", tampered.stderr)
 
 
+class ConfigurationTests(HarnessTestCase):
+    def test_custom_profile_drives_state_roles_evidence_and_external_namespace(self) -> None:
+        config = self.root / "aoi.toml"
+        text = config.read_text(encoding="utf-8")
+        text = text.replace('profile_id = "generic-v1"', 'profile_id = "custom-v1"')
+        text = text.replace('state_dir = ".aoi"', 'state_dir = ".org-state"')
+        text = text.replace(
+            'departments = ["implementation", "verification", "operations", "steward"]',
+            'departments = ["build", "review", "steward"]',
+        )
+        text = text.replace('worker = "advanced"', 'worker = "economical"')
+        text = text.replace(
+            'categories = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "hook_smoke", "skill_validation", "doctor", "independent_review", "documentation_check", "historical_terminal_readback", "citation_hygiene_review", "resource_governance", "delivery_check", "engineering_inference"]',
+            'categories = ["proof", "engineering_inference"]',
+        )
+        text = text.replace(
+            'close_qualifying = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "hook_smoke", "skill_validation", "doctor", "independent_review", "documentation_check", "citation_hygiene_review", "resource_governance", "delivery_check"]',
+            'close_qualifying = ["proof"]',
+        )
+        text = text.replace(
+            'external_lock_namespace = "external"',
+            'external_lock_namespace = "vendor"',
+        )
+        config.write_text(text, encoding="utf-8")
+
+        self.cli("init")
+        self.assertTrue((self.root / ".org-state" / "INDEX.md").is_file())
+        self.assertIn("/.org-state/", (self.root / ".gitignore").read_text())
+        self.cli(
+            "init-task",
+            "--task-id",
+            "custom-profile",
+            "--title",
+            "Custom profile",
+            "--objective",
+            "Exercise configured policy",
+            "--owner",
+            "root",
+            "--completion-boundary",
+            "Configured policy is reflected in durable state",
+        )
+        self.cli(
+            "approve-plan",
+            "--task",
+            "custom-profile",
+            "--note",
+            "Generated plan has explicit scope and verification",
+        )
+        self.cli(
+            "create-packet",
+            "--task",
+            "custom-profile",
+            "--packet-id",
+            "configured-worker",
+            "--agent-role",
+            "worker",
+            "--model-tier",
+            "economical",
+            "--objective",
+            "Read the configured project",
+            "--scope",
+            "Read-only configuration inspection",
+            "--deliverable",
+            "A bounded configuration conclusion",
+            "--validation",
+            "Compare the result with aoi.toml",
+            "--json",
+        )
+        self.cli(
+            "add-verification",
+            "--task",
+            "custom-profile",
+            "--category",
+            "proof",
+            "--status",
+            "pass",
+            "--evidence",
+            "The custom evidence category was accepted",
+            "--command",
+            "inspect aoi.toml",
+            "--boundary",
+            "Configuration routing only",
+        )
+        accepted = self.cli(
+            "check-locks", "--lock", "vendor:file:/tmp/output.log", "--json"
+        )
+        self.assertEqual(
+            json.loads(accepted.stdout)["requested_locks"],
+            ["vendor:file:/tmp/output.log"],
+        )
+        rejected = self.cli(
+            "check-locks", "--lock", "external:file:/tmp/output.log", ok=False
+        )
+        self.assertIn("invalid lock URI", rejected.stderr)
+
+        state = json.loads(
+            (
+                self.root
+                / ".org-state"
+                / "tasks"
+                / "custom-profile"
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["profile_id"], "custom-v1")
+        self.assertEqual(state["packets"][0]["model_tier"], "economical")
+        self.assertEqual(
+            state["config_sha256"], hashlib.sha256(config.read_bytes()).hexdigest()
+        )
+
+    def test_config_drift_blocks_existing_task(self) -> None:
+        self.init_task("config-drift")
+        config = self.root / "aoi.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8").replace(
+                'profile_id = "generic-v1"', 'profile_id = "generic-v2"'
+            ),
+            encoding="utf-8",
+        )
+        result = self.cli("status", "--task", "config-drift", ok=False)
+        self.assertIn("profile differs", result.stderr)
+
+    def test_unknown_config_key_fails_closed(self) -> None:
+        config = self.root / "aoi.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8") + "\nunknown_policy = true\n",
+            encoding="utf-8",
+        )
+        result = self.cli("status", ok=False)
+        self.assertIn("unknown legacy key", result.stderr)
+
+    def test_dangerous_state_directories_fail_closed(self) -> None:
+        config = self.root / "aoi.toml"
+        original = config.read_text(encoding="utf-8")
+        for unsafe in (".", ".git/aoi"):
+            with self.subTest(state_dir=unsafe):
+                config.write_text(
+                    original.replace('state_dir = ".aoi"', f'state_dir = "{unsafe}"'),
+                    encoding="utf-8",
+                )
+                result = self.cli("status", ok=False)
+                self.assertIn("state_dir must be a safe", result.stderr)
+
+    def test_symlinked_root_and_state_fail_closed(self) -> None:
+        linked_root = Path(self.backup_temp.name) / "linked-root"
+        linked_root.symlink_to(self.root, target_is_directory=True)
+        env = self.env.copy()
+        env["AOI_ROOT"] = str(linked_root)
+        linked_result = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "status"],
+            cwd=self.root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(linked_result.returncode, 2, linked_result.stderr)
+        self.assertIn("may not traverse symlinks", linked_result.stderr)
+
+        state = self.root / ".aoi"
+        shutil.rmtree(state)
+        outside = Path(self.backup_temp.name) / "outside-state"
+        outside.mkdir()
+        state.symlink_to(outside, target_is_directory=True)
+        state_result = self.cli("status", ok=False)
+        self.assertIn("state directory may not traverse symlinks", state_result.stderr)
+
+
 class BytecodeHygieneTests(HarnessTestCase):
+    def test_help_and_version_work_outside_an_aoi_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = self.env.copy()
+            env.pop("AOI_ROOT", None)
+            version = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, "--version"],
+                cwd=directory,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(version.returncode, 0, version.stderr)
+            self.assertEqual(version.stdout.strip(), "AOI 0.1.0")
+            help_result = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
+                cwd=directory,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            self.assertIn("--completion-boundary", help_result.stdout)
+            hook_help = subprocess.run(
+                [sys.executable, "-m", HOOK_MODULE, "--help"],
+                cwd=directory,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(hook_help.returncode, 0, hook_help.stderr)
+            self.assertIn("--hook-version", hook_help.stdout)
+
     def test_clean_status_and_hook_leave_no_bytecode(self) -> None:
         clean_root = self.root / "clean-bytecode-root"
-        runtime = clean_root / "scripts" / "harness"
-        runtime.mkdir(parents=True)
-        for source in (CLI, HERE / "harnesslib.py", HOOK):
-            shutil.copy2(source, runtime / source.name)
+        clean_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(clean_root)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
         clean_env = self.env.copy()
-        clean_env["ARISE_HARNESS_ROOT"] = str(clean_root)
+        clean_env["AOI_ROOT"] = str(clean_root)
+        clean_env["PYTHONPATH"] = str(SRC)
         clean_env.pop("PYTHONDONTWRITEBYTECODE", None)
         clean_env.pop("PYTHONPYCACHEPREFIX", None)
 
+        initialized = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "init", "--project-name", "Bytecode Test"],
+            cwd=clean_root,
+            env=clean_env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+
         status = subprocess.run(
-            [sys.executable, str(runtime / "arise_harness.py"), "status", "--json"],
+            [sys.executable, "-m", CLI_MODULE, "status", "--json"],
             cwd=clean_root,
             env=clean_env,
             text=True,
@@ -7315,8 +7527,8 @@ class BytecodeHygieneTests(HarnessTestCase):
         hook = subprocess.run(
             [
                 sys.executable,
-                "-B",
-                str(runtime / "codex_hook.py"),
+                "-m",
+                HOOK_MODULE,
                 "--hook-version",
                 "5",
             ],
@@ -7440,7 +7652,7 @@ class HookTests(HarnessTestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "unbound-1",
                 "turn_id": "turn-1",
-                "prompt": "diagnose ARISE",
+                "prompt": "diagnose example project",
             }
         )
         self.assertIn(
@@ -7502,7 +7714,7 @@ class ConcurrencyTests(HarnessTestCase):
     def claim_command(self, task: str, token: str, lock: str) -> list[str]:
         return [
             sys.executable,
-            str(CLI),
+            "-m", CLI_MODULE,
             "claim",
             "--task",
             task,
@@ -7561,8 +7773,7 @@ class ConcurrencyTests(HarnessTestCase):
         state = json.loads(
             (
                 self.root
-                / "notes"
-                / "harness"
+                / ".aoi"
                 / "tasks"
                 / "race-c"
                 / "state.json"

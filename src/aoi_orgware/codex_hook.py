@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny, fail-open Codex hook dispatcher for the ARISE harness."""
+"""Tiny, fail-open, opt-in Codex hook adapter for AOI."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .harnesslib import get_paths
+
 
 SUPPORTED_HOOK_VERSION = "5"
 SAFE_DISPLAY_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -19,12 +21,7 @@ SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def root_path() -> Path:
-    configured = os.environ.get("ARISE_HARNESS_ROOT")
-    return (
-        Path(configured).resolve()
-        if configured
-        else Path(__file__).resolve().parents[2]
-    )
+    return get_paths().root
 
 
 def read_input() -> dict[str, Any]:
@@ -48,8 +45,9 @@ def session_state(
         return "unbound", None
     if len(session_id) > 512 or "\x00" in session_id:
         return "corrupt", None
+    paths = get_paths(root)
     key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-    mapping_path = root / "notes" / "harness" / "sessions" / f"{key}.json"
+    mapping_path = paths.sessions / f"{key}.json"
     if not mapping_path.exists():
         return "unbound", None
     try:
@@ -59,7 +57,7 @@ def session_state(
         task_id = str(mapping.get("task_id", ""))
         if not SAFE_TASK_ID.fullmatch(task_id):
             return "corrupt", None
-        task_dir = root / "notes" / "harness" / "tasks" / task_id
+        task_dir = paths.tasks / task_id
         state_path = task_dir / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not isinstance(state, dict) or state.get("task_id") != task_id:
@@ -76,13 +74,12 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
     session_id = str(payload.get("session_id", ""))
     source = str(payload.get("source", "startup"))
     mapping_status, mapped = session_state(root, session_id)
+    paths = get_paths(root)
     base = (
-        "ARISE harness v1 is active. The implementation repo is "
-        "/workspace/project, even when this task is opened from "
-        "D:\\Documents\\ARISE. Read AGENTS.md, notes/harness/POLICY.md, and the "
-        "short notes/harness/INDEX.md. Root alone writes harness state; use "
-        "bounded sub-agent packets and do not scan the full legacy "
-        "notes/SESSION_CONTROL.md unless a warning names a row. "
+        f"AOI is active for {paths.project.name!r} at {paths.root}. Read "
+        f"{paths.harness / 'POLICY.md'} and the short {paths.index}. Root alone "
+        "writes AOI state; use bounded sub-agent packets. This hook is a "
+        "procedural guardrail, not a security boundary. "
     )
     if mapping_status == "valid" and mapped:
         state, task_dir = mapped
@@ -98,7 +95,7 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
             "gathering",
             "diagnosing",
             "implementing",
-            "waiting_eda",
+            "waiting_external",
             "verifying",
             "reviewing",
             "closing",
@@ -114,7 +111,7 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
             + f"({status}/{phase}, state revision "
             + f"{revision}, checkpoint revision "
             + f"{checkpoint_revision}). Read {checkpoint} and run "
-            + f"python3 scripts/harness/arise_harness.py resume --task "
+            + f"aoi resume --task "
             + f"{state.get('task_id')} before continuing. "
         )
         if source in {"resume", "compact"}:
@@ -135,13 +132,13 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
         context = (
             base
             + "No unambiguous task mapping exists for this session. Before any "
-            + "material edit or EDA action, resume or initialize exactly one task "
+            + "material edit or external action, resume or initialize exactly one task "
             + "and bind this session. "
         )
         if display_id:
             context += (
                 "After selecting the task, run "
-                + "python3 scripts/harness/arise_harness.py bind-session --task "
+                + "aoi bind-session --task "
                 + f"<task-id> --session-id {display_id}. "
             )
     write_output(
@@ -158,12 +155,13 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
     agent_type = str(payload.get("agent_type", "subagent"))
     if not SAFE_DISPLAY_ID.fullmatch(agent_type):
         agent_type = "subagent"
+    paths = get_paths(root)
     context = (
-        "ARISE sub-agent contract: actual repo=/workspace/project. "
+        f"AOI sub-agent contract for {paths.project.name!r}: repo={paths.root}. "
         f"Role={agent_type}. Work only inside the packet named by the root. "
         "The root owns task state, claims, plan, checkpoint, and final completion. "
-        "Do not edit notes/harness, do not scan the full legacy SESSION_CONTROL.md, "
-        "and do not launch an unrequested long EDA job. Return a bounded summary "
+        f"Do not edit {paths.harness}; "
+        "and do not launch an unrequested long external job. Return a bounded summary "
         "with conclusion, exact evidence/artifact paths, files inspected or changed, "
         "verification, unresolved risks, and one next action; never paste raw logs."
     )
@@ -181,7 +179,7 @@ def user_prompt_submit(root: Path, payload: dict[str, Any]) -> None:
     session_id = str(payload.get("session_id", ""))
     mapping_status, mapped = session_state(root, session_id)
     base = (
-        "ARISE per-turn harness check: substantial code/RTL/EDA/document/evidence "
+        "AOI per-turn check: substantial implementation/document/evidence "
         "work requires one approved plan, explicit claims, bounded packets, and a "
         "semantic checkpoint. Trivial read-only answers do not require a task. "
     )
@@ -189,7 +187,7 @@ def user_prompt_submit(root: Path, payload: dict[str, Any]) -> None:
         context = (
             base
             + "This session is not bound to a valid harness task. Before any material "
-            "mutation or EDA launch, initialize/resume and bind exactly one task. "
+            "mutation or external launch, initialize/resume and bind exactly one task. "
             "Read-only work requires no task; do not add lifecycle boilerplate unless "
             "it is relevant to the user's request."
         )
@@ -241,8 +239,8 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
             {
                 "decision": "block",
                 "reason": (
-                    "ARISE session mapping is corrupt or inconsistent. Run harness "
-                    "doctor and explicitly repair or rebind the session before stopping."
+                    "AOI session mapping is corrupt or inconsistent. Run `aoi doctor` "
+                    "and explicitly repair or rebind the session before stopping."
                 ),
             }
         )
@@ -257,7 +255,7 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
         write_output(
             {
                 "decision": "block",
-                "reason": "ARISE task state is malformed; run harness doctor before stopping.",
+                "reason": "AOI task state is malformed; run harness doctor before stopping.",
             }
         )
         return
@@ -265,7 +263,7 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
         write_output(
             {
                 "decision": "block",
-                "reason": "ARISE task state is malformed; run harness doctor before stopping.",
+                "reason": "AOI task state is malformed; run harness doctor before stopping.",
             }
         )
         return
@@ -274,7 +272,7 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
             {
                 "decision": "block",
                 "reason": (
-                    f"This session is still mapped to closed ARISE task {state.get('task_id')}. "
+                    f"This session is still mapped to closed AOI task {state.get('task_id')}. "
                     "For read-only follow-up, state that explicitly; for new material work, "
                     "initialize/resume a task and rebind before stopping."
                 ),
@@ -285,11 +283,11 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
         write_output(
             {
                 "decision": "block",
-                "reason": "ARISE task status is invalid; run harness doctor before stopping.",
+                "reason": "AOI task status is invalid; run harness doctor before stopping.",
             }
         )
         return
-    checkpoint = root / "notes" / "harness" / "tasks" / state["task_id"] / "checkpoint.md"
+    checkpoint = get_paths(root).tasks / state["task_id"] / "checkpoint.md"
     expected_hash = state.get("checkpoint_sha256")
     try:
         actual_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -306,11 +304,11 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
             {
                 "decision": "block",
                 "reason": (
-                    f"ARISE task {task_id} has stale semantic state "
+                    f"AOI task {task_id} has stale semantic state "
                     f"(state rev {revision}, checkpoint rev {checkpoint_revision}, "
                     f"required={str(required).lower()}, file_hash_match="
                     f"{str(actual_hash == expected_hash).lower()}). Before stopping, run "
-                    f"python3 scripts/harness/arise_harness.py checkpoint --task "
+                    f"aoi checkpoint --task "
                     f"{task_id} --next-action \"<one exact next action>\" and summarize "
                     "material facts, changed files, evidence boundary, and risks."
                 ),
@@ -336,7 +334,9 @@ def dispatch(payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(
+        description="Optional fail-open Codex lifecycle adapter for AOI"
+    )
     parser.add_argument("--hook-version", required=True)
     args = parser.parse_args()
     if args.hook_version != SUPPORTED_HOOK_VERSION:

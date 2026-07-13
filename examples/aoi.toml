@@ -1,0 +1,39 @@
+schema_version = 1
+profile_id = "generic-v1"
+state_dir = ".aoi"
+
+[project]
+name = "Example Project"
+
+[organization]
+departments = ["implementation", "verification", "operations", "steward"]
+
+[roles]
+architect = "frontier"
+analysis_specialist = "frontier"
+implementation_specialist = "expert"
+reviewer = "expert"
+external_systems_expert = "expert"
+worker = "advanced"
+explorer = "standard"
+external_operator = "standard"
+default = "standard"
+batch = "economical"
+
+[evidence]
+categories = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "hook_smoke", "skill_validation", "doctor", "independent_review", "documentation_check", "historical_terminal_readback", "citation_hygiene_review", "resource_governance", "delivery_check", "engineering_inference"]
+close_qualifying = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "hook_smoke", "skill_validation", "doctor", "independent_review", "documentation_check", "citation_hygiene_review", "resource_governance", "delivery_check"]
+
+[receipts]
+components = ["source", "runner", "config", "dependencies", "other"]
+required = ["source", "runner"]
+
+[policy]
+high_risk_paths = [".aoi/", "infra/", "security/", "deploy/"]
+external_lock_namespace = "external"
+
+[hooks.codex]
+enabled = false
+
+[legacy]
+enabled = false

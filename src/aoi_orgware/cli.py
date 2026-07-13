@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan/claim/delegate/verify/checkpoint CLI for ARISE work."""
+"""Plan/claim/delegate/verify/checkpoint CLI for AOI orgware."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ sys.dont_write_bytecode = True
 import argparse
 import gzip
 import hashlib
+import importlib.resources
 import io
 import json
 import os
@@ -22,7 +23,9 @@ import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from harnesslib import (
+from .config import ProjectConfig, default_config_text
+
+from .harnesslib import (
     ACCOUNTED_VERIFICATION_STATUSES,
     ACTIVE_JOB_STATUSES,
     ACTIVE_PACKET_STATUSES,
@@ -116,16 +119,16 @@ Do not edit harness state or work outside this packet.
 """
 
 ROLE_TIER_MAP = {
-    "architect": "sol-max",
-    "numeric_debugger": "sol-max",
-    "rtl_engineer": "sol-high",
-    "reviewer": "sol-high",
-    "eda_expert": "sol-high",
-    "worker": "terra-high",
-    "explorer": "terra-medium",
-    "eda_operator": "terra-medium",
-    "default": "terra-medium",
-    "batch": "luna-low",
+    "architect": "frontier",
+    "analysis_specialist": "frontier",
+    "implementation_specialist": "expert",
+    "reviewer": "expert",
+    "external_systems_expert": "expert",
+    "worker": "advanced",
+    "explorer": "standard",
+    "external_operator": "standard",
+    "default": "standard",
+    "batch": "economical",
 }
 TERMINAL_PACKET_STATUSES = PACKET_STATUSES - ACTIVE_PACKET_STATUSES
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
@@ -136,9 +139,9 @@ VERIFICATION_CATEGORIES = {
     "integration_test",
     "compile_acceptance",
     "runtime_test",
-    "numeric_runtime",
-    "eda_runtime",
-    "physical_evidence",
+    "runtime_test",
+    "external_runtime",
+    "system_evidence",
     "hook_smoke",
     "skill_validation",
     "doctor",
@@ -154,27 +157,24 @@ CLOSE_QUALIFYING_CATEGORIES = VERIFICATION_CATEGORIES - {
     "engineering_inference",
     "historical_terminal_readback",
 }
-RECEIPT_COMPONENTS = ("rtl", "tb", "sram", "runner", "golden", "overlay")
+RECEIPT_COMPONENTS = ("source", "runner", "config", "dependencies", "other")
+REQUIRED_RECEIPT_COMPONENTS = ("source", "runner")
 HOOK_PROTOCOL_VERSION = "5"
 MINI_MAX_LOCKS = 3
 MINI_FORBIDDEN_REPO_PREFIXES = (
-    "rtl/",
-    "tb/",
-    "paper/",
-    "experiments/",
-    "scripts/harness/",
-    "scripts/run/",
+    ".aoi/",
+    "infra/",
+    "security/",
+    "deploy/",
     ".codex/",
-    "docs/current/contracts/",
-    "docs/current/status/evidence/",
 )
 LANE_KINDS = {
     "architecture",
-    "rtl",
-    "numeric",
-    "golden_numeric",
+    "implementation",
+    "analysis",
+    "reference",
     "verification",
-    "eda_pd",
+    "external_systems",
     "physical",
     "performance",
     "integration",
@@ -182,6 +182,36 @@ LANE_KINDS = {
     "capacity_planning",
     "other",
 }
+
+
+def apply_project_config(config: ProjectConfig) -> None:
+    """Apply one immutable project profile before parser construction."""
+
+    global ROLE_TIER_MAP
+    global VERIFICATION_CATEGORIES, CLOSE_QUALIFYING_CATEGORIES
+    global RECEIPT_COMPONENTS, REQUIRED_RECEIPT_COMPONENTS
+    global MINI_FORBIDDEN_REPO_PREFIXES, LANE_KINDS
+    ROLE_TIER_MAP = dict(config.roles)
+    VERIFICATION_CATEGORIES = set(config.evidence_categories)
+    CLOSE_QUALIFYING_CATEGORIES = set(config.close_qualifying_categories)
+    RECEIPT_COMPONENTS = tuple(config.receipt_components)
+    REQUIRED_RECEIPT_COMPONENTS = tuple(config.required_receipt_components)
+    MINI_FORBIDDEN_REPO_PREFIXES = tuple(config.high_risk_paths)
+    LANE_KINDS = {
+        "architecture",
+        "implementation",
+        "analysis",
+        "reference",
+        "verification",
+        "external_systems",
+        "physical",
+        "performance",
+        "integration",
+        "coordination_steward",
+        "capacity_planning",
+        "other",
+        *config.departments,
+    }
 LANE_STATUSES = {
     "active",
     "waiting",
@@ -218,11 +248,11 @@ COMMAND_ARTIFACT_MAX_BYTES = 1024 * 1024
 TERMINAL_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 CAPABILITY_CATALOG_VERSION = 1
 CAPABILITY_TIER_MAP = {
-    "c1_mechanical": "luna-low",
-    "c2_routine": "terra-medium",
-    "c3_advanced": "terra-high",
-    "c4_expert": "sol-high",
-    "c5_frontier": "sol-max",
+    "c1_mechanical": "economical",
+    "c2_routine": "standard",
+    "c3_advanced": "advanced",
+    "c4_expert": "expert",
+    "c5_frontier": "frontier",
 }
 DEPTH_TWO_ROLES = {"batch", "explorer", "worker"}
 IMPROVEMENT_TRIGGER_CLASSES = {"repeated_pain", "critical_single_incident"}
@@ -1417,7 +1447,7 @@ def validate_source_receipt(
                 raise HarnessError(
                     f"source receipt {component_name} entry has invalid SHA-256: {entry_path}"
                 )
-    for required_included in ("rtl", "runner"):
+    for required_included in REQUIRED_RECEIPT_COMPONENTS:
         if components[required_included].get("status") != "included":
             raise HarnessError(f"source receipt component {required_included!r} must be included")
     return payload
@@ -1821,6 +1851,62 @@ def cmd_unbind_session(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
+def _resource_text(name: str) -> str:
+    resource = importlib.resources.files("aoi_orgware.resources").joinpath(name)
+    return resource.read_text(encoding="utf-8")
+
+
+def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    if not (paths.root / ".git").exists():
+        raise HarnessError("aoi init requires a Git repository root")
+    project_name = args.project_name or paths.root.name or "AOI Project"
+    created_config = False
+    if paths.config.exists():
+        if args.project_name and paths.project.name != args.project_name:
+            raise HarnessError(
+                f"AOI is already initialized as {paths.project.name!r}; refusing to rename"
+            )
+    else:
+        try:
+            config_text = default_config_text(project_name)
+        except ValueError as exc:
+            raise HarnessError(str(exc)) from exc
+        atomic_write_text(paths.config, config_text)
+        created_config = True
+    initialized = get_paths(paths.root)
+    ensure_layout(initialized)
+    for name in ("plan.md", "packet.md", "checkpoint.md", "source_receipt.example.json"):
+        destination = initialized.templates / name
+        if not destination.exists():
+            atomic_write_text(destination, _resource_text(f"templates/{name}"))
+    policy = initialized.harness / "POLICY.md"
+    if not policy.exists():
+        atomic_write_text(policy, _resource_text("policy.md"))
+    ignore_path = initialized.root / ".gitignore"
+    ignore_entry = f"/{initialized.project.state_dir.rstrip('/')}/"
+    current_ignore = ignore_path.read_text(encoding="utf-8") if ignore_path.exists() else ""
+    if ignore_entry not in {line.strip() for line in current_ignore.splitlines()}:
+        updated = current_ignore
+        if updated and not updated.endswith("\n"):
+            updated += "\n"
+        updated += ignore_entry + "\n"
+        atomic_write_text(ignore_path, updated)
+    write_index(initialized)
+    emit(
+        {
+            "initialized": True,
+            "created_config": created_config,
+            "project": initialized.project.name,
+            "root": str(initialized.root),
+            "state_dir": str(initialized.harness),
+            "config_sha256": initialized.project.sha256,
+            "hooks_enabled": initialized.project.codex_hooks_enabled,
+        },
+        args.json,
+    )
+    return 0
+
+
 def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
     task_id = validate_id(args.task_id, "task id")
     title = require_text(args.title, "title")
@@ -1835,6 +1921,8 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
         created = now_iso()
         state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
+            "profile_id": paths.project.profile_id,
+            "config_sha256": paths.project.sha256,
             "task_id": task_id,
             "profile": "full",
             "title": title,
@@ -1923,7 +2011,7 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "## Intent and verification\n\n"
         f"- Intent: {intent}\n- Validation: {validation}\n\n"
         "## Fixed exclusions\n\n"
-        "- No RTL, EDA, tree locks, delegation packets, or additional claims.\n"
+        "- No high-risk paths, external jobs, tree locks, delegation packets, or additional claims.\n"
         "- Normal verification, delivery, checkpoint, release, and close gates remain required.\n"
     )
     timestamp = now_iso()
@@ -1950,6 +2038,8 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
         baselines = baselines_for_locks(paths, locks, repo_root=Path(metadata["worktree"]))
         state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
+            "profile_id": paths.project.profile_id,
+            "config_sha256": paths.project.sha256,
             "task_id": task_id,
             "profile": "mini",
             "title": title,
@@ -2085,7 +2175,7 @@ def cmd_bind_session(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
 
 def cmd_import_legacy(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    source = Path(args.source).resolve() if args.source else paths.root / "notes" / "SESSION_CONTROL.md"
+    source = Path(args.source).resolve() if args.source else paths.root / "LEGACY_CONTROL.md"
     with state_lock(paths):
         result = import_legacy(paths, source)
         write_index(paths)
@@ -2272,10 +2362,18 @@ def uncovered_dependencies_after_release(
             log = job.get("log")
             if work_root:
                 dependencies.append(
-                    (f"job {job.get('run_id')}", f"eda:tree:{work_root}")
+                    (
+                        f"job {job.get('run_id')}",
+                        f"{paths.project.external_lock_namespace}:tree:{work_root}",
+                    )
                 )
             if log:
-                dependencies.append((f"job {job.get('run_id')}", f"eda:file:{log}"))
+                dependencies.append(
+                    (
+                        f"job {job.get('run_id')}",
+                        f"{paths.project.external_lock_namespace}:file:{log}",
+                    )
+                )
     return [
         f"{owner} requires {lock}"
         for owner, lock in dependencies
@@ -3315,7 +3413,7 @@ def _skill_release_semantic_integrity_errors(
             or validation.get("structural_pass") is not True
             or validation.get("agents_metadata_consistent") is not True
             or validation.get("bundled_scripts_tested") is not True
-            or not _valid_named_checks(validation.get("representative_arise_fixtures"), 2)
+            or not _valid_named_checks(validation.get("representative_project_fixtures"), 2)
             or not _valid_named_checks(validation.get("adversarial_fixtures"), 3)
             or not _valid_named_checks(validation.get("blind_forward_tests"), 2)
             or independent.get("status") != "pass"
@@ -3552,7 +3650,7 @@ def cmd_skill_release_record(args: argparse.Namespace, paths: HarnessPaths) -> i
             or validation.get("structural_pass") is not True
             or validation.get("agents_metadata_consistent") is not True
             or validation.get("bundled_scripts_tested") is not True
-            or not _valid_named_checks(validation.get("representative_arise_fixtures"), 2)
+            or not _valid_named_checks(validation.get("representative_project_fixtures"), 2)
             or not _valid_named_checks(validation.get("adversarial_fixtures"), 3)
             or not _valid_named_checks(validation.get("blind_forward_tests"), 2)
             or independent.get("status") != "pass"
@@ -5682,9 +5780,9 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
             raise HarnessError(f"unknown verification category: {args.category}")
         if state.get("profile") == "mini" and args.category in {
             "runtime_test",
-            "numeric_runtime",
-            "eda_runtime",
-            "physical_evidence",
+            "runtime_test",
+            "external_runtime",
+            "system_evidence",
             "resource_governance",
         }:
             raise HarnessError(f"mini task may not record {args.category} evidence")
@@ -5698,7 +5796,7 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
             if args.status == "pass" and matches[0].get("status") != "pass":
                 raise HarnessError("passing job-linked verification requires a passing job")
-        if args.category in {"eda_runtime", "numeric_runtime", "physical_evidence"}:
+        if args.category in {"external_runtime", "runtime_test", "system_evidence"}:
             if not args.run_id:
                 raise HarnessError(f"{args.category} verification requires --run-id")
         artifact_refs = []
@@ -6335,8 +6433,8 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         state = load_task(paths, args.task)
         require_open_task(state, "start job for")
         if state.get("profile") == "mini":
-            raise HarnessError("mini task may not launch or register EDA jobs")
-        require_plan_ready(paths, state, "start EDA job")
+            raise HarnessError("mini task may not launch or register external jobs")
+        require_plan_ready(paths, state, "start external job")
         if args.lane_id:
             lane_by_id(state, args.lane_id)
         selection = _validate_active_execution_selection(
@@ -6356,7 +6454,11 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             if claim.get("status") in RESERVING_CLAIM_STATUSES
             for lock in claim.get("locks", [])
         ]
-        required_output_locks = [f"eda:tree:{work_root}", f"eda:file:{log}"]
+        namespace = paths.project.external_lock_namespace
+        required_output_locks = [
+            f"{namespace}:tree:{work_root}",
+            f"{namespace}:file:{log}",
+        ]
         unowned = [
             lock
             for lock in required_output_locks
@@ -6364,7 +6466,7 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         ]
         if unowned:
             raise HarnessError(
-                "EDA job output paths are not covered by this task's claims: "
+                "external job output paths are not covered by this task's claims: "
                 + ", ".join(unowned)
             )
         receipt_snapshot = (
@@ -7028,24 +7130,8 @@ def _backup_sources(paths: HarnessPaths) -> list[tuple[str, Path]]:
                 relative = source.relative_to(source_root).as_posix()
                 sources.append((f"{prefix}/{relative}", source))
 
-    add_file("repo/AGENTS.md", paths.root / "AGENTS.md")
-    add_tree("repo/notes/harness", paths.harness)
-    for name in ("arise_harness.py", "harnesslib.py", "codex_hook.py", "test_arise_harness.py"):
-        add_file(f"repo/scripts/harness/{name}", paths.root / "scripts" / "harness" / name)
-    for name in ("config.toml", "hooks.json"):
-        add_file(f"repo/.codex/{name}", paths.root / ".codex" / name)
-    relay_root = Path(
-        os.environ.get("ARISE_HARNESS_RELAY_ROOT", "/mnt/d/workspace/project")
-    ).resolve()
-    for name in ("config.toml", "hooks.json"):
-        add_file(f"external/windows-relay/.codex/{name}", relay_root / ".codex" / name)
-    skill = Path(
-        os.environ.get(
-            "ARISE_HARNESS_SKILL_PATH",
-            "/opt/aoi/skills/aoi/SKILL.md",
-        )
-    )
-    add_file("external/personal-skill/arise-harness/SKILL.md", skill)
+    add_file("project/aoi.toml", paths.config)
+    add_tree("project/state", paths.harness)
     names = [name for name, _ in sources]
     if len(names) != len(set(names)):
         raise HarnessError("backup allowlist produced duplicate archive names")
@@ -7154,7 +7240,8 @@ def verify_backup(archive_path: Path, sidecar_path: Path) -> dict[str, Any]:
 def cmd_backup_state(args: argparse.Namespace, paths: HarnessPaths) -> int:
     configured_raw = Path(
         os.environ.get(
-            "ARISE_HARNESS_BACKUP_ROOT", "/mnt/d/workspace/project/backups/harness"
+            "AOI_BACKUP_ROOT",
+            str(Path.home() / ".local" / "state" / "aoi" / "backups" / paths.root.name),
         )
     ).expanduser()
     requested_raw = Path(args.destination).expanduser() if args.destination else configured_raw
@@ -7179,7 +7266,7 @@ def cmd_backup_state(args: argparse.Namespace, paths: HarnessPaths) -> int:
     with state_lock(paths):
         archive_bytes, manifest = _build_backup_archive(paths)
     archive_sha = hashlib.sha256(archive_bytes).hexdigest()
-    archive_path = destination / f"arise-harness-state-{archive_sha[:16]}.tar.gz"
+    archive_path = destination / f"aoi-state-{archive_sha[:16]}.tar.gz"
     sidecar_path = archive_path.with_suffix(archive_path.suffix + ".manifest.json")
     manifest_bytes = (
         json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
@@ -7193,7 +7280,7 @@ def cmd_backup_state(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "archive_sha256": archive_sha,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "member_count": len(manifest["members"]),
-        "durability_boundary": "Windows-side same-host recovery copy; not off-host disaster recovery",
+        "durability_boundary": "same-host recovery copy; not off-host disaster recovery",
     }
     if archive_path.exists() or sidecar_path.exists():
         if not (archive_path.exists() and sidecar_path.exists()):
@@ -7447,82 +7534,60 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"task {task['task_id']} backlink has no matching session mapping: {session_id}"
                 )
 
-    relay_root = Path(
-        os.environ.get("ARISE_HARNESS_RELAY_ROOT", "/mnt/d/workspace/project")
-    ).resolve()
-    config_paths = [
-        paths.root / ".codex" / "config.toml",
-        relay_root / ".codex" / "config.toml",
-    ]
-    hook_paths = [
-        paths.root / ".codex" / "hooks.json",
-        relay_root / ".codex" / "hooks.json",
-    ]
-    for path in config_paths:
-        if not path.exists():
-            warnings.append(f"missing project config layer: {path}")
-            continue
-        try:
-            config = tomllib.loads(path.read_text(encoding="utf-8"))
-            if config.get("features", {}).get("hooks") is not True:
-                errors.append(f"hooks feature is not enabled in {path}")
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            errors.append(f"invalid TOML {path}: {exc}")
-    hook_payloads: list[dict[str, Any]] = []
-    for path in hook_paths:
-        if not path.exists():
-            warnings.append(f"missing hook layer: {path}")
+    if paths.project.codex_hooks_enabled:
+        config_path = paths.root / ".codex" / "config.toml"
+        hook_path = paths.root / ".codex" / "hooks.json"
+        if not config_path.exists():
+            errors.append(f"Codex hooks are enabled but config is missing: {config_path}")
         else:
-            _check_json_file(path, errors)
             try:
-                hook_payloads.append(load_json(path))
+                hook_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                if hook_config.get("features", {}).get("hooks") is not True:
+                    errors.append(f"hooks feature is not enabled in {config_path}")
+            except (OSError, tomllib.TOMLDecodeError) as exc:
+                errors.append(f"invalid TOML {config_path}: {exc}")
+        if not hook_path.exists():
+            errors.append(f"Codex hooks are enabled but definition is missing: {hook_path}")
+        else:
+            _check_json_file(hook_path, errors)
+            try:
+                hook_payload = load_json(hook_path)
             except HarnessError:
-                pass
-    if len(hook_payloads) == 2 and hook_paths[0].read_bytes() != hook_paths[1].read_bytes():
-        errors.append("WSL and Windows relay hook definitions differ")
-    expected_events = {"SessionStart", "UserPromptSubmit", "SubagentStart", "Stop"}
-    for path, payload in zip(hook_paths, hook_payloads):
-        hooks = payload.get("hooks", {})
-        if set(hooks) != expected_events:
-            errors.append(f"unexpected hook event set in {path}: {sorted(hooks)}")
-            continue
-        for event in expected_events:
-            entries = hooks.get(event, [])
-            if len(entries) != 1 or len(entries[0].get("hooks", [])) != 1:
-                errors.append(f"{path} must have exactly one handler for {event}")
-                continue
-            handler = entries[0]["hooks"][0]
-            if handler.get("type") != "command":
-                errors.append(f"{path} {event} handler is not a command")
-            if handler.get("timeout", 0) < 30:
-                errors.append(f"{path} {event} timeout is below 30 seconds")
-            for key in ("command", "commandWindows"):
-                if f"--hook-version {HOOK_PROTOCOL_VERSION}" not in str(handler.get(key, "")):
-                    errors.append(f"{path} {event} {key} has wrong hook version")
+                hook_payload = {}
+            expected_events = {"SessionStart", "UserPromptSubmit", "SubagentStart", "Stop"}
+            hooks = hook_payload.get("hooks", {})
+            if set(hooks) != expected_events:
+                errors.append(f"unexpected hook event set in {hook_path}: {sorted(hooks)}")
+            else:
+                for event in expected_events:
+                    entries = hooks.get(event, [])
+                    if len(entries) != 1 or len(entries[0].get("hooks", [])) != 1:
+                        errors.append(f"{hook_path} must have exactly one handler for {event}")
+                        continue
+                    handler = entries[0]["hooks"][0]
+                    if handler.get("type") != "command":
+                        errors.append(f"{hook_path} {event} handler is not a command")
+                    if handler.get("timeout", 0) < 30:
+                        errors.append(f"{hook_path} {event} timeout is below 30 seconds")
+                    for key in ("command", "commandWindows"):
+                        command = str(handler.get(key, ""))
+                        if "aoi-codex-hook" not in command:
+                            errors.append(f"{hook_path} {event} {key} does not invoke AOI")
+                        if f"--hook-version {HOOK_PROTOCOL_VERSION}" not in command:
+                            errors.append(f"{hook_path} {event} {key} has wrong hook version")
 
-    dispatcher = paths.root / "scripts" / "harness" / "codex_hook.py"
-    if dispatcher.exists():
-        source = dispatcher.read_text(encoding="utf-8")
-        if f'SUPPORTED_HOOK_VERSION = "{HOOK_PROTOCOL_VERSION}"' not in source:
-            errors.append("hook dispatcher protocol version differs from hook definitions")
-    else:
-        errors.append(f"hook dispatcher is missing: {dispatcher}")
+    if paths.project.legacy_enabled:
+        legacy_source = paths.root / "LEGACY_CONTROL.md"
+        if not scoped and legacy_source.exists():
+            try:
+                parse_legacy_table(paths, legacy_source)
+            except HarnessError as exc:
+                errors.append(str(exc))
 
-    legacy_source = paths.root / "notes" / "SESSION_CONTROL.md"
-    if not scoped and legacy_source.exists():
-        try:
-            parse_legacy_table(paths, legacy_source)
-        except HarnessError as exc:
-            errors.append(str(exc))
-
-    skill = Path(
-        os.environ.get(
-            "ARISE_HARNESS_SKILL_PATH",
-            "/opt/aoi/skills/aoi/SKILL.md",
-        )
-    )
-    if not skill.exists():
-        warnings.append(f"personal skill not installed: {skill}")
+    if not paths.config.is_file():
+        errors.append(f"AOI configuration is missing: {paths.config}")
+    if paths.harness.exists() and stat.S_IMODE(paths.harness.stat().st_mode) & 0o077:
+        errors.append(f"AOI state directory is not private (expected 0700): {paths.harness}")
     if not paths.index.exists():
         warnings.append(f"index has not been rendered: {paths.index}")
 
@@ -7544,9 +7609,15 @@ def add_json_argument(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="ARISE plan/claim/delegate/verify/checkpoint harness"
+        description="AOI governed multi-agent organization infrastructure"
     )
+    parser.add_argument("--version", action="version", version="AOI 0.1.0")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init", help="initialize AOI in the current Git repository")
+    p.add_argument("--project-name")
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_init)
 
     p = sub.add_parser("init-task")
     p.add_argument("--task-id", required=True)
@@ -8235,10 +8306,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    paths = get_paths()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if "--version" in raw_argv or "--help" in raw_argv or "-h" in raw_argv:
+            parser = build_parser()
+            args = parser.parse_args(raw_argv)
+            return int(args.handler(args, get_paths()))
+        paths = get_paths()
+        command = next((item for item in raw_argv if not item.startswith("-")), "")
+        if command not in {"init", ""} and not paths.config.is_file():
+            raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
+        apply_project_config(paths.project)
+        parser = build_parser()
+        args = parser.parse_args(raw_argv)
         return int(args.handler(args, paths))
     except HarnessError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
