@@ -1,6 +1,6 @@
 # AOI profile schema
 
-AOI v0.1.2 accepts strict TOML schema version 1. Unknown top-level or table keys
+AOI v0.1.x accepts strict TOML schema version 1. Unknown top-level or table keys
 fail closed. Generate a complete candidate; do not rely on omitted defaults.
 
 ```toml

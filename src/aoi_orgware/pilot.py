@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__
-from .harnesslib import HarnessError, replace_file
+from .harnesslib import HarnessError, canonicalize_no_link_traversal, replace_file
 
 
 PILOT_SCHEMA_VERSION = 1
@@ -411,9 +411,10 @@ def validate_record(payload: Any) -> dict[str, Any]:
 
 
 def load_record(path: Path) -> dict[str, Any]:
-    lexical = path.expanduser().absolute()
-    if path.is_symlink() or lexical != path.expanduser().resolve():
-        raise PilotError(f"pilot record may not traverse symlinks: {path}")
+    try:
+        path = canonicalize_no_link_traversal(path, "pilot record")
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
     if not path.is_file():
         raise PilotError(f"pilot record is not a file: {path}")
     if path.stat().st_size > 64 * 1024:
@@ -439,21 +440,45 @@ def _resource_files() -> list[tuple[str, bytes]]:
 
 
 def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o644) -> None:
+    try:
+        path = canonicalize_no_link_traversal(path, "pilot write destination")
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path = canonicalize_no_link_traversal(path, "pilot write destination")
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
     temp_name = ""
     try:
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), mode)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
             temp_name = handle.name
         try:
+            if (
+                canonicalize_no_link_traversal(path, "pilot write destination")
+                != path
+            ):
+                raise PilotError("pilot write destination changed before publication")
+        except HarnessError as exc:
+            raise PilotError(str(exc)) from exc
+        try:
             replace_file(Path(temp_name), path)
         except HarnessError as exc:
             raise PilotError(str(exc)) from exc
-        if os.name != "nt":
-            path.chmod(mode)
         temp_name = ""
+        try:
+            if (
+                canonicalize_no_link_traversal(path, "pilot write destination")
+                != path
+            ):
+                raise PilotError("pilot write destination changed after publication")
+        except HarnessError as exc:
+            raise PilotError(str(exc)) from exc
     finally:
         if temp_name:
             Path(temp_name).unlink(missing_ok=True)
@@ -472,11 +497,10 @@ def initialize_kit(
             "native Windows ACL privacy is not verified by AOI; rerun with "
             "--allow-unverified-windows-acl only after restricting the output directory"
         )
-    output = output.expanduser()
-    lexical = output.absolute()
-    resolved = output.resolve()
-    if output.is_symlink() or lexical != resolved:
-        raise PilotError("pilot output may not traverse symlinks")
+    try:
+        output = canonicalize_no_link_traversal(output, "pilot output")
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
     if output.exists() and not output.is_dir():
         raise PilotError(f"pilot output is not a directory: {output}")
     resources = _resource_files()
@@ -488,15 +512,13 @@ def initialize_kit(
             "refusing to overwrite existing pilot files: " + ", ".join(collisions)
         )
     for relative, path in destinations:
-        if path.is_symlink():
-            raise PilotError(f"pilot destination may not be a symlink: {relative}")
+        try:
+            canonicalize_no_link_traversal(path, f"pilot destination {relative}")
+        except HarnessError as exc:
+            raise PilotError(str(exc)) from exc
         current = output
         for part in Path(relative).parts[:-1]:
             current = current / part
-            if current.is_symlink():
-                raise PilotError(
-                    f"pilot destination parent may not be a symlink: {relative}"
-                )
             if current.exists() and not current.is_dir():
                 raise PilotError(
                     f"pilot destination parent is not a directory: {relative}"
@@ -773,10 +795,10 @@ def write_summary(
     output_format: str,
     force: bool = False,
 ) -> dict[str, Any]:
-    output = output.expanduser()
-    lexical = output.absolute()
-    if output.is_symlink() or lexical != output.resolve():
-        raise PilotError("pilot summary output may not traverse symlinks")
+    try:
+        output = canonicalize_no_link_traversal(output, "pilot summary output")
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
     if output.exists() and output.is_dir():
         raise PilotError(f"pilot summary output is a directory: {output}")
     if output.exists() and not force:

@@ -239,7 +239,12 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"unknown AOI config key(s): {', '.join(unknown)}")
-    if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != CONFIG_SCHEMA_VERSION
+    ):
         raise ValueError("AOI config requires schema_version = 1")
     project = _table(payload, "project")
     _reject_unknown(project, {"name"}, "project")
@@ -356,22 +361,60 @@ def load_config_path(root: Path, source: Path) -> tuple[ProjectConfig, bytes]:
 
     root = root.resolve()
     source = source.expanduser().absolute()
-    if _path_is_link_like(source):
-        raise ValueError(f"AOI configuration may not be a symlink or junction: {source}")
-    if not source.is_file():
-        raise ValueError(f"AOI configuration is not a regular file: {source}")
     try:
-        size = source.stat().st_size
+        before = source.lstat()
     except OSError as exc:
         raise ValueError(f"cannot inspect AOI configuration {source}: {exc}") from exc
-    if size <= 0 or size > MAX_CONFIG_BYTES:
+    if _path_is_link_like(source):
+        raise ValueError(
+            f"AOI configuration may not be a symlink or junction: {source}"
+        )
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"AOI configuration is not a regular file: {source}")
+    if before.st_nlink != 1:
+        raise ValueError(f"AOI configuration may not be hard-linked: {source}")
+    if before.st_size <= 0 or before.st_size > MAX_CONFIG_BYTES:
         raise ValueError(
             f"AOI configuration must be 1-{MAX_CONFIG_BYTES} bytes: {source}"
         )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        raw = source.read_bytes()
+        descriptor = os.open(source, flags)
     except OSError as exc:
-        raise ValueError(f"cannot read AOI configuration {source}: {exc}") from exc
+        raise ValueError(f"cannot open AOI configuration safely {source}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size != before.st_size
+        ):
+            raise ValueError(f"AOI configuration changed while opening: {source}")
+        chunks: list[bytes] = []
+        remaining = MAX_CONFIG_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_dev != opened.st_dev
+            or finished.st_ino != opened.st_ino
+            or finished.st_size != opened.st_size
+            or getattr(finished, "st_mtime_ns", None)
+            != getattr(opened, "st_mtime_ns", None)
+            or len(raw) != finished.st_size
+        ):
+            raise ValueError(f"AOI configuration changed while reading: {source}")
+    finally:
+        os.close(descriptor)
     if not 0 < len(raw) <= MAX_CONFIG_BYTES:
         raise ValueError(
             f"AOI configuration must be 1-{MAX_CONFIG_BYTES} bytes: {source}"

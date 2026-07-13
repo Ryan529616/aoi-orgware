@@ -9,6 +9,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+import copy
 import gzip
 import hashlib
 import importlib.resources
@@ -20,6 +21,7 @@ import stat
 import subprocess
 import tarfile
 import tomllib
+import zlib
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -50,6 +52,7 @@ from .harnesslib import (
     atomic_write_text,
     baselines_for_locks,
     bump_task,
+    canonicalize_no_link_traversal,
     checkpoint_matches,
     claim_path,
     claims_for_task,
@@ -257,6 +260,7 @@ COMMAND_ARTIFACT_MAX_BYTES = 1024 * 1024
 TERMINAL_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 BOUND_ARTIFACT_MAX_COUNT = 64
 BOUND_ARTIFACT_TOTAL_MAX_BYTES = 64 * 1024 * 1024
+RECOVERY_TAR_MAX_MEMBERS = 4096
 CAPABILITY_CATALOG_VERSION = 1
 CAPABILITY_TIER_MAP = {
     "c1_mechanical": "economical",
@@ -338,6 +342,88 @@ def canonical_record_sha256(value: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _is_exact_int(value: Any, expected: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
+def _is_canonical_snapshot_version(value: Any) -> bool:
+    return _is_exact_int(value, 1)
+
+
+def _is_legacy_snapshot_version(value: Any) -> bool:
+    return value is None or _is_exact_int(value, 0)
+
+
+def _packet_schema_version(packet: dict[str, Any]) -> int | None:
+    value = packet.get("packet_schema_version", 0)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
+
+
+SUPERSESSION_MUTATION_FIELDS = {
+    "supersession_version",
+    "source_record_sha256",
+    "original_status",
+    "superseded_at",
+    "supersession_reason",
+    "replacement_index",
+    "replacement_record_sha256",
+    "replacement_materialization",
+}
+
+
+def verification_source_preimage(record: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct the exact verification record before supersession mutation."""
+
+    preimage = copy.deepcopy(record)
+    original_status = preimage.get("original_status")
+    for field in SUPERSESSION_MUTATION_FIELDS:
+        preimage.pop(field, None)
+    preimage["status"] = original_status
+    return preimage
+
+
+def verification_legacy_seal_preimage(record: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct the legacy supersession record immediately before sealing."""
+
+    preimage = copy.deepcopy(record)
+    for field in (
+        "supersession_version",
+        "source_record_sha256",
+        "replacement_materialization",
+    ):
+        preimage.pop(field, None)
+    return preimage
+
+
+def verification_legacy_materialization_preimage(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Reconstruct a legacy live-ref record from canonical snapshot refs."""
+
+    preimage = copy.deepcopy(record)
+    refs: list[dict[str, Any]] = []
+    for artifact in preimage.get("artifact_refs", []):
+        if not _is_canonical_snapshot_version(artifact.get("snapshot_version")):
+            raise HarnessError(
+                "replacement materialization preimage requires canonical snapshots"
+            )
+        source_path = str(artifact.get("source_path", ""))
+        if not Path(source_path).is_absolute():
+            raise HarnessError("canonical snapshot lacks an absolute legacy source path")
+        refs.append(
+            {
+                "path": source_path,
+                "sha256": artifact.get("sha256"),
+                "size_bytes": artifact.get("size_bytes"),
+            }
+        )
+    preimage["artifact_refs"] = refs
+    preimage.pop("artifact_snapshot_version", None)
+    return preimage
+
+
 def read_regular_artifact(
     value: str | Path,
     label: str,
@@ -346,7 +432,9 @@ def read_regular_artifact(
     require_utf8: bool = False,
 ) -> tuple[Path, bytes]:
     """Read one stable regular file without following a final-component symlink."""
-    source = Path(value).expanduser()
+    source = canonicalize_no_link_traversal(
+        Path(value).expanduser(), f"{label} path"
+    )
     try:
         before = os.lstat(source)
     except OSError as exc:
@@ -385,6 +473,13 @@ def read_regular_artifact(
             chunks.append(chunk)
             remaining -= len(chunk)
         data = b"".join(chunks)
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_size != opened.st_size
+            or getattr(finished, "st_mtime_ns", None)
+            != getattr(opened, "st_mtime_ns", None)
+        ):
+            raise HarnessError(f"{label} changed while it was being read")
     finally:
         os.close(descriptor)
     if not data or len(data) > max_bytes:
@@ -396,7 +491,9 @@ def read_regular_artifact(
             data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise HarnessError(f"{label} is not UTF-8: {exc}") from exc
-    return source.resolve(), data
+    if canonicalize_no_link_traversal(source, f"{label} path") != source:
+        raise HarnessError(f"{label} path changed while it was being read")
+    return source, data
 
 
 def snapshot_evidence_artifact(
@@ -439,6 +536,49 @@ def artifact_blob_path(paths: HarnessPaths, task_id: str, digest: str) -> Path:
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise HarnessError("artifact blob SHA-256 must be full 64 hex")
     return task_dir(paths, task_id) / "results" / "artifact-blobs" / digest[:2] / digest
+
+
+def ensure_artifact_blob_parent(
+    paths: HarnessPaths, task_id: str, digest: str, *, create: bool
+) -> Path:
+    """Validate every managed blob ancestor and optionally create missing dirs."""
+
+    destination = artifact_blob_path(paths, task_id, digest)
+    boundary = paths.root
+    try:
+        relative_parent = destination.parent.relative_to(boundary)
+    except ValueError as exc:
+        raise HarnessError("artifact blob path escapes the harness root") from exc
+    current = boundary
+    for part in relative_parent.parts:
+        parent = current
+        current = current / part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            if not create:
+                raise HarnessError(f"artifact blob ancestor is missing: {current}")
+            try:
+                os.mkdir(current, 0o700)
+                fsync_directory(parent)
+            except FileExistsError:
+                pass
+            metadata = os.lstat(current)
+        is_junction = bool(getattr(current, "is_junction", lambda: False)())
+        is_reparse = os.name == "nt" and bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or is_junction
+            or is_reparse
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise HarnessError(
+                f"artifact blob ancestor must be a real directory: {current}"
+            )
+    return destination.parent
 
 
 def prepare_bound_artifacts(
@@ -499,6 +639,7 @@ def preserve_bound_artifacts(
         digest = str(item["sha256"])
         data = bytes(item["data"])
         destination = artifact_blob_path(paths, task_id, digest)
+        ensure_artifact_blob_parent(paths, task_id, digest, create=True)
         if destination.exists():
             _, existing = read_regular_artifact(
                 destination,
@@ -510,7 +651,18 @@ def preserve_bound_artifacts(
                     f"canonical task artifact blob is missing or tampered: {destination}"
                 )
         else:
-            atomic_create_bytes(destination, data)
+            try:
+                atomic_create_bytes(destination, data)
+            except HarnessError:
+                if not destination.exists():
+                    raise
+                _, existing = read_regular_artifact(
+                    destination,
+                    "concurrently published task artifact blob",
+                    max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+                )
+                if hashlib.sha256(existing).hexdigest() != digest or existing != data:
+                    raise
         preserved.append(
             {
                 "snapshot_version": 1,
@@ -521,6 +673,140 @@ def preserve_bound_artifacts(
             }
         )
     return preserved
+
+
+def canonical_recovery_archive_member(member_name: str) -> str:
+    """Return the canonical relative POSIX member name used in recovery receipts."""
+
+    member_name = require_text(member_name, "recovery archive member")
+    member_path = PurePosixPath(member_name)
+    if (
+        "\\" in member_name
+        or member_path.is_absolute()
+        or member_path.as_posix() != member_name
+        or any(part in {"", ".", ".."} for part in member_path.parts)
+    ):
+        raise HarnessError("recovery archive member must be a canonical relative POSIX path")
+    return member_name
+
+
+def read_recovery_tar_member(
+    archive_data: bytes,
+    member_name: str,
+    *,
+    budget: dict[str, int] | None = None,
+) -> bytes:
+    """Read one exact regular member from a bounded in-memory tar archive."""
+
+    member_name = canonical_recovery_archive_member(member_name)
+    if budget is None:
+        budget = {
+            "decompressed_bytes": 0,
+            "member_count": 0,
+            "declared_bytes": 0,
+            "extracted_bytes": 0,
+        }
+    required_budget_fields = {
+        "decompressed_bytes",
+        "member_count",
+        "declared_bytes",
+        "extracted_bytes",
+    }
+    if set(budget) != required_budget_fields or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in budget.values()
+    ):
+        raise HarnessError("recovery archive replay budget is invalid")
+    try:
+        remaining_decompressed = (
+            BOUND_ARTIFACT_TOTAL_MAX_BYTES - budget["decompressed_bytes"]
+        )
+        if remaining_decompressed < 0:
+            raise HarnessError("recovery archive aggregate decompressed budget is exceeded")
+        if archive_data.startswith(b"\x1f\x8b"):
+            with gzip.GzipFile(fileobj=io.BytesIO(archive_data), mode="rb") as stream:
+                tar_data = stream.read(remaining_decompressed + 1)
+        else:
+            tar_data = archive_data[: remaining_decompressed + 1]
+        if len(tar_data) > remaining_decompressed:
+            raise HarnessError(
+                "recovery archive aggregate decompressed budget is exceeded"
+            )
+        budget["decompressed_bytes"] += len(tar_data)
+        with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r:") as archive:
+            match: tarfile.TarInfo | None = None
+            for candidate in archive:
+                budget["member_count"] += 1
+                if budget["member_count"] > RECOVERY_TAR_MAX_MEMBERS:
+                    raise HarnessError(
+                        "recovery archive aggregate member budget is exceeded"
+                    )
+                if candidate.isfile():
+                    if candidate.size < 0 or candidate.size > TERMINAL_ARTIFACT_MAX_BYTES:
+                        raise HarnessError(
+                            "recovery archive contains a file outside the size bound"
+                        )
+                    budget["declared_bytes"] += candidate.size
+                    if budget["declared_bytes"] > BOUND_ARTIFACT_TOTAL_MAX_BYTES:
+                        raise HarnessError(
+                            "recovery archive aggregate declared-size budget is exceeded"
+                        )
+                if candidate.name == member_name:
+                    if match is not None:
+                        raise HarnessError("recovery archive member name is duplicated")
+                    match = candidate
+            if match is None:
+                raise HarnessError("recovery archive member is missing")
+            if not match.isfile() or match.issym() or match.islnk():
+                raise HarnessError("recovery archive member must be a regular file")
+            if match.size <= 0 or match.size > TERMINAL_ARTIFACT_MAX_BYTES:
+                raise HarnessError("recovery archive member size is outside the allowed bound")
+            stream = archive.extractfile(match)
+            if stream is None:
+                raise HarnessError("recovery archive member cannot be read")
+            remaining_extracted = (
+                BOUND_ARTIFACT_TOTAL_MAX_BYTES - budget["extracted_bytes"]
+            )
+            if remaining_extracted < match.size:
+                raise HarnessError("recovery archive aggregate extraction budget is exceeded")
+            data = stream.read(min(TERMINAL_ARTIFACT_MAX_BYTES, remaining_extracted) + 1)
+            if len(data) != match.size:
+                raise HarnessError("recovery archive member size does not match its header")
+            budget["extracted_bytes"] += len(data)
+            return data
+    except HarnessError:
+        raise
+    except (tarfile.TarError, gzip.BadGzipFile, zlib.error, OSError, EOFError) as exc:
+        raise HarnessError(f"recovery archive is invalid: {exc}") from exc
+
+
+def recovery_record_preimage(
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    target_index: int,
+    target: dict[str, Any],
+    carrier_index: int,
+    carrier: dict[str, Any],
+    recovery: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the sealed semantic preimage for one packet-bound recovery."""
+
+    return {
+        "task_id": state.get("task_id"),
+        "packet_id": packet.get("packet_id"),
+        "packet_schema_version": packet.get("packet_schema_version"),
+        "target_input_index": target_index + 1,
+        "target_source_path": target.get("source_path"),
+        "target_sha256": target.get("sha256"),
+        "target_size_bytes": target.get("size_bytes"),
+        "carrier_input_index": carrier_index + 1,
+        "carrier_sha256": carrier.get("sha256"),
+        "carrier_size_bytes": carrier.get("size_bytes"),
+        "archive_member": recovery.get("archive_member"),
+        "packet_result_sha256": recovery.get("packet_result_sha256"),
+        "reason": recovery.get("reason"),
+        "recovered_at": recovery.get("recovered_at"),
+    }
 
 
 def artifact_ref_integrity_error(
@@ -536,14 +822,24 @@ def artifact_ref_integrity_error(
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         return "artifact SHA-256 is invalid"
     expected_size = artifact.get("size_bytes")
-    if not isinstance(expected_size, int) or expected_size <= 0:
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size <= 0
+    ):
         return "artifact size is invalid"
     snapshot_version = artifact.get("snapshot_version")
-    if snapshot_version == 1:
+    if _is_canonical_snapshot_version(snapshot_version):
         expected_path = artifact_blob_path(paths, state["task_id"], digest)
         recorded_path = Path(str(artifact.get("path", "")))
         if recorded_path != expected_path:
             return "artifact snapshot path is not canonical"
+        try:
+            ensure_artifact_blob_parent(
+                paths, state["task_id"], digest, create=False
+            )
+        except HarnessError as exc:
+            return str(exc)
         try:
             _, data = read_regular_artifact(
                 recorded_path,
@@ -572,7 +868,7 @@ def artifact_ref_integrity_error(
             ):
                 return "artifact source changed after snapshot creation"
         return None
-    if snapshot_version not in {None, 0}:
+    if not _is_legacy_snapshot_version(snapshot_version):
         return "artifact snapshot version is unsupported"
     legacy_path = Path(str(artifact.get("path", "")))
     try:
@@ -1469,7 +1765,10 @@ def legacy_ambiguities(
 def packet_contract_integrity_error(
     paths: HarnessPaths, state: dict[str, Any], packet: dict[str, Any]
 ) -> str | None:
-    if int(packet.get("packet_schema_version", 0)) < 4:
+    schema_version = _packet_schema_version(packet)
+    if schema_version is None:
+        return f"packet {packet.get('packet_id')} schema version is invalid"
+    if schema_version < 4:
         return None
     packet_id = str(packet.get("packet_id", ""))
     expected_path = task_dir(paths, state["task_id"]) / "packets" / f"{packet_id}.md"
@@ -1511,21 +1810,67 @@ def packet_input_integrity_errors(
     return errors
 
 
+def packet_authority_integrity_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    *,
+    require_origin: bool,
+) -> list[str]:
+    """Validate every packet authority surface used by a transition/consumer."""
+
+    errors: list[str] = []
+    contract_error = packet_contract_integrity_error(paths, state, packet)
+    if contract_error:
+        errors.append(contract_error)
+    errors.extend(
+        packet_input_integrity_errors(
+            paths, state, packet, require_origin=require_origin
+        )
+    )
+    command_error = packet_command_integrity_error(packet)
+    if command_error:
+        errors.append(command_error)
+    return errors
+
+
 def packet_integrity_warnings(state: dict[str, Any]) -> list[str]:
     warnings: list[str] = []
     for packet in state.get("packets", []):
+        packet_id = str(packet.get("packet_id", ""))
+        schema_version = _packet_schema_version(packet)
         if (
-            int(packet.get("packet_schema_version", 0)) < 4
+            schema_version is not None
+            and schema_version < 4
             and packet.get("status") in {"failed", "cancelled"}
             and any(
-                artifact.get("snapshot_version") != 1
+                _is_legacy_snapshot_version(artifact.get("snapshot_version"))
                 for artifact in packet.get("input_artifact_refs", [])
             )
         ):
             warnings.append(
-                f"packet {packet.get('packet_id')} has legacy digest-only inputs; "
+                f"packet {packet_id} has legacy digest-only inputs; "
                 "failed/cancelled live origins are not revalidated"
             )
+        legacy_recovery_fields = {
+            "version",
+            "method",
+            "carrier_input_index",
+            "carrier_sha256",
+            "archive_member",
+            "packet_result_sha256",
+            "reason",
+            "recovered_at",
+        }
+        for input_index, artifact in enumerate(
+            packet.get("input_artifact_refs", []), start=1
+        ):
+            recovery = artifact.get("recovery")
+            if isinstance(recovery, dict) and set(recovery) == legacy_recovery_fields:
+                warnings.append(
+                    f"packet {packet_id} recovered input #{input_index} has an "
+                    "unsealed legacy receipt; archive identity is replay-validated"
+                )
     return warnings
 
 
@@ -1543,10 +1888,24 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
         contract_error = packet_contract_integrity_error(paths, state, packet)
         if contract_error:
             errors.append(contract_error)
-        if not (
-            int(packet.get("packet_schema_version", 0)) < 4
+        schema_version = _packet_schema_version(packet)
+        legacy_terminal = (
+            schema_version is not None
+            and schema_version < 4
             and status in {"failed", "cancelled"}
-        ):
+        )
+        if legacy_terminal:
+            for artifact in packet.get("input_artifact_refs", []):
+                if _is_legacy_snapshot_version(artifact.get("snapshot_version")):
+                    continue
+                snapshot_error = artifact_ref_integrity_error(
+                    paths, state, artifact, require_origin=False
+                )
+                if snapshot_error:
+                    errors.append(
+                        f"packet {packet_id} input artifact: {snapshot_error}"
+                    )
+        else:
             errors.extend(
                 packet_input_integrity_errors(
                     paths,
@@ -1588,6 +1947,206 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
     return errors
 
 
+def packet_recovery_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    """Validate sealed recovery provenance and the still-bound archive member."""
+
+    errors: list[str] = []
+    recovery_count = 0
+    aggregate_carrier_bytes = 0
+    aggregate_recovered_bytes = 0
+    replay_budget = {
+        "decompressed_bytes": 0,
+        "member_count": 0,
+        "declared_bytes": 0,
+        "extracted_bytes": 0,
+    }
+    required_fields = {
+        "version",
+        "method",
+        "carrier_input_index",
+        "carrier_sha256",
+        "archive_member",
+        "packet_result_sha256",
+        "reason",
+        "recovered_at",
+        "record_sha256",
+    }
+    legacy_required_fields = required_fields - {"record_sha256"}
+    for packet in state.get("packets", []):
+        packet_id = str(packet.get("packet_id", ""))
+        refs = packet.get("input_artifact_refs", [])
+        for target_index, target in enumerate(refs):
+            if "recovery" not in target:
+                continue
+            recovery_count += 1
+            label = f"packet {packet_id} recovered input #{target_index + 1}"
+            if recovery_count > BOUND_ARTIFACT_MAX_COUNT:
+                errors.append(
+                    f"packet recovery receipts exceed {BOUND_ARTIFACT_MAX_COUNT} records"
+                )
+                return errors
+            recovery = target.get("recovery")
+            recovery_fields = set(recovery) if isinstance(recovery, dict) else set()
+            sealed_receipt = recovery_fields == required_fields
+            legacy_receipt = recovery_fields == legacy_required_fields
+            if (
+                not isinstance(recovery, dict)
+                or not (sealed_receipt or legacy_receipt)
+                or not _is_exact_int(recovery.get("version"), 1)
+                or recovery.get("method") != "packet-bound-tar-member"
+            ):
+                errors.append(f"{label} receipt schema is invalid")
+                continue
+            packet_schema_version = packet.get("packet_schema_version")
+            if (
+                not isinstance(packet_schema_version, int)
+                or isinstance(packet_schema_version, bool)
+                or packet_schema_version < 1
+                or packet_schema_version >= 4
+                or packet.get("status") != "done"
+                or not _is_exact_int(packet.get("integrity_version"), 1)
+            ):
+                errors.append(f"{label} is attached to an ineligible packet")
+                continue
+            if not _is_canonical_snapshot_version(target.get("snapshot_version")):
+                errors.append(f"{label} target is not a canonical snapshot")
+                continue
+            target_error = artifact_ref_integrity_error(
+                paths, state, target, require_origin=False
+            )
+            if target_error:
+                errors.append(f"{label} target: {target_error}")
+                continue
+            target_source = Path(str(target.get("source_path", "")))
+            if not target_source.is_absolute():
+                errors.append(f"{label} source path is not absolute")
+                continue
+            carrier_number = recovery.get("carrier_input_index")
+            if (
+                not isinstance(carrier_number, int)
+                or isinstance(carrier_number, bool)
+                or carrier_number < 1
+                or carrier_number > len(refs)
+                or carrier_number == target_index + 1
+            ):
+                errors.append(f"{label} carrier input index is invalid")
+                continue
+            carrier_index = carrier_number - 1
+            carrier = refs[carrier_index]
+            carrier_sha = str(recovery.get("carrier_sha256", ""))
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", carrier_sha)
+                or carrier_sha != carrier.get("sha256")
+            ):
+                errors.append(f"{label} carrier SHA-256 binding is invalid")
+                continue
+            carrier_error = artifact_ref_integrity_error(
+                paths, state, carrier, require_origin=False
+            )
+            if carrier_error:
+                errors.append(f"{label} carrier: {carrier_error}")
+                continue
+            packet_result_sha = str(recovery.get("packet_result_sha256", ""))
+            expected_result_path = (
+                task_dir(paths, state["task_id"]) / "results" / f"{packet_id}.md"
+            )
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", packet_result_sha)
+                or packet_result_sha != packet.get("result_sha256")
+                or Path(str(packet.get("result_path", ""))) != expected_result_path
+                or not expected_result_path.is_file()
+                or expected_result_path.is_symlink()
+                or sha256_file(expected_result_path) != packet_result_sha
+            ):
+                errors.append(f"{label} packet result binding is invalid")
+                continue
+            stored_member = recovery.get("archive_member")
+            try:
+                canonical_member = canonical_recovery_archive_member(stored_member)
+            except (AttributeError, HarnessError) as exc:
+                errors.append(f"{label} archive member is invalid: {exc}")
+                continue
+            if canonical_member != stored_member:
+                errors.append(f"{label} archive member is not canonical")
+                continue
+            reason = recovery.get("reason")
+            if not isinstance(reason, str) or reason != reason.strip():
+                errors.append(f"{label} reason is not canonical text")
+                continue
+            try:
+                require_evidence_detail(reason, f"{label} reason")
+            except HarnessError as exc:
+                errors.append(str(exc))
+                continue
+            recovered_at = recovery.get("recovered_at")
+            if (
+                not isinstance(recovered_at, str)
+                or parse_time(recovered_at) is None
+                or re.search(r"(?:Z|[+-]\d{2}:\d{2})$", recovered_at) is None
+            ):
+                errors.append(f"{label} recovered_at is not a timezone-aware timestamp")
+                continue
+            if sealed_receipt:
+                record_sha = str(recovery.get("record_sha256", ""))
+                expected_record_sha = canonical_record_sha256(
+                    recovery_record_preimage(
+                        state,
+                        packet,
+                        target_index,
+                        target,
+                        carrier_index,
+                        carrier,
+                        recovery,
+                    )
+                )
+                if (
+                    not re.fullmatch(r"[0-9a-f]{64}", record_sha)
+                    or record_sha != expected_record_sha
+                ):
+                    errors.append(f"{label} receipt record SHA-256 mismatch")
+                    continue
+            carrier_size = carrier.get("size_bytes")
+            target_size = target.get("size_bytes")
+            if (
+                not isinstance(carrier_size, int)
+                or isinstance(carrier_size, bool)
+                or not isinstance(target_size, int)
+                or isinstance(target_size, bool)
+            ):
+                errors.append(f"{label} size metadata is invalid")
+                continue
+            aggregate_carrier_bytes += carrier_size
+            aggregate_recovered_bytes += target_size
+            if (
+                aggregate_carrier_bytes > BOUND_ARTIFACT_TOTAL_MAX_BYTES
+                or aggregate_recovered_bytes > BOUND_ARTIFACT_TOTAL_MAX_BYTES
+            ):
+                errors.append("packet recovery aggregate byte budget is exceeded")
+                return errors
+            try:
+                _, carrier_data = read_regular_artifact(
+                    Path(str(carrier.get("path", ""))),
+                    "packet recovery carrier",
+                    max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+                )
+                recovered_data = read_recovery_tar_member(
+                    carrier_data,
+                    canonical_member,
+                    budget=replay_budget,
+                )
+            except HarnessError as exc:
+                errors.append(f"{label} archive replay failed: {exc}")
+                continue
+            if (
+                hashlib.sha256(recovered_data).hexdigest() != target.get("sha256")
+                or len(recovered_data) != target_size
+            ):
+                errors.append(f"{label} archive member no longer matches the target")
+    return errors
+
+
 def _require_done_reviewer_packet(
     paths: HarnessPaths,
     state: dict[str, Any],
@@ -1618,14 +2177,13 @@ def _require_done_reviewer_packet(
         raise HarnessError(
             "independent review packet must be a done reviewer assignment with an agent identity"
         )
-    contract_error = packet_contract_integrity_error(paths, state, packet)
-    input_errors = packet_input_integrity_errors(
+    authority_errors = packet_authority_integrity_errors(
         paths, state, packet, require_origin=False
     )
-    if contract_error or input_errors:
+    if authority_errors:
         raise HarnessError(
-            "independent review packet contract/input is missing or tampered: "
-            + "; ".join(([contract_error] if contract_error else []) + input_errors)
+            "independent review packet authority is missing or tampered: "
+            + "; ".join(authority_errors)
         )
     expected = task_dir(paths, state["task_id"]) / "results" / f"{packet_id}.md"
     if (
@@ -1834,7 +2392,7 @@ def verification_integrity_warnings(state: dict[str, Any]) -> list[str]:
         legacy_refs = [
             artifact
             for artifact in item.get("artifact_refs", [])
-            if artifact.get("snapshot_version") != 1
+            if _is_legacy_snapshot_version(artifact.get("snapshot_version"))
         ]
         if not legacy_refs:
             continue
@@ -1851,13 +2409,174 @@ def verification_integrity_warnings(state: dict[str, Any]) -> list[str]:
     return warnings
 
 
-def verification_integrity_errors(
-    paths: HarnessPaths, state: dict[str, Any]
-) -> list[str]:
+def verification_supersession_errors(state: dict[str, Any]) -> list[str]:
+    """Validate immutable supersession identities and every chain to a pass leaf."""
+
+    records = state.get("verification", [])
     errors: list[str] = []
-    for index, item in enumerate(state.get("verification", []), start=1):
+    for source_index, source in enumerate(records, start=1):
+        label = f"verification #{source_index}"
+        superseded_raw = source.get("superseded_at")
+        superseded = superseded_raw is not None and superseded_raw != ""
+        metadata_present = any(
+            field in source for field in SUPERSESSION_MUTATION_FIELDS
+        )
+        if not superseded:
+            if metadata_present:
+                errors.append(f"{label} has supersession metadata without superseded_at")
+            continue
+        superseded_time = (
+            parse_time(superseded_raw) if isinstance(superseded_raw, str) else None
+        )
+        if superseded_time is None:
+            errors.append(f"{label} superseded_at is not a valid timestamp")
+        reason = source.get("supersession_reason")
+        if not isinstance(reason, str):
+            errors.append(f"{label} supersession reason is not text")
+        else:
+            try:
+                require_evidence_detail(reason, f"{label} supersession reason")
+            except HarnessError as exc:
+                errors.append(str(exc))
+        if not _is_exact_int(source.get("supersession_version"), 2):
+            errors.append(f"{label} supersession is not sealed as version 2")
+            continue
+        source_sha = str(source.get("source_record_sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", source_sha):
+            errors.append(f"{label} source record SHA-256 is invalid")
+        elif canonical_record_sha256(verification_source_preimage(source)) != source_sha:
+            errors.append(f"{label} source preimage SHA-256 mismatch")
+        original_status = source.get("original_status")
+        if original_status not in ACCOUNTED_VERIFICATION_STATUSES - {"skipped"}:
+            errors.append(f"{label} has invalid original superseded status")
+        replacement_index = source.get("replacement_index")
+        if (
+            not isinstance(replacement_index, int)
+            or isinstance(replacement_index, bool)
+            or replacement_index < 1
+            or replacement_index > len(records)
+            or replacement_index == source_index
+        ):
+            errors.append(f"{label} has invalid replacement index")
+            continue
+        replacement = records[replacement_index - 1]
+        stored_replacement_sha = str(source.get("replacement_record_sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", stored_replacement_sha):
+            errors.append(f"{label} replacement record SHA-256 is invalid")
+            continue
+        effective_replacement_sha = stored_replacement_sha
+        materialization = source.get("replacement_materialization")
+        if materialization is not None:
+            required_materialization_fields = {
+                "version",
+                "method",
+                "from_record_sha256",
+                "to_record_sha256",
+                "sealed_at",
+            }
+            if (
+                not isinstance(materialization, dict)
+                or set(materialization) != required_materialization_fields
+                or not _is_exact_int(materialization.get("version"), 1)
+                or materialization.get("method")
+                != "canonical-artifact-materialization"
+            ):
+                errors.append(f"{label} replacement materialization receipt is invalid")
+                continue
+            from_sha = str(materialization.get("from_record_sha256", ""))
+            to_sha = str(materialization.get("to_record_sha256", ""))
+            if from_sha != stored_replacement_sha or not re.fullmatch(
+                r"[0-9a-f]{64}", to_sha
+            ) or from_sha == to_sha:
+                errors.append(f"{label} replacement materialization SHA mapping is invalid")
+                continue
+            sealed_raw = materialization.get("sealed_at")
+            sealed_time = parse_time(sealed_raw) if isinstance(sealed_raw, str) else None
+            if (
+                sealed_time is None
+                or superseded_time is None
+                or sealed_time < superseded_time
+            ):
+                errors.append(f"{label} replacement materialization time is invalid")
+                continue
+            replacement_pre_supersede = (
+                verification_source_preimage(replacement)
+                if replacement.get("superseded_at")
+                and _is_exact_int(replacement.get("supersession_version"), 2)
+                else replacement
+            )
+            try:
+                legacy_preimage_sha = canonical_record_sha256(
+                    verification_legacy_materialization_preimage(
+                        replacement_pre_supersede
+                    )
+                )
+            except HarnessError as exc:
+                errors.append(f"{label} replacement materialization: {exc}")
+                continue
+            if legacy_preimage_sha != from_sha:
+                errors.append(f"{label} replacement legacy preimage SHA-256 mismatch")
+            effective_replacement_sha = to_sha
+        replacement_identity = (
+            str(replacement.get("source_record_sha256", ""))
+            if replacement.get("superseded_at")
+            and _is_exact_int(replacement.get("supersession_version"), 2)
+            else canonical_record_sha256(replacement)
+        )
+        if replacement_identity != effective_replacement_sha:
+            errors.append(f"{label} replacement record SHA-256 mismatch")
+        source_time = parse_time(str(source.get("recorded_at", "")))
+        replacement_time = parse_time(str(replacement.get("recorded_at", "")))
+        if (
+            source.get("category") != replacement.get("category")
+            or source_time is None
+            or replacement_time is None
+            or replacement_time <= source_time
+            or superseded_time is None
+            or superseded_time < replacement_time
+        ):
+            errors.append(f"{label} replacement category/time relationship is invalid")
+
+        seen: set[int] = set()
+        cursor = source_index
+        while True:
+            if cursor in seen:
+                errors.append(f"{label} replacement chain contains a cycle")
+                break
+            seen.add(cursor)
+            current = records[cursor - 1]
+            if not current.get("superseded_at"):
+                if current.get("status") != "pass":
+                    errors.append(f"{label} replacement chain does not end in pass")
+                break
+            next_index = current.get("replacement_index")
+            if (
+                not isinstance(next_index, int)
+                or isinstance(next_index, bool)
+                or next_index < 1
+                or next_index > len(records)
+            ):
+                break
+            cursor = next_index
+    return errors
+
+
+def verification_record_integrity_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    indexed_records: Iterable[tuple[int, dict[str, Any]]] | None = None,
+) -> list[str]:
+    """Validate individual verification records without reindexing graph edges."""
+
+    errors: list[str] = []
+    records = (
+        indexed_records
+        if indexed_records is not None
+        else enumerate(state.get("verification", []), start=1)
+    )
+    for index, item in records:
         label = f"verification #{index}"
-        if item.get("integrity_version") != 1:
+        if not _is_exact_int(item.get("integrity_version"), 1):
             errors.append(f"{label} lacks integrity_version=1")
             continue
         if item.get("category") not in VERIFICATION_CATEGORIES:
@@ -1875,7 +2594,9 @@ def verification_integrity_errors(
         if item.get("superseded_at"):
             if item.get("status") != "skipped":
                 errors.append(f"{label} superseded record must have status='skipped'")
-            if not str(item.get("supersession_reason", "")).strip():
+            if not isinstance(item.get("supersession_reason"), str) or not item.get(
+                "supersession_reason", ""
+            ).strip():
                 errors.append(f"{label} superseded record lacks a reason")
         if item.get("category") == "independent_review" and any(
             item.get(field)
@@ -1899,7 +2620,9 @@ def verification_integrity_errors(
             if not str(item.get("reviewer_agent_id", "")).strip():
                 errors.append(f"{label} lacks reviewer agent identity")
         for artifact in item.get("artifact_refs", []):
-            if item.get("superseded_at") and artifact.get("snapshot_version") != 1:
+            if item.get("superseded_at") and _is_legacy_snapshot_version(
+                artifact.get("snapshot_version")
+            ):
                 continue
             error = artifact_ref_integrity_error(
                 paths, state, artifact, require_origin=False
@@ -1907,6 +2630,29 @@ def verification_integrity_errors(
             if error:
                 errors.append(f"{label} artifact reference: {error}")
     return errors
+
+
+def verification_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    errors = verification_record_integrity_errors(paths, state)
+    errors.extend(verification_supersession_errors(state))
+    return errors
+
+
+def verification_migration_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    """Allow only the explicit unsealed-edge error during one-by-one migration."""
+
+    return [
+        error
+        for error in verification_integrity_errors(paths, state)
+        if not re.fullmatch(
+            r"verification #\d+ supersession is not sealed as version 2",
+            error,
+        )
+    ]
 
 
 def remote_ref_tip(worktree: Path, remote: str, remote_ref: str) -> str:
@@ -3183,14 +3929,13 @@ def cmd_capacity_recommend(args: argparse.Namespace, paths: HarnessPaths) -> int
             raise HarnessError(
                 "capacity recommendation requires a done source packet bound to this review dataset"
             )
-        contract_error = packet_contract_integrity_error(paths, state, source_packet)
-        input_errors = packet_input_integrity_errors(
+        authority_errors = packet_authority_integrity_errors(
             paths, state, source_packet, require_origin=False
         )
-        if contract_error or input_errors:
+        if authority_errors:
             raise HarnessError(
-                "capacity recommendation source packet contract/input is missing or tampered: "
-                + "; ".join(([contract_error] if contract_error else []) + input_errors)
+                "capacity recommendation source packet authority is missing or tampered: "
+                + "; ".join(authority_errors)
             )
         source_result = Path(str(source_packet.get("result_path", "")))
         expected_source_result = (
@@ -6292,36 +7037,101 @@ def cmd_materialize_artifacts(args: argparse.Namespace, paths: HarnessPaths) -> 
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "materialize artifacts for")
+        selected_verifications = set(args.verification_index or [])
+        verification_count = len(state.get("verification", []))
+        if any(index < 1 or index > verification_count for index in selected_verifications):
+            raise HarnessError("verification index is outside the task verification list")
+        pending: list[tuple[dict[str, Any], str]] = []
         plans: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
         skipped_failed_packets: list[str] = []
-        for packet in state.get("packets", []):
+        for packet in [] if selected_verifications else state.get("packets", []):
+            packet_refs = packet.get("input_artifact_refs", [])
+            unsupported_refs = [
+                artifact
+                for artifact in packet_refs
+                if not (
+                    _is_legacy_snapshot_version(artifact.get("snapshot_version"))
+                    or _is_canonical_snapshot_version(artifact.get("snapshot_version"))
+                )
+            ]
+            if unsupported_refs:
+                raise HarnessError(
+                    f"packet {packet.get('packet_id')} contains an unsupported "
+                    "artifact snapshot version"
+                )
             legacy_refs = [
                 artifact
-                for artifact in packet.get("input_artifact_refs", [])
-                if artifact.get("snapshot_version") != 1
+                for artifact in packet_refs
+                if _is_legacy_snapshot_version(artifact.get("snapshot_version"))
             ]
             if not legacy_refs:
                 continue
+            schema_version = _packet_schema_version(packet)
+            if schema_version is None:
+                raise HarnessError(
+                    f"packet {packet.get('packet_id')} schema version is invalid"
+                )
+            if schema_version >= 4:
+                raise HarnessError(
+                    f"schema-v4 packet {packet.get('packet_id')} contains legacy live refs"
+                )
             if packet.get("status") in {"failed", "cancelled"}:
                 skipped_failed_packets.append(str(packet.get("packet_id")))
                 continue
-            for artifact in legacy_refs:
-                prepared = prepare_bound_artifacts(
-                    [f"{artifact.get('path', '')}={artifact.get('sha256', '')}"],
-                    f"packet {packet.get('packet_id')} legacy input",
+            if packet.get("status") != "done":
+                raise HarnessError(
+                    f"packet {packet.get('packet_id')} is {packet.get('status')}; "
+                    "active legacy packet authority cannot be materialized"
                 )
-                plans.append((artifact, prepared))
+            for artifact in legacy_refs:
+                pending.append(
+                    (artifact, f"packet {packet.get('packet_id')} legacy input")
+                )
         for index, verification in enumerate(state.get("verification", []), start=1):
+            if selected_verifications and index not in selected_verifications:
+                continue
             if verification.get("superseded_at"):
                 continue
             for artifact in verification.get("artifact_refs", []):
-                if artifact.get("snapshot_version") == 1:
+                if _is_canonical_snapshot_version(artifact.get("snapshot_version")):
                     continue
-                prepared = prepare_bound_artifacts(
-                    [f"{artifact.get('path', '')}={artifact.get('sha256', '')}"],
-                    f"verification #{index} legacy artifact",
+                if not _is_legacy_snapshot_version(artifact.get("snapshot_version")):
+                    raise HarnessError(
+                        f"verification #{index} contains an unsupported "
+                        "artifact snapshot version"
+                    )
+                pending.append(
+                    (artifact, f"verification #{index} legacy artifact")
                 )
-                plans.append((artifact, prepared))
+
+        if len(pending) > BOUND_ARTIFACT_MAX_COUNT:
+            raise HarnessError(
+                "materialize-artifacts would retain "
+                f"{len(pending)} refs; limit is {BOUND_ARTIFACT_MAX_COUNT}"
+            )
+        aggregate_bytes = 0
+        for artifact, label in pending:
+            legacy_path = Path(str(artifact.get("path", "")))
+            if not legacy_path.is_absolute():
+                raise HarnessError(f"{label} path must be absolute")
+            integrity_error = artifact_ref_integrity_error(
+                paths, state, artifact, require_origin=False
+            )
+            if integrity_error:
+                raise HarnessError(f"{label} is not physically valid: {integrity_error}")
+            prepared = prepare_bound_artifacts(
+                [f"{artifact.get('path', '')}={artifact.get('sha256', '')}"],
+                label,
+            )
+            if prepared[0]["size_bytes"] != artifact.get("size_bytes"):
+                raise HarnessError(f"{label} recorded size changed during materialization")
+            aggregate_bytes += int(prepared[0]["size_bytes"])
+            if aggregate_bytes > BOUND_ARTIFACT_TOTAL_MAX_BYTES:
+                raise HarnessError(
+                    "materialize-artifacts aggregate size exceeds "
+                    f"{BOUND_ARTIFACT_TOTAL_MAX_BYTES} bytes"
+                )
+            plans.append((artifact, prepared))
 
         for target, prepared in plans:
             target.clear()
@@ -6330,11 +7140,17 @@ def cmd_materialize_artifacts(args: argparse.Namespace, paths: HarnessPaths) -> 
         if plans:
             for packet in state.get("packets", []):
                 refs = packet.get("input_artifact_refs", [])
-                if refs and all(ref.get("snapshot_version") == 1 for ref in refs):
+                if refs and all(
+                    _is_canonical_snapshot_version(ref.get("snapshot_version"))
+                    for ref in refs
+                ):
                     packet["input_snapshot_version"] = 1
             for verification in state.get("verification", []):
                 refs = verification.get("artifact_refs", [])
-                if refs and all(ref.get("snapshot_version") == 1 for ref in refs):
+                if refs and all(
+                    _is_canonical_snapshot_version(ref.get("snapshot_version"))
+                    for ref in refs
+                ):
                     verification["artifact_snapshot_version"] = 1
             bump_task(state)
             write_task(paths, state)
@@ -6344,6 +7160,529 @@ def cmd_materialize_artifacts(args: argparse.Namespace, paths: HarnessPaths) -> 
             "task_id": args.task,
             "materialized_refs": len(plans),
             "skipped_legacy_failed_packets": skipped_failed_packets,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_packet_input_recover_from_tar(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    """Recover one drifted legacy done-packet input from a bound tar member."""
+
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "recover packet input for")
+        matches = [
+            packet
+            for packet in state.get("packets", [])
+            if packet.get("packet_id") == args.packet_id
+        ]
+        if len(matches) != 1:
+            raise HarnessError(
+                f"expected exactly one packet named {args.packet_id}, found {len(matches)}"
+            )
+        packet = matches[0]
+        if packet.get("status") != "done":
+            raise HarnessError("archive-member recovery is limited to legacy done packets")
+        schema_version = _packet_schema_version(packet)
+        if schema_version is None:
+            raise HarnessError("packet schema version is invalid")
+        if schema_version >= 4:
+            raise HarnessError("schema-v4 packet inputs already use immutable snapshots")
+
+        expected_result_sha = str(args.expected_result_sha256).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_result_sha):
+            raise HarnessError("expected packet result SHA-256 must be full 64 hex")
+        expected_result_path = (
+            task_dir(paths, args.task) / "results" / f"{args.packet_id}.md"
+        )
+        if (
+            packet.get("integrity_version") != 1
+            or packet.get("result_sha256") != expected_result_sha
+            or Path(str(packet.get("result_path", ""))) != expected_result_path
+            or not expected_result_path.is_file()
+            or expected_result_path.is_symlink()
+            or sha256_file(expected_result_path) != expected_result_sha
+        ):
+            raise HarnessError("done packet result does not match the approved exact SHA-256")
+
+        refs = packet.get("input_artifact_refs", [])
+        input_index = int(args.input_index) - 1
+        carrier_index = int(args.carrier_input_index) - 1
+        if (
+            input_index < 0
+            or input_index >= len(refs)
+            or carrier_index < 0
+            or carrier_index >= len(refs)
+            or input_index == carrier_index
+        ):
+            raise HarnessError("input and carrier indices must name distinct packet inputs")
+        target = refs[input_index]
+        carrier = refs[carrier_index]
+        if not _is_legacy_snapshot_version(target.get("snapshot_version")):
+            raise HarnessError("packet input is already materialized")
+        source_path = Path(str(target.get("path", "")))
+        if not source_path.is_absolute():
+            raise HarnessError("legacy packet input source path must be absolute")
+        target_sha = str(target.get("sha256", "")).lower()
+        expected_target_sha = str(args.expected_input_sha256).lower()
+        target_size = target.get("size_bytes")
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", target_sha)
+            or expected_target_sha != target_sha
+            or not isinstance(target_size, int)
+            or isinstance(target_size, bool)
+            or target_size <= 0
+        ):
+            raise HarnessError("legacy packet input identity does not match the approved SHA-256")
+        if artifact_ref_integrity_error(
+            paths, state, target, require_origin=False
+        ) is None:
+            raise HarnessError(
+                "legacy packet input is still exact; use materialize-artifacts instead"
+            )
+
+        carrier_sha = str(carrier.get("sha256", "")).lower()
+        expected_carrier_sha = str(args.carrier_sha256).lower()
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", carrier_sha)
+            or expected_carrier_sha != carrier_sha
+        ):
+            raise HarnessError("carrier packet input does not match the approved SHA-256")
+        carrier_error = artifact_ref_integrity_error(
+            paths, state, carrier, require_origin=False
+        )
+        if carrier_error:
+            raise HarnessError(f"carrier packet input is not physically valid: {carrier_error}")
+        carrier_path = Path(str(carrier.get("path", "")))
+        _, carrier_data = read_regular_artifact(
+            carrier_path,
+            "packet-bound recovery archive",
+            max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+        )
+        if (
+            hashlib.sha256(carrier_data).hexdigest() != carrier_sha
+            or len(carrier_data) != carrier.get("size_bytes")
+        ):
+            raise HarnessError("carrier packet input changed while being read")
+        canonical_member = canonical_recovery_archive_member(args.archive_member)
+        recovered_data = read_recovery_tar_member(carrier_data, canonical_member)
+        if (
+            hashlib.sha256(recovered_data).hexdigest() != target_sha
+            or len(recovered_data) != target_size
+        ):
+            raise HarnessError("recovery archive member does not match the legacy input identity")
+
+        recovery_reason = require_evidence_detail(
+            args.reason, "packet input recovery reason"
+        )
+        recovered_at = now_iso()
+        preserved = preserve_bound_artifacts(
+            paths,
+            args.task,
+            [
+                {
+                    "source_path": str(source_path),
+                    "sha256": target_sha,
+                    "size_bytes": target_size,
+                    "data": recovered_data,
+                }
+            ],
+        )[0]
+        recovery = {
+            "version": 1,
+            "method": "packet-bound-tar-member",
+            "carrier_input_index": carrier_index + 1,
+            "carrier_sha256": carrier_sha,
+            "archive_member": canonical_member,
+            "packet_result_sha256": expected_result_sha,
+            "reason": recovery_reason,
+            "recovered_at": recovered_at,
+        }
+        recovery["record_sha256"] = canonical_record_sha256(
+            recovery_record_preimage(
+                state,
+                packet,
+                input_index,
+                preserved,
+                carrier_index,
+                carrier,
+                recovery,
+            )
+        )
+        preserved["recovery"] = recovery
+        target.clear()
+        target.update(preserved)
+        recovery_errors = packet_recovery_integrity_errors(paths, state)
+        if recovery_errors:
+            raise HarnessError(
+                "recovered packet input failed provenance validation: "
+                + "; ".join(recovery_errors)
+            )
+        if refs and all(
+            _is_canonical_snapshot_version(ref.get("snapshot_version")) for ref in refs
+        ):
+            packet["input_snapshot_version"] = 1
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "packet_id": args.packet_id,
+            "input_index": input_index + 1,
+            "snapshot_path": preserved["path"],
+            "sha256": preserved["sha256"],
+            "recovery": preserved["recovery"],
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_verification_supersession_seal(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    """Seal a legacy supersession against its exact canonical replacement."""
+
+    migration_field = "terminal_supersession_checkpoint_migration"
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        terminal_migration = state.get("status") in {"done", "cancelled"}
+        records = state.get("verification", [])
+        source_index = int(args.verification_index) - 1
+        replacement_index = int(args.replacement_index) - 1
+        if (
+            source_index < 0
+            or source_index >= len(records)
+            or replacement_index < 0
+            or replacement_index >= len(records)
+            or source_index == replacement_index
+        ):
+            raise HarnessError("verification and replacement indices must name distinct records")
+        source = records[source_index]
+        replacement = records[replacement_index]
+        supplied_hashes = {
+            "current source": str(args.expected_current_record_sha256).lower(),
+            "source preimage": str(args.expected_source_record_sha256).lower(),
+            "replacement before materialize": str(
+                args.expected_replacement_before_materialize_sha256
+            ).lower(),
+            "replacement current": str(
+                args.expected_replacement_current_sha256
+            ).lower(),
+        }
+        if any(
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in supplied_hashes.values()
+        ):
+            raise HarnessError("supersession seal SHA-256 values must be full 64 hex")
+
+        pending = state.get(migration_field)
+        checkpoint: Path | None = None
+        resumed = False
+        already_sealed = False
+        replacement_is_sealed_supersession = bool(
+            replacement.get("superseded_at")
+            and _is_exact_int(replacement.get("supersession_version"), 2)
+        )
+        replacement_was_materialized = (
+            not replacement_is_sealed_supersession
+            and supplied_hashes["replacement before materialize"]
+            != supplied_hashes["replacement current"]
+        )
+        completed_replay = (
+            pending is None
+            and terminal_migration
+            and _is_exact_int(source.get("supersession_version"), 2)
+        )
+        if completed_replay:
+            if (
+                canonical_record_sha256(verification_legacy_seal_preimage(source))
+                != supplied_hashes["current source"]
+                or source.get("source_record_sha256")
+                != supplied_hashes["source preimage"]
+                or source.get("replacement_index") != replacement_index + 1
+                or source.get("replacement_record_sha256")
+                != supplied_hashes["replacement before materialize"]
+                or canonical_record_sha256(replacement)
+                != supplied_hashes["replacement current"]
+            ):
+                raise HarnessError("completed supersession seal identity does not match replay")
+            materialization = source.get("replacement_materialization")
+            if replacement_was_materialized:
+                if (
+                    not isinstance(materialization, dict)
+                    or materialization.get("from_record_sha256")
+                    != supplied_hashes["replacement before materialize"]
+                    or materialization.get("to_record_sha256")
+                    != supplied_hashes["replacement current"]
+                ):
+                    raise HarnessError(
+                        "completed supersession materialization does not match replay"
+                    )
+            elif materialization is not None:
+                raise HarnessError(
+                    "completed direct supersession unexpectedly has materialization metadata"
+                )
+            checkpoint_ok, checkpoint_reason = checkpoint_matches(paths, state)
+            if not checkpoint_ok:
+                raise HarnessError(
+                    "completed terminal supersession checkpoint is invalid: "
+                    + checkpoint_reason
+                )
+            integrity_errors = verification_migration_integrity_errors(paths, state)
+            if integrity_errors:
+                raise HarnessError(
+                    "completed terminal supersession migration is damaged: "
+                    + "; ".join(integrity_errors)
+                )
+            checkpoint = task_dir(paths, args.task) / "checkpoint.md"
+            write_index(paths)
+            resumed = True
+            already_sealed = True
+        elif pending is not None:
+            required_pending_fields = {
+                "version",
+                "method",
+                "verification_index",
+                "replacement_index",
+                "previous_source_record_sha256",
+                "source_preimage_sha256",
+                "replacement_before_materialize_sha256",
+                "replacement_current_sha256",
+                "replacement_was_materialized",
+                "pending_state_sha256",
+                "target_checkpoint_sha256",
+                "target_state_sha256",
+            }
+            expected_pending = {
+                "verification_index": source_index + 1,
+                "replacement_index": replacement_index + 1,
+                "previous_source_record_sha256": supplied_hashes["current source"],
+                "source_preimage_sha256": supplied_hashes["source preimage"],
+                "replacement_before_materialize_sha256": supplied_hashes[
+                    "replacement before materialize"
+                ],
+                "replacement_current_sha256": supplied_hashes["replacement current"],
+            }
+            state_revision = state.get("revision")
+            if (
+                not terminal_migration
+                or not isinstance(pending, dict)
+                or set(pending) != required_pending_fields
+                or not _is_exact_int(pending.get("version"), 2)
+                or pending.get("method") != "terminal-supersession-checkpoint-v2"
+                or any(pending.get(key) != value for key, value in expected_pending.items())
+                or not isinstance(pending.get("replacement_was_materialized"), bool)
+                or pending.get("replacement_was_materialized")
+                != replacement_was_materialized
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(pending.get("pending_state_sha256", ""))
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(pending.get("target_state_sha256", ""))
+                )
+                or state.get("checkpoint_required") is not True
+                or not isinstance(state_revision, int)
+                or isinstance(state_revision, bool)
+                or state.get("checkpoint_revision") != state_revision - 1
+            ):
+                raise HarnessError("terminal supersession checkpoint migration state is invalid")
+            pending_preimage = copy.deepcopy(state)
+            pending_preimage.pop(migration_field, None)
+            if canonical_record_sha256(pending_preimage) != pending.get(
+                "pending_state_sha256"
+            ):
+                raise HarnessError(
+                    "terminal supersession pending state identity changed"
+                )
+            if (
+                not _is_exact_int(source.get("supersession_version"), 2)
+                or source.get("source_record_sha256") != supplied_hashes["source preimage"]
+                or source.get("replacement_index") != replacement_index + 1
+                or source.get("replacement_record_sha256")
+                != supplied_hashes["replacement before materialize"]
+            ):
+                raise HarnessError("terminal supersession checkpoint migration identity changed")
+            integrity_errors = verification_migration_integrity_errors(paths, state)
+            if integrity_errors:
+                raise HarnessError(
+                    "terminal supersession checkpoint migration is damaged: "
+                    + "; ".join(integrity_errors)
+                )
+            final_state = copy.deepcopy(state)
+            final_state.pop(migration_field, None)
+            final_state["checkpoint_required"] = False
+            final_state["checkpoint_revision"] = final_state["revision"]
+            checkpoint, checkpoint_text, checkpoint_sha = prepare_checkpoint(
+                paths, final_state
+            )
+            if pending.get("target_checkpoint_sha256") != checkpoint_sha:
+                raise HarnessError("terminal supersession target checkpoint SHA-256 changed")
+            final_state["checkpoint_sha256"] = checkpoint_sha
+            if canonical_record_sha256(final_state) != pending.get(
+                "target_state_sha256"
+            ):
+                raise HarnessError("terminal supersession target state identity changed")
+            atomic_write_text(checkpoint, checkpoint_text)
+            write_task(paths, final_state)
+            write_index(paths)
+            state = final_state
+            replacement_was_materialized = bool(
+                pending["replacement_was_materialized"]
+            )
+            resumed = True
+        else:
+            if terminal_migration:
+                checkpoint_ok, checkpoint_reason = checkpoint_matches(paths, state)
+                if not checkpoint_ok:
+                    raise HarnessError(
+                        "terminal supersession migration requires a current physical checkpoint: "
+                        + checkpoint_reason
+                    )
+                migration_errors = verification_migration_integrity_errors(paths, state)
+                if migration_errors:
+                    raise HarnessError(
+                        "terminal supersession migration found unrelated verification damage: "
+                        + "; ".join(migration_errors)
+                    )
+            else:
+                require_open_task(state, "seal verification supersession for")
+            if canonical_record_sha256(source) != supplied_hashes["current source"]:
+                raise HarnessError("superseded verification changed after seal approval")
+            if not source.get("superseded_at") or _is_exact_int(
+                source.get("supersession_version"), 2
+            ):
+                raise HarnessError("verification must be an unsealed legacy supersession")
+            if (
+                source.get("replacement_index") != replacement_index + 1
+                or source.get("replacement_record_sha256")
+                != supplied_hashes["replacement before materialize"]
+            ):
+                raise HarnessError("legacy supersession replacement identity changed")
+            if canonical_record_sha256(
+                verification_source_preimage(source)
+            ) != supplied_hashes["source preimage"]:
+                raise HarnessError("legacy supersession source preimage SHA-256 mismatch")
+            if canonical_record_sha256(replacement) != supplied_hashes[
+                "replacement current"
+            ]:
+                raise HarnessError("materialized replacement changed after seal approval")
+            if any(
+                not _is_canonical_snapshot_version(artifact.get("snapshot_version"))
+                for artifact in replacement.get("artifact_refs", [])
+            ):
+                raise HarnessError("supersession seal replacement is not fully materialized")
+            if replacement_is_sealed_supersession:
+                if replacement.get("source_record_sha256") != supplied_hashes[
+                    "replacement before materialize"
+                ]:
+                    raise HarnessError(
+                        "replacement supersession source identity does not match legacy edge"
+                    )
+            elif replacement_was_materialized:
+                legacy_replacement_sha = canonical_record_sha256(
+                    verification_legacy_materialization_preimage(replacement)
+                )
+                if legacy_replacement_sha != supplied_hashes[
+                    "replacement before materialize"
+                ]:
+                    raise HarnessError("replacement legacy preimage SHA-256 mismatch")
+            replacement_errors = verification_record_integrity_errors(
+                paths, state, [(replacement_index + 1, replacement)]
+            )
+            if replacement_errors:
+                raise HarnessError(
+                    "supersession seal replacement is not physically valid: "
+                    + "; ".join(replacement_errors)
+                )
+            source_time = parse_time(str(source.get("recorded_at", "")))
+            replacement_time = parse_time(str(replacement.get("recorded_at", "")))
+            if (
+                source.get("category") != replacement.get("category")
+                or (
+                    replacement.get("status") != "pass"
+                    and not (
+                        replacement_is_sealed_supersession
+                        and replacement.get("status") == "skipped"
+                    )
+                )
+                or source_time is None
+                or replacement_time is None
+                or replacement_time <= source_time
+            ):
+                raise HarnessError("legacy supersession replacement relationship is invalid")
+            source["supersession_version"] = 2
+            source["source_record_sha256"] = supplied_hashes["source preimage"]
+            if replacement_was_materialized:
+                source["replacement_materialization"] = {
+                    "version": 1,
+                    "method": "canonical-artifact-materialization",
+                    "from_record_sha256": supplied_hashes[
+                        "replacement before materialize"
+                    ],
+                    "to_record_sha256": supplied_hashes["replacement current"],
+                    "sealed_at": now_iso(),
+                }
+            else:
+                source.pop("replacement_materialization", None)
+            staged_errors = verification_migration_integrity_errors(paths, state)
+            if staged_errors:
+                raise HarnessError(
+                    "sealed supersession failed integrity validation: "
+                    + "; ".join(staged_errors)
+                )
+            if terminal_migration:
+                bump_task(state, checkpoint_required=True)
+                final_state = copy.deepcopy(state)
+                final_state["checkpoint_required"] = False
+                final_state["checkpoint_revision"] = final_state["revision"]
+                checkpoint, checkpoint_text, checkpoint_sha = prepare_checkpoint(
+                    paths, final_state
+                )
+                final_state["checkpoint_sha256"] = checkpoint_sha
+                pending_state_sha = canonical_record_sha256(state)
+                target_state_sha = canonical_record_sha256(final_state)
+                state[migration_field] = {
+                    "version": 2,
+                    "method": "terminal-supersession-checkpoint-v2",
+                    "verification_index": source_index + 1,
+                    "replacement_index": replacement_index + 1,
+                    "previous_source_record_sha256": supplied_hashes["current source"],
+                    "source_preimage_sha256": supplied_hashes["source preimage"],
+                    "replacement_before_materialize_sha256": supplied_hashes[
+                        "replacement before materialize"
+                    ],
+                    "replacement_current_sha256": supplied_hashes[
+                        "replacement current"
+                    ],
+                    "replacement_was_materialized": replacement_was_materialized,
+                    "pending_state_sha256": pending_state_sha,
+                    "target_checkpoint_sha256": checkpoint_sha,
+                    "target_state_sha256": target_state_sha,
+                }
+                write_task(paths, state)
+                atomic_write_text(checkpoint, checkpoint_text)
+                write_task(paths, final_state)
+                state = final_state
+            else:
+                bump_task(state)
+                write_task(paths, state)
+            write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "verification_index": source_index + 1,
+            "replacement_index": replacement_index + 1,
+            "supersession_version": 2,
+            "replacement_was_materialized": replacement_was_materialized,
+            "terminal_migration": terminal_migration,
+            "resumed": resumed,
+            "already_sealed": already_sealed,
+            "checkpoint": str(checkpoint) if checkpoint is not None else None,
         },
         args.json,
     )
@@ -6381,6 +7720,15 @@ def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) ->
             raise HarnessError("replacement verification record changed after approval")
         if source.get("superseded_at"):
             raise HarnessError("verification record is already superseded")
+        if source.get("status") not in ACCOUNTED_VERIFICATION_STATUSES - {"skipped"}:
+            raise HarnessError("only an accounted non-skipped verification can be superseded")
+        if any(
+            not _is_canonical_snapshot_version(artifact.get("snapshot_version"))
+            for artifact in replacement.get("artifact_refs", [])
+        ):
+            raise HarnessError(
+                "replacement verification artifacts must be materialized before supersession"
+            )
         source_time = parse_time(str(source.get("recorded_at", "")))
         replacement_time = parse_time(str(replacement.get("recorded_at", "")))
         if (
@@ -6393,20 +7741,23 @@ def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) ->
             raise HarnessError(
                 "replacement must be a later passing verification in the same category"
             )
-        replacement_errors = verification_integrity_errors(
-            paths, {**state, "verification": [replacement]}
+        replacement_errors = verification_record_integrity_errors(
+            paths, state, [(replacement_index + 1, replacement)]
         )
         if replacement_errors:
             raise HarnessError(
                 "replacement verification is not physically valid: "
                 + "; ".join(replacement_errors)
             )
+        supersession_reason = require_evidence_detail(
+            args.reason, "verification supersession reason"
+        )
         source["original_status"] = source.get("status")
         source["status"] = "skipped"
         source["superseded_at"] = now_iso()
-        source["supersession_reason"] = require_evidence_detail(
-            args.reason, "verification supersession reason"
-        )
+        source["supersession_reason"] = supersession_reason
+        source["supersession_version"] = 2
+        source["source_record_sha256"] = expected_source_sha
         source["replacement_index"] = replacement_index + 1
         source["replacement_record_sha256"] = expected_replacement_sha
         bump_task(state)
@@ -6724,23 +8075,17 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
         packet = matches[0]
         previous_status = packet.get("status")
         if args.status == "dispatched":
-            contract_error = packet_contract_integrity_error(paths, state, packet)
-            input_errors = packet_input_integrity_errors(
+            authority_errors = packet_authority_integrity_errors(
                 paths,
                 state,
                 packet,
                 require_origin=previous_status == "ready",
             )
-            if contract_error or input_errors:
+            if authority_errors:
                 raise HarnessError(
-                    "packet contract/input is missing or tampered: "
-                    + "; ".join(
-                        ([contract_error] if contract_error else []) + input_errors
-                    )
+                    "packet authority is missing or tampered: "
+                    + "; ".join(authority_errors)
                 )
-            command_error = packet_command_integrity_error(packet)
-            if command_error:
-                raise HarnessError(command_error)
             _validate_active_execution_selection(
                 state,
                 str(packet.get("lane_id", "")),
@@ -6787,16 +8132,13 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "actual model tier differs from requested tier; do not claim routing verification"
             )
         if args.status == "done":
-            contract_error = packet_contract_integrity_error(paths, state, packet)
-            input_errors = packet_input_integrity_errors(
+            authority_errors = packet_authority_integrity_errors(
                 paths, state, packet, require_origin=False
             )
-            if contract_error or input_errors:
+            if authority_errors:
                 raise HarnessError(
-                    "done packet contract/input is missing or tampered: "
-                    + "; ".join(
-                        ([contract_error] if contract_error else []) + input_errors
-                    )
+                    "done packet authority is missing or tampered: "
+                    + "; ".join(authority_errors)
                 )
         if args.status in TERMINAL_PACKET_STATUSES:
             summary = require_text(args.summary or "", "terminal packet summary")
@@ -7393,6 +8735,7 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     if active_packets:
         failures.append("unfinished delegation packets: " + ", ".join(active_packets))
     failures.extend(packet_integrity_errors(paths, state))
+    failures.extend(packet_recovery_integrity_errors(paths, state))
     failures.extend(job_integrity_errors(paths, state))
     failures.extend(verification_integrity_errors(paths, state))
     failures.extend(portfolio_integrity_errors(state, paths))
@@ -7559,6 +8902,7 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if state.get("delivery", {}).get("mode") == "pending":
             failures.append("delivery disposition is pending")
         failures.extend(packet_integrity_errors(paths, state))
+        failures.extend(packet_recovery_integrity_errors(paths, state))
         failures.extend(job_integrity_errors(paths, state))
         worktree_errors, _ = worktree_integrity_errors(paths, state)
         failures.extend(worktree_errors)
@@ -8021,6 +9365,10 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 for item in packet_integrity_errors(paths, task)
             )
             errors.extend(
+                f"task {task_id}: {item}"
+                for item in packet_recovery_integrity_errors(paths, task)
+            )
+            errors.extend(
                 f"task {task_id}: {item}" for item in job_integrity_errors(paths, task)
             )
             errors.extend(
@@ -8043,6 +9391,10 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"{prefix} {task_id}: {item}"
                     for item in packet_integrity_errors(paths, packet_state)
                 )
+            errors.extend(
+                f"terminal task {task_id}: {item}"
+                for item in packet_recovery_integrity_errors(paths, task)
+            )
             for job in task.get("jobs", []):
                 job_state = {**task, "jobs": [job]}
                 destination = warnings if job.get("integrity_version") != 1 else errors
@@ -8053,8 +9405,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"{prefix} {task_id}: {item}"
                     for item in job_integrity_errors(paths, job_state)
                 )
-            for item in task.get("verification", []):
-                verification_state = {**task, "verification": [item]}
+            for verification_index, item in enumerate(
+                task.get("verification", []), start=1
+            ):
                 destination = (
                     warnings if item.get("integrity_version") != 1 else errors
                 )
@@ -8063,10 +9416,30 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
                 destination.extend(
                     f"{prefix} {task_id}: {message}"
-                    for message in verification_integrity_errors(
-                        paths, verification_state
+                    for message in verification_record_integrity_errors(
+                        paths, task, [(verification_index, item)]
                     )
                 )
+            supersession_records = [
+                item
+                for item in task.get("verification", [])
+                if item.get("superseded_at")
+            ]
+            graph_destination = (
+                warnings
+                if supersession_records
+                and all(item.get("integrity_version") != 1 for item in supersession_records)
+                else errors
+            )
+            graph_prefix = (
+                "legacy terminal task"
+                if graph_destination is warnings
+                else "terminal task"
+            )
+            graph_destination.extend(
+                f"{graph_prefix} {task_id}: {message}"
+                for message in verification_supersession_errors(task)
+            )
 
         for packet in task.get("packets", []):
             packet_id = packet.get("packet_id")
@@ -8825,8 +10198,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="snapshot still-valid legacy packet and verification artifacts",
     )
     p.add_argument("--task", required=True)
+    p.add_argument("--verification-index", type=int, action="append", default=[])
     add_json_argument(p)
     p.set_defaults(handler=cmd_materialize_artifacts)
+
+    p = sub.add_parser(
+        "packet-input-recover-from-tar",
+        help="recover one drifted legacy done-packet input from a bound tar member",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--packet-id", required=True)
+    p.add_argument("--input-index", type=int, required=True)
+    p.add_argument("--expected-input-sha256", required=True)
+    p.add_argument("--carrier-input-index", type=int, required=True)
+    p.add_argument("--carrier-sha256", required=True)
+    p.add_argument("--archive-member", required=True)
+    p.add_argument("--expected-result-sha256", required=True)
+    p.add_argument("--reason", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_packet_input_recover_from_tar)
 
     p = sub.add_parser(
         "verification-supersede",
@@ -8840,6 +10230,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", required=True)
     add_json_argument(p)
     p.set_defaults(handler=cmd_verification_supersede)
+
+    p = sub.add_parser(
+        "verification-supersession-seal",
+        help="seal a legacy supersession against its exact canonical replacement",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--verification-index", type=int, required=True)
+    p.add_argument("--expected-current-record-sha256", required=True)
+    p.add_argument("--expected-source-record-sha256", required=True)
+    p.add_argument("--replacement-index", type=int, required=True)
+    p.add_argument(
+        "--expected-replacement-before-materialize-sha256", required=True
+    )
+    p.add_argument("--expected-replacement-current-sha256", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_verification_supersession_seal)
 
     p = sub.add_parser("create-packet")
     p.add_argument("--task", required=True)

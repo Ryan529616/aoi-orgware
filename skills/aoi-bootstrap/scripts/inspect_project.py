@@ -228,6 +228,44 @@ def _link_like(path: Path) -> bool:
         return True
 
 
+def _canonicalize_no_link_traversal(path: Path, label: str) -> Path:
+    """Resolve a path after rejecting actual symlink/reparse components.
+
+    Windows ``resolve()`` expands benign 8.3 aliases, so lexical inequality is
+    not evidence that a path crossed a symlink or junction.
+    """
+
+    lexical = path.expanduser()
+    if not lexical.is_absolute():
+        lexical = Path.cwd() / lexical
+    current = Path(lexical.anchor)
+    for part in lexical.parts[1:]:
+        if part == "..":
+            raise InspectError(f"{label} may not contain parent traversal")
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise InspectError(
+                f"cannot inspect {label} path component {current}: {exc}"
+            ) from exc
+        is_link = stat.S_ISLNK(metadata.st_mode)
+        if os.name == "nt":
+            attributes = getattr(metadata, "st_file_attributes", 0)
+            is_link = is_link or bool(
+                attributes
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+        if is_link:
+            raise InspectError(f"{label} may not traverse symlinks or junctions")
+    try:
+        return current.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise InspectError(f"cannot resolve {label} path {lexical}: {exc}") from exc
+
+
 def _is_hardware_testbench(
     parts: tuple[str, ...], name: str, suffix: str
 ) -> bool:
@@ -405,13 +443,9 @@ def _path_traverses_link(root: Path, relative: str) -> bool:
 
 def inspect(root_arg: Path, max_files: int) -> dict[str, object]:
     lexical = root_arg.expanduser().absolute()
-    if _link_like(lexical):
-        raise InspectError(f"repository root may not be a symlink or junction: {lexical}")
     if not lexical.is_dir():
         raise InspectError(f"repository root is not a directory: {lexical}")
-    root = lexical.resolve()
-    if lexical != root:
-        raise InspectError("repository root may not traverse symlinks or junctions")
+    root = _canonicalize_no_link_traversal(lexical, "repository root")
     git_root = Path(_run_git(root, "rev-parse", "--show-toplevel")).resolve()
     if git_root != root:
         raise InspectError(f"--root must name the exact Git worktree root: {git_root}")
@@ -592,6 +626,8 @@ def inspect(root_arg: Path, max_files: int) -> dict[str, object]:
             value = payload.get("lock_domain") if isinstance(payload, dict) else None
             if (
                 not isinstance(payload, dict)
+                or not isinstance(payload.get("schema_version"), int)
+                or isinstance(payload.get("schema_version"), bool)
                 or payload.get("schema_version") != 1
                 or value not in LOCK_DOMAINS
             ):

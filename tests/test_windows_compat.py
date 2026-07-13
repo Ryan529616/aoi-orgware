@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import harnesslib as h  # noqa: E402
+from aoi_orgware.pilot import PilotError, initialize_kit  # noqa: E402
 
 
 CLI_MODULE = "aoi_orgware.cli"
@@ -92,6 +94,136 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
         self.assertTrue(
             any("windows_acl_unverified" in item for item in doctor["warnings"])
         )
+
+    def test_ntfs_short_alias_is_canonicalized_without_link_false_positive(self) -> None:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32_768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(
+            str(self.root.resolve()), buffer, len(buffer)
+        )
+        candidates = []
+        if length and length < len(buffer):
+            candidates.append(Path(buffer.value))
+        candidates.extend((Path(r"C:\PROGRA~1"), Path(r"C:\PROGRA~2")))
+        short_root = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.exists()
+                and candidate.absolute() != candidate.resolve()
+            ),
+            None,
+        )
+        if short_root is None:
+            self.skipTest("no distinct NTFS short-path spelling is available")
+
+        metadata = short_root.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        self.assertFalse(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+        self.assertEqual(
+            h.canonicalize_no_link_traversal(short_root, "test alias"),
+            short_root.resolve(),
+        )
+        self.assertEqual(h.discover_root(short_root), short_root.resolve())
+        if short_root.resolve() == self.root.resolve():
+            self.assertEqual(h.get_paths(short_root).root, self.root.resolve())
+
+    def test_explicit_root_junction_is_still_rejected(self) -> None:
+        junction = self.root.parent / f"{self.root.name}-root-junction"
+        try:
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(self.root)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if created.returncode != 0:
+                self.skipTest(f"junction creation unavailable: {created.stderr}")
+            with self.assertRaisesRegex(h.HarnessError, "symlinks or junctions"):
+                h.get_paths(junction)
+        finally:
+            if junction.exists():
+                os.rmdir(junction)
+
+    def test_managed_task_junction_rejects_read_write_and_dot_bypass(self) -> None:
+        task_id = "managed-junction-boundary"
+        self.cli(
+            "init-task",
+            "--task-id",
+            task_id,
+            "--title",
+            "Managed junction boundary",
+            "--objective",
+            "Prove dynamic state descendants reject junction traversal",
+            "--owner",
+            "windows-test",
+            "--completion-boundary",
+            "Read and write paths fail before crossing the junction",
+        )
+        paths = h.get_paths(self.root)
+        task_path = paths.tasks / task_id
+        outside = self.root.parent / f"{self.root.name}-managed-task-target"
+        task_path.rename(outside)
+        junction = task_path
+        try:
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if created.returncode != 0:
+                self.skipTest(f"junction creation unavailable: {created.stderr}")
+            status = self.cli("status", "--task", task_id, "--json", ok=False)
+            self.assertIn("symlinks or junctions", status.stderr)
+            escaped = junction / "packets" / "escaped.md"
+            with self.assertRaisesRegex(h.HarnessError, "symlinks or junctions"):
+                h.atomic_write_text(escaped, "must not escape\n")
+            self.assertFalse((outside / "packets" / "escaped.md").exists())
+            disguised = (
+                paths.tasks
+                / "missing"
+                / ".."
+                / task_id
+                / "packets"
+                / "escaped.md"
+            )
+            with self.assertRaisesRegex(h.HarnessError, "parent traversal"):
+                h.canonicalize_no_link_traversal(disguised, "disguised task path")
+        finally:
+            if junction.exists():
+                os.rmdir(junction)
+            if outside.exists():
+                outside.rename(task_path)
+
+    def test_pilot_nested_junction_is_rejected_before_external_write(self) -> None:
+        kit = self.root / "pilot-kit-junction"
+        outside = self.root.parent / f"{self.root.name}-pilot-target"
+        kit.mkdir()
+        outside.mkdir()
+        junction = kit / "sample_project"
+        try:
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if created.returncode != 0:
+                self.skipTest(f"junction creation unavailable: {created.stderr}")
+            with self.assertRaisesRegex(PilotError, "symlinks or junctions"):
+                initialize_kit(
+                    kit,
+                    force=True,
+                    allow_unverified_windows_acl=True,
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+        finally:
+            if junction.exists():
+                os.rmdir(junction)
+            if outside.exists():
+                outside.rmdir()
 
     def test_open_reader_replace_retry_and_timeout_preserve_old_state(self) -> None:
         target = self.root / "replace.json"

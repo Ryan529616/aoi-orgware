@@ -285,6 +285,25 @@ class BootstrapInspectorSignalTests(unittest.TestCase):
             any("full Git status" in item for item in payload["warnings"])
         )
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlink case; Windows junction is below")
+    def test_canonicalizer_rejects_parent_traversal_without_hiding_links(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        link = self.root / "linked"
+        link.symlink_to(outside, target_is_directory=True)
+        disguised = self.root / "missing" / ".." / "linked" / "file.txt"
+        with self.assertRaisesRegex(INSPECTOR_MODULE.InspectError, "parent traversal"):
+            INSPECTOR_MODULE._canonicalize_no_link_traversal(
+                disguised, "disguised inspector path"
+            )
+        linked_parent = link / ".." / "repo" / "file.txt"
+        with self.assertRaisesRegex(
+            INSPECTOR_MODULE.InspectError, "symlinks or junctions"
+        ):
+            INSPECTOR_MODULE._canonicalize_no_link_traversal(
+                linked_parent, "linked parent inspector path"
+            )
+
     @unittest.skipUnless(os.name == "nt", "native Windows reparse metadata")
     def test_lstat_reparse_fallback_and_real_junction_are_link_like(self) -> None:
         class ReparsePath:
@@ -311,6 +330,13 @@ class BootstrapInspectorSignalTests(unittest.TestCase):
             if created.returncode != 0:
                 self.skipTest(f"junction creation unavailable: {created.stderr}")
             try:
+                disguised = self.root / "missing" / ".." / "tb" / "outside_tb.sv"
+                with self.assertRaisesRegex(
+                    INSPECTOR_MODULE.InspectError, "parent traversal"
+                ):
+                    INSPECTOR_MODULE._canonicalize_no_link_traversal(
+                        disguised, "disguised inspector path"
+                    )
                 inventory = json.loads(self.inspect().stdout)["inventory"]
                 self.assertIn("tb", inventory["skipped_links"])
                 self.assertFalse(inventory["hardware_testbench_markers"])

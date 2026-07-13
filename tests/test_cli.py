@@ -14,6 +14,7 @@ import tempfile
 import tarfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -27,6 +28,109 @@ from aoi_orgware import harnesslib as h  # noqa: E402
 
 CLI_MODULE = "aoi_orgware.cli"
 HOOK_MODULE = "aoi_orgware.codex_hook"
+
+
+class AtomicPrimitiveTests(unittest.TestCase):
+    def test_atomic_create_publishes_complete_bytes_without_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "atomic" / "blob.bin"
+            payload = b"complete immutable payload\n"
+            observed: list[tuple[bool, bytes]] = []
+            publish_name = "rename" if os.name == "nt" else "link"
+            real_publish = getattr(os, publish_name)
+
+            def inspect_then_publish(
+                source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                **kwargs: object,
+            ) -> None:
+                observed.append((Path(target).exists(), Path(source).read_bytes()))
+                real_publish(source, target, **kwargs)
+
+            with mock.patch.object(
+                h.os, publish_name, side_effect=inspect_then_publish
+            ), mock.patch.object(
+                h.os, "chmod", side_effect=AssertionError("path chmod is forbidden")
+            ):
+                h.atomic_create_bytes(destination, payload)
+
+            self.assertEqual(observed, [(False, payload)])
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertFalse(
+                list(destination.parent.glob(f".{destination.name}.tmp-*"))
+            )
+
+            before = destination.read_bytes()
+            with self.assertRaises(h.HarnessError):
+                h.atomic_create_bytes(destination, b"replacement must fail\n")
+            self.assertEqual(destination.read_bytes(), before)
+
+    def test_recovery_tar_replay_uses_one_shared_aggregate_budget(self) -> None:
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as handle:
+            member = tarfile.TarInfo("release/evidence.bin")
+            member.size = 1
+            handle.addfile(member, io.BytesIO(b"x"))
+        archive_data = archive.getvalue()
+        budget = {
+            "decompressed_bytes": 0,
+            "member_count": 0,
+            "declared_bytes": 0,
+            "extracted_bytes": 0,
+        }
+        with mock.patch.object(
+            cli_impl,
+            "BOUND_ARTIFACT_TOTAL_MAX_BYTES",
+            len(archive_data) + 1,
+        ):
+            self.assertEqual(
+                cli_impl.read_recovery_tar_member(
+                    archive_data,
+                    "release/evidence.bin",
+                    budget=budget,
+                ),
+                b"x",
+            )
+            with self.assertRaisesRegex(
+                h.HarnessError, "aggregate decompressed budget"
+            ):
+                cli_impl.read_recovery_tar_member(
+                    archive_data,
+                    "release/evidence.bin",
+                    budget=budget,
+                )
+        malformed_gzip = (
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03" + b"\xff" * 20
+        )
+        with self.assertRaisesRegex(h.HarnessError, "recovery archive is invalid"):
+            cli_impl.read_recovery_tar_member(malformed_gzip, "release/evidence.bin")
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink boundary; junction is tested natively")
+    def test_managed_reads_and_writes_reject_descendant_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            link = managed / "task"
+            link.symlink_to(outside, target_is_directory=True)
+            destination = link / "state.json"
+            with self.assertRaisesRegex(h.HarnessError, "symlinks or junctions"):
+                h.atomic_write_bytes(destination, b"{}\n")
+            with self.assertRaisesRegex(h.HarnessError, "symlinks or junctions"):
+                h.atomic_create_bytes(destination, b"{}\n")
+            self.assertEqual(list(outside.iterdir()), [])
+
+            (outside / "state.json").write_text('{"outside": true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(h.HarnessError, "symlinks or junctions"):
+                h.load_json(destination)
+            disguised = managed / "missing" / ".." / "task" / "state.json"
+            with self.assertRaisesRegex(h.HarnessError, "parent traversal"):
+                h.canonicalize_no_link_traversal(disguised, "disguised state")
+            linked_parent = link / ".." / "managed" / "state.json"
+            with self.assertRaisesRegex(h.HarnessError, "symlinks or junctions"):
+                h.canonicalize_no_link_traversal(linked_parent, "linked parent state")
 
 
 class HarnessTestCase(unittest.TestCase):
@@ -256,6 +360,16 @@ class HarnessTestCase(unittest.TestCase):
 
 
 class LockTests(HarnessTestCase):
+    def test_initialized_policy_matches_canonical_packaged_resource(self) -> None:
+        canonical = (REPO / "docs" / "POLICY.md").read_bytes()
+        packaged = (SRC / "aoi_orgware" / "resources" / "policy.md").read_bytes()
+        initialized = (self.root / ".aoi" / "POLICY.md").read_bytes()
+        self.assertEqual(packaged, canonical)
+        self.assertEqual(initialized, canonical)
+        text = initialized.decode("utf-8")
+        self.assertIn("packet-input-recover-from-tar", text)
+        self.assertIn("verification-supersession-seal", text)
+
     def test_overlap_matrix_and_path_escape(self) -> None:
         self.assertTrue(
             h.locks_overlap("repo:file:rtl/a.sv", "repo:tree:rtl")
@@ -842,7 +956,7 @@ class LifecycleTests(HarnessTestCase):
             "--task",
             "rollback-task",
             "--fact",
-            "x" * 13000,
+            "x" * 26000,
             "--next-action",
             "Should fail",
             ok=False,
@@ -874,7 +988,7 @@ class LifecycleTests(HarnessTestCase):
             "--task",
             "rollback-task",
             "--summary",
-            "x" * 13000,
+            "x" * 26000,
             ok=False,
         )
         self.assertEqual(state_path.read_bytes(), before_state)
@@ -1212,7 +1326,9 @@ class LifecycleTests(HarnessTestCase):
         before = json.dumps(state, sort_keys=True)
         paths = h.get_paths(self.root)
         full = h.render_checkpoint(paths, state)
-        self.assertGreater(len(full.encode("utf-8")), h.CHECKPOINT_MAX_BYTES)
+        self.assertGreater(
+            len(full.encode("utf-8")), h.CHECKPOINT_COMPACT_THRESHOLD_BYTES
+        )
 
         _, prepared, digest = h.prepare_checkpoint(paths, state)
         _, repeated, repeated_digest = h.prepare_checkpoint(paths, state)
@@ -1592,6 +1708,43 @@ class LifecycleTests(HarnessTestCase):
         self.assertNotIn("Terminal packet history:", below_rendered)
         self.assertIn("terminal-packet-0 [done]", below_rendered)
 
+    def test_compact_fallback_allows_required_active_detail_above_target(self) -> None:
+        self.init_task("active-checkpoint-above-target")
+        state_path = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / "active-checkpoint-above-target"
+            / "state.json"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        active_detail = "ACTIVE-DETAIL-" + "x" * 13000
+        state["jobs"].append(
+            {
+                "run_id": "active-above-target-job",
+                "status": "running",
+                "host": "eda",
+                "tool": "VCS",
+                "log": "/runs/active-above-target-job/simv.log",
+                "pid": "1234",
+                "tmux": "active-above-target",
+                "stop_condition": active_detail,
+                "source_sha": "c" * 64,
+                "source_scope": "current source",
+                "evidence": "still running",
+            }
+        )
+        paths = h.get_paths(self.root)
+        compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        compact_bytes = len(compact.encode("utf-8"))
+        self.assertGreater(compact_bytes, h.CHECKPOINT_COMPACT_THRESHOLD_BYTES)
+        self.assertLessEqual(compact_bytes, h.CHECKPOINT_MAX_BYTES)
+
+        _, prepared, _ = h.prepare_checkpoint(paths, state)
+
+        self.assertEqual(prepared, compact)
+        self.assertIn(active_detail, prepared)
+
     def test_compact_fallback_never_truncates_oversized_active_detail(self) -> None:
         self.init_task("active-oversized-checkpoint")
         state_path = (
@@ -1611,13 +1764,15 @@ class LifecycleTests(HarnessTestCase):
                 "log": "/runs/active-oversized-job/simv.log",
                 "pid": "1234",
                 "tmux": "active-oversized",
-                "stop_condition": "ACTIVE-DETAIL-" + "x" * 13000,
+                "stop_condition": "ACTIVE-DETAIL-" + "x" * 26000,
                 "source_sha": "c" * 64,
                 "source_scope": "current source",
                 "evidence": "still running",
             }
         )
-        with self.assertRaisesRegex(h.HarnessError, "checkpoint exceeds 12 KiB"):
+        with self.assertRaisesRegex(
+            h.HarnessError, "checkpoint exceeds 24 KiB hard ceiling"
+        ):
             h.prepare_checkpoint(h.get_paths(self.root), state)
 
     def test_compact_fallback_never_hides_oversized_active_claim_locks(self) -> None:
@@ -1641,7 +1796,7 @@ class LifecycleTests(HarnessTestCase):
         ]
         locks = [
             f"repo:file:scripts/verify/active-lock-{index:03d}-{'x' * 80}.py"
-            for index in range(130)
+            for index in range(220)
         ]
         for lock in locks:
             claim_args.extend(["--lock", lock])
@@ -1651,7 +1806,9 @@ class LifecycleTests(HarnessTestCase):
         compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
         for lock in locks:
             self.assertIn(lock, compact)
-        with self.assertRaisesRegex(h.HarnessError, "checkpoint exceeds 12 KiB"):
+        with self.assertRaisesRegex(
+            h.HarnessError, "checkpoint exceeds 24 KiB hard ceiling"
+        ):
             h.prepare_checkpoint(paths, state)
 
     def test_close_gate_requires_claim_release_checkpoint_and_delivery(self) -> None:
@@ -4347,7 +4504,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             command_sha,
             ok=False,
         )
-        self.assertIn("non-symlink", symlink.stderr)
+        self.assertIn("symlinks or junctions", symlink.stderr)
         self.assertEqual(state_path.read_bytes(), before)
         created = json.loads(
             self.cli(
@@ -4422,6 +4579,216 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             any("exact command artifact identity mismatch" in item for item in doctor["errors"]),
             doctor,
         )
+
+    def test_exact_command_tamper_blocks_done_and_reviewer_consumer(self) -> None:
+        task_id = "packet-command-consumers"
+        self.init_task(task_id)
+        command = self.root / "consumer-command.sh"
+        command.write_text("#!/bin/sh\nprintf 'bounded command\\n'\n", encoding="utf-8")
+        command_sha = hashlib.sha256(command.read_bytes()).hexdigest()
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "consumer-command-claim",
+            "--owner",
+            "test-root",
+            "--kind",
+            "COMMAND",
+            "--lock",
+            "repo:file:consumer-command.sh",
+            "--intent",
+            "Own the exact command execution authority",
+            "--validation",
+            "Every transition and consumer revalidates command identity",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+
+        def create_exact(packet_id: str, role: str, tier: str) -> Path:
+            self.cli(
+                "create-packet",
+                "--task",
+                task_id,
+                "--packet-id",
+                packet_id,
+                "--agent-role",
+                role,
+                "--model-tier",
+                tier,
+                "--objective",
+                "Use only the exact approved command",
+                "--scope",
+                "Exact command consumer gate fixture",
+                "--deliverable",
+                "Integrity-bound terminal result",
+                "--validation",
+                "Command identity is revalidated",
+                "--packet-mode",
+                "exact_command",
+                "--lock",
+                "repo:file:consumer-command.sh",
+                "--command-artifact",
+                str(command),
+                "--command-sha256",
+                command_sha,
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            packet = next(
+                item for item in state["packets"] if item["packet_id"] == packet_id
+            )
+            return Path(packet["command_path"])
+
+        worker_snapshot = create_exact("exact-worker", "external_operator", "standard")
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "exact-worker",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/exact-worker",
+        )
+        worker_snapshot.write_text("tampered after dispatch\n", encoding="utf-8")
+        before_done = state_path.read_bytes()
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "exact-worker",
+            "--status",
+            "done",
+            "--summary",
+            "This transition must not commit",
+            "--evidence",
+            "The command snapshot changed after dispatch",
+            ok=False,
+        )
+        self.assertIn("exact command artifact identity mismatch", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before_done)
+
+        worker_snapshot.write_bytes(command.read_bytes())
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "exact-worker",
+            "--status",
+            "done",
+            "--summary",
+            "The exact command remained intact through completion",
+            "--evidence",
+            "The command snapshot matched its approved SHA-256",
+        )
+
+        reviewer_snapshot = create_exact("exact-reviewer", "reviewer", "expert")
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "exact-reviewer",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/exact-reviewer",
+            "--actual-role",
+            "reviewer",
+            "--actual-model-tier",
+            "expert",
+            "--routing-evidence",
+            "The exact reviewer identity and capability tier were exposed",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "exact-reviewer",
+            "--status",
+            "done",
+            "--summary",
+            "Reviewer completed while command authority was intact",
+            "--evidence",
+            "The review result was bound to the exact command",
+        )
+        reviewer_snapshot.write_text("tampered after reviewer completion\n", encoding="utf-8")
+        before_consumer = state_path.read_bytes()
+        rejected = self.cli(
+            "add-verification",
+            "--task",
+            task_id,
+            "--category",
+            "independent_review",
+            "--status",
+            "pass",
+            "--evidence",
+            "A tampered reviewer command cannot qualify this verification",
+            "--command",
+            "bounded reviewer command",
+            "--boundary",
+            "Synthetic reviewer authority gate",
+            "--review-packet-id",
+            "exact-reviewer",
+            ok=False,
+        )
+        self.assertIn("exact command artifact identity mismatch", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before_consumer)
+
+    def test_packet_schema_version_requires_an_exact_non_boolean_integer(self) -> None:
+        task_id = "packet-schema-exact-int"
+        self.init_task(task_id)
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "schema-reader",
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Read one bounded fixture",
+            "--scope",
+            "Packet schema type validation",
+            "--deliverable",
+            "No mutation",
+            "--validation",
+            "Schema routing fails closed",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        pristine = json.loads(state_path.read_text(encoding="utf-8"))
+        for invalid_version in (True, "4"):
+            with self.subTest(packet_schema_version=invalid_version):
+                damaged = json.loads(json.dumps(pristine))
+                packet = damaged["packets"][0]
+                packet["packet_schema_version"] = invalid_version
+                packet.pop("packet_contract_sha256", None)
+                state_path.write_text(
+                    json.dumps(damaged, indent=2) + "\n", encoding="utf-8"
+                )
+                before = state_path.read_bytes()
+                rejected = self.cli(
+                    "packet-update",
+                    "--task",
+                    task_id,
+                    "--packet-id",
+                    "schema-reader",
+                    "--status",
+                    "dispatched",
+                    "--agent-id",
+                    "/root/schema-reader",
+                    ok=False,
+                )
+                self.assertIn("schema version is invalid", rejected.stderr)
+                self.assertEqual(before, state_path.read_bytes())
 
     def test_packet_inputs_use_canonical_snapshots_and_dispatch_fences_origin(self) -> None:
         task_id = "packet-input-snapshot"
@@ -4512,6 +4879,62 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         doctor = self.cli("doctor", "--task", task_id, "--json")
         self.assertTrue(json.loads(doctor.stdout)["ok"])
+
+    def test_artifact_blob_ancestor_link_is_rejected_before_write(self) -> None:
+        task_id = "artifact-blob-ancestor-link"
+        self.init_task(task_id)
+        source = self.root / "ancestor-link-source.txt"
+        source.write_text("exact artifact bytes\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        task_root = self.root / ".aoi" / "tasks" / task_id
+        blob_root = task_root / "results" / "artifact-blobs"
+        outside = self.root / "outside-artifact-store"
+        outside.mkdir()
+        blob_root.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(blob_root), str(outside)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if created.returncode != 0:
+                self.skipTest(f"junction creation unavailable: {created.stderr}")
+        else:
+            blob_root.symlink_to(outside, target_is_directory=True)
+        try:
+            state_path = task_root / "state.json"
+            before = state_path.read_bytes()
+            rejected = self.cli(
+                "create-packet",
+                "--task",
+                task_id,
+                "--packet-id",
+                "linked-input",
+                "--agent-role",
+                "explorer",
+                "--model-tier",
+                "standard",
+                "--objective",
+                "Reject linked artifact store ancestors",
+                "--scope",
+                "Synthetic linked-ancestor fixture",
+                "--deliverable",
+                "No packet or external blob",
+                "--validation",
+                "Managed artifact ancestors remain real directories",
+                "--input-artifact",
+                f"{source}={digest}",
+                ok=False,
+            )
+            self.assertIn("must be a real directory", rejected.stderr)
+            self.assertEqual(state_path.read_bytes(), before)
+            self.assertEqual(list(outside.iterdir()), [])
+        finally:
+            if os.name == "nt" and blob_root.exists():
+                os.rmdir(blob_root)
+            elif blob_root.is_symlink():
+                blob_root.unlink()
 
     def test_v4_snapshot_tamper_blocks_dispatch_and_remains_doctor_error(self) -> None:
         task_id = "packet-input-tamper"
@@ -4655,7 +5078,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             source.write_text("legitimate later source\n", encoding="utf-8")
             return state_path, source
 
-        make_terminal("legacy-failed-input", "failed")
+        failed_state_path, failed_source = make_terminal(
+            "legacy-failed-input", "failed"
+        )
         failed_doctor = self.cli(
             "doctor", "--task", "legacy-failed-input", "--json"
         )
@@ -4664,6 +5089,58 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertTrue(
             any("legacy digest-only inputs" in item for item in failed_payload["warnings"]),
             failed_payload,
+        )
+
+        failed_state = json.loads(failed_state_path.read_text(encoding="utf-8"))
+        failed_packet = failed_state["packets"][0]
+        failed_ref = failed_packet["input_artifact_refs"][0]
+        failed_digest = failed_ref["sha256"]
+        snapshot = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / "legacy-failed-input"
+            / "results"
+            / "artifact-blobs"
+            / failed_digest[:2]
+            / failed_digest
+        )
+        snapshot.write_text("tampered canonical snapshot\n", encoding="utf-8")
+        failed_packet["input_artifact_refs"] = [
+            {
+                "snapshot_version": 1,
+                "source_path": str(failed_source.resolve()),
+                "path": str(snapshot),
+                "sha256": failed_digest,
+                "size_bytes": len(b"legacy input\n"),
+            }
+        ]
+        failed_state_path.write_text(
+            json.dumps(failed_state, indent=2) + "\n", encoding="utf-8"
+        )
+        mixed_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                "legacy-failed-input",
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertTrue(
+            any(
+                "packet legacy-reader input artifact: artifact snapshot identity mismatch"
+                in item
+                for item in json.loads(mixed_doctor.stdout)["errors"]
+            )
         )
 
         make_terminal("legacy-done-input", "done")
@@ -4746,7 +5223,51 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             }
         ]
         state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+        second_ref = second_record["artifact_refs"][0]
+        second_ref["snapshot_version"] = 2
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        before_unsupported = state_path.read_bytes()
+        unsupported = self.cli(
+            "materialize-artifacts",
+            "--task",
+            task_id,
+            "--verification-index",
+            "2",
+            ok=False,
+        )
+        self.assertIn("unsupported artifact snapshot version", unsupported.stderr)
+        self.assertEqual(before_unsupported, state_path.read_bytes())
+        second_ref.pop("snapshot_version")
+        second_ref["size_bytes"] = second.stat().st_size + 1
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        before_wrong_size = state_path.read_bytes()
+        wrong_size = self.cli(
+            "materialize-artifacts",
+            "--task",
+            task_id,
+            "--verification-index",
+            "2",
+            ok=False,
+        )
+        self.assertIn("not physically valid", wrong_size.stderr)
+        self.assertEqual(before_wrong_size, state_path.read_bytes())
+        second_ref["size_bytes"] = second.stat().st_size
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         first.write_text("superseded origin evolved\n", encoding="utf-8")
+        materialized = json.loads(
+            self.cli(
+                "materialize-artifacts",
+                "--task",
+                task_id,
+                "--verification-index",
+                "2",
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(materialized["materialized_refs"], 1)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        first_record, second_record = state["verification"]
         source_record_sha = hashlib.sha256(
             json.dumps(
                 first_record,
@@ -4778,12 +5299,12 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--reason",
             "The original live-path artifact was replaced by a later exact passing record",
         )
-        materialized = json.loads(
-            self.cli("materialize-artifacts", "--task", task_id, "--json").stdout
-        )
-        self.assertEqual(materialized["materialized_refs"], 1)
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(migrated["verification"][0]["status"], "skipped")
+        self.assertEqual(migrated["verification"][0]["supersession_version"], 2)
+        self.assertEqual(
+            migrated["verification"][0]["source_record_sha256"], source_record_sha
+        )
         self.assertEqual(
             migrated["verification"][1]["artifact_refs"][0]["snapshot_version"], 1
         )
@@ -4794,6 +5315,898 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             any("explicitly superseded" in item for item in payload["warnings"]),
             payload,
         )
+
+    def test_canonical_snapshot_rejects_boolean_size_and_version(self) -> None:
+        task_id = "canonical-snapshot-bool-schema"
+        self.init_task(task_id)
+        artifact = self.root / "one-byte-evidence.bin"
+        artifact.write_bytes(b"x")
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        self.cli(
+            "add-verification",
+            "--task",
+            task_id,
+            "--category",
+            "static_check",
+            "--status",
+            "pass",
+            "--evidence",
+            "One-byte canonical snapshot schema fixture",
+            "--command",
+            "bounded schema validation",
+            "--boundary",
+            "Synthetic snapshot metadata only",
+            "--artifact-ref",
+            f"{artifact}={digest}",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+
+        def run_damaged_doctor() -> dict[str, object]:
+            result = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+                cwd=self.root,
+                env=self.env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            return json.loads(result.stdout)
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        ref = state["verification"][0]["artifact_refs"][0]
+        ref["size_bytes"] = True
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        size_payload = run_damaged_doctor()
+        self.assertFalse(size_payload["ok"])
+        self.assertTrue(
+            any("artifact size is invalid" in item for item in size_payload["errors"]),
+            size_payload,
+        )
+        ref["size_bytes"] = 1
+        ref["snapshot_version"] = True
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        version_payload = run_damaged_doctor()
+        self.assertFalse(version_payload["ok"])
+        self.assertTrue(
+            any(
+                "snapshot version is unsupported" in item
+                for item in version_payload["errors"]
+            ),
+            version_payload,
+        )
+        ref["snapshot_version"] = 1
+        state["verification"][0]["integrity_version"] = True
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        integrity_payload = run_damaged_doctor()
+        self.assertFalse(integrity_payload["ok"])
+        self.assertTrue(
+            any(
+                "lacks integrity_version=1" in item
+                for item in integrity_payload["errors"]
+            ),
+            integrity_payload,
+        )
+
+    def test_legacy_done_packet_input_recovers_from_bound_tar_member(self) -> None:
+        task_id = "packet-input-archive-recovery"
+        self.init_task(task_id)
+        source = self.root / "reviewed-source.txt"
+        carrier = self.root / "reviewed-release.tar.gz"
+        original = b"x"
+        source.write_bytes(original)
+        member_name = "release-1.0/reviewed-source.txt"
+        with tarfile.open(carrier, mode="w:gz") as archive:
+            info = tarfile.TarInfo(member_name)
+            info.size = len(original)
+            archive.addfile(info, io.BytesIO(original))
+        source_sha = hashlib.sha256(original).hexdigest()
+        carrier_sha = hashlib.sha256(carrier.read_bytes()).hexdigest()
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reviewer",
+            "--agent-role",
+            "reviewer",
+            "--model-tier",
+            "expert",
+            "--objective",
+            "Review an exact release archive and its source",
+            "--scope",
+            "Synthetic release recovery fixture",
+            "--deliverable",
+            "Exact reviewer result",
+            "--validation",
+            "Recovered input must remain byte-identical",
+            "--input-artifact",
+            f"{source}={source_sha}",
+            "--input-artifact",
+            f"{carrier}={carrier_sha}",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reviewer",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/reviewer",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reviewer",
+            "--status",
+            "done",
+            "--summary",
+            "Reviewer accepted the exact source and release archive",
+            "--evidence",
+            "The result is bound to both exact input identities",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        packet = state["packets"][0]
+        result_sha = packet["result_sha256"]
+        packet["packet_schema_version"] = 3
+        packet.pop("packet_contract_sha256", None)
+        packet.pop("input_snapshot_version", None)
+        packet["input_artifact_refs"] = [
+            {
+                "path": str(source.resolve()),
+                "sha256": source_sha,
+                "size_bytes": len(original),
+            },
+            {
+                "path": str(carrier.resolve()),
+                "sha256": carrier_sha,
+                "size_bytes": carrier.stat().st_size,
+            },
+        ]
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        source.write_text("legitimate later source evolution\n", encoding="utf-8")
+
+        packet["input_artifact_refs"][0]["size_bytes"] = True
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        before_bool_size = state_path.read_bytes()
+        bool_size = self.cli(
+            "packet-input-recover-from-tar",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reviewer",
+            "--input-index",
+            "1",
+            "--expected-input-sha256",
+            source_sha,
+            "--carrier-input-index",
+            "2",
+            "--carrier-sha256",
+            carrier_sha,
+            "--archive-member",
+            member_name,
+            "--expected-result-sha256",
+            result_sha,
+            "--reason",
+            "Boolean size metadata must never qualify as a one-byte identity",
+            ok=False,
+        )
+        self.assertIn("legacy packet input identity", bool_size.stderr)
+        self.assertEqual(before_bool_size, state_path.read_bytes())
+        packet["input_artifact_refs"][0]["size_bytes"] = len(original)
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+        before = state_path.read_bytes()
+        rejected = self.cli(
+            "packet-input-recover-from-tar",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reviewer",
+            "--input-index",
+            "1",
+            "--expected-input-sha256",
+            "0" * 64,
+            "--carrier-input-index",
+            "2",
+            "--carrier-sha256",
+            carrier_sha,
+            "--archive-member",
+            member_name,
+            "--expected-result-sha256",
+            result_sha,
+            "--reason",
+            "Attempted recovery must remain bound to the approved input identity",
+            ok=False,
+        )
+        self.assertIn("approved SHA-256", rejected.stderr)
+        self.assertEqual(before, state_path.read_bytes())
+
+        self.cli(
+            "packet-input-recover-from-tar",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reviewer",
+            "--input-index",
+            "1",
+            "--expected-input-sha256",
+            source_sha,
+            "--carrier-input-index",
+            "2",
+            "--carrier-sha256",
+            carrier_sha,
+            "--archive-member",
+            f"  {member_name}  ",
+            "--expected-result-sha256",
+            result_sha,
+            "--reason",
+            "The drifted live source is recovered from the exact reviewed release archive",
+        )
+        recovered = json.loads(state_path.read_text(encoding="utf-8"))
+        recovered_ref = recovered["packets"][0]["input_artifact_refs"][0]
+        self.assertEqual(recovered_ref["snapshot_version"], 1)
+        self.assertEqual(Path(recovered_ref["path"]).read_bytes(), original)
+        self.assertEqual(recovered_ref["source_path"], str(source.resolve()))
+        self.assertEqual(
+            recovered_ref["recovery"]["method"], "packet-bound-tar-member"
+        )
+        self.assertEqual(recovered_ref["recovery"]["carrier_sha256"], carrier_sha)
+        self.assertEqual(recovered_ref["recovery"]["archive_member"], member_name)
+        self.assertRegex(recovered_ref["recovery"]["record_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            source.read_text(encoding="utf-8"), "legitimate later source evolution\n"
+        )
+        recovery_doctor = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(recovery_doctor["ok"], recovery_doctor)
+
+        paths = h.get_paths(self.root)
+        legacy_receipt = json.loads(json.dumps(recovered))
+        legacy_receipt["packets"][0]["input_artifact_refs"][0]["recovery"].pop(
+            "record_sha256"
+        )
+        self.assertEqual(
+            cli_impl.packet_recovery_integrity_errors(paths, legacy_receipt), []
+        )
+        self.assertTrue(
+            any(
+                "unsealed legacy receipt" in item
+                for item in cli_impl.packet_integrity_warnings(legacy_receipt)
+            )
+        )
+        tamper_cases = {
+            "boolean receipt version": ("version", True),
+            "wrong method": ("method", "unbound-tar-member"),
+            "boolean carrier index": ("carrier_input_index", True),
+            "noncanonical member": ("archive_member", f" {member_name}"),
+            "wrong packet result": ("packet_result_sha256", "0" * 64),
+            "wrong record seal": ("record_sha256", "0" * 64),
+        }
+        for label, (field, value) in tamper_cases.items():
+            damaged = json.loads(json.dumps(recovered))
+            damaged["packets"][0]["input_artifact_refs"][0]["recovery"][field] = value
+            self.assertTrue(
+                cli_impl.packet_recovery_integrity_errors(paths, damaged),
+                label,
+            )
+
+        migrated = json.loads(
+            self.cli("materialize-artifacts", "--task", task_id, "--json").stdout
+        )
+        self.assertEqual(migrated["materialized_refs"], 1)
+        final_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(final_state["packets"][0]["input_snapshot_version"], 1)
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        doctor_payload = json.loads(doctor.stdout)
+        self.assertTrue(doctor_payload["ok"], doctor_payload)
+
+    def test_legacy_supersession_can_be_sealed_after_materialization(self) -> None:
+        task_id = "verification-supersession-seal"
+        self.init_task(task_id)
+        first = self.root / "supersession-source.txt"
+        second = self.root / "supersession-replacement.txt"
+        first.write_text("source evidence\n", encoding="utf-8")
+        second.write_text("replacement evidence\n", encoding="utf-8")
+        for path, evidence in (
+            (first, "Initial verification was recorded before replacement"),
+            (second, "Later canonical replacement verification was recorded"),
+        ):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.cli(
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "static_check",
+                "--status",
+                "pass",
+                "--evidence",
+                evidence,
+                "--command",
+                "bounded static verification",
+                "--boundary",
+                "Synthetic supersession seal fixture only",
+                "--artifact-ref",
+                f"{path}={digest}",
+            )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        source, replacement = state["verification"]
+        source_preimage_sha = cli_impl.canonical_record_sha256(source)
+        replacement_current_sha = cli_impl.canonical_record_sha256(replacement)
+        replacement_legacy = json.loads(json.dumps(replacement))
+        replacement_legacy.pop("artifact_snapshot_version", None)
+        replacement_legacy["artifact_refs"] = [
+            {
+                "path": ref["source_path"],
+                "sha256": ref["sha256"],
+                "size_bytes": ref["size_bytes"],
+            }
+            for ref in replacement["artifact_refs"]
+        ]
+        replacement_legacy_sha = cli_impl.canonical_record_sha256(
+            replacement_legacy
+        )
+        source["original_status"] = source["status"]
+        source["status"] = "skipped"
+        source["superseded_at"] = h.now_iso()
+        source["supersession_reason"] = (
+            "Legacy supersession was recorded before replacement materialization"
+        )
+        source["replacement_index"] = 2
+        source["replacement_record_sha256"] = replacement_legacy_sha
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        source_current_sha = cli_impl.canonical_record_sha256(source)
+        self.cli(
+            "verification-supersession-seal",
+            "--task",
+            task_id,
+            "--verification-index",
+            "1",
+            "--expected-current-record-sha256",
+            source_current_sha,
+            "--expected-source-record-sha256",
+            source_preimage_sha,
+            "--replacement-index",
+            "2",
+            "--expected-replacement-before-materialize-sha256",
+            replacement_legacy_sha,
+            "--expected-replacement-current-sha256",
+            replacement_current_sha,
+        )
+        sealed = json.loads(state_path.read_text(encoding="utf-8"))
+        sealed_source = sealed["verification"][0]
+        self.assertEqual(sealed_source["supersession_version"], 2)
+        self.assertEqual(sealed_source["source_record_sha256"], source_preimage_sha)
+        self.assertEqual(
+            sealed_source["replacement_materialization"]["from_record_sha256"],
+            replacement_legacy_sha,
+        )
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertFalse(
+            any(
+                "supersession" in item
+                for item in json.loads(doctor.stdout)["errors"]
+            )
+        )
+        supersession_tamper_cases = {
+            "boolean receipt version": lambda item: item[
+                "replacement_materialization"
+            ].__setitem__("version", True),
+            "wrong receipt method": lambda item: item[
+                "replacement_materialization"
+            ].__setitem__("method", "unsealed-materialization"),
+            "extra receipt field": lambda item: item[
+                "replacement_materialization"
+            ].__setitem__("extra", "not allowed"),
+            "invalid seal time": lambda item: item[
+                "replacement_materialization"
+            ].__setitem__("sealed_at", "not-a-time"),
+            "nontext reason": lambda item: item.__setitem__(
+                "supersession_reason", True
+            ),
+            "invalid superseded time": lambda item: item.__setitem__(
+                "superseded_at", True
+            ),
+        }
+        for label, mutate in supersession_tamper_cases.items():
+            damaged = json.loads(json.dumps(sealed))
+            mutate(damaged["verification"][0])
+            self.assertTrue(
+                cli_impl.verification_supersession_errors(damaged),
+                label,
+            )
+
+    def test_legacy_supersession_with_canonical_replacement_can_be_sealed(self) -> None:
+        task_id = "verification-supersession-direct-seal"
+        self.init_task(task_id)
+        first = self.root / "direct-seal-source.txt"
+        second = self.root / "direct-seal-replacement.txt"
+        first.write_text("source evidence\n", encoding="utf-8")
+        second.write_text("canonical replacement evidence\n", encoding="utf-8")
+        for path, evidence in (
+            (first, "Initial canonical verification before direct seal"),
+            (second, "Later canonical replacement before direct seal"),
+        ):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.cli(
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "static_check",
+                "--status",
+                "pass",
+                "--evidence",
+                evidence,
+                "--command",
+                "bounded static verification",
+                "--boundary",
+                "Synthetic direct supersession seal fixture only",
+                "--artifact-ref",
+                f"{path}={digest}",
+            )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        source, replacement = state["verification"]
+        source_preimage_sha = cli_impl.canonical_record_sha256(source)
+        replacement_sha = cli_impl.canonical_record_sha256(replacement)
+        source["original_status"] = source["status"]
+        source["status"] = "skipped"
+        source["superseded_at"] = h.now_iso()
+        source["supersession_reason"] = (
+            "Legacy supersession already named a canonical replacement"
+        )
+        source["replacement_index"] = 2
+        source["replacement_record_sha256"] = replacement_sha
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+        result = json.loads(
+            self.cli(
+                "verification-supersession-seal",
+                "--task",
+                task_id,
+                "--verification-index",
+                "1",
+                "--expected-current-record-sha256",
+                cli_impl.canonical_record_sha256(source),
+                "--expected-source-record-sha256",
+                source_preimage_sha,
+                "--replacement-index",
+                "2",
+                "--expected-replacement-before-materialize-sha256",
+                replacement_sha,
+                "--expected-replacement-current-sha256",
+                replacement_sha,
+                "--json",
+            ).stdout
+        )
+        self.assertFalse(result["replacement_was_materialized"])
+        sealed = json.loads(state_path.read_text(encoding="utf-8"))
+        sealed_source = sealed["verification"][0]
+        self.assertEqual(sealed_source["supersession_version"], 2)
+        self.assertEqual(sealed_source["source_record_sha256"], source_preimage_sha)
+        self.assertNotIn("replacement_materialization", sealed_source)
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertTrue(json.loads(doctor.stdout)["ok"], doctor.stdout)
+
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", first.name, second.name], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "seal fixture artifacts"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.cli(
+            "set-delivery",
+            "--task",
+            task_id,
+            "--mode",
+            "none",
+            "--detail",
+            "Synthetic supersession migration has no tracked delivery",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            task_id,
+            "--next-action",
+            "Close the canonical supersession fixture",
+        )
+        self.cli(
+            "close-task",
+            "--task",
+            task_id,
+            "--summary",
+            "Canonical supersession fixture completed",
+        )
+        closed_payload = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(closed_payload["ok"], closed_payload)
+
+        paths = h.get_paths(self.root)
+        terminal = h.load_task(paths, task_id)
+        terminal_source = terminal["verification"][0]
+        terminal_source.pop("supersession_version")
+        terminal_source.pop("source_record_sha256")
+        terminal_current_sha = cli_impl.canonical_record_sha256(terminal_source)
+        cli_impl.commit_checkpoint(paths, terminal)
+        seal_cli_args = (
+            "verification-supersession-seal",
+            "--task",
+            task_id,
+            "--verification-index",
+            "1",
+            "--expected-current-record-sha256",
+            terminal_current_sha,
+            "--expected-source-record-sha256",
+            source_preimage_sha,
+            "--replacement-index",
+            "2",
+            "--expected-replacement-before-materialize-sha256",
+            replacement_sha,
+            "--expected-replacement-current-sha256",
+            replacement_sha,
+            "--json",
+        )
+        legacy_doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(legacy_doctor.returncode, 1, legacy_doctor.stderr)
+        self.assertNotIn("Traceback", legacy_doctor.stderr)
+        legacy_payload = json.loads(legacy_doctor.stdout)
+        self.assertFalse(legacy_payload["ok"])
+        self.assertTrue(
+            any("not sealed as version 2" in item for item in legacy_payload["errors"]),
+            legacy_payload,
+        )
+        self.assertFalse(
+            any("invalid replacement index" in item for item in legacy_payload["errors"]),
+            legacy_payload,
+        )
+
+        checkpoint_path = h.task_dir(paths, task_id) / "checkpoint.md"
+        checkpoint_bytes = checkpoint_path.read_bytes()
+        checkpoint_path.write_text("damaged terminal checkpoint\n", encoding="utf-8")
+        damaged_checkpoint = self.cli(*seal_cli_args, ok=False)
+        self.assertIn("current physical checkpoint", damaged_checkpoint.stderr)
+        h.atomic_write_bytes(checkpoint_path, checkpoint_bytes)
+
+        seal_args = cli_impl.argparse.Namespace(
+            task=task_id,
+            verification_index=1,
+            expected_current_record_sha256=terminal_current_sha,
+            expected_source_record_sha256=source_preimage_sha,
+            replacement_index=2,
+            expected_replacement_before_materialize_sha256=replacement_sha,
+            expected_replacement_current_sha256=replacement_sha,
+            json=True,
+        )
+        with mock.patch.object(
+            cli_impl,
+            "atomic_write_text",
+            side_effect=OSError("injected checkpoint publication interruption"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected checkpoint"):
+                cli_impl.cmd_verification_supersession_seal(seal_args, paths)
+        pending = h.load_task(paths, task_id)
+        self.assertTrue(pending["checkpoint_required"])
+        self.assertIn("terminal_supersession_checkpoint_migration", pending)
+        pending_bytes = state_path.read_bytes()
+        pending["verification"][0]["supersession_reason"] = (
+            "A different but superficially valid supersession reason"
+        )
+        h.atomic_write_json(state_path, pending)
+        damaged_pending = self.cli(*seal_cli_args, ok=False)
+        self.assertIn("pending state identity changed", damaged_pending.stderr)
+        h.atomic_write_bytes(state_path, pending_bytes)
+
+        resumed = json.loads(self.cli(*seal_cli_args).stdout)
+        self.assertTrue(resumed["terminal_migration"])
+        self.assertTrue(resumed["resumed"])
+        self.assertFalse(resumed["already_sealed"])
+        final_payload = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(final_payload["ok"], final_payload)
+        replayed = json.loads(self.cli(*seal_cli_args).stdout)
+        self.assertTrue(replayed["resumed"])
+        self.assertTrue(replayed["already_sealed"])
+
+    def test_multiple_legacy_supersessions_can_be_sealed_one_by_one(self) -> None:
+        task_id = "verification-multi-edge-seal"
+        self.init_task(task_id)
+        artifacts: list[Path] = []
+        for index in range(4):
+            artifact = self.root / f"multi-edge-{index + 1}.txt"
+            artifact.write_text(f"verification edge fixture {index + 1}\n", encoding="utf-8")
+            artifacts.append(artifact)
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self.cli(
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "static_check",
+                "--status",
+                "pass",
+                "--evidence",
+                f"Canonical verification record {index + 1} for migration",
+                "--command",
+                "bounded static verification",
+                "--boundary",
+                "Synthetic multiple-edge migration fixture",
+                "--artifact-ref",
+                f"{artifact}={digest}",
+            )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        records = state["verification"]
+        seal_inputs: list[tuple[int, int, str, str, str]] = []
+        for source_number, replacement_number in ((1, 2), (3, 4)):
+            source = records[source_number - 1]
+            replacement = records[replacement_number - 1]
+            source_preimage_sha = cli_impl.canonical_record_sha256(source)
+            replacement_sha = cli_impl.canonical_record_sha256(replacement)
+            source["original_status"] = source["status"]
+            source["status"] = "skipped"
+            source["superseded_at"] = h.now_iso()
+            source["supersession_reason"] = (
+                f"Legacy edge {source_number} names canonical replacement {replacement_number}"
+            )
+            source["replacement_index"] = replacement_number
+            source["replacement_record_sha256"] = replacement_sha
+            seal_inputs.append(
+                (
+                    source_number,
+                    replacement_number,
+                    cli_impl.canonical_record_sha256(source),
+                    source_preimage_sha,
+                    replacement_sha,
+                )
+            )
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+        for ordinal, (
+            source_number,
+            replacement_number,
+            current_source_sha,
+            source_preimage_sha,
+            replacement_sha,
+        ) in enumerate(seal_inputs, start=1):
+            self.cli(
+                "verification-supersession-seal",
+                "--task",
+                task_id,
+                "--verification-index",
+                str(source_number),
+                "--expected-current-record-sha256",
+                current_source_sha,
+                "--expected-source-record-sha256",
+                source_preimage_sha,
+                "--replacement-index",
+                str(replacement_number),
+                "--expected-replacement-before-materialize-sha256",
+                replacement_sha,
+                "--expected-replacement-current-sha256",
+                replacement_sha,
+            )
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                cli_impl._is_exact_int(
+                    migrated["verification"][source_number - 1].get(
+                        "supersession_version"
+                    ),
+                    2,
+                )
+            )
+            if ordinal == 1:
+                doctor = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        CLI_MODULE,
+                        "doctor",
+                        "--task",
+                        task_id,
+                        "--json",
+                    ],
+                    cwd=self.root,
+                    env=self.env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                )
+                self.assertEqual(doctor.returncode, 1, doctor.stderr)
+                self.assertIn("not sealed as version 2", doctor.stdout)
+
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertTrue(json.loads(doctor.stdout)["ok"], doctor.stdout)
+        migrated = json.loads(state_path.read_text(encoding="utf-8"))
+        migrated["verification"][0]["supersession_version"] = 2.0
+        self.assertTrue(cli_impl.verification_supersession_errors(migrated))
+
+    def test_legacy_supersession_can_seal_to_an_already_superseded_replacement(self) -> None:
+        task_id = "verification-chain-seal"
+        self.init_task(task_id)
+        for index in range(3):
+            artifact = self.root / f"chain-edge-{index + 1}.txt"
+            artifact.write_text(f"chain verification {index + 1}\n", encoding="utf-8")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            self.cli(
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "static_check",
+                "--status",
+                "pass",
+                "--evidence",
+                f"Canonical chain verification record {index + 1}",
+                "--command",
+                "bounded static verification",
+                "--boundary",
+                "Synthetic chained supersession migration fixture",
+                "--artifact-ref",
+                f"{artifact}={digest}",
+            )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        source, middle, leaf = state["verification"]
+        source_preimage_sha = cli_impl.canonical_record_sha256(source)
+        middle_preimage_sha = cli_impl.canonical_record_sha256(middle)
+        leaf_sha = cli_impl.canonical_record_sha256(leaf)
+        source["original_status"] = source["status"]
+        source["status"] = "skipped"
+        source["superseded_at"] = h.now_iso()
+        source["supersession_reason"] = (
+            "Legacy source names a replacement that is later superseded again"
+        )
+        source["replacement_index"] = 2
+        source["replacement_record_sha256"] = middle_preimage_sha
+        source_current_sha = cli_impl.canonical_record_sha256(source)
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+        self.cli(
+            "verification-supersede",
+            "--task",
+            task_id,
+            "--verification-index",
+            "2",
+            "--expected-record-sha256",
+            middle_preimage_sha,
+            "--replacement-index",
+            "3",
+            "--replacement-record-sha256",
+            leaf_sha,
+            "--reason",
+            "The middle verification was replaced by the later canonical leaf",
+        )
+        chained = json.loads(state_path.read_text(encoding="utf-8"))
+        middle_current_sha = cli_impl.canonical_record_sha256(
+            chained["verification"][1]
+        )
+        sealed = json.loads(
+            self.cli(
+                "verification-supersession-seal",
+                "--task",
+                task_id,
+                "--verification-index",
+                "1",
+                "--expected-current-record-sha256",
+                source_current_sha,
+                "--expected-source-record-sha256",
+                source_preimage_sha,
+                "--replacement-index",
+                "2",
+                "--expected-replacement-before-materialize-sha256",
+                middle_preimage_sha,
+                "--expected-replacement-current-sha256",
+                middle_current_sha,
+                "--json",
+            ).stdout
+        )
+        self.assertFalse(sealed["replacement_was_materialized"])
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertTrue(json.loads(doctor.stdout)["ok"], doctor.stdout)
+
+    def test_materialize_rejects_active_authority_and_global_ref_overflow(self) -> None:
+        task_id = "artifact-materialize-bounds"
+        self.init_task(task_id)
+        source = self.root / "legacy-live-input.txt"
+        source.write_text("bounded legacy input\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "active-reader",
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Keep active legacy authority immutable",
+            "--scope",
+            "Synthetic active-packet migration fixture",
+            "--deliverable",
+            "No authority rewrite",
+            "--validation",
+            "Materialization must reject active packets",
+            "--input-artifact",
+            f"{source}={digest}",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        packet = state["packets"][0]
+        packet["packet_schema_version"] = 3
+        packet.pop("packet_contract_sha256", None)
+        packet["input_artifact_refs"] = [
+            {
+                "path": str(source.resolve()),
+                "sha256": digest,
+                "size_bytes": source.stat().st_size,
+            }
+        ]
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        before_active = state_path.read_bytes()
+        rejected = self.cli("materialize-artifacts", "--task", task_id, ok=False)
+        self.assertIn("active legacy packet authority", rejected.stderr)
+        self.assertEqual(before_active, state_path.read_bytes())
+
+        self.cli(
+            "add-verification",
+            "--task",
+            task_id,
+            "--category",
+            "static_check",
+            "--status",
+            "pass",
+            "--evidence",
+            "A bounded fixture creates one valid verification record",
+            "--command",
+            "bounded static check",
+            "--boundary",
+            "Synthetic materialization-count gate only",
+            "--artifact-ref",
+            f"{source}={digest}",
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["packets"][0]["status"] = "failed"
+        legacy_ref = {
+            "path": str(source.resolve()),
+            "sha256": digest,
+            "size_bytes": source.stat().st_size,
+        }
+        state["verification"][0].pop("artifact_snapshot_version", None)
+        state["verification"][0]["artifact_refs"] = [
+            dict(legacy_ref) for _ in range(65)
+        ]
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        before_overflow = state_path.read_bytes()
+        rejected = self.cli("materialize-artifacts", "--task", task_id, ok=False)
+        self.assertIn("limit is 64", rejected.stderr)
+        self.assertEqual(before_overflow, state_path.read_bytes())
 
     def test_steward_distributes_chief_decision_and_tracks_acknowledgement(self) -> None:
         self.init_task("steward-control-plane", session_id="chief-session")
@@ -8310,7 +9723,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertEqual(version.stdout.strip(), "AOI 0.1.2")
+            self.assertEqual(version.stdout.strip(), "AOI 0.1.3")
             help_result = subprocess.run(
                 [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
                 cwd=directory,

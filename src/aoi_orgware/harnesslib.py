@@ -47,7 +47,9 @@ ACTIVE_PACKET_STATUSES = {"ready", "dispatched"}
 VERIFICATION_STATUSES = {"pending", "pass", "fail", "blocked", "skipped"}
 ACCOUNTED_VERIFICATION_STATUSES = VERIFICATION_STATUSES - {"pending"}
 DELIVERY_MODES = {"pending", "pushed", "local-only", "blocked", "none"}
-CHECKPOINT_MAX_BYTES = 12 * 1024
+CHECKPOINT_COMPACT_THRESHOLD_BYTES = 12 * 1024
+CHECKPOINT_MAX_BYTES = 24 * 1024
+MANAGED_JSON_MAX_BYTES = 16 * 1024 * 1024
 COMPACT_CLAIM_HISTORY_THRESHOLD = 16
 COMPACT_CLAIM_RECENT_TAIL = 3
 COMPACT_VERIFICATION_HISTORY_THRESHOLD = 16
@@ -129,10 +131,11 @@ def discover_root(start: Path | None = None) -> Path:
     configured = os.environ.get("AOI_ROOT")
     raw_candidate = Path(configured).expanduser() if configured else (start or Path.cwd())
     explicit = configured is not None or start is not None
-    lexical = raw_candidate.absolute()
-    candidate = raw_candidate.resolve()
-    if explicit and lexical != candidate:
-        raise HarnessError("explicit AOI root may not traverse symlinks")
+    candidate = (
+        canonicalize_no_link_traversal(raw_candidate, "explicit AOI root")
+        if explicit
+        else raw_candidate.resolve()
+    )
     if explicit:
         root = candidate
     else:
@@ -154,9 +157,9 @@ def paths_for_project(root: Path, project: ProjectConfig) -> HarnessPaths:
     root = root.resolve()
     EXTERNAL_LOCK_NAMESPACE = project.external_lock_namespace
     harness = root / project.state_dir
-    resolved_harness = harness.resolve()
-    if harness.absolute() != resolved_harness:
-        raise HarnessError("AOI state directory may not traverse symlinks")
+    resolved_harness = canonicalize_no_link_traversal(
+        harness, "AOI state directory"
+    )
     try:
         resolved_harness.relative_to(root)
     except ValueError as exc:
@@ -183,6 +186,14 @@ def paths_for_project(root: Path, project: ProjectConfig) -> HarnessPaths:
 
 def get_paths(root: Path | None = None) -> HarnessPaths:
     root = discover_root(root)
+    config_path = root / CONFIG_FILE
+    if config_path.exists():
+        canonical_config = canonicalize_no_link_traversal(
+            config_path, "AOI configuration"
+        )
+        if canonical_config != config_path:
+            raise HarnessError("AOI configuration path changed during validation")
+        validate_existing_regular_file(config_path, "AOI configuration")
     try:
         project = load_config(root, allow_missing=True)
     except ValueError as exc:
@@ -316,6 +327,50 @@ def _path_is_link_like(path: Path) -> bool:
     return False
 
 
+def canonicalize_no_link_traversal(path: Path, label: str) -> Path:
+    """Return one canonical path after rejecting real linked components.
+
+    ``Path.resolve()`` also expands benign Windows path aliases such as the
+    ``RUNNER~1`` spelling used by GitHub-hosted runners.  Comparing that result
+    with the lexical path therefore cannot distinguish an NTFS 8.3 alias from
+    a symlink or junction.  Inspect existing components directly, then resolve
+    only after the traversal boundary has been validated.
+    """
+
+    # Keep raw parent components until after the component walk.  Normalizing
+    # first can erase an already-traversed symlink (``link/../target``) or turn
+    # a path through a missing directory into a different writable path.
+    lexical = path.expanduser()
+    if not lexical.is_absolute():
+        lexical = Path.cwd() / lexical
+    current = Path(lexical.anchor)
+    for part in lexical.parts[1:]:
+        if part == "..":
+            raise HarnessError(f"{label} may not contain parent traversal")
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot inspect {label} path component {current}: {exc}"
+            ) from exc
+        is_link = stat.S_ISLNK(metadata.st_mode)
+        if os.name == "nt":
+            attributes = getattr(metadata, "st_file_attributes", 0)
+            is_link = is_link or bool(
+                attributes
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+        if is_link:
+            raise HarnessError(f"{label} may not traverse symlinks or junctions")
+    try:
+        return current.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise HarnessError(f"cannot resolve {label} path {lexical}: {exc}") from exc
+
+
 def validate_existing_regular_directory(path: Path, label: str) -> None:
     """Reject linked, junction-backed, or non-directory managed paths."""
 
@@ -353,7 +408,12 @@ def _read_platform_marker(path: Path) -> dict[str, Any]:
         raise HarnessError(f"invalid AOI platform marker {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise HarnessError(f"AOI platform marker must contain an object: {path}")
-    if payload.get("schema_version") != PLATFORM_MARKER_SCHEMA_VERSION:
+    marker_version = payload.get("schema_version")
+    if (
+        not isinstance(marker_version, int)
+        or isinstance(marker_version, bool)
+        or marker_version != PLATFORM_MARKER_SCHEMA_VERSION
+    ):
         raise HarnessError(f"unsupported AOI platform marker schema: {path}")
     domain = payload.get("lock_domain")
     if domain not in {"posix-flock-v1", "windows-msvcrt-v1"}:
@@ -510,47 +570,71 @@ def atomic_create_text(path: Path, text: str) -> None:
 
 
 def atomic_create_bytes(path: Path, payload: bytes) -> None:
-    """Durably create one file while refusing concurrent replacement."""
+    """Atomically publish one complete private file without replacement."""
 
+    path = canonicalize_no_link_traversal(path, "atomic create destination")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if canonicalize_no_link_traversal(path, "atomic create destination") != path:
+        raise HarnessError("atomic create destination changed during parent creation")
     descriptor: int | None = None
-    created = False
-    complete = False
+    temp_name = ""
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        try:
-            descriptor = os.open(path, flags, 0o600)
-            created = True
-        except FileExistsError as exc:
-            raise HarnessError(f"refusing to replace existing file during create: {path}") from exc
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.tmp-", dir=path.parent
+        )
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        _chmod_private(path, 0o600)
+        if canonicalize_no_link_traversal(path, "atomic create destination") != path:
+            raise HarnessError("atomic create destination changed before publication")
+        try:
+            if os.name == "nt":
+                # Windows rename is atomic and refuses an existing destination.
+                os.rename(temp_name, path)
+                temp_name = ""
+            else:
+                os.link(temp_name, path, follow_symlinks=False)
+                Path(temp_name).unlink()
+                temp_name = ""
+        except FileExistsError as exc:
+            raise HarnessError(
+                f"refusing to replace existing file during create: {path}"
+            ) from exc
+        if canonicalize_no_link_traversal(path, "atomic create destination") != path:
+            raise HarnessError("atomic create destination changed after publication")
         fsync_directory(path.parent)
-        complete = True
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        if created and not complete:
+        if temp_name:
             with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+                Path(temp_name).unlink()
 
 
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path = canonicalize_no_link_traversal(path, "atomic write destination")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if canonicalize_no_link_traversal(path, "atomic write destination") != path:
+        raise HarnessError("atomic write destination changed during parent creation")
     temp_name = ""
     try:
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
             temp_name = handle.name
             handle.flush()
             os.fsync(handle.fileno())
+        if canonicalize_no_link_traversal(path, "atomic write destination") != path:
+            raise HarnessError("atomic write destination changed before publication")
         replace_file(Path(temp_name), path)
-        _chmod_private(path, 0o600)
         temp_name = ""
+        if canonicalize_no_link_traversal(path, "atomic write destination") != path:
+            raise HarnessError("atomic write destination changed after publication")
         fsync_directory(path.parent)
     finally:
         if temp_name:
@@ -561,10 +645,27 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
 def replace_file(source: Path, destination: Path) -> None:
     """Atomically replace destination, retrying transient Windows sharing failures."""
 
+    destination = canonicalize_no_link_traversal(
+        destination, "atomic replace destination"
+    )
     deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_SECONDS
     while True:
         try:
+            if (
+                canonicalize_no_link_traversal(
+                    destination, "atomic replace destination"
+                )
+                != destination
+            ):
+                raise HarnessError("atomic replace destination changed before publication")
             os.replace(source, destination)
+            if (
+                canonicalize_no_link_traversal(
+                    destination, "atomic replace destination"
+                )
+                != destination
+            ):
+                raise HarnessError("atomic replace destination changed after publication")
             return
         except PermissionError as exc:
             if os.name != "nt" or time.monotonic() >= deadline:
@@ -594,10 +695,31 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        path = canonicalize_no_link_traversal(path, "managed JSON state")
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise HarnessError(f"managed JSON state must be a private regular file: {path}")
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            data = handle.read(MANAGED_JSON_MAX_BYTES + 1)
+            finished = os.fstat(handle.fileno())
+        if len(data) > MANAGED_JSON_MAX_BYTES:
+            raise HarnessError(f"managed JSON state exceeds the size bound: {path}")
+        identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        if any(
+            getattr(metadata, field, None) != getattr(opened, field, None)
+            or getattr(opened, field, None) != getattr(finished, field, None)
+            for field in identity_fields
+        ) or opened.st_nlink != 1 or len(data) != finished.st_size:
+            raise HarnessError(f"managed JSON state changed while being read: {path}")
+        if canonicalize_no_link_traversal(path, "managed JSON state") != path:
+            raise HarnessError(f"managed JSON state path changed while being read: {path}")
+        value = json.loads(data.decode("utf-8"))
     except FileNotFoundError as exc:
         raise HarnessError(f"missing state file: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except HarnessError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HarnessError(f"invalid state file {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise HarnessError(f"state file must contain a JSON object: {path}")
@@ -624,6 +746,8 @@ def task_state_path(paths: HarnessPaths, task_id: str) -> Path:
 def load_task(paths: HarnessPaths, task_id: str) -> dict[str, Any]:
     state = load_json(task_state_path(paths, task_id))
     validate_task_state(state, task_state_path(paths, task_id))
+    if state.get("task_id") != task_id:
+        raise HarnessError(f"task state identity does not match requested task {task_id}")
     if state.get("profile_id") != paths.project.profile_id:
         raise HarnessError(
             f"task {task_id} profile differs from current AOI configuration"
@@ -637,7 +761,12 @@ def load_task(paths: HarnessPaths, task_id: str) -> dict[str, Any]:
 
 def validate_task_state(state: dict[str, Any], source: Path | None = None) -> None:
     where = f" in {source}" if source else ""
-    if state.get("schema_version") != SCHEMA_VERSION:
+    schema_version = state.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != SCHEMA_VERSION
+    ):
         raise HarnessError(f"unsupported task schema{where}")
     if not isinstance(state.get("profile_id"), str) or not state.get("profile_id"):
         raise HarnessError(f"task lacks profile identity{where}")
@@ -974,10 +1103,41 @@ def lock_covers(outer: str, inner: str) -> bool:
 
 
 def sha256_file(path: Path) -> str:
+    path = canonicalize_no_link_traversal(path, "SHA-256 input")
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"SHA-256 input is missing or unreadable: {path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise HarnessError(f"SHA-256 input must be a non-linked regular file: {path}")
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size != before.st_size
+        ):
+            raise HarnessError(f"SHA-256 input changed while being opened: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_size != opened.st_size
+            or getattr(finished, "st_mtime_ns", None)
+            != getattr(opened, "st_mtime_ns", None)
+        ):
+            raise HarnessError(f"SHA-256 input changed while being read: {path}")
+    finally:
+        os.close(descriptor)
+    if canonicalize_no_link_traversal(path, "SHA-256 input") != path:
+        raise HarnessError(f"SHA-256 input path changed while being read: {path}")
     return digest.hexdigest()
 
 
@@ -1037,7 +1197,12 @@ def _claim_files(directory: Path) -> Iterator[Path]:
 
 def load_claim_file(path: Path) -> dict[str, Any]:
     claim = load_json(path)
-    if claim.get("schema_version") != SCHEMA_VERSION:
+    schema_version = claim.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != SCHEMA_VERSION
+    ):
         raise HarnessError(f"unsupported claim schema: {path}")
     if not claim.get("legacy"):
         validate_id(str(claim.get("token", "")), "claim token")
@@ -1095,6 +1260,8 @@ def load_all_tasks(paths: HarnessPaths) -> list[dict[str, Any]]:
     for path in sorted(paths.tasks.glob("*/state.json")):
         state = load_json(path)
         validate_task_state(state, path)
+        if state.get("task_id") != path.parent.name:
+            raise HarnessError(f"task state identity does not match directory: {path}")
         tasks.append(state)
     return tasks
 
@@ -1756,11 +1923,11 @@ def prepare_checkpoint(
 ) -> tuple[Path, str, str]:
     destination = task_dir(paths, state["task_id"]) / "checkpoint.md"
     text = render_checkpoint(paths, state)
-    if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
+    if len(text.encode("utf-8")) > CHECKPOINT_COMPACT_THRESHOLD_BYTES:
         text = render_checkpoint(paths, state, compact_terminal_detail=True)
     if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
         raise HarnessError(
-            "checkpoint exceeds 12 KiB; summarize facts/evidence and keep raw logs outside state"
+            "checkpoint exceeds 24 KiB hard ceiling; summarize facts/evidence and keep raw logs outside state"
         )
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return destination, text, digest

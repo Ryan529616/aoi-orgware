@@ -159,7 +159,7 @@ class BootstrapCliTests(unittest.TestCase):
 
         result = self.cli("init", "--json", ok=False)
 
-        self.assertIn("not a regular file", result.stderr)
+        self.assertIn("regular non-linked file", result.stderr)
         self.assertTrue((self.root / "aoi.toml").is_dir())
         self.assertFalse((self.root / ".aoi").exists())
 

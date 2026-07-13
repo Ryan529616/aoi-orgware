@@ -9,7 +9,7 @@ It is not another chat router. It sits above an agent runtime and records what
 the organization is allowed to do, what it decided, what changed, and what was
 actually verified.
 
-> Status: **v0.1.2 alpha**. The core lifecycle is tested, but AOI has not yet been
+> Status: **v0.1.3 alpha**. The core lifecycle is tested, but AOI has not yet been
 > proven better than a simpler single-agent or supervisor topology. Benchmark it
 > on your own workload before relying on it.
 
@@ -70,7 +70,9 @@ uses `fcntl`, while native Windows uses `msvcrt` byte-range locking. Do not
 alternate or concurrently write the same state tree from WSL and native
 Windows; their locks do not interoperate. Native Windows support is limited to
 ordinary local filesystems. UNC/network shares and case-sensitive NTFS are not
-supported in v0.1.2.
+supported in the v0.1 line. Benign NTFS 8.3 aliases are canonicalized after
+component-level reparse inspection; actual symlink/junction traversal is
+rejected.
 
 ## Install from source
 

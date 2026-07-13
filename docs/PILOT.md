@@ -1,6 +1,6 @@
 # Closed-alpha pilot guide
 
-AOI v0.1.2 includes an executable pilot kit for letting 3–5 classmates try the
+AOI v0.1.3 includes an executable pilot kit for letting 3–5 classmates try the
 workflow without turning their private Codex traces into public data. This is a
 feasibility and onboarding study, not a benchmark result.
 

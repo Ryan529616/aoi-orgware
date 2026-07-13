@@ -61,13 +61,16 @@ decisions.
 - Project root is an explicit `AOI_ROOT`, an explicit library argument, or the
   nearest `aoi.toml`/Git root.
 - Explicit roots do not walk upward into a parent project.
-- filesystem root, the user's home directory, symlinked explicit roots, path
-  traversal, and malformed lock URIs fail closed.
+- filesystem root, the user's home directory, explicit roots crossing real
+  symlink/reparse components, path traversal, and malformed lock URIs fail
+  closed; benign Windows 8.3 aliases are canonicalized after component checks.
 - configured state paths are validated under both POSIX and Windows path
   semantics and must resolve inside the project root;
 - state writes use same-directory replacement after flushing the new file;
 - writers are serialized with `fcntl.flock` on POSIX/WSL or a one-byte
   `msvcrt` lock on native Windows;
+- immutable packet/verification blobs are completed and flushed before atomic
+  no-replace publication, and every managed ancestor is checked for links;
 - `.aoi/platform.json` permanently binds the tree to one lock domain so
   alternating WSL/native writers fail closed;
 - existing repo/host tree claims receive a bounded recursive identity audit;
@@ -94,7 +97,9 @@ without bypassing AOI authority rules.
   ACL enforcement through the Python standard library.
 - Nonexistent planned trees have no filesystem identity to inspect and retain
   only AOI's cooperative lexical reservation until a later claim/release audit.
-- One cooperative root writer; no distributed transaction service.
+- One cooperative root writer; the state lock covers one CLI transaction, not
+  a cross-command Chief lease or stale-turn fencing credential. Overlapping
+  Chief turns remain prohibited until the planned v0.2 fencing architecture.
 - Initialization is resumable and non-clobbering, but its multiple filesystem
   writes are not one atomic transaction; rerun the same profile after an
   interruption.
