@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__
+from .harnesslib import HarnessError, replace_file
 
 
 PILOT_SCHEMA_VERSION = 1
@@ -108,15 +109,89 @@ TOP_LEVEL_FIELDS = {
     "questionnaire",
     "consent",
 }
-PRIVATE_TEXT = re.compile(
-    r"(?i)(?:"
-    r"[A-Za-z]:[\\/]"
-    r"|/(?:home|Users|mnt)/"
-    r"|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|(?:ghp|github_pat|sk)-[A-Za-z0-9_-]{12,}"
-    r"|(?:api[_-]?key|access[_-]?token|secret)\s*[:=]"
-    r")"
+PRIVATE_IDENTITY_TEXT = re.compile(
+    r"(?:[A-Za-z]:[\\/]|/(?:home|Users|mnt)/|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})",
+    re.IGNORECASE,
+)
+PROVIDER_CREDENTIAL_PATTERNS = (
+    (
+        "private_key",
+        re.compile(
+            r"-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) PRIVATE KEY|PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"
+        ),
+    ),
+    (
+        "github_token",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9_.-])"
+        ),
+    ),
+    (
+        "anthropic_key",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])sk-ant-(?:api\d{2}|admin\d{2})-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "openai_key",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])sk-(?:(?:proj|svcacct)-)?[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "aws_access_key_id",
+        re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
+    ),
+    (
+        "slack_token",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])(?:xox[a-z]-|xapp-)[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])"
+        ),
+    ),
+    (
+        "slack_webhook",
+        re.compile(
+            r"https://hooks\.slack\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+"
+        ),
+    ),
+    (
+        "google_api_key",
+        re.compile(r"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "google_oauth_secret",
+        re.compile(r"(?<![A-Za-z0-9_-])GOCSPX-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "gitlab_token",
+        re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "stripe_live_key",
+        re.compile(r"(?<![A-Za-z0-9_-])(?:sk|rk)_live_[A-Za-z0-9]{16,}(?![A-Za-z0-9_])"),
+    ),
+    (
+        "stripe_webhook_secret",
+        re.compile(r"(?<![A-Za-z0-9_-])whsec_[A-Za-z0-9]{16,}(?![A-Za-z0-9_])"),
+    ),
+)
+AUTHORIZATION_HEADER = re.compile(
+    r"\bauthorization\s*:\s*(?:bearer|basic)\s+[A-Za-z0-9+/._=-]{8,}",
+    re.IGNORECASE,
+)
+SENSITIVE_ASSIGNMENT = re.compile(
+    r"\b(?P<name>(?:(?:aws|openai|anthropic|github|google|slack)[_-])?"
+    r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|session[_-]?token|"
+    r"client[_-]?secret|signing[_-]?secret|webhook[_-]?secret|"
+    r"secret[_-]?(?:access[_-]?)?(?:key|token)|password|passwd))\b"
+    r"\s*[:=]\s*(?P<value>\"[^\"\r\n]{0,256}\"|'[^'\r\n]{0,256}'|[^\s,;\r\n]{0,256})",
+    re.IGNORECASE,
+)
+PLACEHOLDER_VALUE = re.compile(
+    r"(?:redacted|placeholder|example|sample|changeme|not[_-]?set|none|null|n/?a|"
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z0-9_. -]+>|\[[A-Za-z0-9_. -]+\]|"
+    r"[*xX_-]{3,})",
+    re.IGNORECASE,
 )
 
 
@@ -171,6 +246,28 @@ def _nonnegative(value: Any, label: str, *, integer: bool) -> int | float:
     return value
 
 
+def _assignment_contains_secret(text: str) -> bool:
+    for match in SENSITIVE_ASSIGNMENT.finditer(text):
+        value = match.group("value").strip().strip("\"'")
+        if not value or PLACEHOLDER_VALUE.fullmatch(value):
+            continue
+        return True
+    return False
+
+
+def _private_text_reason(text: str) -> str | None:
+    if PRIVATE_IDENTITY_TEXT.search(text):
+        return "identity_or_path"
+    for label, pattern in PROVIDER_CREDENTIAL_PATTERNS:
+        if pattern.search(text):
+            return label
+    if AUTHORIZATION_HEADER.search(text):
+        return "authorization_header"
+    if _assignment_contains_secret(text):
+        return "sensitive_assignment"
+    return None
+
+
 def _scan_private_text(value: Any, label: str = "record") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -178,8 +275,13 @@ def _scan_private_text(value: Any, label: str = "record") -> None:
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _scan_private_text(item, f"{label}[{index}]")
-    elif isinstance(value, str) and PRIVATE_TEXT.search(value):
-        raise PilotError(f"{label} appears to contain private identity, path, or credential text")
+    elif isinstance(value, str):
+        reason = _private_text_reason(value)
+        if reason:
+            raise PilotError(
+                f"{label} appears to contain private identity, path, or credential text "
+                f"({reason})"
+            )
 
 
 def validate_record(payload: Any) -> dict[str, Any]:
@@ -345,17 +447,31 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o644) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temp_name = handle.name
-        os.replace(temp_name, path)
-        path.chmod(mode)
+        try:
+            replace_file(Path(temp_name), path)
+        except HarnessError as exc:
+            raise PilotError(str(exc)) from exc
+        if os.name != "nt":
+            path.chmod(mode)
         temp_name = ""
     finally:
         if temp_name:
             Path(temp_name).unlink(missing_ok=True)
 
 
-def initialize_kit(output: Path, *, force: bool = False) -> dict[str, Any]:
+def initialize_kit(
+    output: Path,
+    *,
+    force: bool = False,
+    allow_unverified_windows_acl: bool = False,
+) -> dict[str, Any]:
     """Copy the packaged tester kit after an all-files no-clobber preflight."""
 
+    if os.name == "nt" and not allow_unverified_windows_acl:
+        raise PilotError(
+            "native Windows ACL privacy is not verified by AOI; rerun with "
+            "--allow-unverified-windows-acl only after restricting the output directory"
+        )
     output = output.expanduser()
     lexical = output.absolute()
     resolved = output.resolve()
@@ -416,6 +532,9 @@ def initialize_kit(output: Path, *, force: bool = False) -> dict[str, Any]:
         "output": str(output.resolve()),
         "file_count": len(file_entries) + 1,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "privacy_boundary": (
+            "windows_acl_unverified" if os.name == "nt" else "posix_private_modes"
+        ),
     }
 
 

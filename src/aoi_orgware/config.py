@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
 CONFIG_FILE = "aoi.toml"
 CONFIG_SCHEMA_VERSION = 1
+MAX_CONFIG_BYTES = 256 * 1024
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+WINDOWS_FORBIDDEN = frozenset('<>:"|?*')
+WINDOWS_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
 
 DEFAULT_ROLES = {
     "architect": "frontier",
@@ -58,6 +67,12 @@ DEFAULT_RECEIPT_COMPONENTS = ("source", "runner", "config", "dependencies", "oth
 DEFAULT_REQUIRED_RECEIPT_COMPONENTS = ("source", "runner")
 DEFAULT_DEPARTMENTS = ("implementation", "verification", "operations", "steward")
 DEFAULT_HIGH_RISK_PATHS = (".aoi/", "infra/", "security/", "deploy/")
+CAPABILITY_TIERS = frozenset(
+    {"frontier", "expert", "advanced", "standard", "economical"}
+)
+NON_CLOSE_QUALIFYING_EVIDENCE = frozenset(
+    {"engineering_inference", "historical_terminal_readback"}
+)
 
 
 @dataclass(frozen=True)
@@ -147,6 +162,51 @@ def _valid_project_name(value: Any) -> bool:
     )
 
 
+def _safe_project_relative_path(value: Any, label: str) -> str:
+    """Validate one canonical path on both POSIX and Windows runtimes."""
+
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ValueError(f"{label} must be a safe project-relative POSIX path")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or bool(windows.drive)
+        or not posix.parts
+        or str(posix) != value
+    ):
+        raise ValueError(f"{label} must be a safe project-relative POSIX path")
+    for part in posix.parts:
+        folded = part.casefold()
+        stem = folded.split(".", 1)[0]
+        if (
+            folded in {".", "..", ".git"}
+            or stem in WINDOWS_RESERVED
+            or part.endswith((" ", "."))
+            or any(character in WINDOWS_FORBIDDEN for character in part)
+            or any(ord(character) < 32 for character in part)
+        ):
+            raise ValueError(f"{label} must be a safe project-relative POSIX path")
+    return value
+
+
+def _safe_project_relative_prefix(value: Any, label: str) -> str:
+    """Validate one exact path or directory prefix used by policy."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a safe project-relative POSIX path")
+    directory_prefix = value.endswith("/")
+    core = value[:-1] if directory_prefix else value
+    canonical = _safe_project_relative_path(core, label)
+    return canonical + ("/" if directory_prefix else "")
+
+
+def _prefix_covers_path(prefix: str, path: str) -> bool:
+    canonical = prefix.rstrip("/")
+    return path == canonical or path.startswith(canonical + "/")
+
+
 def _reject_unknown(table: dict[str, Any], allowed: set[str], label: str) -> None:
     unknown = sorted(set(table) - allowed)
     if unknown:
@@ -167,17 +227,7 @@ def _table(payload: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
-    root = root.resolve()
-    source = root / CONFIG_FILE
-    if source.is_symlink():
-        raise ValueError(f"AOI configuration may not be a symlink: {source}")
-    if not source.is_file():
-        if not allow_missing:
-            raise ValueError(f"AOI is not initialized at {root}; run 'aoi init' first")
-        raw = default_config_text(root.name or "AOI Project").encode("utf-8")
-    else:
-        raw = source.read_bytes()
+def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
     try:
         payload = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -199,18 +249,7 @@ def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
     profile_id = payload.get("profile_id")
     if not isinstance(profile_id, str) or not SAFE_ID.fullmatch(profile_id):
         raise ValueError("profile_id must be a simple identifier")
-    state_dir = payload.get("state_dir")
-    if not isinstance(state_dir, str) or not state_dir:
-        raise ValueError("state_dir is required")
-    state_path = PurePosixPath(state_dir)
-    if (
-        state_path.is_absolute()
-        or not state_path.parts
-        or ".." in state_path.parts
-        or "\\" in state_dir
-        or state_path.parts[0] == ".git"
-    ):
-        raise ValueError("state_dir must be a safe project-relative POSIX path")
+    state_dir = _safe_project_relative_path(payload.get("state_dir"), "state_dir")
     organization = _table(payload, "organization")
     _reject_unknown(organization, {"departments"}, "organization")
     departments = _strings(
@@ -222,8 +261,14 @@ def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
         raise ValueError("roles must not be empty")
     roles: dict[str, str] = {}
     for role, tier in roles_payload.items():
-        if not isinstance(role, str) or not isinstance(tier, str) or not role or not tier:
-            raise ValueError("roles must map non-empty names to non-empty tiers")
+        if not isinstance(role, str) or not SAFE_ID.fullmatch(role):
+            raise ValueError("role names must be simple identifiers")
+        if not isinstance(tier, str) or tier not in CAPABILITY_TIERS:
+            allowed_tiers = ", ".join(sorted(CAPABILITY_TIERS))
+            raise ValueError(
+                f"roles.{role} must use a model-agnostic capability tier: "
+                f"{allowed_tiers}"
+            )
         roles[role] = tier
     evidence = _table(payload, "evidence")
     _reject_unknown(evidence, {"categories", "close_qualifying"}, "evidence")
@@ -233,6 +278,12 @@ def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
     )
     if not set(close_categories).issubset(categories):
         raise ValueError("evidence.close_qualifying must be a subset of categories")
+    weak_close = sorted(set(close_categories) & NON_CLOSE_QUALIFYING_EVIDENCE)
+    if weak_close:
+        raise ValueError(
+            "evidence.close_qualifying may not include non-qualifying evidence: "
+            + ", ".join(weak_close)
+        )
     receipts = _table(payload, "receipts")
     _reject_unknown(receipts, {"components", "required"}, "receipts")
     components = _strings(receipts.get("components"), "receipts.components")
@@ -243,9 +294,20 @@ def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
     _reject_unknown(
         policy, {"high_risk_paths", "external_lock_namespace"}, "policy"
     )
-    high_risk = _strings(
+    raw_high_risk = _strings(
         policy.get("high_risk_paths", []), "policy.high_risk_paths", allow_empty=True
     )
+    high_risk = tuple(
+        _safe_project_relative_prefix(
+            item, f"policy.high_risk_paths[{index}]"
+        )
+        for index, item in enumerate(raw_high_risk)
+    )
+    canonical_high_risk = [item.rstrip("/") for item in high_risk]
+    if len(canonical_high_risk) != len(set(canonical_high_risk)):
+        raise ValueError("policy.high_risk_paths contains duplicate canonical paths")
+    if not any(_prefix_covers_path(prefix, state_dir) for prefix in high_risk):
+        raise ValueError("policy.high_risk_paths must cover state_dir")
     namespace = policy.get("external_lock_namespace", "external")
     if not isinstance(namespace, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", namespace):
         raise ValueError("policy.external_lock_namespace is invalid")
@@ -272,3 +334,62 @@ def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
         legacy_enabled=_boolean(legacy, "enabled", "legacy.enabled"),
         sha256=hashlib.sha256(raw).hexdigest(),
     )
+
+
+def _path_is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction and is_junction():
+        return True
+    if os.name == "nt":
+        try:
+            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        except (FileNotFoundError, OSError):
+            return False
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return False
+
+
+def load_config_path(root: Path, source: Path) -> tuple[ProjectConfig, bytes]:
+    """Load one explicit candidate without mutating the target project."""
+
+    root = root.resolve()
+    source = source.expanduser().absolute()
+    if _path_is_link_like(source):
+        raise ValueError(f"AOI configuration may not be a symlink or junction: {source}")
+    if not source.is_file():
+        raise ValueError(f"AOI configuration is not a regular file: {source}")
+    try:
+        size = source.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"cannot inspect AOI configuration {source}: {exc}") from exc
+    if size <= 0 or size > MAX_CONFIG_BYTES:
+        raise ValueError(
+            f"AOI configuration must be 1-{MAX_CONFIG_BYTES} bytes: {source}"
+        )
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"cannot read AOI configuration {source}: {exc}") from exc
+    if not 0 < len(raw) <= MAX_CONFIG_BYTES:
+        raise ValueError(
+            f"AOI configuration must be 1-{MAX_CONFIG_BYTES} bytes: {source}"
+        )
+    return _parse_config(root, raw, source), raw
+
+
+def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:
+    root = root.resolve()
+    source = root / CONFIG_FILE
+    if _path_is_link_like(source):
+        raise ValueError(f"AOI configuration may not be a symlink or junction: {source}")
+    if not source.exists():
+        if not allow_missing:
+            raise ValueError(f"AOI is not initialized at {root}; run 'aoi init' first")
+        raw = default_config_text(root.name or "AOI Project").encode("utf-8")
+        return _parse_config(root, raw, source)
+    if not source.is_file():
+        raise ValueError(f"AOI configuration is not a regular file: {source}")
+    config, _raw = load_config_path(root, source)
+    return config

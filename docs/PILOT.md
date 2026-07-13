@@ -1,6 +1,6 @@
 # Closed-alpha pilot guide
 
-AOI v0.1.1 includes an executable pilot kit for letting 3–5 classmates try the
+AOI v0.1.2 includes an executable pilot kit for letting 3–5 classmates try the
 workflow without turning their private Codex traces into public data. This is a
 feasibility and onboarding study, not a benchmark result.
 
@@ -11,6 +11,14 @@ Install the exact wheel under test, save its SHA-256, then run:
 ```bash
 aoi --version
 aoi pilot-init --output ./aoi-pilot-kit --json
+```
+
+On native Windows, AOI cannot verify that the generated private files have a
+POSIX-equivalent owner-only ACL. Inspect the destination ACL, keep the kit on a
+local non-shared filesystem, and acknowledge the boundary explicitly:
+
+```powershell
+aoi pilot-init --output .\aoi-pilot-kit --allow-unverified-windows-acl --json
 ```
 
 `pilot-init` performs a complete collision preflight and refuses to overwrite
@@ -69,7 +77,9 @@ aoi pilot-validate --record records/run-001.json --json
 
 Validation is strict: unknown fields, missing measurement provenance, absent
 pre-registration, invalid timestamps, and common privacy leaks fail closed.
-Free-text feedback stays in the separate private form.
+Free-text feedback stays in the separate private form. Credential detection is
+a versioned set of common provider and assignment patterns, not a complete
+secret scanner; a human must still review every shareable record.
 
 ## Summarize
 

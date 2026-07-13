@@ -9,7 +9,7 @@ It is not another chat router. It sits above an agent runtime and records what
 the organization is allowed to do, what it decided, what changed, and what was
 actually verified.
 
-> Status: **v0.1.1 alpha**. The core lifecycle is tested, but AOI has not yet been
+> Status: **v0.1.2 alpha**. The core lifecycle is tested, but AOI has not yet been
 > proven better than a simpler single-agent or supervisor topology. Benchmark it
 > on your own workload before relying on it.
 
@@ -42,7 +42,8 @@ every request through every lane.
 
 - Git-bound tasks, plans, claims, checkpoints, delivery records, and close gates
 - exact file/tree/contract locks with conflict detection and SHA-bound baselines
-- bounded delegation packets and external-job ownership
+- bounded delegation packets and external-job ownership, with task-local
+  content-addressed snapshots for packet and verification artifacts
 - lanes, dependencies, coordination requests, Chief decisions, directives, and
   independent verification before resolution
 - `needs_user` escalation for goal, risk, budget, and preference decisions
@@ -62,9 +63,14 @@ turn an acknowledgement into proof of implementation.
 
 - Python 3.11+
 - Git
-- Linux, WSL, or another POSIX environment (`fcntl` locking is currently used)
+- Linux/WSL or native Windows on a local filesystem
 
-Native Windows support is not part of v0.1. On Windows, run AOI inside WSL.
+AOI binds each `.aoi/` state tree to one lock domain on first use: POSIX/WSL
+uses `fcntl`, while native Windows uses `msvcrt` byte-range locking. Do not
+alternate or concurrently write the same state tree from WSL and native
+Windows; their locks do not interoperate. Native Windows support is limited to
+ordinary local filesystems. UNC/network shares and case-sensitive NTFS are not
+supported in v0.1.2.
 
 ## Install from source
 
@@ -77,12 +83,15 @@ python -m pip install .
 aoi --version
 ```
 
+On PowerShell, activate the virtual environment with
+`.\.venv\Scripts\Activate.ps1`. On POSIX shells, use `. .venv/bin/activate`.
+
 AOI is not published to PyPI yet. A wheel and source distribution can be built
 with `python -m build`.
 
 ## Initialize a project
 
-Run this in an existing Git repository with at least one commit:
+Run this in an existing Git repository:
 
 ```bash
 cd /path/to/project
@@ -93,6 +102,38 @@ aoi doctor
 
 Initialization creates and tracks `aoi.toml`, adds `/.aoi/` to `.gitignore`,
 and creates private runtime state under `.aoi/`. It does not install hooks.
+
+### Bootstrap from project requirements
+
+The repository includes the first-party [`aoi-bootstrap`](skills/aoi-bootstrap/)
+Codex skill. It inspects an existing Git repository, combines that evidence with
+the user's project requirements, and drafts a conservative organization profile.
+Its fixed gate is:
+
+```text
+inspect -> draft -> validate -> preview -> explicit approval -> apply -> doctor
+```
+
+The skill does not initialize AOI, enable hooks, or overwrite an existing
+profile before approval of the exact candidate SHA-256. Install or point Codex
+at `skills/aoi-bootstrap`, then ask it to bootstrap AOI in the target repository.
+The `aoi` CLI must already be installed in that environment.
+
+Without the skill, the same validation/apply boundary is available directly:
+
+```bash
+# Run from the target Git repository root.
+aoi config-check --file /path/to/candidate-aoi.toml --json
+aoi init --config /path/to/candidate-aoi.toml \
+  --expected-config-sha256 <approved-config-sha256> --json
+aoi doctor --json
+```
+
+`config-check` is read-only and works even when an existing `aoi.toml` is
+malformed. `init --config` requires the full approved SHA-256, copies the exact
+validated bytes, refuses a different existing profile, and preflights the
+selected state tree's lock domain, managed paths, and project `.gitignore`
+before writing the configuration.
 
 ## Minimal governed task
 
@@ -160,6 +201,14 @@ aoi pilot-init --output ./aoi-pilot-kit --json
 cd ./aoi-pilot-kit
 ```
 
+Native Windows cannot prove POSIX-style private permissions through the Python
+standard library. Review the destination ACL yourself, then acknowledge that
+boundary explicitly when generating private pilot material:
+
+```powershell
+aoi pilot-init --output .\aoi-pilot-kit --allow-unverified-windows-acl --json
+```
+
 The kit contains a controlled A/C protocol (`single` versus `aoi`), Codex
 instructions, assignment and run-record templates, a private feedback form, and
 an intentionally broken onboarding sample. The pilot commands work outside an
@@ -199,6 +248,11 @@ directives, and regression recurrence. See [evaluation](docs/evaluation.md).
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
   python3 -m unittest discover -s tests -v
 ```
+
+Validate the bundled skill with Codex's `skill-creator` validator before a
+release. The skill is included in the Git repository and source distribution;
+installing the Python wheel does not silently install it into a user's Codex
+skill directory.
 
 The repository keeps the original sanitized import as an auditable first
 commit. [PROVENANCE.md](PROVENANCE.md) and `IMPORT_MANIFEST.json` document that

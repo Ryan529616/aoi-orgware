@@ -21,6 +21,7 @@ REPO = HERE.parent
 SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
+from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
 
 
@@ -274,12 +275,258 @@ class LockTests(HarnessTestCase):
             h.normalize_lock("repo:file:../escape")
         with self.assertRaises(h.HarnessError):
             h.normalize_lock("external:tree:relative/path")
+        with self.assertRaisesRegex(h.HarnessError, "double-slash root"):
+            h.normalize_lock("external:file://tmp/alias")
         with self.assertRaises(h.HarnessError):
             h.normalize_lock("repo:tree:rtl/*")
         locks, _ = h.legacy_scope_locks(
             h.get_paths(self.root), "legacy `scripts/*model_top*` scope"
         )
         self.assertEqual(locks, ["repo:tree:scripts"])
+
+    def test_external_double_slash_alias_cannot_issue_a_second_claim(self) -> None:
+        self.init_task("external-alias-a")
+        self.init_task("external-alias-b")
+        self.cli(
+            "claim",
+            "--task",
+            "external-alias-a",
+            "--token",
+            "external-alias-claim-a",
+            "--owner",
+            "a",
+            "--kind",
+            "EXTERNAL",
+            "--lock",
+            "external:file:/tmp/aoi-lock-alias",
+            "--intent",
+            "Reserve one canonical external file",
+            "--validation",
+            "A double-slash spelling must not bypass ownership",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        rejected = self.cli(
+            "claim",
+            "--task",
+            "external-alias-b",
+            "--token",
+            "external-alias-claim-b",
+            "--owner",
+            "b",
+            "--kind",
+            "EXTERNAL",
+            "--lock",
+            "external:file://tmp/aoi-lock-alias",
+            "--intent",
+            "Attempt an alternate spelling of the reserved file",
+            "--validation",
+            "Normalization must reject the alias",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("double-slash root", rejected.stderr)
+        self.assertFalse(
+            (h.get_paths(self.root).claims_active / "external-alias-claim-b.json").exists()
+        )
+
+    def test_state_tree_is_pinned_to_one_runtime_lock_domain(self) -> None:
+        paths = h.get_paths(self.root)
+        marker = json.loads(paths.platform.read_text(encoding="utf-8"))
+        self.assertEqual(marker["lock_domain"], h.runtime_lock_domain())
+        marker["lock_domain"] = (
+            "posix-flock-v1"
+            if h.runtime_lock_domain() == "windows-msvcrt-v1"
+            else "windows-msvcrt-v1"
+        )
+        paths.platform.write_text(json.dumps(marker), encoding="utf-8")
+        rejected = self.cli(
+            "init-task",
+            "--task-id",
+            "wrong-lock-domain",
+            "--title",
+            "Must fail before mutation",
+            "--objective",
+            "Reject a writer from the wrong lock domain",
+            "--owner",
+            "test-root",
+            "--completion-boundary",
+            "No task state is created",
+            ok=False,
+        )
+        self.assertIn("lock domain", rejected.stderr)
+        self.assertFalse((paths.tasks / "wrong-lock-domain").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation is not guaranteed on Windows")
+    def test_repo_file_baseline_rejects_final_and_parent_symlinks(self) -> None:
+        self.init_task("repo-symlink")
+        outside = Path(self.backup_temp.name) / "outside.txt"
+        outside.write_text("outside authority\n", encoding="utf-8")
+        (self.root / "leak.txt").symlink_to(outside)
+        rejected = self.cli(
+            "claim",
+            "--task",
+            "repo-symlink",
+            "--token",
+            "repo-symlink-final",
+            "--owner",
+            "root",
+            "--kind",
+            "CODE",
+            "--lock",
+            "repo:file:leak.txt",
+            "--intent",
+            "Attempt a final-component symlink baseline",
+            "--validation",
+            "Claim must reject the symlink",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("may not traverse a symlink", rejected.stderr)
+
+        outside_dir = Path(self.backup_temp.name) / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "target.txt").write_text("outside parent\n", encoding="utf-8")
+        (self.root / "linked-dir").symlink_to(outside_dir, target_is_directory=True)
+        parent_rejected = self.cli(
+            "claim",
+            "--task",
+            "repo-symlink",
+            "--token",
+            "repo-symlink-parent",
+            "--owner",
+            "root",
+            "--kind",
+            "CODE",
+            "--lock",
+            "repo:file:linked-dir/target.txt",
+            "--intent",
+            "Attempt a parent-component symlink baseline",
+            "--validation",
+            "Claim must reject the parent symlink",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("may not traverse a symlink", parent_rejected.stderr)
+
+        tree_rejected = self.cli(
+            "claim",
+            "--task",
+            "repo-symlink",
+            "--token",
+            "repo-symlink-tree",
+            "--owner",
+            "root",
+            "--kind",
+            "CODE",
+            "--lock",
+            "repo:tree:linked-dir",
+            "--intent",
+            "Attempt a tree claim through a symlink",
+            "--validation",
+            "Tree claims must reject link traversal too",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("may not traverse a symlink", tree_rejected.stderr)
+
+    def test_repo_file_baseline_rejects_hardlinked_targets(self) -> None:
+        self.init_task("repo-hardlink")
+        source = self.root / "hardlink-source.txt"
+        alias = self.root / "hardlink-alias.txt"
+        source.write_text("one filesystem identity\n", encoding="utf-8")
+        os.link(source, alias)
+
+        for token, relative_path in (
+            ("repo-hardlink-source", source.name),
+            ("repo-hardlink-alias", alias.name),
+        ):
+            rejected = self.cli(
+                "claim",
+                "--task",
+                "repo-hardlink",
+                "--token",
+                token,
+                "--owner",
+                "root",
+                "--kind",
+                "CODE",
+                "--lock",
+                f"repo:file:{relative_path}",
+                "--intent",
+                "Attempt to reserve one spelling of a hard-linked file",
+                "--validation",
+                "Hard-linked targets must fail closed",
+                "--expires-at",
+                "2099-01-01T00:00:00+00:00",
+                ok=False,
+            )
+            self.assertIn("must not be hard-linked", rejected.stderr)
+            self.assertFalse(
+                (h.get_paths(self.root).claims_active / f"{token}.json").exists()
+            )
+
+    def test_repo_tree_baseline_rejects_nested_identity_aliases(self) -> None:
+        self.init_task("repo-tree-identities")
+        first = self.root / "tree-one"
+        second = self.root / "tree-two"
+        first.mkdir()
+        second.mkdir()
+        source = first / "source.txt"
+        source.write_text("shared inode\n", encoding="utf-8")
+        os.link(source, second / "alias.txt")
+
+        hardlink_rejected = self.cli(
+            "claim",
+            "--task",
+            "repo-tree-identities",
+            "--token",
+            "repo-tree-hardlink",
+            "--owner",
+            "root",
+            "--kind",
+            "CODE",
+            "--lock",
+            "repo:tree:tree-one",
+            "--intent",
+            "Attempt to reserve a tree containing a hard-linked file",
+            "--validation",
+            "Tree identity audit must fail closed",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("may not contain a hard-linked file", hardlink_rejected.stderr)
+
+        if os.name != "nt":
+            clean_tree = self.root / "tree-with-link"
+            clean_tree.mkdir()
+            (clean_tree / "nested-link").symlink_to(source)
+            symlink_rejected = self.cli(
+                "claim",
+                "--task",
+                "repo-tree-identities",
+                "--token",
+                "repo-tree-symlink",
+                "--owner",
+                "root",
+                "--kind",
+                "CODE",
+                "--lock",
+                "repo:tree:tree-with-link",
+                "--intent",
+                "Attempt to reserve a tree containing a symlink",
+                "--validation",
+                "Nested links must fail closed",
+                "--expires-at",
+                "2099-01-01T00:00:00+00:00",
+                ok=False,
+            )
+            self.assertIn("may not contain a symlink", symlink_rejected.stderr)
 
     def test_expired_and_blocked_claims_still_reserve(self) -> None:
         self.init_task("task-a")
@@ -442,9 +689,18 @@ class LockTests(HarnessTestCase):
             with self.assertRaises(h.HarnessError):
                 h.normalize_lock(invalid)
 
-        host_file = self.root / "host-mount" / "d" / "workspace" / "project" / "hook.json"
+        host_file = (
+            self.root / "native-host" / "hook.json"
+            if os.name == "nt"
+            else self.root / "host-mount" / "d" / "workspace" / "project" / "hook.json"
+        )
         host_file.parent.mkdir(parents=True)
         host_file.write_text("v1\n", encoding="utf-8")
+        lock = (
+            h.normalize_lock(f"host:file:{host_file.as_posix()}")
+            if os.name == "nt"
+            else "host:file:D:/workspace/project/hook.json"
+        )
         self.init_task("host-baseline")
         self.cli(
             "claim",
@@ -457,7 +713,7 @@ class LockTests(HarnessTestCase):
             "--kind",
             "HOST",
             "--lock",
-            "host:file:D:/workspace/project/hook.json",
+            lock,
             "--intent",
             "protect relay file",
             "--validation",
@@ -473,7 +729,6 @@ class LockTests(HarnessTestCase):
             / "host-baseline-claim.json"
         )
         claim = json.loads(claim_path.read_text(encoding="utf-8"))
-        lock = "host:file:D:/workspace/project/hook.json"
         self.assertEqual(
             claim["baselines"][lock]["sha256"],
             hashlib.sha256(host_file.read_bytes()).hexdigest(),
@@ -491,30 +746,31 @@ class LockTests(HarnessTestCase):
         )
         self.assertTrue(json.loads(result.stdout)["baseline_changed"][lock])
 
-        symlink = host_file.parent / "link.json"
-        symlink.symlink_to(host_file)
-        self.init_task("host-symlink")
-        rejected = self.cli(
-            "claim",
-            "--task",
-            "host-symlink",
-            "--token",
-            "host-symlink-claim",
-            "--owner",
-            "root",
-            "--kind",
-            "HOST",
-            "--lock",
-            "host:file:D:/workspace/project/link.json",
-            "--intent",
-            "reject symlink",
-            "--validation",
-            "must fail closed",
-            "--expires-at",
-            "2099-01-01T00:00:00+00:00",
-            ok=False,
-        )
-        self.assertIn("symlink", rejected.stderr)
+        if os.name != "nt":
+            symlink = host_file.parent / "link.json"
+            symlink.symlink_to(host_file)
+            self.init_task("host-symlink")
+            rejected = self.cli(
+                "claim",
+                "--task",
+                "host-symlink",
+                "--token",
+                "host-symlink-claim",
+                "--owner",
+                "root",
+                "--kind",
+                "HOST",
+                "--lock",
+                "host:file:D:/workspace/project/link.json",
+                "--intent",
+                "reject symlink",
+                "--validation",
+                "must fail closed",
+                "--expires-at",
+                "2099-01-01T00:00:00+00:00",
+                ok=False,
+            )
+            self.assertIn("symlink", rejected.stderr)
 
 
 class LifecycleTests(HarnessTestCase):
@@ -1489,6 +1745,171 @@ class LifecycleTests(HarnessTestCase):
         self.assertEqual(state["status"], "done")
         self.assertFalse(state["checkpoint_required"])
         self.assertEqual(state["revision"], state["checkpoint_revision"])
+
+    def test_close_gate_rejects_empty_and_pending_verification(self) -> None:
+        self.init_task("close-empty-verification")
+        self.cli(
+            "set-delivery",
+            "--task",
+            "close-empty-verification",
+            "--mode",
+            "none",
+            "--detail",
+            "No tracked delivery is expected for this gate test",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            "close-empty-verification",
+            "--next-action",
+            "Prove empty verification blocks close",
+        )
+        empty = self.cli(
+            "close-task",
+            "--task",
+            "close-empty-verification",
+            "--summary",
+            "must remain open",
+            ok=False,
+        )
+        self.assertIn("no verification/evidence record", empty.stderr)
+        self.assertEqual(
+            h.load_task(h.get_paths(self.root), "close-empty-verification")["status"],
+            "active",
+        )
+
+        self.init_task("close-pending-verification")
+        self.cli(
+            "add-verification",
+            "--task",
+            "close-pending-verification",
+            "--category",
+            "unit_test",
+            "--status",
+            "pending",
+            "--evidence",
+            "The bounded test command has not completed yet",
+            "--command",
+            "python3 -m unittest pending-case",
+            "--boundary",
+            "Only the named pending close-gate behavior",
+        )
+        self.cli(
+            "set-delivery",
+            "--task",
+            "close-pending-verification",
+            "--mode",
+            "none",
+            "--detail",
+            "No tracked delivery is expected for this gate test",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            "close-pending-verification",
+            "--next-action",
+            "Prove pending verification blocks close",
+        )
+        pending = self.cli(
+            "close-task",
+            "--task",
+            "close-pending-verification",
+            "--summary",
+            "must remain open",
+            ok=False,
+        )
+        self.assertIn("at least one passing, close-qualifying verification", pending.stderr)
+        self.assertIn("unaccounted verification: unit_test", pending.stderr)
+        self.assertEqual(
+            h.load_task(h.get_paths(self.root), "close-pending-verification")["status"],
+            "active",
+        )
+
+    def test_malformed_task_list_fields_fail_as_harness_errors(self) -> None:
+        self.init_task("malformed-list-state")
+        paths = h.get_paths(self.root)
+        state_path = h.task_state_path(paths, "malformed-list-state")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["verification"] = "oops"
+        h.atomic_write_json(state_path, state)
+        rejected = self.cli(
+            "checkpoint",
+            "--task",
+            "malformed-list-state",
+            "--next-action",
+            "must not render malformed state",
+            ok=False,
+        )
+        self.assertIn("task field 'verification' must be a list", rejected.stderr)
+
+        valid = {
+            "schema_version": 1,
+            "profile_id": "default",
+            "config_sha256": "0" * 64,
+            "task_id": "shape-check",
+            "status": "active",
+            "phase": "planning",
+            "profile": "full",
+            "revision": 1,
+            "checkpoint_revision": 0,
+        }
+        for field in sorted(h.TASK_STRING_LIST_FIELDS | h.TASK_OBJECT_LIST_FIELDS):
+            with self.subTest(field=field):
+                malformed = dict(valid)
+                malformed[field] = "not-a-list"
+                with self.assertRaisesRegex(h.HarnessError, "must be a list"):
+                    h.validate_task_state(malformed)
+
+    def test_cancel_requires_needs_user_disposition(self) -> None:
+        self.init_task("cancel-needs-user")
+        self.cli(
+            "set-delivery",
+            "--task",
+            "cancel-needs-user",
+            "--mode",
+            "none",
+            "--detail",
+            "Cancellation test has no tracked delivery",
+        )
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, "cancel-needs-user")
+        state["needs_user_escalations"] = [
+            {
+                "integrity_version": 1,
+                "escalation_id": "budget-choice",
+                "status": "needs_user",
+                "category": "cost_budget",
+            }
+        ]
+        h.bump_task(state)
+        h.write_task(paths, state)
+        blocked = self.cli(
+            "cancel-task",
+            "--task",
+            "cancel-needs-user",
+            "--reason",
+            "Do not hide an unresolved user-owned budget choice",
+            ok=False,
+        )
+        self.assertIn("unresolved needs-user escalations: budget-choice", blocked.stderr)
+        self.assertEqual(h.load_task(paths, "cancel-needs-user")["status"], "active")
+
+        state = h.load_task(paths, "cancel-needs-user")
+        state["needs_user_escalations"][0]["status"] = "resolved"
+        state["needs_user_escalations"][0]["user_disposition"] = {
+            "decision": "Cancel the entire task",
+            "evidence": "Explicit test-user disposition",
+        }
+        h.bump_task(state)
+        h.write_task(paths, state)
+        self.cli(
+            "cancel-task",
+            "--task",
+            "cancel-needs-user",
+            "--reason",
+            "User disposition explicitly selected cancellation",
+        )
+        self.assertEqual(h.load_task(paths, "cancel-needs-user")["status"], "cancelled")
 
     def test_orphan_active_claim_blocks_close(self) -> None:
         self.init_task("orphan-task")
@@ -3054,6 +3475,42 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             ).read_text(encoding="utf-8")
         )
 
+    def test_skill_canary_binding_precedes_wall_clock_order(self) -> None:
+        canary_time = "2026-07-14T00:00:00+00:00"
+        packet = {
+            "packet_id": "candidate",
+            "status": "done",
+            "result_sha256": "a" * 64,
+            "completed_at": "2026-07-13T23:59:59+00:00",
+            "lane_id": "rtl",
+        }
+        state = {"packets": [packet]}
+        common = {
+            "label": "skill canary",
+            "minimum": 1,
+            "canary_recorded_at": canary_time,
+            "require_after_canary": True,
+            "expected_skill_release_id": "skill-v1",
+            "expected_skill_version": "1.0.0",
+            "expected_canary_event_id": "canary-1",
+        }
+        with self.assertRaisesRegex(h.HarnessError, "not bound to the exact skill canary"):
+            cli_impl._resolve_adoption_work_units(
+                state, ["packet:candidate"], **common
+            )
+
+        packet.update(
+            {
+                "skill_release_id": "skill-v1",
+                "skill_version": "1.0.0",
+                "skill_canary_event_id": "canary-1",
+            }
+        )
+        with self.assertRaisesRegex(h.HarnessError, "does not postdate the bound canary"):
+            cli_impl._resolve_adoption_work_units(
+                state, ["packet:candidate"], **common
+            )
+
     def lane_state(self, task_id: str, lane_id: str) -> dict:
         lanes = self.task_state(task_id)["lanes"]
         if isinstance(lanes, dict):
@@ -3499,6 +3956,10 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertEqual(
             arbitration["root_arbitrations"][-1]["root_owner"], "test-root"
         )
+        self.assertIn(
+            "does not authenticate",
+            arbitration["root_arbitrations"][-1]["authority_boundary"],
+        )
         self.assertEqual(self.lane_state("coordination", "rtl"), before_target)
         self.create_lane(
             "coordination",
@@ -3852,7 +4313,12 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertIn("64-hex", short_sha.stderr)
         self.assertEqual(state_path.read_bytes(), before)
         command_link = self.root / "exact-command-link.sh"
-        command_link.symlink_to(command)
+        try:
+            command_link.symlink_to(command)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("native Windows symlink privilege is unavailable")
+            raise
         symlink = self.cli(
             "create-packet",
             "--task",
@@ -3955,6 +4421,378 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertTrue(
             any("exact command artifact identity mismatch" in item for item in doctor["errors"]),
             doctor,
+        )
+
+    def test_packet_inputs_use_canonical_snapshots_and_dispatch_fences_origin(self) -> None:
+        task_id = "packet-input-snapshot"
+        self.init_task(task_id)
+        source = self.root.parent / f"{self.root.name}-packet-input.txt"
+        source.write_text("approved input\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Inspect one exact input",
+            "--scope",
+            "Read-only packet snapshot fixture",
+            "--deliverable",
+            "Bounded findings",
+            "--validation",
+            "Origin and snapshot identities are fenced",
+            "--input-artifact",
+            f"{source}={digest}",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        packet = state["packets"][0]
+        artifact = packet["input_artifact_refs"][0]
+        snapshot = Path(artifact["path"])
+        self.assertEqual(packet["packet_schema_version"], 4)
+        self.assertEqual(artifact["snapshot_version"], 1)
+        self.assertEqual(Path(artifact["source_path"]), source.resolve())
+        self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), digest)
+        self.assertIn("artifact-blobs", snapshot.parts)
+        contract = Path(packet["path"])
+        self.assertEqual(
+            hashlib.sha256(contract.read_bytes()).hexdigest(),
+            packet["packet_contract_sha256"],
+        )
+        self.assertIn(str(snapshot), contract.read_text(encoding="utf-8"))
+
+        source.write_text("changed before dispatch\n", encoding="utf-8")
+        before = state_path.read_bytes()
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/reader",
+            ok=False,
+        )
+        self.assertIn("source changed after snapshot", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        source.write_text("approved input\n", encoding="utf-8")
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/reader",
+        )
+        source.write_text("legitimate evolution after dispatch\n", encoding="utf-8")
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--status",
+            "done",
+            "--summary",
+            "Reader completed against the immutable task snapshot",
+            "--evidence",
+            "Canonical snapshot SHA remained exact after source evolution",
+        )
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertTrue(json.loads(doctor.stdout)["ok"])
+
+    def test_v4_snapshot_tamper_blocks_dispatch_and_remains_doctor_error(self) -> None:
+        task_id = "packet-input-tamper"
+        self.init_task(task_id)
+        source = self.root.parent / f"{self.root.name}-packet-tamper.txt"
+        source.write_text("immutable input\n", encoding="utf-8")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Reject a modified snapshot",
+            "--scope",
+            "Read-only tamper fixture",
+            "--deliverable",
+            "No accepted dispatch",
+            "--validation",
+            "Snapshot physical SHA is checked",
+            "--input-artifact",
+            f"{source}={digest}",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        snapshot = Path(state["packets"][0]["input_artifact_refs"][0]["path"])
+        snapshot.write_text("tampered\n", encoding="utf-8")
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/reader",
+            ok=False,
+        )
+        self.assertIn("snapshot identity mismatch", rejected.stderr)
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "reader",
+            "--status",
+            "cancelled",
+            "--summary",
+            "Cancelled after the immutable snapshot failed integrity",
+        )
+        doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        payload = json.loads(doctor.stdout)
+        self.assertTrue(
+            any("snapshot identity mismatch" in item for item in payload["errors"]),
+            payload,
+        )
+
+    def test_legacy_failed_packet_is_digest_only_but_legacy_done_stays_strict(self) -> None:
+        def make_terminal(task_id: str, terminal_status: str) -> tuple[Path, Path]:
+            self.init_task(task_id)
+            source = self.root.parent / f"{self.root.name}-{task_id}.txt"
+            source.write_text("legacy input\n", encoding="utf-8")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            self.cli(
+                "create-packet",
+                "--task",
+                task_id,
+                "--packet-id",
+                "legacy-reader",
+                "--agent-role",
+                "explorer",
+                "--model-tier",
+                "standard",
+                "--objective",
+                "Emulate one schema-v3 live input",
+                "--scope",
+                "Legacy compatibility fixture",
+                "--deliverable",
+                "Terminal result",
+                "--validation",
+                "Status-aware legacy handling",
+                "--input-artifact",
+                f"{source}={digest}",
+            )
+            self.cli(
+                "packet-update",
+                "--task",
+                task_id,
+                "--packet-id",
+                "legacy-reader",
+                "--status",
+                "dispatched",
+                "--agent-id",
+                "/root/legacy-reader",
+            )
+            terminal_args = [
+                "packet-update",
+                "--task",
+                task_id,
+                "--packet-id",
+                "legacy-reader",
+                "--status",
+                terminal_status,
+                "--summary",
+                "Legacy packet reached its terminal test state",
+            ]
+            if terminal_status in {"done", "failed"}:
+                terminal_args.extend(
+                    ["--evidence", "Canonical terminal result was recorded before migration"]
+                )
+            self.cli(*terminal_args)
+            state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            packet = state["packets"][0]
+            packet["packet_schema_version"] = 3
+            packet.pop("packet_contract_sha256", None)
+            packet.pop("input_snapshot_version", None)
+            packet["input_artifact_refs"] = [
+                {
+                    "path": str(source.resolve()),
+                    "sha256": digest,
+                    "size_bytes": len("legacy input\n".encode("utf-8")),
+                }
+            ]
+            state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            source.write_text("legitimate later source\n", encoding="utf-8")
+            return state_path, source
+
+        make_terminal("legacy-failed-input", "failed")
+        failed_doctor = self.cli(
+            "doctor", "--task", "legacy-failed-input", "--json"
+        )
+        failed_payload = json.loads(failed_doctor.stdout)
+        self.assertFalse(failed_payload["errors"])
+        self.assertTrue(
+            any("legacy digest-only inputs" in item for item in failed_payload["warnings"]),
+            failed_payload,
+        )
+
+        make_terminal("legacy-done-input", "done")
+        done_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                "legacy-done-input",
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(done_doctor.returncode, 1, done_doctor.stderr)
+        done_payload = json.loads(done_doctor.stdout)
+        self.assertTrue(
+            any("legacy artifact reference identity mismatch" in item for item in done_payload["errors"]),
+            done_payload,
+        )
+
+    def test_verification_snapshot_materialize_and_explicit_supersession(self) -> None:
+        task_id = "verification-artifact-migration"
+        self.init_task(task_id)
+        first = self.root.parent / f"{self.root.name}-verification-first.txt"
+        second = self.root.parent / f"{self.root.name}-verification-second.txt"
+        first.write_text("first evidence\n", encoding="utf-8")
+        second.write_text("replacement evidence\n", encoding="utf-8")
+        first_sha = hashlib.sha256(first.read_bytes()).hexdigest()
+        second_sha = hashlib.sha256(second.read_bytes()).hexdigest()
+        for path, digest, evidence in (
+            (first, first_sha, "Initial exact static-check evidence was recorded"),
+            (second, second_sha, "Later replacement static-check evidence was recorded"),
+        ):
+            self.cli(
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "static_check",
+                "--status",
+                "pass",
+                "--evidence",
+                evidence,
+                "--command",
+                "python -m compileall bounded-fixture",
+                "--boundary",
+                "Synthetic static artifact identity only",
+                "--artifact-ref",
+                f"{path}={digest}",
+            )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        first_record = state["verification"][0]
+        second_record = state["verification"][1]
+        self.assertEqual(first_record["artifact_refs"][0]["snapshot_version"], 1)
+
+        # Emulate two historical schema-v1 live refs. The first origin evolves;
+        # the second remains exact and can be materialized.
+        first_record.pop("artifact_snapshot_version", None)
+        first_record["artifact_refs"] = [
+            {
+                "path": str(first.resolve()),
+                "sha256": first_sha,
+                "size_bytes": first.stat().st_size,
+            }
+        ]
+        second_record.pop("artifact_snapshot_version", None)
+        second_record["artifact_refs"] = [
+            {
+                "path": str(second.resolve()),
+                "sha256": second_sha,
+                "size_bytes": second.stat().st_size,
+            }
+        ]
+        state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        first.write_text("superseded origin evolved\n", encoding="utf-8")
+        source_record_sha = hashlib.sha256(
+            json.dumps(
+                first_record,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        replacement_record_sha = hashlib.sha256(
+            json.dumps(
+                second_record,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.cli(
+            "verification-supersede",
+            "--task",
+            task_id,
+            "--verification-index",
+            "1",
+            "--expected-record-sha256",
+            source_record_sha,
+            "--replacement-index",
+            "2",
+            "--replacement-record-sha256",
+            replacement_record_sha,
+            "--reason",
+            "The original live-path artifact was replaced by a later exact passing record",
+        )
+        materialized = json.loads(
+            self.cli("materialize-artifacts", "--task", task_id, "--json").stdout
+        )
+        self.assertEqual(materialized["materialized_refs"], 1)
+        migrated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["verification"][0]["status"], "skipped")
+        self.assertEqual(
+            migrated["verification"][1]["artifact_refs"][0]["snapshot_version"], 1
+        )
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        payload = json.loads(doctor.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(
+            any("explicitly superseded" in item for item in payload["warnings"]),
+            payload,
         )
 
     def test_steward_distributes_chief_decision_and_tracks_acknowledgement(self) -> None:
@@ -6813,7 +7651,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "Pre-canary work units must not be relabeled as skill canary evidence",
             ok=False,
         )
-        self.assertIn("does not postdate the bound canary", stale_units_rejected.stderr)
+        self.assertIn("not bound to the exact skill canary", stale_units_rejected.stderr)
         good_adopt = self.root / "good-adopt.json"
         good_adopt.write_text(
             json.dumps(
@@ -7260,7 +8098,12 @@ class V5FeatureTests(HarnessTestCase):
         real_destination = Path(self.backup_temp.name) / "real"
         real_destination.mkdir()
         linked_destination = Path(self.backup_temp.name) / "linked"
-        linked_destination.symlink_to(real_destination, target_is_directory=True)
+        try:
+            linked_destination.symlink_to(real_destination, target_is_directory=True)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("native Windows symlink privilege is unavailable")
+            raise
         linked = self.cli(
             "backup-state", "--destination", str(linked_destination), ok=False
         )
@@ -7280,6 +8123,10 @@ class ConfigurationTests(HarnessTestCase):
         text = config.read_text(encoding="utf-8")
         text = text.replace('profile_id = "generic-v1"', 'profile_id = "custom-v1"')
         text = text.replace('state_dir = ".aoi"', 'state_dir = ".org-state"')
+        text = text.replace(
+            'high_risk_paths = [".aoi/",',
+            'high_risk_paths = [".org-state/",',
+        )
         text = text.replace(
             'departments = ["implementation", "verification", "operations", "steward"]',
             'departments = ["build", "review", "steward"]',
@@ -7419,7 +8266,12 @@ class ConfigurationTests(HarnessTestCase):
 
     def test_symlinked_root_and_state_fail_closed(self) -> None:
         linked_root = Path(self.backup_temp.name) / "linked-root"
-        linked_root.symlink_to(self.root, target_is_directory=True)
+        try:
+            linked_root.symlink_to(self.root, target_is_directory=True)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                self.skipTest("native Windows symlink privilege is unavailable")
+            raise
         env = self.env.copy()
         env["AOI_ROOT"] = str(linked_root)
         linked_result = subprocess.run(
@@ -7458,7 +8310,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertEqual(version.stdout.strip(), "AOI 0.1.1")
+            self.assertEqual(version.stdout.strip(), "AOI 0.1.2")
             help_result = subprocess.run(
                 [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
                 cwd=directory,

@@ -22,6 +22,7 @@ sys.path.insert(0, str(SRC))
 from aoi_orgware import __version__  # noqa: E402
 from aoi_orgware.pilot import (  # noqa: E402
     PilotError,
+    _private_text_reason,
     initialize_kit,
     load_record,
     summary_csv,
@@ -146,6 +147,59 @@ class PilotRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(PilotError, "missing_reason must be one of"):
             validate_record(private)
 
+    def test_provider_credentials_and_assignment_leaks_fail_closed(self) -> None:
+        provider_values = {
+            "github_classic": "ghp_" + "A" * 36,
+            "github_oauth": "gho_" + "B" * 36,
+            "github_user": "ghu_" + "C" * 36,
+            "github_server": "ghs_" + "D" * 36,
+            "github_refresh": "ghr_" + "E" * 36,
+            "openai_legacy": "sk-" + "F" * 32,
+            "openai_project": "sk-proj-" + "G" * 32,
+            "anthropic": "sk-ant-api03-" + "H" * 32,
+            "aws_long_term": "AKIA" + "J" * 16,
+            "aws_temporary": "ASIA" + "K" * 16,
+            "slack_bot": "xoxb-" + "L" * 24,
+            "slack_app": "xapp-" + "M" * 24,
+            "google_api": "AIza" + "N" * 35,
+            "google_oauth": "GOCSPX-" + "P" * 24,
+            "stripe_webhook": "whsec_" + "T" * 32,
+        }
+        for label, secret in provider_values.items():
+            with self.subTest(label=label):
+                payload = record()
+                payload["environment"]["runtime_label"] = secret
+                with self.assertRaises(PilotError) as caught:
+                    validate_record(payload)
+                self.assertNotIn(secret, str(caught.exception))
+
+        direct_leaks = (
+            "github_pat_" + "Q" * 70,
+            "https://hooks.slack.com/services/T000/B000/secretvalue123",
+            "Authorization: Bearer " + "R" * 24,
+            "AWS_SECRET_ACCESS_KEY=" + "S" * 40,
+            "SLACK_SIGNING_SECRET=" + "U" * 32,
+            "STRIPE_WEBHOOK_SECRET=whsec_" + "V" * 32,
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        )
+        for secret in direct_leaks:
+            with self.subTest(secret_kind=secret[:16]):
+                self.assertIsNotNone(_private_text_reason(secret))
+
+    def test_credential_boundaries_and_placeholders_avoid_false_positives(self) -> None:
+        benign = (
+            "flask-api-server-production",
+            "risk-sk-benchmark-reference",
+            "api_key=",
+            "api_key=${OPENAI_API_KEY}",
+            "api_key=REDACTED",
+            "password=<placeholder>",
+        )
+        for text in benign:
+            with self.subTest(text=text):
+                self.assertIsNone(_private_text_reason(text))
+
     def test_non_finite_numbers_fail_closed(self) -> None:
         for value in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(value=value):
@@ -260,9 +314,16 @@ class PilotKitTests(unittest.TestCase):
             )
         return result
 
+    def initialize(self, output: Path, *, force: bool = False) -> dict[str, object]:
+        return initialize_kit(
+            output,
+            force=force,
+            allow_unverified_windows_acl=os.name == "nt",
+        )
+
     def test_initialize_no_clobber_force_and_manifest(self) -> None:
         kit = self.root / "kit"
-        result = initialize_kit(kit)
+        result = self.initialize(kit)
         self.assertTrue(result["created"])
         self.assertEqual(result["file_count"], 14)
         manifest = json.loads((kit / "MANIFEST.json").read_text(encoding="utf-8"))
@@ -285,7 +346,7 @@ class PilotKitTests(unittest.TestCase):
         readme = kit / "README.md"
         readme.write_text("tester note\n", encoding="utf-8")
         with self.assertRaisesRegex(PilotError, "refusing to overwrite"):
-            initialize_kit(kit)
+            self.initialize(kit)
         self.assertEqual(readme.read_text(encoding="utf-8"), "tester note\n")
 
         unknown = kit / "keep-me.txt"
@@ -295,14 +356,14 @@ class PilotKitTests(unittest.TestCase):
             "withdrawal_code,participant_id\nrandomcode,pilot001\n",
             encoding="utf-8",
         )
-        initialize_kit(kit, force=True)
+        self.initialize(kit, force=True)
         self.assertIn("AOI Closed Alpha Kit", readme.read_text(encoding="utf-8"))
         self.assertEqual(unknown.read_text(encoding="utf-8"), "private note\n")
         self.assertIn("randomcode", private_mapping.read_text(encoding="utf-8"))
 
     def test_template_requires_fill_and_sample_oracle_starts_failing(self) -> None:
         kit = self.root / "kit"
-        initialize_kit(kit)
+        self.initialize(kit)
         with self.assertRaisesRegex(PilotError, "package_sha256"):
             load_record(kit / "run-record.template.json")
 
@@ -318,9 +379,11 @@ class PilotKitTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FAILED", result.stderr)
 
-    @unittest.skipIf(os.name == "nt", "AOI CLI requires POSIX/WSL")
     def test_standalone_cli_init_validate_and_deterministic_summary(self) -> None:
-        init = self.cli("pilot-init", "--output", "kit", "--json")
+        init_args = ["pilot-init", "--output", "kit", "--json"]
+        if os.name == "nt":
+            init_args.append("--allow-unverified-windows-acl")
+        init = self.cli(*init_args)
         self.assertTrue(json.loads(init.stdout)["created"])
 
         records_dir = self.root / "records"
@@ -363,10 +426,18 @@ class PilotKitTests(unittest.TestCase):
             (self.root / "summary-b.json").read_bytes(),
         )
 
-    @unittest.skipIf(os.name == "nt", "AOI CLI requires POSIX/WSL")
     def test_pilot_help_works_outside_initialized_project(self) -> None:
         result = self.cli("pilot-init", "--help")
         self.assertIn("closed-alpha tester kit", result.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "native Windows ACL boundary")
+    def test_native_windows_pilot_requires_explicit_acl_acknowledgement(self) -> None:
+        with self.assertRaisesRegex(PilotError, "ACL privacy is not verified"):
+            initialize_kit(self.root / "unacknowledged")
+        result = initialize_kit(
+            self.root / "acknowledged", allow_unverified_windows_acl=True
+        )
+        self.assertEqual(result["privacy_boundary"], "windows_acl_unverified")
 
     def test_summary_refuses_directory_even_with_force(self) -> None:
         with self.assertRaisesRegex(PilotError, "is a directory"):

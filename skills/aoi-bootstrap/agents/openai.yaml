@@ -1,0 +1,4 @@
+interface:
+  display_name: "AOI Bootstrap"
+  short_description: "Initialize AOI governance from project requirements"
+  default_prompt: "Use $aoi-bootstrap to inspect this repository, draft a reviewable AOI organization profile, and initialize it only after my approval."

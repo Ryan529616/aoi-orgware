@@ -17,6 +17,20 @@ authority and evidence boundaries below.
 Only the root/Chief process writes AOI state. Delegated agents return bounded
 results to root; they do not edit `.aoi/`.
 
+This authority model is cooperative. A task/session binding demonstrates task
+association only; it does not authenticate the caller or prove that the caller
+is the Chief. Actor and lane fields are auditable assertions. Deployments with
+mutually untrusted controlling processes need an external identity,
+authorization, or OS-isolation boundary.
+
+The runtime state lock serializes one CLI transaction; it is not a Chief lease
+across commands or turns. Two overlapping root turns that share a session can
+still interleave source work unless the deployment provides a separate
+per-turn fencing credential and an all-write enforcement boundary. Until that
+facility exists and is trusted, overlapping Chief turns are prohibited and
+source preservation is verified by exact snapshots rather than claimed as
+physically prevented.
+
 ## Task lifecycle
 
 Before material writes, external jobs, or mutable delegation, root must:
@@ -33,6 +47,10 @@ Before material writes, external jobs, or mutable delegation, root must:
 Task status (`active`, `blocked`, `done`, `cancelled`) is separate from phase
 (`planning`, `gathering`, `diagnosing`, `implementing`, `waiting_external`,
 `verifying`, `reviewing`, `closing`).
+
+Cancellation is not an escape hatch from user authority. A task with an open
+`needs_user` escalation cannot be cancelled until the bound user disposition is
+recorded.
 
 `acknowledged` means a directive was received. Resolution additionally requires
 implementation evidence against the selected baseline and verification by a
@@ -54,12 +72,23 @@ git:merge:<branch>
 ```
 
 File/tree ancestry conflicts are rejected. Traversal and glob syntax are
-rejected. Exact project-file claims record a SHA-256 baseline. Expiry is a
-warning, not automatic release: an expired claim reserves scope until it is
-explicitly marked terminal.
+rejected. Existing file targets must be regular, non-linked files. Existing
+tree targets are recursively identity-audited without following links; a tree
+containing a symlink, junction, hard-linked file, special node, or more than
+100,000 entries fails closed. Exact project-file claims record a SHA-256
+baseline. Nonexistent planned trees have no filesystem identity to audit and
+therefore retain only the cooperative path boundary. Expiry is a warning, not
+automatic release: an expired claim reserves scope until it is explicitly
+marked terminal.
 
 Locks coordinate cooperative agents. They cannot stop an unrelated process
 from changing a file.
+
+Each state tree is tagged with one runtime lock domain. POSIX/WSL and native
+Windows locks are intentionally incompatible, so a domain mismatch fails
+closed before mutation. Native Windows support excludes UNC/network shares and
+case-sensitive NTFS in v0.1.2. In the native-Windows domain, project paths and
+Git merge branch locks are case-folded before conflict comparison.
 
 ## Delegation
 
@@ -67,6 +96,22 @@ A packet has one objective, scope, deliverable, validation boundary, requested
 role/tier, and optional covered locks. Root must choose the least expensive tier
 that is plausibly sufficient. A packet's requested route is not proof of the
 model actually used; actual routing needs separate evidence.
+
+Packet schema v4 copies every SHA-bound input into a task-local,
+content-addressed blob before recording the packet. The original `source_path`
+must still match at first dispatch; after dispatch the canonical snapshot is the
+authority, so legitimate source evolution cannot rewrite history. The packet
+contract Markdown is itself SHA-bound. A modified contract or snapshot blocks
+dispatch, successful completion, downstream review/capacity consumption,
+doctor, and close. Legacy failed/cancelled packets retain digest-only metadata
+as an explicit warning; they cannot qualify evidence, but a later source edit
+does not permanently poison the task.
+
+Verification artifact refs use the same snapshot store. Still-valid legacy refs
+can be upgraded with `materialize-artifacts`. A stale legacy verification may be
+retired only by `verification-supersede`, bound to the exact old and replacement
+record SHA-256 values and a later valid pass in the same category; supersession
+never repairs or hides a damaged canonical snapshot.
 
 Depth two is reserved for bounded leaf work. A depth-two agent may not spawn
 further agents, arbitrate, mutate AOI state, or report directly to the user.

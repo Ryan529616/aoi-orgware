@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
-import fcntl
+import errno
 import hashlib
 import json
 import os
 import re
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from .config import CONFIG_FILE, ProjectConfig, load_config
 
@@ -55,6 +61,45 @@ COMPACT_FACT_RECENT_TAIL = 8
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
 EXTERNAL_LOCK_NAMESPACE = "external"
+PLATFORM_MARKER_SCHEMA_VERSION = 1
+WINDOWS_REPLACE_RETRY_SECONDS = 2.0
+TREE_IDENTITY_SCAN_MAX_ENTRIES = 100_000
+WINDOWS_RESERVED_BASENAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+TASK_STRING_LIST_FIELDS = {
+    "blockers",
+    "changed_files",
+    "claims",
+    "decisions",
+    "facts",
+    "rejected_paths",
+    "risks",
+    "session_ids",
+}
+TASK_OBJECT_LIST_FIELDS = {
+    "branch_adoptions",
+    "capacity_reviews",
+    "coordination_requests",
+    "cross_lane_sessions",
+    "execution_selections",
+    "improvement_requests",
+    "integration_baselines",
+    "jobs",
+    "lane_dependencies",
+    "lanes",
+    "needs_user_escalations",
+    "packets",
+    "skill_adoption_events",
+    "skill_releases",
+    "verification",
+}
 
 
 class HarnessError(RuntimeError):
@@ -77,6 +122,7 @@ class HarnessPaths:
     templates: Path
     index: Path
     lock: Path
+    platform: Path
 
 
 def discover_root(start: Path | None = None) -> Path:
@@ -96,20 +142,25 @@ def discover_root(start: Path | None = None) -> Path:
             root = next((item for item in search if (item / ".git").exists()), candidate)
     if root == Path(root.anchor) or root == Path.home().resolve():
         raise HarnessError(f"refusing dangerous AOI project root: {root}")
+    if os.name == "nt" and str(root.anchor).startswith("\\\\"):
+        raise HarnessError("native Windows AOI does not support UNC/network project roots")
     return root
 
 
-def get_paths(root: Path | None = None) -> HarnessPaths:
+def paths_for_project(root: Path, project: ProjectConfig) -> HarnessPaths:
+    """Construct paths for an already validated project profile."""
+
     global EXTERNAL_LOCK_NAMESPACE
-    root = discover_root(root)
-    try:
-        project = load_config(root, allow_missing=True)
-    except ValueError as exc:
-        raise HarnessError(str(exc)) from exc
+    root = root.resolve()
     EXTERNAL_LOCK_NAMESPACE = project.external_lock_namespace
     harness = root / project.state_dir
-    if harness.absolute() != harness.resolve():
+    resolved_harness = harness.resolve()
+    if harness.absolute() != resolved_harness:
         raise HarnessError("AOI state directory may not traverse symlinks")
+    try:
+        resolved_harness.relative_to(root)
+    except ValueError as exc:
+        raise HarnessError("AOI state directory must remain inside the project root") from exc
     claims = harness / "claims"
     return HarnessPaths(
         root=root,
@@ -126,12 +177,24 @@ def get_paths(root: Path | None = None) -> HarnessPaths:
         templates=harness / "templates",
         index=harness / "INDEX.md",
         lock=harness / ".state.lock",
+        platform=harness / "platform.json",
     )
 
 
+def get_paths(root: Path | None = None) -> HarnessPaths:
+    root = discover_root(root)
+    try:
+        project = load_config(root, allow_missing=True)
+    except ValueError as exc:
+        raise HarnessError(str(exc)) from exc
+    return paths_for_project(root, project)
+
+
 def ensure_layout(paths: HarnessPaths) -> None:
+    preflight_layout(paths)
+    _ensure_platform_domain(paths)
     directories = [
-        paths.harness,
+        paths.claims,
         paths.tasks,
         paths.claims_active,
         paths.claims_archive,
@@ -141,26 +204,256 @@ def ensure_layout(paths: HarnessPaths) -> None:
     if paths.project.legacy_enabled:
         directories.extend((paths.legacy_pending, paths.legacy_decisions))
     for directory in directories:
+        validate_existing_regular_directory(directory, "AOI managed directory")
         directory.mkdir(parents=True, exist_ok=True)
+        _chmod_private(directory, 0o700)
+    preflight_layout(paths)
+
+
+def preflight_layout(paths: HarnessPaths) -> None:
+    """Validate an existing state tree without creating or changing it."""
+
+    managed_directories = [
+        paths.harness,
+        paths.claims,
+        paths.tasks,
+        paths.claims_active,
+        paths.claims_archive,
+        paths.sessions,
+        paths.templates,
+    ]
+    if paths.project.legacy_enabled:
+        managed_directories.extend((paths.legacy_pending, paths.legacy_decisions))
+    for directory in managed_directories:
+        validate_existing_regular_directory(directory, "AOI managed directory")
+
+    managed_files = [
+        paths.platform,
+        paths.lock,
+        paths.index,
+        paths.harness / "POLICY.md",
+        *(
+            paths.templates / name
+            for name in (
+                "plan.md",
+                "packet.md",
+                "checkpoint.md",
+                "source_receipt.example.json",
+            )
+        ),
+    ]
+    for managed_file in managed_files:
+        validate_existing_regular_file(managed_file, "AOI managed file")
+
+    if not paths.harness.exists():
+        return
+    try:
+        entries = list(paths.harness.iterdir())
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect AOI state path {paths.harness}: {exc}") from exc
+    if not paths.platform.exists():
+        if os.name == "nt" and entries:
+            raise HarnessError(
+                "untagged pre-v0.1.2 AOI state cannot be opened by native Windows; "
+                "run one POSIX/WSL AOI command first or initialize a fresh state tree"
+            )
+        return
+    marker = _read_platform_marker(paths.platform)
+    expected = runtime_lock_domain()
+    if marker.get("lock_domain") != expected:
+        raise HarnessError(
+            f"AOI state lock domain is {marker.get('lock_domain')!r}, but this runtime "
+            f"requires {expected!r}; simultaneous or alternating WSL/native writers "
+            "are unsupported"
+        )
+
+
+def runtime_lock_domain() -> str:
+    return "windows-msvcrt-v1" if os.name == "nt" else "posix-flock-v1"
+
+
+def platform_capabilities() -> dict[str, Any]:
+    if os.name == "nt":
+        return {
+            "lock_domain": runtime_lock_domain(),
+            "lock_backend": "msvcrt-byte-range",
+            "atomic_visibility": True,
+            "file_fsync": True,
+            "parent_directory_fsync": False,
+            "private_permissions": "windows-acl-unverified",
+        }
+    return {
+        "lock_domain": runtime_lock_domain(),
+        "lock_backend": "fcntl-flock",
+        "atomic_visibility": True,
+        "file_fsync": True,
+        "parent_directory_fsync": True,
+        "private_permissions": "posix-mode",
+    }
+
+
+def _chmod_private(path: Path, mode: int) -> None:
+    if os.name == "nt":
+        return
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
+def _path_is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction and is_junction():
+        return True
+    if os.name == "nt":
         try:
-            directory.chmod(0o700)
-        except OSError:
-            pass
+            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        except (FileNotFoundError, OSError):
+            return False
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return False
+
+
+def validate_existing_regular_directory(path: Path, label: str) -> None:
+    """Reject linked, junction-backed, or non-directory managed paths."""
+
+    if _path_is_link_like(path):
+        raise HarnessError(f"{label} must not be a symlink or junction: {path}")
+    if path.exists() and not path.is_dir():
+        raise HarnessError(f"{label} must be a regular directory: {path}")
+
+
+def validate_existing_regular_file(path: Path, label: str) -> None:
+    """Reject linked, junction-backed, or non-file managed paths."""
+
+    if _path_is_link_like(path):
+        raise HarnessError(f"{label} must be a regular non-linked file: {path}")
+    if path.exists() and not path.is_file():
+        raise HarnessError(f"{label} must be a regular non-linked file: {path}")
+
+
+def _platform_marker_payload() -> dict[str, Any]:
+    capabilities = platform_capabilities()
+    return {
+        "schema_version": PLATFORM_MARKER_SCHEMA_VERSION,
+        "lock_domain": capabilities["lock_domain"],
+        "lock_backend": capabilities["lock_backend"],
+        "created_at": now_iso(),
+    }
+
+
+def _read_platform_marker(path: Path) -> dict[str, Any]:
+    if _path_is_link_like(path) or not path.is_file():
+        raise HarnessError(f"AOI platform marker must be a regular non-linked file: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HarnessError(f"invalid AOI platform marker {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HarnessError(f"AOI platform marker must contain an object: {path}")
+    if payload.get("schema_version") != PLATFORM_MARKER_SCHEMA_VERSION:
+        raise HarnessError(f"unsupported AOI platform marker schema: {path}")
+    domain = payload.get("lock_domain")
+    if domain not in {"posix-flock-v1", "windows-msvcrt-v1"}:
+        raise HarnessError(f"invalid AOI lock domain in {path}: {domain!r}")
+    return payload
+
+
+def _create_platform_marker(path: Path) -> bool:
+    payload = (
+        json.dumps(_platform_marker_payload(), indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _chmod_private(path, 0o600)
+        fsync_directory(path.parent)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        raise
+    return True
+
+
+def _ensure_platform_domain(paths: HarnessPaths) -> None:
+    existed = paths.harness.exists()
+    if existed and (_path_is_link_like(paths.harness) or not paths.harness.is_dir()):
+        raise HarnessError(f"AOI state path must be a regular directory: {paths.harness}")
+    legacy_nonempty = existed and any(paths.harness.iterdir())
+    paths.harness.mkdir(parents=True, exist_ok=True)
+    _chmod_private(paths.harness, 0o700)
+
+    if not paths.platform.exists():
+        if os.name == "nt" and legacy_nonempty:
+            raise HarnessError(
+                "untagged pre-v0.1.2 AOI state cannot be opened by native Windows; "
+                "run one POSIX/WSL AOI command first or initialize a fresh state tree"
+            )
+        _create_platform_marker(paths.platform)
+
+    marker = _read_platform_marker(paths.platform)
+    expected = runtime_lock_domain()
+    if marker.get("lock_domain") != expected:
+        raise HarnessError(
+            f"AOI state lock domain is {marker.get('lock_domain')!r}, but this runtime "
+            f"requires {expected!r}; simultaneous or alternating WSL/native writers "
+            "are unsupported"
+        )
 
 
 @contextlib.contextmanager
 def state_lock(paths: HarnessPaths) -> Iterator[None]:
     ensure_layout(paths)
-    with paths.lock.open("a+", encoding="utf-8") as handle:
-        try:
-            paths.lock.chmod(0o600)
-        except OSError:
-            pass
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    with paths.lock.open("a+b") as handle:
+        _chmod_private(paths.lock, 0o600)
+        _acquire_state_lock(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _release_state_lock(handle)
+
+
+def _acquire_state_lock(handle: Any) -> None:
+    if os.name != "nt":
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+
+    # msvcrt locks a byte range rather than the whole file. Keep one durable
+    # byte at offset zero and retry the non-blocking operation so Windows has
+    # the same wait-until-exclusive behavior as POSIX flock.
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+    while True:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise HarnessError(f"could not acquire AOI state lock: {exc}") from exc
+            time.sleep(0.05)
+
+
+def _release_state_lock(handle: Any) -> None:
+    if os.name != "nt":
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError as exc:
+        raise HarnessError(f"could not release AOI state lock: {exc}") from exc
 
 
 def now_iso() -> str:
@@ -212,6 +505,40 @@ def atomic_write_text(path: Path, text: str) -> None:
     atomic_write_bytes(path, text.encode("utf-8"))
 
 
+def atomic_create_text(path: Path, text: str) -> None:
+    atomic_create_bytes(path, text.encode("utf-8"))
+
+
+def atomic_create_bytes(path: Path, payload: bytes) -> None:
+    """Durably create one file while refusing concurrent replacement."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor: int | None = None
+    created = False
+    complete = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            created = True
+        except FileExistsError as exc:
+            raise HarnessError(f"refusing to replace existing file during create: {path}") from exc
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _chmod_private(path, 0o600)
+        fsync_directory(path.parent)
+        complete = True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created and not complete:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_name = ""
@@ -221,11 +548,8 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
             temp_name = handle.name
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        replace_file(Path(temp_name), path)
+        _chmod_private(path, 0o600)
         temp_name = ""
         fsync_directory(path.parent)
     finally:
@@ -234,7 +558,28 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
                 Path(temp_name).unlink()
 
 
+def replace_file(source: Path, destination: Path) -> None:
+    """Atomically replace destination, retrying transient Windows sharing failures."""
+
+    deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_SECONDS
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if os.name != "nt" or time.monotonic() >= deadline:
+                raise HarnessError(
+                    f"atomic replace remained blocked by another process: {destination}"
+                ) from exc
+            time.sleep(0.05)
+
+
 def fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Python exposes no portable directory-handle fsync on Windows. The
+        # temporary file itself is fsynced before os.replace; crash durability
+        # of the directory entry remains a documented platform boundary.
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(path, flags)
     try:
@@ -307,12 +652,28 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
         raise HarnessError(f"invalid task profile{where}: {state.get('profile')!r}")
     revision = state.get("revision")
     checkpoint_revision = state.get("checkpoint_revision")
-    if not isinstance(revision, int) or revision < 1:
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
         raise HarnessError(f"invalid task revision{where}")
-    if not isinstance(checkpoint_revision, int) or checkpoint_revision < 0:
+    if (
+        isinstance(checkpoint_revision, bool)
+        or not isinstance(checkpoint_revision, int)
+        or checkpoint_revision < 0
+    ):
         raise HarnessError(f"invalid checkpoint revision{where}")
     if checkpoint_revision > revision:
         raise HarnessError(f"checkpoint revision exceeds task revision{where}")
+    for field in sorted(TASK_STRING_LIST_FIELDS | TASK_OBJECT_LIST_FIELDS):
+        if field not in state:
+            continue
+        value = state[field]
+        if not isinstance(value, list):
+            raise HarnessError(f"task field {field!r} must be a list{where}")
+        expected_type = dict if field in TASK_OBJECT_LIST_FIELDS else str
+        if any(not isinstance(item, expected_type) for item in value):
+            kind = "objects" if expected_type is dict else "strings"
+            raise HarnessError(f"task field {field!r} must contain only {kind}{where}")
+    if "delivery" in state and not isinstance(state["delivery"], dict):
+        raise HarnessError(f"task field 'delivery' must be an object{where}")
 
 
 def bump_task(state: dict[str, Any], checkpoint_required: bool = True) -> None:
@@ -328,7 +689,7 @@ def write_task(paths: HarnessPaths, state: dict[str, Any]) -> None:
 
 
 def _normalize_repo_path(raw: str) -> str:
-    if "\\" in raw:
+    if "\x00" in raw or "\\" in raw:
         raise HarnessError(f"repo lock must use POSIX separators: {raw!r}")
     if not raw or raw.startswith("/"):
         raise HarnessError(f"repo lock path must be relative: {raw!r}")
@@ -342,12 +703,21 @@ def _normalize_repo_path(raw: str) -> str:
         return "."
     if normalized.startswith("../"):
         raise HarnessError(f"repo lock path escapes the repo: {raw!r}")
-    return normalized.rstrip("/")
+    normalized = normalized.rstrip("/")
+    # Native Windows support is explicitly limited to ordinary
+    # case-insensitive local filesystems. Canonicalize repo locks to the same
+    # comparison domain so alternate casing cannot bypass mutual exclusion.
+    if os.name == "nt":
+        _validate_windows_path_components(raw.split("/"), "repo lock", raw)
+        normalized = normalized.casefold()
+    return normalized
 
 
 def _normalize_external_path(raw: str) -> str:
-    if "\\" in raw:
+    if not raw or "\x00" in raw or "\\" in raw:
         raise HarnessError(f"external lock must use POSIX separators: {raw!r}")
+    if raw.startswith("//"):
+        raise HarnessError(f"external lock path may not use a double-slash root: {raw!r}")
     path = PurePosixPath(raw)
     if any(marker in raw for marker in ("*", "?", "[", "]", "{", "}")):
         raise HarnessError(f"structured external locks may not contain glob syntax: {raw!r}")
@@ -356,6 +726,32 @@ def _normalize_external_path(raw: str) -> str:
     if ".." in path.parts:
         raise HarnessError(f"external lock path may not contain '..': {raw!r}")
     return path.as_posix().rstrip("/") or "/"
+
+
+def _validate_windows_path_components(
+    parts: Iterable[str], label: str, raw: str
+) -> None:
+    invalid_characters = set('<>:"|?*')
+    for part in parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise HarnessError(f"{label} path may not contain '..': {raw!r}")
+        if part.endswith((".", " ")):
+            raise HarnessError(
+                f"{label} path component may not end with dot or space: {raw!r}"
+            )
+        if any(ord(character) < 32 for character in part) or any(
+            character in invalid_characters for character in part
+        ):
+            raise HarnessError(
+                f"{label} path contains a Win32-reserved character: {raw!r}"
+            )
+        basename = part.split(".", 1)[0].casefold()
+        if basename in WINDOWS_RESERVED_BASENAMES:
+            raise HarnessError(
+                f"{label} path uses a Win32-reserved device name: {raw!r}"
+            )
 
 
 def _normalize_host_path(raw: str) -> str:
@@ -370,6 +766,7 @@ def _normalize_host_path(raw: str) -> str:
     raw_parts = raw[3:].split("/")
     if any(part in {".", ".."} for part in raw_parts):
         raise HarnessError(f"host lock path may not contain '.' or '..': {raw!r}")
+    _validate_windows_path_components(raw_parts, "host lock", raw)
     path = PureWindowsPath(raw)
     if not path.drive or not path.root or len(path.drive) != 2:
         raise HarnessError(f"host lock path must be drive-absolute: {raw!r}")
@@ -379,16 +776,127 @@ def _normalize_host_path(raw: str) -> str:
     return f"{drive}:/{suffix}" if suffix else f"{drive}:/"
 
 
-def host_path_to_wsl(raw: str) -> Path:
+def host_path_to_runtime(raw: str) -> Path:
     canonical = _normalize_host_path(raw)
+    if os.name == "nt":
+        return Path(PureWindowsPath(canonical))
     drive = canonical[0].lower()
     suffix = canonical[3:]
     mount_root = Path(os.environ.get("AOI_HOST_MOUNT_ROOT", "/mnt"))
     return mount_root / drive / suffix
 
 
+def host_path_to_wsl(raw: str) -> Path:
+    """Compatibility alias for the pre-v0.1.2 public helper name."""
+
+    return host_path_to_runtime(raw)
+
+
+def _host_trusted_root(raw: str) -> Path:
+    canonical = _normalize_host_path(raw)
+    if os.name == "nt":
+        return Path(PureWindowsPath(canonical).anchor)
+    mount_root = Path(os.environ.get("AOI_HOST_MOUNT_ROOT", "/mnt"))
+    return mount_root / canonical[0].lower()
+
+
+def _reject_link_traversal(
+    candidate: Path, trusted_root: Path, *, namespace: str, raw_path: str
+) -> None:
+    if _path_is_link_like(trusted_root):
+        raise HarnessError(
+            f"{namespace} lock trusted root may not be a symlink or junction: {trusted_root}"
+        )
+    try:
+        relative = candidate.relative_to(trusted_root)
+    except ValueError as exc:
+        raise HarnessError(
+            f"{namespace} lock escapes its trusted root: {raw_path}"
+        ) from exc
+    current = trusted_root
+    for part in relative.parts:
+        current /= part
+        if _path_is_link_like(current):
+            raise HarnessError(
+                f"{namespace} lock may not traverse a symlink or junction: {raw_path}"
+            )
+    try:
+        resolved_root = trusted_root.resolve()
+        candidate.resolve(strict=False).relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HarnessError(
+            f"{namespace} lock escapes its trusted root: {raw_path}"
+        ) from exc
+
+
+def _validate_existing_tree_identity(
+    candidate: Path, *, namespace: str, raw_path: str
+) -> int | None:
+    """Reject alternate filesystem identities inside an existing tree."""
+
+    try:
+        metadata = candidate.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise HarnessError(
+            f"cannot inspect {namespace} tree lock target {raw_path}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise HarnessError(f"tree lock target is not a directory: {candidate}")
+
+    inspected = 0
+    pending = [candidate]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                children = list(entries)
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot inspect {namespace} tree lock target {raw_path}: {exc}"
+            ) from exc
+        for entry in children:
+            inspected += 1
+            if inspected > TREE_IDENTITY_SCAN_MAX_ENTRIES:
+                raise HarnessError(
+                    f"{namespace} tree lock exceeds the fail-closed identity scan "
+                    f"limit of {TREE_IDENTITY_SCAN_MAX_ENTRIES} entries: {raw_path}"
+                )
+            child = Path(entry.path)
+            try:
+                if _path_is_link_like(child):
+                    raise HarnessError(
+                        f"{namespace} tree lock may not contain a symlink or "
+                        f"junction: {raw_path}"
+                    )
+                child_metadata = entry.stat(follow_symlinks=False)
+            except HarnessError:
+                raise
+            except OSError as exc:
+                raise HarnessError(
+                    f"cannot inspect {namespace} tree lock target {raw_path}: {exc}"
+                ) from exc
+            if stat.S_ISDIR(child_metadata.st_mode):
+                pending.append(child)
+            elif stat.S_ISREG(child_metadata.st_mode):
+                if child_metadata.st_nlink != 1:
+                    raise HarnessError(
+                        f"{namespace} tree lock may not contain a hard-linked "
+                        f"file: {raw_path}"
+                    )
+            else:
+                raise HarnessError(
+                    f"{namespace} tree lock may not contain a special filesystem "
+                    f"node: {raw_path}"
+                )
+    return inspected
+
+
 def normalize_lock(lock: str) -> str:
-    parts = lock.strip().split(":", 2)
+    if lock != lock.strip():
+        raise HarnessError("lock URI may not have leading or trailing whitespace")
+    parts = lock.split(":", 2)
     if len(parts) == 3 and parts[0] in {"repo", EXTERNAL_LOCK_NAMESPACE, "host"}:
         namespace, kind, raw_path = parts
         if kind not in {"file", "tree"}:
@@ -410,6 +918,8 @@ def normalize_lock(lock: str) -> str:
         branch = parts[2]
         if not SLUG_RE.fullmatch(branch) or ".." in PurePosixPath(branch).parts:
             raise HarnessError(f"invalid git merge branch: {branch!r}")
+        if os.name == "nt":
+            branch = branch.casefold()
         return f"git:merge:{branch}"
     raise HarnessError(f"invalid lock URI: {lock!r}")
 
@@ -478,18 +988,36 @@ def baselines_for_locks(
     baseline_root = (repo_root or paths.root).resolve()
     for lock in locks:
         namespace, kind, raw_path = parse_lock(lock)
-        if kind != "file" or namespace not in {"repo", "host"}:
+        if namespace not in {"repo", "host"}:
             continue
         candidate = (
             baseline_root / raw_path
             if namespace == "repo"
-            else host_path_to_wsl(raw_path)
+            else host_path_to_runtime(raw_path)
         )
-        if namespace == "host" and candidate.is_symlink():
-            raise HarnessError(f"host file lock may not target a symlink: {raw_path}")
+        if namespace == "repo":
+            _reject_link_traversal(
+                candidate, baseline_root, namespace="repo", raw_path=raw_path
+            )
+        else:
+            _reject_link_traversal(
+                candidate,
+                _host_trusted_root(raw_path),
+                namespace="host",
+                raw_path=raw_path,
+            )
+        if kind == "tree":
+            _validate_existing_tree_identity(
+                candidate, namespace=namespace, raw_path=raw_path
+            )
+            continue
         if candidate.exists() and not stat.S_ISREG(candidate.stat().st_mode):
             raise HarnessError(f"file lock target is not a regular file: {candidate}")
         if candidate.is_file():
+            if candidate.stat().st_nlink != 1:
+                raise HarnessError(
+                    f"file lock target must not be hard-linked: {candidate}"
+                )
             result[lock] = {"exists": True, "sha256": sha256_file(candidate)}
         else:
             result[lock] = {"exists": False, "sha256": None}

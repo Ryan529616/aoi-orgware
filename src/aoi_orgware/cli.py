@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from . import __version__
-from .config import ProjectConfig, default_config_text
+from .config import ProjectConfig, default_config_text, load_config_path
 from .pilot import PilotError, initialize_kit, load_record, write_summary
 
 from .harnesslib import (
@@ -43,6 +43,8 @@ from .harnesslib import (
     VERIFICATION_STATUSES,
     HarnessError,
     HarnessPaths,
+    atomic_create_bytes,
+    atomic_create_text,
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
@@ -52,6 +54,7 @@ from .harnesslib import (
     claim_path,
     claims_for_task,
     claims_owned_by_task,
+    discover_root,
     ensure_layout,
     find_conflicts,
     fsync_directory,
@@ -71,6 +74,9 @@ from .harnesslib import (
     parse_legacy_table,
     parse_lock,
     parse_time,
+    platform_capabilities,
+    paths_for_project,
+    preflight_layout,
     prepare_checkpoint,
     record_legacy_decision,
     render_checkpoint,
@@ -81,6 +87,7 @@ from .harnesslib import (
     task_state_path,
     task_summary,
     validate_id,
+    validate_existing_regular_file,
     write_index,
     write_task,
 )
@@ -248,6 +255,8 @@ CRITICAL_VIEW_MAX_BYTES = 12 * 1024
 CRITICAL_TEXT_LIMIT = 160
 COMMAND_ARTIFACT_MAX_BYTES = 1024 * 1024
 TERMINAL_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
+BOUND_ARTIFACT_MAX_COUNT = 64
+BOUND_ARTIFACT_TOTAL_MAX_BYTES = 64 * 1024 * 1024
 CAPABILITY_CATALOG_VERSION = 1
 CAPABILITY_TIER_MAP = {
     "c1_mechanical": "economical",
@@ -289,6 +298,9 @@ NEEDS_USER_CATEGORIES = {
     "user_preference",
 }
 NEEDS_USER_STATUSES = {"needs_user", "resolved", "cancelled"}
+COOPERATIVE_AUTHORITY_BOUNDARY = (
+    "task-bound session assertion only; AOI does not authenticate the caller identity"
+)
 
 
 def emit(payload: Any, as_json: bool = False) -> None:
@@ -319,6 +331,13 @@ def require_evidence_detail(value: str, label: str) -> str:
     return detail
 
 
+def canonical_record_sha256(value: dict[str, Any]) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def read_regular_artifact(
     value: str | Path,
     label: str,
@@ -338,7 +357,10 @@ def read_regular_artifact(
         raise HarnessError(f"{label} must not be hard-linked")
     if before.st_size <= 0 or before.st_size > max_bytes:
         raise HarnessError(f"{label} must be non-empty and at most {max_bytes} bytes")
-    flags = os.O_RDONLY
+    # Windows low-level descriptors default to text mode, which silently
+    # translates CRLF to LF and breaks physical SHA-256 identity. Always read
+    # artifacts as exact bytes on every platform.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -395,7 +417,9 @@ def snapshot_evidence_artifact(
     )
     actual = hashlib.sha256(data).hexdigest()
     if actual != expected:
-        raise HarnessError(f"{label} SHA-256 mismatch")
+        raise HarnessError(
+            f"{label} SHA-256 mismatch: expected {expected}, actual {actual}"
+        )
     destination = task_dir(paths, task_id) / "results" / basename
     if destination.exists():
         raise HarnessError(f"canonical {label} snapshot already exists: {destination}")
@@ -407,6 +431,161 @@ def snapshot_evidence_artifact(
         "sha256": actual,
         "size_bytes": len(data),
     }
+
+
+def artifact_blob_path(paths: HarnessPaths, task_id: str, digest: str) -> Path:
+    """Return the canonical task-local path for one content-addressed artifact."""
+
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise HarnessError("artifact blob SHA-256 must be full 64 hex")
+    return task_dir(paths, task_id) / "results" / "artifact-blobs" / digest[:2] / digest
+
+
+def prepare_bound_artifacts(
+    values: Iterable[str],
+    label: str,
+) -> list[dict[str, Any]]:
+    """Safely read and SHA-bind a bounded set of artifacts before state mutation."""
+
+    raw_values = list(values)
+    if len(raw_values) > BOUND_ARTIFACT_MAX_COUNT:
+        raise HarnessError(
+            f"{label} accepts at most {BOUND_ARTIFACT_MAX_COUNT} artifacts"
+        )
+    prepared: list[dict[str, Any]] = []
+    total_bytes = 0
+    for index, value in enumerate(raw_values, start=1):
+        path_text, separator, digest = value.rpartition("=")
+        if not separator:
+            raise HarnessError(f"{label} must use absolute-path=sha256")
+        digest = digest.lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise HarnessError(f"{label} SHA-256 must be full 64 hex")
+        source, data = read_regular_artifact(
+            path_text,
+            f"{label} #{index}",
+            max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+        )
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != digest:
+            raise HarnessError(
+                f"{label} #{index} SHA-256 mismatch: expected {digest}, actual {actual}"
+            )
+        total_bytes += len(data)
+        if total_bytes > BOUND_ARTIFACT_TOTAL_MAX_BYTES:
+            raise HarnessError(
+                f"{label} aggregate size exceeds {BOUND_ARTIFACT_TOTAL_MAX_BYTES} bytes"
+            )
+        prepared.append(
+            {
+                "source_path": str(source),
+                "sha256": actual,
+                "size_bytes": len(data),
+                "data": data,
+            }
+        )
+    return prepared
+
+
+def preserve_bound_artifacts(
+    paths: HarnessPaths,
+    task_id: str,
+    prepared: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Create or safely reuse canonical content-addressed task artifact blobs."""
+
+    preserved: list[dict[str, Any]] = []
+    for item in prepared:
+        digest = str(item["sha256"])
+        data = bytes(item["data"])
+        destination = artifact_blob_path(paths, task_id, digest)
+        if destination.exists():
+            _, existing = read_regular_artifact(
+                destination,
+                "existing task artifact blob",
+                max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+            )
+            if hashlib.sha256(existing).hexdigest() != digest or existing != data:
+                raise HarnessError(
+                    f"canonical task artifact blob is missing or tampered: {destination}"
+                )
+        else:
+            atomic_create_bytes(destination, data)
+        preserved.append(
+            {
+                "snapshot_version": 1,
+                "source_path": str(item["source_path"]),
+                "path": str(destination),
+                "sha256": digest,
+                "size_bytes": len(data),
+            }
+        )
+    return preserved
+
+
+def artifact_ref_integrity_error(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    artifact: dict[str, Any],
+    *,
+    require_origin: bool,
+) -> str | None:
+    """Validate a legacy live ref or a canonical snapshot without mutating state."""
+
+    digest = str(artifact.get("sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return "artifact SHA-256 is invalid"
+    expected_size = artifact.get("size_bytes")
+    if not isinstance(expected_size, int) or expected_size <= 0:
+        return "artifact size is invalid"
+    snapshot_version = artifact.get("snapshot_version")
+    if snapshot_version == 1:
+        expected_path = artifact_blob_path(paths, state["task_id"], digest)
+        recorded_path = Path(str(artifact.get("path", "")))
+        if recorded_path != expected_path:
+            return "artifact snapshot path is not canonical"
+        try:
+            _, data = read_regular_artifact(
+                recorded_path,
+                "artifact snapshot",
+                max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+            )
+        except HarnessError as exc:
+            return str(exc)
+        if len(data) != expected_size or hashlib.sha256(data).hexdigest() != digest:
+            return "artifact snapshot identity mismatch"
+        if require_origin:
+            source_path = Path(str(artifact.get("source_path", "")))
+            if not source_path.is_absolute():
+                return "artifact source path is not absolute"
+            try:
+                _, source_data = read_regular_artifact(
+                    source_path,
+                    "artifact source",
+                    max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+                )
+            except HarnessError as exc:
+                return str(exc)
+            if (
+                len(source_data) != expected_size
+                or hashlib.sha256(source_data).hexdigest() != digest
+            ):
+                return "artifact source changed after snapshot creation"
+        return None
+    if snapshot_version not in {None, 0}:
+        return "artifact snapshot version is unsupported"
+    legacy_path = Path(str(artifact.get("path", "")))
+    try:
+        _, data = read_regular_artifact(
+            legacy_path,
+            "legacy artifact reference",
+            max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+        )
+    except HarnessError as exc:
+        return str(exc)
+    if len(data) != expected_size or hashlib.sha256(data).hexdigest() != digest:
+        return "legacy artifact reference identity mismatch"
+    return None
 
 
 def require_open_task(state: dict[str, Any], action: str) -> None:
@@ -606,9 +785,12 @@ def needs_user_by_id(state: dict[str, Any], escalation_id: str) -> dict[str, Any
 def require_root_session(
     paths: HarnessPaths, state: dict[str, Any], session_id: str
 ) -> str:
+    """Check task/session continuity, not platform-authenticated identity."""
     session_id = check_session_id(session_id)
     if session_id not in state.get("session_ids", []):
-        raise HarnessError("root arbitration requires a session bound to this task")
+        raise HarnessError(
+            "root arbitration requires a cooperatively asserted session bound to this task"
+        )
     mapping = load_json(session_path(paths, session_id))
     if mapping.get("task_id") != state.get("task_id"):
         raise HarnessError("root arbitration session mapping does not match this task")
@@ -1225,7 +1407,8 @@ def validate_mini_locks(raw_locks: Iterable[str]) -> list[str]:
         if namespace not in {"repo", "host"} or kind != "file":
             raise HarnessError("mini task accepts only exact repo:file or host:file locks")
         if namespace == "repo" and any(
-            raw_path == prefix.rstrip("/") or raw_path.startswith(prefix)
+            raw_path == prefix.rstrip("/")
+            or raw_path.startswith(prefix.rstrip("/") + "/")
             for prefix in MINI_FORBIDDEN_REPO_PREFIXES
         ):
             raise HarnessError(f"mini task may not own high-risk path: {raw_path}")
@@ -1283,30 +1466,98 @@ def legacy_ambiguities(
     return ambiguous
 
 
+def packet_contract_integrity_error(
+    paths: HarnessPaths, state: dict[str, Any], packet: dict[str, Any]
+) -> str | None:
+    if int(packet.get("packet_schema_version", 0)) < 4:
+        return None
+    packet_id = str(packet.get("packet_id", ""))
+    expected_path = task_dir(paths, state["task_id"]) / "packets" / f"{packet_id}.md"
+    recorded_path = Path(str(packet.get("path", "")))
+    expected_sha = str(packet.get("packet_contract_sha256", ""))
+    if recorded_path != expected_path:
+        return f"packet {packet_id} contract path is not canonical"
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        return f"packet {packet_id} contract SHA-256 is invalid"
+    try:
+        _, data = read_regular_artifact(
+            recorded_path,
+            "packet contract",
+            max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+            require_utf8=True,
+        )
+    except HarnessError as exc:
+        return f"packet {packet_id} contract is missing or tampered: {exc}"
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        return f"packet {packet_id} contract SHA-256 mismatch"
+    return None
+
+
+def packet_input_integrity_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    *,
+    require_origin: bool,
+) -> list[str]:
+    packet_id = str(packet.get("packet_id", ""))
+    errors: list[str] = []
+    for artifact in packet.get("input_artifact_refs", []):
+        error = artifact_ref_integrity_error(
+            paths, state, artifact, require_origin=require_origin
+        )
+        if error:
+            errors.append(f"packet {packet_id} input artifact: {error}")
+    return errors
+
+
+def packet_integrity_warnings(state: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    for packet in state.get("packets", []):
+        if (
+            int(packet.get("packet_schema_version", 0)) < 4
+            and packet.get("status") in {"failed", "cancelled"}
+            and any(
+                artifact.get("snapshot_version") != 1
+                for artifact in packet.get("input_artifact_refs", [])
+            )
+        ):
+            warnings.append(
+                f"packet {packet.get('packet_id')} has legacy digest-only inputs; "
+                "failed/cancelled live origins are not revalidated"
+            )
+    return warnings
+
+
 def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     for packet in state.get("packets", []):
         packet_id = str(packet.get("packet_id", ""))
+        status = packet.get("status")
         mode = packet.get("packet_mode", "legacy")
         locks = packet.get("locks", [])
         if mode == "read_only" and locks:
             errors.append(f"packet {packet_id} read_only mode has mutation locks")
         if mode in {"bounded_mutation", "exact_command"} and not locks:
             errors.append(f"packet {packet_id} {mode} mode lacks mutation authority")
-        for artifact in packet.get("input_artifact_refs", []):
-            artifact_path = Path(str(artifact.get("path", "")))
-            artifact_sha = str(artifact.get("sha256", ""))
-            if (
-                not artifact_path.is_file()
-                or artifact_path.is_symlink()
-                or not re.fullmatch(r"[0-9a-f]{64}", artifact_sha)
-                or sha256_file(artifact_path) != artifact_sha
-            ):
-                errors.append(f"packet {packet_id} input artifact is missing or tampered")
+        contract_error = packet_contract_integrity_error(paths, state, packet)
+        if contract_error:
+            errors.append(contract_error)
+        if not (
+            int(packet.get("packet_schema_version", 0)) < 4
+            and status in {"failed", "cancelled"}
+        ):
+            errors.extend(
+                packet_input_integrity_errors(
+                    paths,
+                    state,
+                    packet,
+                    require_origin=status == "ready",
+                )
+            )
         command_error = packet_command_integrity_error(packet)
         if command_error:
             errors.append(command_error)
-        status = packet.get("status")
         if status not in PACKET_STATUSES:
             errors.append(f"packet {packet_id} has invalid status {status!r}")
             continue
@@ -1367,6 +1618,15 @@ def _require_done_reviewer_packet(
         raise HarnessError(
             "independent review packet must be a done reviewer assignment with an agent identity"
         )
+    contract_error = packet_contract_integrity_error(paths, state, packet)
+    input_errors = packet_input_integrity_errors(
+        paths, state, packet, require_origin=False
+    )
+    if contract_error or input_errors:
+        raise HarnessError(
+            "independent review packet contract/input is missing or tampered: "
+            + "; ".join(([contract_error] if contract_error else []) + input_errors)
+        )
     expected = task_dir(paths, state["task_id"]) / "results" / f"{packet_id}.md"
     if (
         Path(str(packet.get("result_path", ""))) != expected
@@ -1395,17 +1655,21 @@ def validate_source_receipt(
     tool_path: str,
     tool_version: str,
     command: str,
-) -> dict[str, Any]:
-    if not source.is_file():
-        raise HarnessError(f"source receipt does not exist: {source}")
-    actual_sha = sha256_file(source)
+) -> tuple[dict[str, Any], bytes]:
+    _, source_data = read_regular_artifact(
+        source,
+        "source receipt",
+        max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+        require_utf8=True,
+    )
+    actual_sha = hashlib.sha256(source_data).hexdigest()
     if actual_sha != expected_sha:
         raise HarnessError(
             f"source receipt SHA-256 mismatch: expected {expected_sha}, actual {actual_sha}"
         )
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(source_data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise HarnessError(f"source receipt is not valid UTF-8 JSON: {exc}") from exc
     if not isinstance(payload, dict) or payload.get("receipt_version") != 1:
         raise HarnessError("source receipt must be an object with receipt_version=1")
@@ -1452,7 +1716,7 @@ def validate_source_receipt(
     for required_included in REQUIRED_RECEIPT_COMPONENTS:
         if components[required_included].get("status") != "included":
             raise HarnessError(f"source receipt component {required_included!r} must be included")
-    return payload
+    return payload, source_data
 
 
 def job_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
@@ -1564,7 +1828,32 @@ def job_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str
     return errors
 
 
-def verification_integrity_errors(state: dict[str, Any]) -> list[str]:
+def verification_integrity_warnings(state: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    for index, item in enumerate(state.get("verification", []), start=1):
+        legacy_refs = [
+            artifact
+            for artifact in item.get("artifact_refs", [])
+            if artifact.get("snapshot_version") != 1
+        ]
+        if not legacy_refs:
+            continue
+        if item.get("superseded_at"):
+            warnings.append(
+                f"verification #{index} is explicitly superseded with legacy "
+                "digest-only artifact metadata"
+            )
+        else:
+            warnings.append(
+                f"verification #{index} uses legacy live artifact references; "
+                "materialize or supersede it before the origins evolve"
+            )
+    return warnings
+
+
+def verification_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
     errors: list[str] = []
     for index, item in enumerate(state.get("verification", []), start=1):
         label = f"verification #{index}"
@@ -1583,6 +1872,11 @@ def verification_integrity_errors(state: dict[str, Any]) -> list[str]:
             item.get("command", "")
         ).strip():
             errors.append(f"{label} pass/fail record has empty command or method")
+        if item.get("superseded_at"):
+            if item.get("status") != "skipped":
+                errors.append(f"{label} superseded record must have status='skipped'")
+            if not str(item.get("supersession_reason", "")).strip():
+                errors.append(f"{label} superseded record lacks a reason")
         if item.get("category") == "independent_review" and any(
             item.get(field)
             for field in (
@@ -1605,15 +1899,13 @@ def verification_integrity_errors(state: dict[str, Any]) -> list[str]:
             if not str(item.get("reviewer_agent_id", "")).strip():
                 errors.append(f"{label} lacks reviewer agent identity")
         for artifact in item.get("artifact_refs", []):
-            path = Path(str(artifact.get("path", "")))
-            digest = str(artifact.get("sha256", ""))
-            if (
-                not path.is_file()
-                or path.is_symlink()
-                or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or sha256_file(path) != digest
-            ):
-                errors.append(f"{label} artifact reference is missing or tampered")
+            if item.get("superseded_at") and artifact.get("snapshot_version") != 1:
+                continue
+            error = artifact_ref_integrity_error(
+                paths, state, artifact, require_origin=False
+            )
+            if error:
+                errors.append(f"{label} artifact reference: {error}")
     return errors
 
 
@@ -1745,6 +2037,16 @@ def require_absolute_posix(value: str, label: str) -> str:
     return path.as_posix()
 
 
+def require_absolute_local_path(value: str, label: str) -> Path:
+    """Validate a controller-local path without imposing remote POSIX syntax."""
+
+    cleaned = require_text(value, label)
+    path = Path(cleaned).expanduser()
+    if not path.is_absolute() or ".." in path.parts:
+        raise HarnessError(f"{label} must be an absolute normalized local path: {value!r}")
+    return path
+
+
 def commit_checkpoint(paths: HarnessPaths, state: dict[str, Any]) -> Path:
     destination, text, digest = prepare_checkpoint(paths, state)
     # Safe order: a crash after the file write leaves old state marked stale;
@@ -1858,24 +2160,104 @@ def _resource_text(name: str) -> str:
     return resource.read_text(encoding="utf-8")
 
 
+def _explicit_config(root: Path, value: str) -> tuple[ProjectConfig, bytes, Path]:
+    source = Path(value).expanduser().absolute()
+    try:
+        config, raw = load_config_path(root, source)
+    except ValueError as exc:
+        raise HarnessError(str(exc)) from exc
+    return config, raw, source
+
+
+def _config_summary(config: ProjectConfig, source: Path) -> dict[str, Any]:
+    warnings: list[str] = []
+    if config.state_dir != ".aoi":
+        warnings.append("non-default state_dir requires explicit user review")
+    if config.codex_hooks_enabled:
+        warnings.append("Codex hooks are enabled in policy but are not installed by init")
+    if config.legacy_enabled:
+        warnings.append("legacy compatibility is enabled")
+    if "steward" not in config.departments:
+        warnings.append("no department is literally named 'steward'; verify control-plane ownership")
+    return {
+        "valid": True,
+        "source": str(source),
+        "project": config.name,
+        "profile_id": config.profile_id,
+        "state_dir": config.state_dir,
+        "departments": list(config.departments),
+        "roles": dict(config.roles),
+        "evidence_categories": list(config.evidence_categories),
+        "close_qualifying_categories": list(config.close_qualifying_categories),
+        "receipt_components": list(config.receipt_components),
+        "required_receipt_components": list(config.required_receipt_components),
+        "high_risk_paths": list(config.high_risk_paths),
+        "external_lock_namespace": config.external_lock_namespace,
+        "hooks_enabled": config.codex_hooks_enabled,
+        "legacy_enabled": config.legacy_enabled,
+        "config_sha256": config.sha256,
+        "warnings": warnings,
+    }
+
+
+def cmd_config_check(args: argparse.Namespace, paths: HarnessPaths | None) -> int:
+    root = discover_root()
+    config, _raw, source = _explicit_config(root, args.file)
+    emit(_config_summary(config, source), args.json)
+    return 0
+
+
 def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if not (paths.root / ".git").exists():
         raise HarnessError("aoi init requires a Git repository root")
-    project_name = args.project_name or paths.root.name or "AOI Project"
+    ignore_path = paths.root / ".gitignore"
+    validate_existing_regular_file(ignore_path, "project .gitignore")
+    candidate: ProjectConfig | None = None
+    candidate_raw: bytes | None = None
+    expected_config_sha256 = (args.expected_config_sha256 or "").lower()
+    if expected_config_sha256 and not args.config:
+        raise HarnessError("--expected-config-sha256 requires --config")
+    if args.config and not expected_config_sha256:
+        raise HarnessError("--config requires --expected-config-sha256")
+    if expected_config_sha256 and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_config_sha256
+    ):
+        raise HarnessError("--expected-config-sha256 must be a full SHA-256")
+    if args.config:
+        candidate, candidate_raw, _source = _explicit_config(paths.root, args.config)
+        if candidate.sha256 != expected_config_sha256:
+            raise HarnessError(
+                "candidate configuration SHA-256 differs from the approved digest"
+            )
     created_config = False
     if paths.config.exists():
+        if candidate is not None and candidate.sha256 != paths.project.sha256:
+            raise HarnessError(
+                "AOI is already initialized with a different configuration; refusing to overwrite"
+            )
         if args.project_name and paths.project.name != args.project_name:
             raise HarnessError(
                 f"AOI is already initialized as {paths.project.name!r}; refusing to rename"
             )
+        initialized = paths
     else:
-        try:
-            config_text = default_config_text(project_name)
-        except ValueError as exc:
-            raise HarnessError(str(exc)) from exc
-        atomic_write_text(paths.config, config_text)
+        if candidate is not None:
+            initialized = paths_for_project(paths.root, candidate)
+            assert candidate_raw is not None
+            preflight_layout(initialized)
+            atomic_create_bytes(paths.config, candidate_raw)
+        else:
+            project_name = args.project_name or paths.root.name or "AOI Project"
+            try:
+                config_text = default_config_text(project_name)
+            except ValueError as exc:
+                raise HarnessError(str(exc)) from exc
+            preflight_layout(paths)
+            atomic_create_text(paths.config, config_text)
+            initialized = get_paths(paths.root)
         created_config = True
-    initialized = get_paths(paths.root)
+    # Establish the selected state lock domain only after the candidate profile
+    # has passed strict parsing and non-clobber checks.
     ensure_layout(initialized)
     for name in ("plan.md", "packet.md", "checkpoint.md", "source_receipt.example.json"):
         destination = initialized.templates / name
@@ -1884,7 +2266,6 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     policy = initialized.harness / "POLICY.md"
     if not policy.exists():
         atomic_write_text(policy, _resource_text("policy.md"))
-    ignore_path = initialized.root / ".gitignore"
     ignore_entry = f"/{initialized.project.state_dir.rstrip('/')}/"
     current_ignore = ignore_path.read_text(encoding="utf-8") if ignore_path.exists() else ""
     if ignore_entry not in {line.strip() for line in current_ignore.splitlines()}:
@@ -1903,6 +2284,7 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "state_dir": str(initialized.harness),
             "config_sha256": initialized.project.sha256,
             "hooks_enabled": initialized.project.codex_hooks_enabled,
+            "platform": platform_capabilities(),
         },
         args.json,
     )
@@ -1910,7 +2292,11 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
 
 def cmd_pilot_init(args: argparse.Namespace, _paths: HarnessPaths | None) -> int:
-    result = initialize_kit(Path(args.output), force=args.force)
+    result = initialize_kit(
+        Path(args.output),
+        force=args.force,
+        allow_unverified_windows_acl=args.allow_unverified_windows_acl,
+    )
     emit(result, args.json)
     return 0
 
@@ -2789,13 +3175,22 @@ def cmd_capacity_recommend(args: argparse.Namespace, paths: HarnessPaths) -> int
             or not source_packet.get("result_sha256")
             or source_packet.get("capacity_review_source_id") != review["review_id"]
             or not any(
-                ref.get("path") == dataset.get("path")
+                (ref.get("source_path") or ref.get("path")) == dataset.get("path")
                 and ref.get("sha256") == dataset.get("sha256")
                 for ref in source_packet.get("input_artifact_refs", [])
             )
         ):
             raise HarnessError(
                 "capacity recommendation requires a done source packet bound to this review dataset"
+            )
+        contract_error = packet_contract_integrity_error(paths, state, source_packet)
+        input_errors = packet_input_integrity_errors(
+            paths, state, source_packet, require_origin=False
+        )
+        if contract_error or input_errors:
+            raise HarnessError(
+                "capacity recommendation source packet contract/input is missing or tampered: "
+                + "; ".join(([contract_error] if contract_error else []) + input_errors)
             )
         source_result = Path(str(source_packet.get("result_path", "")))
         expected_source_result = (
@@ -3047,6 +3442,15 @@ def _resolve_adoption_work_units(
             raise HarnessError(
                 f"{label} reference {item['reference']} is not a successful work unit"
             )
+        if require_after_canary and (
+            item.get("kind") not in {"packet", "job"}
+            or item.get("skill_release_id") != expected_skill_release_id
+            or item.get("skill_version") != expected_skill_version
+            or item.get("skill_canary_event_id") != expected_canary_event_id
+        ):
+            raise HarnessError(
+                f"{label} reference {item['reference']} is not bound to the exact skill canary"
+            )
         completed = parse_time(str(item.get("completed_at", "")))
         canary_time = parse_time(canary_recorded_at)
         if completed is None or canary_time is None:
@@ -3058,15 +3462,6 @@ def _resolve_adoption_work_units(
         if not require_after_canary and completed >= canary_time:
             raise HarnessError(
                 f"{label} reference {item['reference']} is not a pre-canary baseline"
-            )
-        if require_after_canary and (
-            item.get("kind") not in {"packet", "job"}
-            or item.get("skill_release_id") != expected_skill_release_id
-            or item.get("skill_version") != expected_skill_version
-            or item.get("skill_canary_event_id") != expected_canary_event_id
-        ):
-            raise HarnessError(
-                f"{label} reference {item['reference']} is not bound to the exact skill canary"
             )
     return bindings
 
@@ -3314,8 +3709,11 @@ def _load_json_artifact(
     source, data = read_regular_artifact(
         value, label, max_bytes=COMMAND_ARTIFACT_MAX_BYTES, require_utf8=True
     )
-    if hashlib.sha256(data).hexdigest() != expected_sha:
-        raise HarnessError(f"{label} SHA-256 mismatch")
+    actual_sha = hashlib.sha256(data).hexdigest()
+    if actual_sha != expected_sha:
+        raise HarnessError(
+            f"{label} SHA-256 mismatch: expected {expected_sha}, actual {actual_sha}"
+        )
     try:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -4908,6 +5306,7 @@ def cmd_coordination_arbitrate(args: argparse.Namespace, paths: HarnessPaths) ->
             "selected_option": str(args.selected_option or ""),
             "root_owner": state.get("owner"),
             "root_session_id": session_id,
+            "authority_boundary": COOPERATIVE_AUTHORITY_BOUNDARY,
             "recorded_at": recorded,
         }
         request.setdefault("root_arbitrations", []).append(arbitration)
@@ -5838,24 +6237,9 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if args.category in {"external_runtime", "runtime_test", "system_evidence"}:
             if not args.run_id:
                 raise HarnessError(f"{args.category} verification requires --run-id")
-        artifact_refs = []
-        for value in args.artifact_ref:
-            path_text, separator, digest = value.rpartition("=")
-            if not separator:
-                raise HarnessError("verification artifact ref must use absolute-path=sha256")
-            path = Path(path_text).resolve()
-            digest = digest.lower()
-            if (
-                not path.is_absolute()
-                or not path.is_file()
-                or path.is_symlink()
-                or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or sha256_file(path) != digest
-            ):
-                raise HarnessError("verification artifact ref is missing or has a SHA-256 mismatch")
-            artifact_refs.append(
-                {"path": str(path), "sha256": digest, "size_bytes": path.stat().st_size}
-            )
+        prepared_artifact_refs = prepare_bound_artifacts(
+            args.artifact_ref, "verification artifact ref"
+        )
         review_packet = None
         if args.category == "independent_review":
             if not args.review_packet_id:
@@ -5866,14 +6250,20 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 paths,
                 state,
                 args.review_packet_id,
-                required_artifact_shas={item["sha256"] for item in artifact_refs},
+                required_artifact_shas={
+                    item["sha256"] for item in prepared_artifact_refs
+                },
             )
         elif args.review_packet_id:
             raise HarnessError(
                 "--review-packet-id is accepted only for independent_review verification"
             )
+        artifact_refs = preserve_bound_artifacts(
+            paths, args.task, prepared_artifact_refs
+        )
         item = {
             "integrity_version": 1,
+            "artifact_snapshot_version": 1,
             "category": require_text(args.category, "category"),
             "status": args.status,
             "evidence": require_evidence_detail(args.evidence, "evidence"),
@@ -5893,6 +6283,144 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
         write_task(paths, state)
         write_index(paths)
     emit(item, args.json)
+    return 0
+
+
+def cmd_materialize_artifacts(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """Migrate still-valid legacy live refs into canonical task-local blobs."""
+
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "materialize artifacts for")
+        plans: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+        skipped_failed_packets: list[str] = []
+        for packet in state.get("packets", []):
+            legacy_refs = [
+                artifact
+                for artifact in packet.get("input_artifact_refs", [])
+                if artifact.get("snapshot_version") != 1
+            ]
+            if not legacy_refs:
+                continue
+            if packet.get("status") in {"failed", "cancelled"}:
+                skipped_failed_packets.append(str(packet.get("packet_id")))
+                continue
+            for artifact in legacy_refs:
+                prepared = prepare_bound_artifacts(
+                    [f"{artifact.get('path', '')}={artifact.get('sha256', '')}"],
+                    f"packet {packet.get('packet_id')} legacy input",
+                )
+                plans.append((artifact, prepared))
+        for index, verification in enumerate(state.get("verification", []), start=1):
+            if verification.get("superseded_at"):
+                continue
+            for artifact in verification.get("artifact_refs", []):
+                if artifact.get("snapshot_version") == 1:
+                    continue
+                prepared = prepare_bound_artifacts(
+                    [f"{artifact.get('path', '')}={artifact.get('sha256', '')}"],
+                    f"verification #{index} legacy artifact",
+                )
+                plans.append((artifact, prepared))
+
+        for target, prepared in plans:
+            target.clear()
+            target.update(preserve_bound_artifacts(paths, args.task, prepared)[0])
+
+        if plans:
+            for packet in state.get("packets", []):
+                refs = packet.get("input_artifact_refs", [])
+                if refs and all(ref.get("snapshot_version") == 1 for ref in refs):
+                    packet["input_snapshot_version"] = 1
+            for verification in state.get("verification", []):
+                refs = verification.get("artifact_refs", [])
+                if refs and all(ref.get("snapshot_version") == 1 for ref in refs):
+                    verification["artifact_snapshot_version"] = 1
+            bump_task(state)
+            write_task(paths, state)
+            write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "materialized_refs": len(plans),
+            "skipped_legacy_failed_packets": skipped_failed_packets,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """Explicitly retire one legacy verification in favor of a valid replacement."""
+
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "supersede verification for")
+        records = state.get("verification", [])
+        source_index = int(args.verification_index) - 1
+        replacement_index = int(args.replacement_index) - 1
+        if (
+            source_index < 0
+            or source_index >= len(records)
+            or replacement_index < 0
+            or replacement_index >= len(records)
+            or source_index == replacement_index
+        ):
+            raise HarnessError("verification and replacement indices must name distinct records")
+        source = records[source_index]
+        replacement = records[replacement_index]
+        expected_source_sha = str(args.expected_record_sha256).lower()
+        expected_replacement_sha = str(args.replacement_record_sha256).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_source_sha) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_replacement_sha
+        ):
+            raise HarnessError("verification record SHA-256 values must be full 64 hex")
+        if canonical_record_sha256(source) != expected_source_sha:
+            raise HarnessError("verification record changed after approval")
+        if canonical_record_sha256(replacement) != expected_replacement_sha:
+            raise HarnessError("replacement verification record changed after approval")
+        if source.get("superseded_at"):
+            raise HarnessError("verification record is already superseded")
+        source_time = parse_time(str(source.get("recorded_at", "")))
+        replacement_time = parse_time(str(replacement.get("recorded_at", "")))
+        if (
+            source.get("category") != replacement.get("category")
+            or replacement.get("status") != "pass"
+            or source_time is None
+            or replacement_time is None
+            or replacement_time <= source_time
+        ):
+            raise HarnessError(
+                "replacement must be a later passing verification in the same category"
+            )
+        replacement_errors = verification_integrity_errors(
+            paths, {**state, "verification": [replacement]}
+        )
+        if replacement_errors:
+            raise HarnessError(
+                "replacement verification is not physically valid: "
+                + "; ".join(replacement_errors)
+            )
+        source["original_status"] = source.get("status")
+        source["status"] = "skipped"
+        source["superseded_at"] = now_iso()
+        source["supersession_reason"] = require_evidence_detail(
+            args.reason, "verification supersession reason"
+        )
+        source["replacement_index"] = replacement_index + 1
+        source["replacement_record_sha256"] = expected_replacement_sha
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "verification_index": source_index + 1,
+            "replacement_index": replacement_index + 1,
+            "status": "skipped",
+        },
+        args.json,
+    )
     return 0
 
 
@@ -5952,24 +6480,9 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             args.skill_canary_event_id or "",
             require_live_canary=True,
         )
-        input_artifact_refs = []
-        for value in args.input_artifact:
-            path_text, separator, digest = value.rpartition("=")
-            if not separator:
-                raise HarnessError("packet input artifact must use absolute-path=sha256")
-            path = Path(path_text).resolve()
-            digest = digest.lower()
-            if (
-                not path.is_absolute()
-                or not path.is_file()
-                or path.is_symlink()
-                or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or sha256_file(path) != digest
-            ):
-                raise HarnessError("packet input artifact is missing or has a SHA-256 mismatch")
-            input_artifact_refs.append(
-                {"path": str(path), "sha256": digest, "size_bytes": path.stat().st_size}
-            )
+        prepared_input_artifacts = prepare_bound_artifacts(
+            args.input_artifact, "packet input artifact"
+        )
         if args.capacity_review_source_id:
             source_review = capacity_review_by_id(state, args.capacity_review_source_id)
             dataset = source_review.get("dataset", {})
@@ -5978,9 +6491,9 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or args.lane_id != source_review.get("capacity_lane_id")
                 or task_type != "capacity-analysis"
                 or not any(
-                    ref.get("path") == dataset.get("path")
+                    ref.get("source_path") == dataset.get("path")
                     and ref.get("sha256") == dataset.get("sha256")
-                    for ref in input_artifact_refs
+                    for ref in prepared_input_artifacts
                 )
             ):
                 raise HarnessError(
@@ -6086,6 +6599,9 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
         destination = task_dir(paths, args.task) / "packets" / f"{packet_id}.md"
         if destination.exists():
             raise HarnessError(f"packet already exists: {packet_id}")
+        input_artifact_refs = preserve_bound_artifacts(
+            paths, args.task, prepared_input_artifacts
+        )
         command_record: dict[str, Any] = {}
         if args.packet_mode == "exact_command":
             expected_sha = str(args.command_sha256).lower()
@@ -6135,11 +6651,22 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 f"- SHA-256: `{command_record['command_sha256']}`\n"
                 f"- Size: `{command_record['command_size_bytes']}` bytes\n"
             )
+        if input_artifact_refs:
+            text += "\n## Immutable input snapshots\n\n"
+            for artifact in input_artifact_refs:
+                text += (
+                    f"- Source: `{artifact['source_path']}`\n"
+                    f"  Snapshot authority: `{artifact['path']}`\n"
+                    f"  SHA-256: `{artifact['sha256']}`\n"
+                    f"  Size: `{artifact['size_bytes']}` bytes\n"
+                )
         atomic_write_text(destination, text)
+        packet_contract_sha256 = sha256_file(destination)
         state.setdefault("packets", []).append(
             {
                 "packet_id": packet_id,
                 "path": str(destination),
+                "packet_contract_sha256": packet_contract_sha256,
                 "agent_role": args.agent_role,
                 "model_tier": args.model_tier,
                 "lane_id": args.lane_id or "",
@@ -6147,7 +6674,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 if selection
                 else "",
                 **(skill_binding or {}),
-                "packet_schema_version": 3,
+                "packet_schema_version": 4,
                 "packet_mode": args.packet_mode,
                 "task_type": task_type,
                 "delegation_depth": args.delegation_depth,
@@ -6197,6 +6724,20 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
         packet = matches[0]
         previous_status = packet.get("status")
         if args.status == "dispatched":
+            contract_error = packet_contract_integrity_error(paths, state, packet)
+            input_errors = packet_input_integrity_errors(
+                paths,
+                state,
+                packet,
+                require_origin=previous_status == "ready",
+            )
+            if contract_error or input_errors:
+                raise HarnessError(
+                    "packet contract/input is missing or tampered: "
+                    + "; ".join(
+                        ([contract_error] if contract_error else []) + input_errors
+                    )
+                )
             command_error = packet_command_integrity_error(packet)
             if command_error:
                 raise HarnessError(command_error)
@@ -6245,6 +6786,18 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             raise HarnessError(
                 "actual model tier differs from requested tier; do not claim routing verification"
             )
+        if args.status == "done":
+            contract_error = packet_contract_integrity_error(paths, state, packet)
+            input_errors = packet_input_integrity_errors(
+                paths, state, packet, require_origin=False
+            )
+            if contract_error or input_errors:
+                raise HarnessError(
+                    "done packet contract/input is missing or tampered: "
+                    + "; ".join(
+                        ([contract_error] if contract_error else []) + input_errors
+                    )
+                )
         if args.status in TERMINAL_PACKET_STATUSES:
             summary = require_text(args.summary or "", "terminal packet summary")
             if args.status in {"done", "failed"} and not args.evidence:
@@ -6452,7 +7005,7 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
     run_id = validate_id(args.run_id, "run id")
     work_root = require_absolute_posix(args.work_root, "work root")
     log = require_absolute_posix(args.log, "log")
-    source_manifest = require_absolute_posix(args.source_manifest, "source manifest")
+    source_manifest = require_absolute_local_path(args.source_manifest, "source manifest")
     tool_path = require_absolute_posix(args.tool_path, "tool path")
     source_sha = require_text(args.source_sha, "source SHA-256").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", source_sha):
@@ -6461,8 +7014,8 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         raise HarnessError("job-start must record status queued before any launch")
     tool_version = require_text(args.tool_version, "tool version")
     command = require_text(args.command, "command")
-    validate_source_receipt(
-        Path(source_manifest),
+    _, source_receipt_data = validate_source_receipt(
+        source_manifest,
         source_sha,
         tool_path=tool_path,
         tool_version=tool_version,
@@ -6511,8 +7064,7 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         receipt_snapshot = (
             task_dir(paths, args.task) / "results" / f"source-receipt-{run_id}.json"
         )
-        receipt_text = Path(source_manifest).read_text(encoding="utf-8")
-        atomic_write_text(receipt_snapshot, receipt_text)
+        atomic_write_bytes(receipt_snapshot, source_receipt_data)
         if sha256_file(receipt_snapshot) != source_sha:
             raise HarnessError("source receipt snapshot SHA-256 changed during copy")
         command_snapshot = (
@@ -6541,7 +7093,7 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "tmux": args.tmux or "",
             "stop_condition": require_text(args.stop_condition, "stop condition"),
             "source_sha": source_sha,
-            "source_manifest": source_manifest,
+            "source_manifest": str(source_manifest),
             "source_receipt_path": str(receipt_snapshot),
             "tool_path": tool_path,
             "tool_version": tool_version,
@@ -6842,7 +7394,7 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
         failures.append("unfinished delegation packets: " + ", ".join(active_packets))
     failures.extend(packet_integrity_errors(paths, state))
     failures.extend(job_integrity_errors(paths, state))
-    failures.extend(verification_integrity_errors(state))
+    failures.extend(verification_integrity_errors(paths, state))
     failures.extend(portfolio_integrity_errors(state, paths))
     unresolved_coordination = [
         str(request.get("request_id"))
@@ -6987,6 +7539,11 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             for packet in state.get("packets", [])
             if packet.get("status") in ACTIVE_PACKET_STATUSES
         ]
+        open_user_escalations = [
+            str(item.get("escalation_id"))
+            for item in state.get("needs_user_escalations", [])
+            if item.get("status") == "needs_user"
+        ]
         failures = []
         if nonterminal:
             failures.append("non-terminal claims: " + ", ".join(nonterminal))
@@ -6994,6 +7551,11 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             failures.append("unresolved jobs: " + ", ".join(active_jobs))
         if active_packets:
             failures.append("unfinished packets: " + ", ".join(active_packets))
+        if open_user_escalations:
+            failures.append(
+                "unresolved needs-user escalations: "
+                + ", ".join(open_user_escalations)
+            )
         if state.get("delivery", {}).get("mode") == "pending":
             failures.append("delivery disposition is pending")
         failures.extend(packet_integrity_errors(paths, state))
@@ -7446,6 +8008,12 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         errors.extend(
             f"task {task_id}: {item}" for item in portfolio_integrity_errors(task, paths)
         )
+        warnings.extend(
+            f"task {task_id}: {item}" for item in packet_integrity_warnings(task)
+        )
+        warnings.extend(
+            f"task {task_id}: {item}" for item in verification_integrity_warnings(task)
+        )
 
         if task.get("status") in {"active", "blocked"}:
             errors.extend(
@@ -7456,7 +8024,8 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 f"task {task_id}: {item}" for item in job_integrity_errors(paths, task)
             )
             errors.extend(
-                f"task {task_id}: {item}" for item in verification_integrity_errors(task)
+                f"task {task_id}: {item}"
+                for item in verification_integrity_errors(paths, task)
             )
         else:
             # Grandfather only records that explicitly predate integrity v1.
@@ -7494,7 +8063,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
                 destination.extend(
                     f"{prefix} {task_id}: {message}"
-                    for message in verification_integrity_errors(verification_state)
+                    for message in verification_integrity_errors(
+                        paths, verification_state
+                    )
                 )
 
         for packet in task.get("packets", []):
@@ -7625,7 +8196,12 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
     if not paths.config.is_file():
         errors.append(f"AOI configuration is missing: {paths.config}")
-    if paths.harness.exists() and stat.S_IMODE(paths.harness.stat().st_mode) & 0o077:
+    if os.name == "nt":
+        warnings.append(
+            "windows_acl_unverified: AOI cannot prove that the state directory ACL "
+            f"is private; restrict access manually: {paths.harness}"
+        )
+    elif paths.harness.exists() and stat.S_IMODE(paths.harness.stat().st_mode) & 0o077:
         errors.append(f"AOI state directory is not private (expected 0700): {paths.harness}")
     if not paths.index.exists():
         warnings.append(f"index has not been rendered: {paths.index}")
@@ -7637,6 +8213,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "warnings": warnings,
         "task_count": len(tasks),
         "claim_count": len(claims),
+        "platform": platform_capabilities(),
     }
     emit(payload, args.json)
     return 0 if not errors else 1
@@ -7654,9 +8231,29 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="initialize AOI in the current Git repository")
-    p.add_argument("--project-name")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--project-name")
+    source.add_argument(
+        "--config",
+        help="initialize from one strictly validated candidate aoi.toml",
+    )
+    p.add_argument(
+        "--expected-config-sha256",
+        help=(
+            "required with --config; fail unless it still matches this "
+            "approved full SHA-256"
+        ),
+    )
     add_json_argument(p)
     p.set_defaults(handler=cmd_init)
+
+    p = sub.add_parser(
+        "config-check",
+        help="validate and summarize a candidate aoi.toml without applying it",
+    )
+    p.add_argument("--file", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_config_check)
 
     p = sub.add_parser(
         "pilot-init",
@@ -7665,6 +8262,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--output", required=True)
     p.add_argument("--force", action="store_true")
+    p.add_argument(
+        "--allow-unverified-windows-acl",
+        action="store_true",
+        help="acknowledge that AOI cannot verify private file ACLs on native Windows",
+    )
     add_json_argument(p)
     p.set_defaults(handler=cmd_pilot_init)
 
@@ -8218,6 +8820,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_argument(p)
     p.set_defaults(handler=cmd_add_verification)
 
+    p = sub.add_parser(
+        "materialize-artifacts",
+        help="snapshot still-valid legacy packet and verification artifacts",
+    )
+    p.add_argument("--task", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_materialize_artifacts)
+
+    p = sub.add_parser(
+        "verification-supersede",
+        help="retire one exact legacy verification in favor of a later valid pass",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--verification-index", type=int, required=True)
+    p.add_argument("--expected-record-sha256", required=True)
+    p.add_argument("--replacement-index", type=int, required=True)
+    p.add_argument("--replacement-record-sha256", required=True)
+    p.add_argument("--reason", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_verification_supersede)
+
     p = sub.add_parser("create-packet")
     p.add_argument("--task", required=True)
     p.add_argument("--packet-id", required=True)
@@ -8383,12 +9006,12 @@ def main(argv: list[str] | None = None) -> int:
             args = parser.parse_args(raw_argv)
             return int(args.handler(args, get_paths()))
         command = next((item for item in raw_argv if not item.startswith("-")), "")
-        if command in {"pilot-init", "pilot-validate", "pilot-summary"}:
+        if command in {"pilot-init", "pilot-validate", "pilot-summary", "config-check"}:
             parser = build_parser()
             args = parser.parse_args(raw_argv)
             return int(args.handler(args, None))
         paths = get_paths()
-        if command not in {"init", ""} and not paths.config.is_file():
+        if command not in {"init", "config-check", ""} and not paths.config.is_file():
             raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
         apply_project_config(paths.project)
         parser = build_parser()
