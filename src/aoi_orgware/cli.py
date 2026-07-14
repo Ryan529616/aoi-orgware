@@ -10,6 +10,7 @@ sys.dont_write_bytecode = True
 
 import argparse
 import copy
+import datetime as dt
 import gzip
 import hashlib
 import importlib.resources
@@ -27,12 +28,19 @@ from typing import Any, Iterable
 
 from . import __version__
 from .config import ProjectConfig, default_config_text, load_config_path
-from .pilot import PilotError, initialize_kit, load_record, write_summary
+from .pilot import (
+    PilotError,
+    _pilot_output_projects,
+    initialize_kit,
+    load_record,
+    write_summary,
+)
 
 from .harnesslib import (
     ACCOUNTED_VERIFICATION_STATUSES,
     ACTIVE_JOB_STATUSES,
     ACTIVE_PACKET_STATUSES,
+    CHIEF_DEFAULT_TTL_SECONDS,
     CLAIM_STATUSES,
     DELIVERY_MODES,
     JOB_STATUSES,
@@ -50,15 +58,17 @@ from .harnesslib import (
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
+    acquire_chief_authority,
     baselines_for_locks,
+    bootstrap_chief_state_lock,
     bump_task,
     canonicalize_no_link_traversal,
     checkpoint_matches,
+    chief_authority_summary,
     claim_path,
     claims_for_task,
     claims_owned_by_task,
     discover_root,
-    ensure_layout,
     find_conflicts,
     fsync_directory,
     get_paths,
@@ -70,6 +80,8 @@ from .harnesslib import (
     load_all_claims,
     load_all_tasks,
     load_claim_file,
+    load_chief_authority,
+    load_chief_credential,
     load_json,
     load_task,
     normalize_lock,
@@ -78,17 +90,23 @@ from .harnesslib import (
     parse_lock,
     parse_time,
     platform_capabilities,
-    paths_for_project,
     preflight_layout,
+    paths_for_project,
     prepare_checkpoint,
+    release_chief_authority,
+    remove_chief_credential,
     record_legacy_decision,
     render_checkpoint,
+    renew_chief_authority,
+    require_complete_layout,
+    require_chief_authority,
     session_path,
     sha256_file,
     state_lock,
     task_dir,
     task_state_path,
     task_summary,
+    takeover_chief_authority,
     validate_id,
     validate_existing_regular_file,
     write_index,
@@ -143,6 +161,10 @@ ROLE_TIER_MAP = {
     "batch": "economical",
 }
 TERMINAL_PACKET_STATUSES = PACKET_STATUSES - ACTIVE_PACKET_STATUSES
+EXECUTING_PACKET_STATUSES = {"armed", "dispatched"}
+EXECUTION_POLICY_VERSION = 2
+TASK_EXECUTION_SCHEMA_VERSION = 2
+NATIVE_V5_PACKET_CONTRACT_MARKER = "- AOI dispatch schema origin: `native_v5`"
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 FULL_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 VERIFICATION_CATEGORIES = {
@@ -171,7 +193,16 @@ CLOSE_QUALIFYING_CATEGORIES = VERIFICATION_CATEGORIES - {
 }
 RECEIPT_COMPONENTS = ("source", "runner", "config", "dependencies", "other")
 REQUIRED_RECEIPT_COMPONENTS = ("source", "runner")
-HOOK_PROTOCOL_VERSION = "5"
+HOOK_PROTOCOL_VERSION = "6"
+DISPATCH_ARM_MAX_SECONDS = 15 * 60
+HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
+ROOT_SESSION_MAPPING_KIND = "root"
+SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
+DISPATCH_PROVENANCES = {
+    "none",
+    "codex_subagent_start_observed",
+    "manual_unverified",
+}
 MINI_MAX_LOCKS = 3
 MINI_FORBIDDEN_REPO_PREFIXES = (
     ".aoi/",
@@ -305,6 +336,57 @@ NEEDS_USER_STATUSES = {"needs_user", "resolved", "cancelled"}
 COOPERATIVE_AUTHORITY_BOUNDARY = (
     "task-bound session assertion only; AOI does not authenticate the caller identity"
 )
+CHIEF_AUTHORITY_CONTROL_COMMANDS = {
+    "chief-acquire",
+    "chief-renew",
+    "chief-release",
+    "chief-takeover",
+}
+CHIEF_PROJECT_READ_ONLY_COMMANDS = {
+    "chief-status",
+    "check-locks",
+    "inspect-legacy",
+    "reconcile",
+    "resume",
+    "status",
+    "verify-backup",
+    "doctor",
+}
+CHIEF_STANDALONE_READ_ONLY_COMMANDS = {
+    "config-check",
+    "pilot-validate",
+}
+CHIEF_STANDALONE_WRITER_COMMANDS = {
+    "pilot-init",
+    "pilot-summary",
+}
+CHIEF_STANDALONE_COMMANDS = (
+    CHIEF_STANDALONE_READ_ONLY_COMMANDS | CHIEF_STANDALONE_WRITER_COMMANDS
+)
+KNOWN_MANAGED_POLICY_SHA256 = {
+    # AOI v0.1.3 packaged policy; safe one-way replacement during authenticated init.
+    "76f116580d535ec33ca19da1e53ec3c3d35c107b05768a55d5ee654f477a3c85",
+}
+
+
+class AOIArgumentParser(argparse.ArgumentParser):
+    """Disable ambiguous long-option abbreviation on every parser level."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+
+def command_requires_chief(command: str, *, initialized: bool) -> bool:
+    """Default-fence every project command not explicitly proven exempt."""
+
+    if command == "init":
+        return initialized
+    return command not in (
+        CHIEF_AUTHORITY_CONTROL_COMMANDS
+        | CHIEF_PROJECT_READ_ONLY_COMMANDS
+        | CHIEF_STANDALONE_READ_ONLY_COMMANDS
+    )
 
 
 def emit(payload: Any, as_json: bool = False) -> None:
@@ -344,6 +426,112 @@ def canonical_record_sha256(value: dict[str, Any]) -> str:
 
 def _is_exact_int(value: Any, expected: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
+def _execution_policy_v2_enabled(state: dict[str, Any]) -> bool:
+    """Return the task-global policy generation, failing closed on downgrade."""
+
+    task_schema = state.get("task_execution_schema_version")
+    policy_version = state.get("execution_policy_version")
+    legacy_provenance_present = "legacy_execution_policy" in state
+    legacy_execution_policy = state.get("legacy_execution_policy")
+    if legacy_provenance_present and not isinstance(legacy_execution_policy, bool):
+        raise HarnessError("legacy_execution_policy must be exactly true or false")
+    if task_schema is not None and not _is_exact_int(
+        task_schema, TASK_EXECUTION_SCHEMA_VERSION
+    ):
+        raise HarnessError(
+            f"task_execution_schema_version must be {TASK_EXECUTION_SCHEMA_VERSION}"
+        )
+    if _is_exact_int(task_schema, TASK_EXECUTION_SCHEMA_VERSION) and not _is_exact_int(
+        policy_version, EXECUTION_POLICY_VERSION
+    ):
+        raise HarnessError(
+            "task execution policy marker is missing or downgraded from schema v2"
+        )
+    v2_artifacts_exist = any(
+        _is_exact_int(item.get("execution_selection_version"), 2)
+        for item in state.get("execution_selections", [])
+    ) or any(
+        item.get("dispatch_schema_origin") == "native_v5"
+        for item in state.get("packets", [])
+    ) or any(
+        _is_exact_int(item.get("task_execution_policy_version"), 2)
+        for item in state.get("jobs", [])
+    )
+    if legacy_execution_policy is False and (
+        not _is_exact_int(task_schema, TASK_EXECUTION_SCHEMA_VERSION)
+        or not _is_exact_int(policy_version, EXECUTION_POLICY_VERSION)
+    ):
+        raise HarnessError(
+            "native execution-policy task lost or downgraded its schema-v2 markers"
+        )
+    if legacy_execution_policy is True:
+        if task_schema is not None or policy_version is not None or v2_artifacts_exist:
+            raise HarnessError(
+                "legacy execution-policy provenance conflicts with v2 execution state"
+            )
+        return False
+    if policy_version is None and v2_artifacts_exist:
+        raise HarnessError(
+            "task execution policy marker is missing while v2 execution artifacts exist"
+        )
+    if policy_version is None:
+        return False
+    if not _is_exact_int(policy_version, EXECUTION_POLICY_VERSION):
+        raise HarnessError(
+            f"execution_policy_version must be {EXECUTION_POLICY_VERSION}"
+        )
+    return True
+
+
+def _adopt_execution_policy_v2_for_new_work(state: dict[str, Any]) -> None:
+    """Upgrade a quiescent legacy task before it creates v0.2 execution work."""
+
+    if _execution_policy_v2_enabled(state):
+        state["legacy_execution_policy"] = False
+        return
+    if state.get("execution_selections"):
+        raise HarnessError(
+            "legacy task already has execution selections; finish it under the legacy "
+            "policy or start a new task before creating v0.2 execution work"
+        )
+    active_records = [
+        f"packet:{item.get('packet_id')}"
+        for item in state.get("packets", [])
+        if item.get("status") in ACTIVE_PACKET_STATUSES
+    ] + [
+        f"job:{item.get('run_id')}"
+        for item in state.get("jobs", [])
+        if item.get("status") in ACTIVE_JOB_STATUSES
+    ]
+    if active_records:
+        raise HarnessError(
+            "legacy task must be quiescent before adopting execution policy v2: "
+            + ", ".join(active_records)
+        )
+    state["task_execution_schema_version"] = TASK_EXECUTION_SCHEMA_VERSION
+    state["execution_policy_version"] = EXECUTION_POLICY_VERSION
+    state["legacy_execution_policy"] = False
+
+
+def _adopt_legacy_execution_provenance_for_v4_migration(
+    state: dict[str, Any],
+) -> None:
+    """Seal a clean pre-marker task as legacy before its one-way v4 upgrade."""
+
+    provenance = state.get("legacy_execution_policy")
+    if provenance is False:
+        raise HarnessError(
+            "schema-v4 migration is forbidden for a native execution-policy task"
+        )
+    if provenance is not None and provenance is not True:
+        raise HarnessError("legacy_execution_policy must be exactly true or false")
+    if _execution_policy_v2_enabled(state):
+        raise HarnessError(
+            "schema-v4 migration requires an explicitly legacy execution-policy task"
+        )
+    state["legacy_execution_policy"] = True
 
 
 def _is_canonical_snapshot_version(value: Any) -> bool:
@@ -1050,6 +1238,502 @@ def _validate_active_execution_selection(
     return selection
 
 
+def _lane_authority_snapshot(lane: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lane_id": lane["lane_id"],
+        "revision": lane["revision"],
+        "authority_commit": lane["authority_commit"],
+        "contract_version": lane["contract_version"],
+    }
+
+
+def _is_steward_synthesis_packet(packet: dict[str, Any]) -> bool:
+    return packet.get("packet_purpose") == "steward_synthesis"
+
+
+def _selection_synthesis_freeze_packet_ids(
+    state: dict[str, Any], selection_id: str
+) -> list[str]:
+    return sorted(
+        str(packet.get("packet_id", ""))
+        for packet in state.get("packets", [])
+        if packet.get("execution_selection_id") == selection_id
+        and _is_steward_synthesis_packet(packet)
+        and packet.get("status") not in {"failed", "cancelled"}
+    )
+
+
+def _validate_steward_synthesis_dispatch(
+    state: dict[str, Any], packet: dict[str, Any]
+) -> dict[str, Any]:
+    selection_id = str(packet.get("execution_selection_id", ""))
+    selection = execution_selection_by_id(state, selection_id)
+    if (
+        selection.get("status") != "active"
+        or not _is_exact_int(selection.get("execution_selection_version"), 2)
+        or selection.get("mode") not in {"centralized_parallel", "hybrid"}
+    ):
+        raise HarnessError(
+            "Steward synthesis requires an active parallel/hybrid selection v2"
+        )
+    selected_steward = selection.get("steward_snapshot", {})
+    current_steward = _engaged_steward_lane(state)
+    if (
+        not isinstance(selected_steward, dict)
+        or not selected_steward
+        or packet.get("lane_id") != selected_steward.get("lane_id")
+        or packet.get("steward_selection_snapshot") != selected_steward
+        or packet.get("steward_execution_snapshot")
+        != _lane_authority_snapshot(current_steward)
+    ):
+        raise HarnessError("Steward synthesis authority snapshot is stale or mismatched")
+    bindings = _selection_terminal_packet_bindings(state, selection_id)
+    if not bindings or packet.get("steward_input_bindings") != bindings:
+        raise HarnessError("Steward synthesis specialist result bindings are stale")
+    selected_lane_ids = {
+        str(item.get("lane_id", "")) for item in selection.get("lane_snapshots", [])
+    }
+    if {item["lane_id"] for item in bindings} != selected_lane_ids:
+        raise HarnessError(
+            "Steward synthesis requires terminal specialist evidence from every selected lane"
+        )
+    unfinished = [
+        str(item.get("packet_id", ""))
+        for item in state.get("packets", [])
+        if item.get("packet_id") != packet.get("packet_id")
+        and item.get("execution_selection_id") == selection_id
+        and not _is_steward_synthesis_packet(item)
+        and item.get("status") in ACTIVE_PACKET_STATUSES
+    ]
+    active_jobs = [
+        str(item.get("run_id", ""))
+        for item in state.get("jobs", [])
+        if item.get("execution_selection_id") == selection_id
+        and item.get("status") in ACTIVE_JOB_STATUSES
+    ]
+    if unfinished or active_jobs:
+        raise HarnessError(
+            "Steward synthesis requires terminal specialist work: "
+            + ", ".join(unfinished + active_jobs)
+        )
+    return selection
+
+
+def _validate_dispatch_selection(
+    state: dict[str, Any], packet: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Validate the exact topology contract used by a packet activation."""
+
+    if _is_steward_synthesis_packet(packet):
+        return _validate_steward_synthesis_dispatch(state, packet)
+    selection = _validate_active_execution_selection(
+        state,
+        str(packet.get("lane_id", "")),
+        str(packet.get("execution_selection_id", "")),
+    )
+    if selection is None:
+        return None
+    if not _is_exact_int(selection.get("execution_selection_version"), 2):
+        raise HarnessError(
+            "packet activation requires execution selection v2; supersede the legacy selection"
+        )
+    mode = str(selection.get("mode", ""))
+    steward_snapshot = selection.get("steward_snapshot", {})
+    if mode == "single":
+        if steward_snapshot not in ({}, None):
+            raise HarnessError("single execution selection may not carry a Steward snapshot")
+        return selection
+    if mode not in {"centralized_parallel", "hybrid"}:
+        raise HarnessError("execution selection has an invalid dispatch mode")
+    if not isinstance(steward_snapshot, dict) or not steward_snapshot:
+        raise HarnessError("parallel execution selection lacks its Steward snapshot")
+    steward = _engaged_steward_lane(state)
+    if steward_snapshot != _lane_authority_snapshot(steward):
+        raise HarnessError(
+            "execution selection Steward snapshot is stale; select topology again"
+        )
+    selected_lane_ids = {
+        str(item.get("lane_id", "")) for item in selection.get("lane_snapshots", [])
+    }
+    if steward["lane_id"] in selected_lane_ids:
+        raise HarnessError("parallel specialist lanes may not include the Steward lane")
+    return selection
+
+
+def _packet_by_id(state: dict[str, Any], packet_id: str) -> dict[str, Any]:
+    matches = [
+        packet
+        for packet in state.get("packets", [])
+        if packet.get("packet_id") == packet_id
+    ]
+    if len(matches) != 1:
+        raise HarnessError(
+            f"expected exactly one packet named {packet_id}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def _validate_packet_activation_topology(
+    state: dict[str, Any], packet: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Fence active packet chains; ready packets remain pre-buildable."""
+
+    selection = _validate_dispatch_selection(state, packet)
+    packet_id = str(packet.get("packet_id", ""))
+    depth = int(packet.get("delegation_depth", 1))
+    executing = [
+        item
+        for item in state.get("packets", [])
+        if item.get("packet_id") != packet_id
+        and item.get("status") in EXECUTING_PACKET_STATUSES
+    ]
+    standalone_jobs = [
+        item
+        for item in state.get("jobs", [])
+        if item.get("status") in ACTIVE_JOB_STATUSES
+        and not str(item.get("owner_packet_id", ""))
+    ]
+
+    def chain_names(
+        packets: list[dict[str, Any]], jobs: list[dict[str, Any]]
+    ) -> str:
+        return ", ".join(
+            [str(item.get("packet_id")) for item in packets]
+            + [f"job:{item.get('run_id')}" for item in jobs]
+        )
+
+    selection_id = str(packet.get("execution_selection_id", ""))
+    lane_id = str(packet.get("lane_id", ""))
+    if depth == 1:
+        peers = [
+            item
+            for item in executing
+            if int(item.get("delegation_depth", 1)) == 1
+        ]
+        if _is_steward_synthesis_packet(packet):
+            if peers or standalone_jobs:
+                raise HarnessError(
+                    "Steward synthesis is sequential and requires an empty task execution epoch: "
+                    + chain_names(peers, standalone_jobs)
+                )
+            return selection
+        if _execution_policy_v2_enabled(state):
+            synthesis_peers = [
+                item for item in peers if _is_steward_synthesis_packet(item)
+            ]
+            if synthesis_peers:
+                raise HarnessError(
+                    "Steward synthesis already occupies the sequential execution phase: "
+                    + ", ".join(
+                        str(item.get("packet_id")) for item in synthesis_peers
+                    )
+                )
+            if selection is None:
+                if peers or standalone_jobs:
+                    raise HarnessError(
+                        "implicit single execution already has an active depth-one "
+                        "packet chain: "
+                        + chain_names(peers, standalone_jobs)
+                    )
+                return None
+            foreign = [
+                item
+                for item in peers
+                if str(item.get("execution_selection_id", "")) != selection_id
+            ]
+            if foreign:
+                raise HarnessError(
+                    "task-global execution epoch is already occupied by another "
+                    "selection/implicit chain: "
+                    + ", ".join(str(item.get("packet_id")) for item in foreign)
+                )
+            foreign_jobs = [
+                item
+                for item in standalone_jobs
+                if str(item.get("execution_selection_id", "")) != selection_id
+            ]
+            if foreign_jobs:
+                raise HarnessError(
+                    "task-global execution epoch is already occupied by another "
+                    "selection/implicit job chain: "
+                    + chain_names([], foreign_jobs)
+                )
+            mode = str(selection.get("mode", "single"))
+            if mode == "single" and (peers or standalone_jobs):
+                raise HarnessError(
+                    "single execution mode already has an active depth-one packet chain: "
+                    + chain_names(peers, standalone_jobs)
+                )
+            if mode in {"centralized_parallel", "hybrid"}:
+                same_lane = [item for item in peers if item.get("lane_id") == lane_id]
+                same_lane_jobs = [
+                    item for item in standalone_jobs if item.get("lane_id") == lane_id
+                ]
+                if same_lane or same_lane_jobs:
+                    raise HarnessError(
+                        "parallel execution mode already has an active depth-one chain in lane "
+                        f"{lane_id}: "
+                        + chain_names(same_lane, same_lane_jobs)
+                    )
+            return selection
+        if selection is None:
+            # Legacy/unselected tasks retain their prior cooperative behavior.
+            # Once a task selects topology, v2 activation rules are mandatory.
+            return None
+        peers = [
+            item
+            for item in executing
+            if int(item.get("delegation_depth", 1)) == 1
+            and str(item.get("execution_selection_id", "")) == selection_id
+        ]
+        selection_jobs = [
+            item
+            for item in standalone_jobs
+            if str(item.get("execution_selection_id", "")) == selection_id
+        ]
+        mode = str(selection.get("mode", "single")) if selection else "single"
+        if mode == "single" and (peers or selection_jobs):
+            raise HarnessError(
+                "single execution mode already has an active depth-one packet chain: "
+                + chain_names(peers, selection_jobs)
+            )
+        if mode in {"centralized_parallel", "hybrid"}:
+            same_lane = [item for item in peers if item.get("lane_id") == lane_id]
+            same_lane_jobs = [
+                item for item in selection_jobs if item.get("lane_id") == lane_id
+            ]
+            if same_lane or same_lane_jobs:
+                raise HarnessError(
+                    "parallel execution mode already has an active depth-one chain in lane "
+                    f"{lane_id}: "
+                    + chain_names(same_lane, same_lane_jobs)
+                )
+        return selection
+    if depth != 2:
+        raise HarnessError("packet delegation depth is invalid")
+    parent_id = str(packet.get("parent_packet_id", ""))
+    parent = _packet_by_id(state, parent_id)
+    if (
+        parent.get("status") != "dispatched"
+        or int(parent.get("delegation_depth", 1)) != 1
+        or str(parent.get("lane_id", "")) != lane_id
+        or str(parent.get("execution_selection_id", "")) != selection_id
+    ):
+        raise HarnessError(
+            "depth-two activation requires its dispatched depth-one parent in the same lane"
+        )
+    siblings = [
+        item
+        for item in executing
+        if int(item.get("delegation_depth", 1)) == 2
+        and item.get("parent_packet_id") == parent_id
+    ]
+    if siblings:
+        raise HarnessError(
+            "depth-two parent already has an active child: "
+            + ", ".join(str(item.get("packet_id")) for item in siblings)
+        )
+    return selection
+
+
+def _validate_owned_job_authority(
+    paths: HarnessPaths | None,
+    state: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    require_dispatched: bool,
+) -> dict[str, Any]:
+    """Recompute the physical and semantic authority for one owned job."""
+
+    run_id = str(job.get("run_id", ""))
+    owner_packet_id = str(job.get("owner_packet_id", ""))
+    owner = _packet_by_id(state, owner_packet_id)
+    if (
+        int(owner.get("delegation_depth", 1)) != 1
+        or _is_steward_synthesis_packet(owner)
+        or owner.get("packet_mode") not in {"bounded_mutation", "exact_command"}
+        or str(owner.get("lane_id", "")) != str(job.get("lane_id", ""))
+        or str(owner.get("execution_selection_id", ""))
+        != str(job.get("execution_selection_id", ""))
+    ):
+        raise HarnessError(
+            "external job owner must be a depth-one mutation packet in the same "
+            "lane and execution selection"
+        )
+    if require_dispatched and owner.get("status") != "dispatched":
+        raise HarnessError("active external job owner packet is not dispatched")
+    if job.get("owner_packet_contract_sha256") != owner.get(
+        "packet_contract_sha256", ""
+    ):
+        raise HarnessError("external job owner packet contract binding changed")
+    if paths is not None:
+        authority_errors = packet_authority_integrity_errors(
+            paths,
+            state,
+            owner,
+            require_origin=False,
+        )
+        if authority_errors:
+            raise HarnessError(
+                "external job owner packet authority is missing or tampered: "
+                + "; ".join(authority_errors)
+            )
+        namespace = paths.project.external_lock_namespace
+        if job.get("external_lock_namespace") != namespace:
+            raise HarnessError(
+                f"external job {run_id} lost its external lock namespace binding"
+            )
+        required_output_locks = [
+            f"{namespace}:tree:{job.get('work_root', '')}",
+            f"{namespace}:file:{job.get('log', '')}",
+        ]
+        if job.get("required_output_locks") != required_output_locks:
+            raise HarnessError(
+                f"external job {run_id} required output locks are non-canonical or changed"
+            )
+        uncovered = [
+            lock
+            for lock in required_output_locks
+            if not any(
+                lock_covers(held, lock) for held in owner.get("locks", [])
+            )
+        ]
+        if uncovered:
+            raise HarnessError(
+                "external job output paths exceed the owner packet locks: "
+                + ", ".join(uncovered)
+            )
+    if (
+        owner.get("packet_mode") == "exact_command"
+        and owner.get("command_sha256") != job.get("command_sha256")
+    ):
+        raise HarnessError(
+            "external job command differs from its exact-command owner packet"
+        )
+    return owner
+
+
+def _validate_job_activation_topology(
+    state: dict[str, Any],
+    job: dict[str, Any],
+    selection: dict[str, Any] | None,
+    *,
+    paths: HarnessPaths | None = None,
+    exclude_run_id: str = "",
+) -> dict[str, Any] | None:
+    """Bind an external job to one depth-one chain or make it that chain."""
+
+    selection_id = str(job.get("execution_selection_id", ""))
+    lane_id = str(job.get("lane_id", ""))
+    owner_packet_id = str(job.get("owner_packet_id", ""))
+    if owner_packet_id:
+        owner = _validate_owned_job_authority(
+            paths, state, job, require_dispatched=True
+        )
+        _validate_packet_activation_topology(state, owner)
+        return selection
+
+    packet_chains = [
+        packet
+        for packet in state.get("packets", [])
+        if packet.get("status") in EXECUTING_PACKET_STATUSES
+        and int(packet.get("delegation_depth", 1)) == 1
+    ]
+    job_chains = [
+        item
+        for item in state.get("jobs", [])
+        if item.get("status") in ACTIVE_JOB_STATUSES
+        and not str(item.get("owner_packet_id", ""))
+        and str(item.get("run_id", "")) != exclude_run_id
+    ]
+
+    def names(
+        packets: list[dict[str, Any]], jobs: list[dict[str, Any]]
+    ) -> str:
+        return ", ".join(
+            [f"packet:{item.get('packet_id')}" for item in packets]
+            + [f"job:{item.get('run_id')}" for item in jobs]
+        )
+
+    if _execution_policy_v2_enabled(state):
+        if selection is None:
+            if packet_chains or job_chains:
+                raise HarnessError(
+                    "implicit single execution already has an active chain: "
+                    + names(packet_chains, job_chains)
+                )
+            return None
+        foreign_packets = [
+            item
+            for item in packet_chains
+            if str(item.get("execution_selection_id", "")) != selection_id
+        ]
+        foreign_jobs = [
+            item
+            for item in job_chains
+            if str(item.get("execution_selection_id", "")) != selection_id
+        ]
+        if foreign_packets or foreign_jobs:
+            raise HarnessError(
+                "task-global execution epoch is already occupied by another "
+                "selection/implicit chain: "
+                + names(foreign_packets, foreign_jobs)
+            )
+        mode = str(selection.get("mode", "single"))
+        if mode == "single" and (packet_chains or job_chains):
+            raise HarnessError(
+                "single execution mode already has an active chain: "
+                + names(packet_chains, job_chains)
+            )
+        if mode in {"centralized_parallel", "hybrid"}:
+            same_lane_packets = [
+                item for item in packet_chains if item.get("lane_id") == lane_id
+            ]
+            same_lane_jobs = [
+                item for item in job_chains if item.get("lane_id") == lane_id
+            ]
+            if same_lane_packets or same_lane_jobs:
+                raise HarnessError(
+                    "parallel execution mode already has an active chain in lane "
+                    f"{lane_id}: "
+                    + names(same_lane_packets, same_lane_jobs)
+                )
+        return selection
+
+    if selection is None:
+        return None
+    same_selection_packets = [
+        item
+        for item in packet_chains
+        if str(item.get("execution_selection_id", "")) == selection_id
+    ]
+    same_selection_jobs = [
+        item
+        for item in job_chains
+        if str(item.get("execution_selection_id", "")) == selection_id
+    ]
+    mode = str(selection.get("mode", "single"))
+    if mode == "single" and (same_selection_packets or same_selection_jobs):
+        raise HarnessError(
+            "single execution mode already has an active chain: "
+            + names(same_selection_packets, same_selection_jobs)
+        )
+    if mode in {"centralized_parallel", "hybrid"}:
+        same_lane_packets = [
+            item for item in same_selection_packets if item.get("lane_id") == lane_id
+        ]
+        same_lane_jobs = [
+            item for item in same_selection_jobs if item.get("lane_id") == lane_id
+        ]
+        if same_lane_packets or same_lane_jobs:
+            raise HarnessError(
+                "parallel execution mode already has an active chain in lane "
+                f"{lane_id}: "
+                + names(same_lane_packets, same_lane_jobs)
+            )
+    return selection
+
+
 def cross_lane_session_by_id(state: dict[str, Any], session_id: str) -> dict[str, Any]:
     session_id = validate_id(session_id, "cross-lane session id")
     matches = [
@@ -1088,7 +1772,11 @@ def require_root_session(
             "root arbitration requires a cooperatively asserted session bound to this task"
         )
     mapping = load_json(session_path(paths, session_id))
-    if mapping.get("task_id") != state.get("task_id"):
+    if (
+        mapping.get("task_id") != state.get("task_id")
+        or mapping.get("mapping_kind", ROOT_SESSION_MAPPING_KIND)
+        != ROOT_SESSION_MAPPING_KIND
+    ):
         raise HarnessError("root arbitration session mapping does not match this task")
     return session_id
 
@@ -1426,6 +2114,11 @@ def portfolio_integrity_errors(
     escalations = state.get("needs_user_escalations", [])
     if any((selections, cross_sessions, escalations)) and state.get("execution_model_version") != 1:
         errors.append("execution governance records require execution_model_version=1")
+    try:
+        policy_v2 = _execution_policy_v2_enabled(state)
+    except HarnessError as exc:
+        errors.append(str(exc))
+        policy_v2 = False
     selection_ids: set[str] = set()
     active_work_units: set[str] = set()
     for selection in selections:
@@ -1457,6 +2150,20 @@ def portfolio_integrity_errors(
             )
         mode = selection.get("mode")
         snapshots = selection.get("lane_snapshots", [])
+        selection_version = selection.get("execution_selection_version")
+        if policy_v2 and not _is_exact_int(selection_version, 2):
+            errors.append(
+                f"execution selection {selection_id} is not sealed as version 2 "
+                "under task execution policy v2"
+            )
+        elif selection_version is None and "steward_snapshot" in selection:
+            errors.append(
+                f"execution selection {selection_id} has v2-only fields without a selection version"
+            )
+        if selection_version is not None and not _is_exact_int(selection_version, 2):
+            errors.append(
+                f"execution selection {selection_id} has an invalid selection version"
+            )
         if mode not in EXECUTION_MODES:
             errors.append(f"execution selection {selection_id} has invalid mode")
         if mode == "single" and len(snapshots) != 1:
@@ -1469,6 +2176,32 @@ def portfolio_integrity_errors(
         for snapshot in snapshots:
             if snapshot.get("lane_id") not in lane_ids:
                 errors.append(f"execution selection {selection_id} references missing lane")
+        if _is_exact_int(selection_version, 2):
+            steward_snapshot = selection.get("steward_snapshot")
+            if mode == "single" and steward_snapshot != {}:
+                errors.append(
+                    f"execution selection {selection_id} single mode carries a Steward snapshot"
+                )
+            if mode in {"centralized_parallel", "hybrid"}:
+                if not isinstance(steward_snapshot, dict) or not steward_snapshot:
+                    errors.append(
+                        f"execution selection {selection_id} parallel mode lacks a Steward snapshot"
+                    )
+                else:
+                    steward_lane_id = steward_snapshot.get("lane_id")
+                    steward_matches = [
+                        lane
+                        for lane in state.get("lanes", [])
+                        if lane.get("lane_id") == steward_lane_id
+                    ]
+                    if (
+                        len(steward_matches) != 1
+                        or steward_matches[0].get("kind") != "coordination_steward"
+                        or steward_lane_id in snapshot_lane_ids
+                    ):
+                        errors.append(
+                            f"execution selection {selection_id} has an invalid Steward binding"
+                        )
         if selection.get("root_session_id") not in state.get("session_ids", []):
             errors.append(f"execution selection {selection_id} lacks task-bound Chief session")
     for selection in selections:
@@ -1485,6 +2218,71 @@ def portfolio_integrity_errors(
     selection_by_id = {
         str(item.get("selection_id")): item for item in selections
     }
+    brief_ids: set[str] = set()
+    for brief in state.get("execution_briefs", []):
+        brief_id = str(brief.get("brief_id", ""))
+        if brief_id in brief_ids:
+            errors.append(f"duplicate execution brief id {brief_id}")
+        brief_ids.add(brief_id)
+        selection_id = str(brief.get("execution_selection_id", ""))
+        selection = selection_by_id.get(selection_id)
+        selected_steward = (
+            selection.get("steward_snapshot", {})
+            if isinstance(selection, dict)
+            else {}
+        )
+        if not isinstance(selected_steward, dict):
+            selected_steward = {}
+        preimage = copy.deepcopy(brief)
+        stored_sha = str(preimage.pop("brief_sha256", ""))
+        brief_version = brief.get("brief_version")
+        if (
+            not _is_exact_int(brief.get("integrity_version"), 1)
+            or not any(_is_exact_int(brief_version, version) for version in (1, 2, 3))
+            or not re.fullmatch(r"[0-9a-f]{64}", stored_sha)
+            or stored_sha != canonical_record_sha256(preimage)
+        ):
+            errors.append(f"execution brief {brief_id} lost integrity")
+        if (
+            selection is None
+            or selection.get("mode") not in {"centralized_parallel", "hybrid"}
+            or brief.get("mode") != selection.get("mode")
+            or brief.get("steward_snapshot") != selection.get("steward_snapshot")
+        ):
+            errors.append(f"execution brief {brief_id} has an invalid selection binding")
+        if not isinstance(brief.get("packet_bindings"), list):
+            errors.append(f"execution brief {brief_id} packet bindings are malformed")
+        if any(_is_exact_int(brief_version, version) for version in (2, 3)):
+            recording_steward = brief.get("recording_steward_snapshot")
+            if (
+                not isinstance(recording_steward, dict)
+                or recording_steward.get("lane_id")
+                != selected_steward.get("lane_id")
+            ):
+                errors.append(
+                    f"execution brief {brief_id} lacks its recording Steward binding"
+                )
+        if _is_exact_int(brief_version, 3):
+            stored_binding = brief.get("steward_packet_binding")
+            try:
+                current_binding = _steward_packet_binding(
+                    state,
+                    selection_id,
+                    str(stored_binding.get("packet_id", ""))
+                    if isinstance(stored_binding, dict)
+                    else "",
+                )
+            except HarnessError as exc:
+                errors.append(
+                    f"execution brief {brief_id} has an invalid Steward packet binding: {exc}"
+                )
+            else:
+                if stored_binding != current_binding:
+                    errors.append(
+                        f"execution brief {brief_id} Steward packet binding is stale"
+                    )
+        if brief.get("root_session_id") not in state.get("session_ids", []):
+            errors.append(f"execution brief {brief_id} lacks task-bound Chief session")
     for record_kind, records, active_statuses, identity_field in (
         ("packet", state.get("packets", []), ACTIVE_PACKET_STATUSES, "packet_id"),
         ("job", state.get("jobs", []), ACTIVE_JOB_STATUSES, "run_id"),
@@ -1518,7 +2316,23 @@ def portfolio_integrity_errors(
                     str(item.get("lane_id"))
                     for item in selection_by_id[selection_id].get("lane_snapshots", [])
                 }
-                if record.get("lane_id") not in selection_lane_ids:
+                is_steward_packet = (
+                    record_kind == "packet"
+                    and _is_steward_synthesis_packet(record)
+                )
+                selected_steward_snapshot = selection_by_id[selection_id].get(
+                    "steward_snapshot", {}
+                )
+                selected_steward_lane = (
+                    str(selected_steward_snapshot.get("lane_id", ""))
+                    if isinstance(selected_steward_snapshot, dict)
+                    else ""
+                )
+                if is_steward_packet:
+                    lane_valid = record.get("lane_id") == selected_steward_lane
+                else:
+                    lane_valid = record.get("lane_id") in selection_lane_ids
+                if not lane_valid:
                     errors.append(
                         f"{record_kind} {record.get(identity_field)} lane is outside its execution selection"
                     )
@@ -1544,6 +2358,35 @@ def portfolio_integrity_errors(
                 errors.append(f"{record_kind} {record.get(identity_field)}: {exc}")
             if record_kind == "job":
                 errors.extend(_job_launch_authority_errors(state, record))
+    for packet in state.get("packets", []):
+        if packet.get("status") not in EXECUTING_PACKET_STATUSES:
+            continue
+        try:
+            _validate_packet_activation_topology(state, packet)
+        except (HarnessError, TypeError, ValueError) as exc:
+            errors.append(
+                f"packet {packet.get('packet_id')} violates execution topology: {exc}"
+            )
+    for job in state.get("jobs", []):
+        if job.get("status") not in ACTIVE_JOB_STATUSES:
+            continue
+        try:
+            selection = _validate_active_execution_selection(
+                state,
+                str(job.get("lane_id", "")),
+                str(job.get("execution_selection_id", "")),
+            )
+            _validate_job_activation_topology(
+                state,
+                job,
+                selection,
+                paths=paths,
+                exclude_run_id=str(job.get("run_id", "")),
+            )
+        except (HarnessError, TypeError, ValueError) as exc:
+            errors.append(
+                f"job {job.get('run_id')} violates execution topology: {exc}"
+            )
     cross_ids: set[str] = set()
     for item in cross_sessions:
         cross_id = str(item.get("cross_lane_session_id", ""))
@@ -1789,6 +2632,20 @@ def packet_contract_integrity_error(
         return f"packet {packet_id} contract is missing or tampered: {exc}"
     if hashlib.sha256(data).hexdigest() != expected_sha:
         return f"packet {packet_id} contract SHA-256 mismatch"
+    contract_lines = data.decode("utf-8").splitlines()
+    has_native_v5_marker = NATIVE_V5_PACKET_CONTRACT_MARKER in contract_lines
+    dispatch_origin = packet.get("dispatch_schema_origin")
+    if schema_version < 5 and (
+        has_native_v5_marker or dispatch_origin == "native_v5"
+    ):
+        return f"packet {packet_id} native-v5 contract was downgraded to a legacy schema"
+    if schema_version >= 5:
+        if dispatch_origin == "native_v5" and not has_native_v5_marker:
+            return f"packet {packet_id} native-v5 dispatch origin lost its contract marker"
+        if dispatch_origin == "legacy_v4_migration" and has_native_v5_marker:
+            return f"packet {packet_id} falsely claims a legacy-v4 dispatch migration"
+        if dispatch_origin not in {"native_v5", "legacy_v4_migration"}:
+            return f"packet {packet_id} dispatch schema origin is missing or invalid"
     return None
 
 
@@ -1852,6 +2709,14 @@ def packet_integrity_warnings(state: dict[str, Any]) -> list[str]:
                 f"packet {packet_id} has legacy digest-only inputs; "
                 "failed/cancelled live origins are not revalidated"
             )
+        if (
+            schema_version is not None
+            and schema_version < 5
+            and packet.get("status") in {"dispatched", "done", "failed", "cancelled"}
+        ):
+            warnings.append(
+                f"packet {packet_id} dispatch timing/provenance is legacy_unverified"
+            )
         legacy_recovery_fields = {
             "version",
             "method",
@@ -1881,6 +2746,29 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
         status = packet.get("status")
         mode = packet.get("packet_mode", "legacy")
         locks = packet.get("locks", [])
+        packet_purpose = packet.get("packet_purpose", "work")
+        if packet_purpose not in {"work", "steward_synthesis"}:
+            errors.append(f"packet {packet_id} has an invalid packet purpose")
+        if packet_purpose == "steward_synthesis":
+            if (
+                int(packet.get("delegation_depth", 1)) != 1
+                or mode != "read_only"
+                or not packet.get("execution_selection_id")
+                or not isinstance(packet.get("steward_selection_snapshot"), dict)
+                or not isinstance(packet.get("steward_execution_snapshot"), dict)
+                or not isinstance(packet.get("steward_input_bindings"), list)
+            ):
+                errors.append(
+                    f"packet {packet_id} has malformed Steward synthesis authority"
+                )
+            if status not in {"failed", "cancelled"} and packet.get(
+                "steward_input_bindings"
+            ) != _selection_terminal_packet_bindings(
+                state, str(packet.get("execution_selection_id", ""))
+            ):
+                errors.append(
+                    f"packet {packet_id} Steward synthesis specialist bindings are stale"
+                )
         if mode == "read_only" and locks:
             errors.append(f"packet {packet_id} read_only mode has mutation locks")
         if mode in {"bounded_mutation", "exact_command"} and not locks:
@@ -1911,7 +2799,7 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
                     paths,
                     state,
                     packet,
-                    require_origin=status == "ready",
+                    require_origin=status in {"ready", "armed"},
                 )
             )
         command_error = packet_command_integrity_error(packet)
@@ -1922,6 +2810,228 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
             continue
         if status == "dispatched" and not packet.get("agent_id"):
             errors.append(f"packet {packet_id} is dispatched without an agent id")
+        if schema_version is not None and schema_version >= 5:
+            if (
+                not _is_exact_int(packet.get("dispatch_version"), 1)
+                or packet.get("dispatch_provenance") not in DISPATCH_PROVENANCES
+                or not isinstance(packet.get("dispatch_attempts"), list)
+            ):
+                errors.append(f"packet {packet_id} dispatch schema is invalid")
+            if packet.get("dispatched_at"):
+                errors.append(
+                    f"packet {packet_id} v5 must not claim an unobserved dispatched_at"
+                )
+            attempts = packet.get("dispatch_attempts", [])
+            active_attempts = [
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, dict) and attempt.get("status") == "armed"
+            ]
+            if status == "armed" and len(active_attempts) != 1:
+                errors.append(f"packet {packet_id} armed state lacks one active permit")
+            if status != "armed" and active_attempts:
+                errors.append(f"packet {packet_id} retains an active permit after arm state")
+            for attempt_index, attempt in enumerate(attempts, start=1):
+                if not isinstance(attempt, dict):
+                    errors.append(
+                        f"packet {packet_id} dispatch attempt {attempt_index} is malformed"
+                    )
+                    continue
+                attempt_status = attempt.get("status")
+                if attempt.get("arm_authority_sha256") != (
+                    _dispatch_attempt_authority_sha256(attempt)
+                ):
+                    errors.append(
+                        f"packet {packet_id} dispatch attempt {attempt_index} lost authority integrity"
+                    )
+                if attempt_status not in {
+                    "armed",
+                    "consumed",
+                    "disarmed",
+                    "expired",
+                }:
+                    errors.append(
+                        f"packet {packet_id} dispatch attempt {attempt_index} has invalid status"
+                    )
+                    continue
+                if (
+                    not _is_exact_int(attempt.get("attempt"), attempt_index)
+                    or attempt.get("arm_id") != f"{packet_id}-a{attempt_index}"
+                ):
+                    errors.append(
+                        f"packet {packet_id} dispatch attempt {attempt_index} has invalid sequence identity"
+                    )
+                armed_time = parse_time(str(attempt.get("armed_at", "")))
+                expiry_time = parse_time(str(attempt.get("expires_at", "")))
+                if (
+                    armed_time is None
+                    or expiry_time is None
+                    or expiry_time <= armed_time
+                    or expiry_time - armed_time
+                    > dt.timedelta(seconds=DISPATCH_ARM_MAX_SECONDS)
+                ):
+                    errors.append(
+                        f"packet {packet_id} dispatch attempt {attempt_index} has invalid arm timing"
+                    )
+                observation = attempt.get("observation")
+                closed_at = str(attempt.get("closed_at", ""))
+                reason = str(attempt.get("reason", ""))
+                if attempt_status == "armed":
+                    if (
+                        expiry_time is not None
+                        and expiry_time <= dt.datetime.now().astimezone()
+                    ):
+                        errors.append(
+                            f"packet {packet_id} active dispatch attempt {attempt_index} is expired"
+                        )
+                    if observation is not None or closed_at or reason:
+                        errors.append(
+                            f"packet {packet_id} active dispatch attempt {attempt_index} carries closure data"
+                        )
+                elif attempt_status == "consumed":
+                    required_observation_fields = {
+                        "event_id",
+                        "hook_protocol_version",
+                        "parent_session_id",
+                        "turn_id",
+                        "agent_id",
+                        "agent_type",
+                        "permission_mode",
+                        "observed_at",
+                    }
+                    if (
+                        not isinstance(observation, dict)
+                        or set(observation) != required_observation_fields
+                    ):
+                        errors.append(
+                            f"packet {packet_id} consumed dispatch attempt {attempt_index} has an invalid observation schema"
+                        )
+                    else:
+                        observation_time = parse_time(
+                            str(observation.get("observed_at", ""))
+                        )
+                        observation_payload = {
+                            "session_id": observation.get("parent_session_id", ""),
+                            "turn_id": observation.get("turn_id", ""),
+                            "agent_id": observation.get("agent_id", ""),
+                            "agent_type": observation.get("agent_type", ""),
+                        }
+                        if (
+                            not _is_exact_int(
+                                observation.get("hook_protocol_version"),
+                                int(HOOK_PROTOCOL_VERSION),
+                            )
+                            or observation_time is None
+                            or closed_at != observation.get("observed_at")
+                            or reason
+                            or observation.get("event_id")
+                            != _subagent_event_id(observation_payload)
+                            or observation.get("parent_session_id")
+                            != attempt.get("parent_session_id")
+                            or observation.get("agent_type")
+                            != attempt.get("expected_agent_type")
+                            or not HOOK_ID_RE.fullmatch(
+                                str(observation.get("parent_session_id", ""))
+                            )
+                            or not HOOK_ID_RE.fullmatch(
+                                str(observation.get("agent_id", ""))
+                            )
+                            or not HOOK_ID_RE.fullmatch(
+                                str(observation.get("agent_type", ""))
+                            )
+                            or not isinstance(observation.get("turn_id"), str)
+                            or _safe_hook_observation_text(
+                                observation.get("turn_id", "")
+                            )
+                            != observation.get("turn_id")
+                            or not isinstance(observation.get("permission_mode"), str)
+                            or _safe_hook_observation_text(
+                                observation.get("permission_mode", "")
+                            )
+                            != observation.get("permission_mode")
+                        ):
+                            errors.append(
+                                f"packet {packet_id} consumed dispatch attempt {attempt_index} observation lost identity integrity"
+                            )
+                elif (
+                    observation is not None
+                    or parse_time(closed_at) is None
+                    or not reason
+                ):
+                    errors.append(
+                        f"packet {packet_id} closed dispatch attempt {attempt_index} lacks valid closure evidence"
+                    )
+            provenance = packet.get("dispatch_provenance")
+            dispatch_recorded_at = str(packet.get("dispatch_recorded_at", ""))
+            if status in {"ready", "armed"} and provenance != "none":
+                errors.append(
+                    f"packet {packet_id} has dispatch provenance before dispatch"
+                )
+            if provenance == "none" and dispatch_recorded_at:
+                errors.append(
+                    f"packet {packet_id} records dispatch timing without dispatch provenance"
+                )
+            if status == "dispatched" and provenance not in {
+                "codex_subagent_start_observed",
+                "manual_unverified",
+            }:
+                errors.append(f"packet {packet_id} dispatched state lacks provenance")
+            if status in {"done", "failed"} and provenance not in {
+                "codex_subagent_start_observed",
+                "manual_unverified",
+            }:
+                errors.append(f"packet {packet_id} terminal work lacks dispatch provenance")
+            if provenance == "manual_unverified":
+                if not packet.get("manual_unverified_reason"):
+                    errors.append(f"packet {packet_id} manual dispatch lacks a reason")
+                if parse_time(dispatch_recorded_at) is None:
+                    errors.append(
+                        f"packet {packet_id} manual dispatch lacks a valid registration time"
+                    )
+                if any(
+                    isinstance(attempt, dict) and attempt.get("observation")
+                    for attempt in attempts
+                ):
+                    errors.append(
+                        f"packet {packet_id} manual dispatch carries a hook observation"
+                    )
+                if not any(
+                    isinstance(attempt, dict)
+                    and attempt.get("status") == "disarmed"
+                    for attempt in attempts
+                ) and packet.get("legacy_manual_dispatch_migration") is not True:
+                    errors.append(
+                        f"packet {packet_id} manual dispatch lacks a prior arm or legacy migration marker"
+                    )
+            if provenance == "codex_subagent_start_observed":
+                consumed = [
+                    attempt
+                    for attempt in attempts
+                    if isinstance(attempt, dict)
+                    and attempt.get("status") == "consumed"
+                    and isinstance(attempt.get("observation"), dict)
+                ]
+                if len(consumed) != 1:
+                    errors.append(
+                        f"packet {packet_id} observed dispatch lacks one consumed observation"
+                    )
+                else:
+                    observation = consumed[0]["observation"]
+                    if (
+                        packet.get("agent_id") != observation.get("agent_id")
+                        or dispatch_recorded_at != observation.get("observed_at")
+                        or packet.get("manual_unverified_reason")
+                    ):
+                        errors.append(
+                            f"packet {packet_id} observed dispatch lost packet/observation binding"
+                        )
+            if provenance in {
+                "codex_subagent_start_observed",
+                "manual_unverified",
+            } and not packet.get("agent_id"):
+                errors.append(
+                    f"packet {packet_id} dispatch provenance lacks an agent id"
+                )
         if status in TERMINAL_PACKET_STATUSES:
             expected_path = task_dir(paths, state["task_id"]) / "results" / f"{packet_id}.md"
             recorded_path = Path(str(packet.get("result_path", "")))
@@ -1944,6 +3054,65 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
                 errors.append(f"packet {packet_id} terminal summary is empty")
             if status in {"done", "failed"} and not packet.get("evidence"):
                 errors.append(f"packet {packet_id} terminal evidence is empty")
+    return errors
+
+
+def subagent_incident_integrity_errors(state: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    incidents = state.get("subagent_incidents", [])
+    v5_packets = any(
+        (_packet_schema_version(packet) or 0) >= 5
+        for packet in state.get("packets", [])
+    )
+    if (incidents or v5_packets) and state.get("dispatch_model_version") != 1:
+        errors.append("dispatch v1 records require dispatch_model_version=1")
+    seen: set[str] = set()
+    arm_slots: dict[tuple[str, str], str] = {}
+    for packet in state.get("packets", []):
+        if packet.get("status") != "armed":
+            continue
+        try:
+            attempt = _active_dispatch_attempt(packet)
+        except HarnessError as exc:
+            errors.append(str(exc))
+            continue
+        slot = (
+            str(attempt.get("parent_session_id", "")),
+            str(attempt.get("expected_agent_type", "")),
+        )
+        prior = arm_slots.get(slot)
+        if prior is not None:
+            errors.append(
+                "multiple armed packets occupy parent-session/agent-type slot "
+                f"{slot[0]}/{slot[1]}: {prior}, {packet.get('packet_id')}"
+            )
+        arm_slots[slot] = str(packet.get("packet_id", ""))
+    for incident in incidents:
+        incident_id = str(incident.get("incident_id", ""))
+        if not re.fullmatch(r"spawn-[0-9a-f]{32}", incident_id):
+            errors.append(f"spawn incident {incident_id!r} has an invalid id")
+        if incident_id in seen:
+            errors.append(f"duplicate spawn incident id {incident_id}")
+        seen.add(incident_id)
+        if (
+            incident.get("kind") != "unmanaged_subagent_start"
+            or incident.get("status") not in {"open", "accounted"}
+            or not _is_exact_int(
+                incident.get("hook_protocol_version"), int(HOOK_PROTOCOL_VERSION)
+            )
+            or not isinstance(incident.get("candidate_packet_ids"), list)
+        ):
+            errors.append(f"spawn incident {incident_id} has an invalid schema")
+        if incident.get("status") == "open" and incident.get("resolution") is not None:
+            errors.append(f"open spawn incident {incident_id} carries a resolution")
+        if incident.get("status") == "accounted":
+            resolution = incident.get("resolution")
+            if (
+                not isinstance(resolution, dict)
+                or resolution.get("disposition")
+                not in {"no_material_work", "work_discarded", "manual_unverified"}
+            ):
+                errors.append(f"accounted spawn incident {incident_id} lacks disposition")
     return errors
 
 
@@ -2279,6 +3448,11 @@ def validate_source_receipt(
 
 def job_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    try:
+        policy_v2 = _execution_policy_v2_enabled(state)
+    except HarnessError as exc:
+        errors.append(str(exc))
+        policy_v2 = False
     for job in state.get("jobs", []):
         run_id = str(job.get("run_id", ""))
         status = job.get("status")
@@ -2287,7 +3461,36 @@ def job_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str
             continue
         if job.get("integrity_version") != 1:
             errors.append(f"job {run_id} lacks integrity_version=1")
+        owner_packet_id = str(job.get("owner_packet_id", ""))
+        if owner_packet_id:
+            try:
+                _validate_owned_job_authority(
+                    paths,
+                    state,
+                    job,
+                    require_dispatched=status in ACTIVE_JOB_STATUSES,
+                )
+            except (HarnessError, TypeError, ValueError) as exc:
+                errors.append(f"job {run_id} owner packet authority is invalid: {exc}")
         if job.get("job_schema_version") == 2:
+            if policy_v2 and status in ACTIVE_JOB_STATUSES and not _is_exact_int(
+                job.get("task_execution_policy_version"), EXECUTION_POLICY_VERSION
+            ):
+                errors.append(
+                    f"job {run_id} lacks its task execution policy v2 binding"
+                )
+            namespace = paths.project.external_lock_namespace
+            expected_output_locks = [
+                f"{namespace}:tree:{job.get('work_root', '')}",
+                f"{namespace}:file:{job.get('log', '')}",
+            ]
+            if (
+                job.get("external_lock_namespace") != namespace
+                or job.get("required_output_locks") != expected_output_locks
+            ):
+                errors.append(
+                    f"job {run_id} external output-lock authority is non-canonical or changed"
+                )
             command_path = Path(str(job.get("command_path", "")))
             command_sha = str(job.get("command_sha256", ""))
             if not command_path.is_file():
@@ -2832,6 +4035,14 @@ def bind_session_unlocked(
     destination = session_path(paths, session_id)
     if destination.exists():
         current = load_json(destination)
+        if (
+            current.get("mapping_kind", ROOT_SESSION_MAPPING_KIND)
+            == SUBAGENT_PARENT_MAPPING_KIND
+        ):
+            raise HarnessError(
+                "subagent parent mapping cannot be promoted to a root session; "
+                "explicitly unbind it first"
+            )
         if current.get("task_id") != state["task_id"] and not force:
             raise HarnessError(
                 f"session is already bound to task {current.get('task_id')}; use --force only after auditing"
@@ -2850,6 +4061,7 @@ def bind_session_unlocked(
                 write_task(paths, old_state)
     mapping = {
         "schema_version": SCHEMA_VERSION,
+        "mapping_kind": ROOT_SESSION_MAPPING_KIND,
         "session_id": session_id,
         "task_id": state["task_id"],
         "checkpoint_path": str(task_dir(paths, state["task_id"]) / "checkpoint.md"),
@@ -2865,8 +4077,52 @@ def bind_session_unlocked(
         write_task(paths, state)
 
 
+def ensure_subagent_parent_mapping_unlocked(
+    paths: HarnessPaths, state: dict[str, Any], packet: dict[str, Any]
+) -> None:
+    """Bind a depth-one agent only for nested SubagentStart task lookup."""
+
+    if int(packet.get("delegation_depth", 1)) != 1:
+        raise HarnessError("only a depth-one packet may own a subagent parent mapping")
+    session_id = str(packet.get("agent_id", ""))
+    if not HOOK_ID_RE.fullmatch(session_id):
+        raise HarnessError("depth-one packet agent id is unsafe for parent mapping")
+    destination = session_path(paths, session_id)
+    expected_identity = {
+        "mapping_kind": SUBAGENT_PARENT_MAPPING_KIND,
+        "session_id": session_id,
+        "task_id": state["task_id"],
+        "packet_id": str(packet.get("packet_id", "")),
+    }
+    if destination.exists():
+        current = load_json(destination)
+        if any(current.get(key) != value for key, value in expected_identity.items()):
+            raise HarnessError(
+                "depth-one agent id already has a different session authority mapping"
+            )
+    else:
+        atomic_write_json(
+            destination,
+            {
+                "schema_version": SCHEMA_VERSION,
+                **expected_identity,
+                "checkpoint_path": str(
+                    task_dir(paths, state["task_id"]) / "checkpoint.md"
+                ),
+                "updated_at": now_iso(),
+            },
+        )
+    parent_ids = state.setdefault("subagent_parent_session_ids", [])
+    if session_id not in parent_ids:
+        parent_ids.append(session_id)
+
+
 def unbind_all_sessions_unlocked(paths: HarnessPaths, state: dict[str, Any]) -> None:
-    for session_id in state.get("session_ids", []):
+    session_ids = [
+        *state.get("session_ids", []),
+        *state.get("subagent_parent_session_ids", []),
+    ]
+    for session_id in dict.fromkeys(session_ids):
         destination = session_path(paths, session_id)
         if not destination.exists():
             continue
@@ -2891,8 +4147,14 @@ def cmd_unbind_session(args: argparse.Namespace, paths: HarnessPaths) -> int:
         state = load_task(paths, task_id)
         destination.unlink()
         if state.get("status") in {"active", "blocked"}:
-            state["session_ids"] = [
-                item for item in state.get("session_ids", []) if item != session_id
+            mapping_kind = mapping.get("mapping_kind", ROOT_SESSION_MAPPING_KIND)
+            backlink_field = (
+                "subagent_parent_session_ids"
+                if mapping_kind == SUBAGENT_PARENT_MAPPING_KIND
+                else "session_ids"
+            )
+            state[backlink_field] = [
+                item for item in state.get(backlink_field, []) if item != session_id
             ]
             bump_task(state)
             write_task(paths, state)
@@ -2953,6 +4215,23 @@ def cmd_config_check(args: argparse.Namespace, paths: HarnessPaths | None) -> in
     return 0
 
 
+def _require_pristine_bootstrap_state(paths: HarnessPaths) -> None:
+    preflight_layout(paths)
+    if not paths.harness.exists():
+        return
+    try:
+        populated = any(paths.harness.iterdir())
+    except OSError as exc:
+        raise HarnessError(
+            f"cannot inspect unconfigured AOI state directory {paths.harness}: {exc}"
+        ) from exc
+    if populated:
+        raise HarnessError(
+            "aoi.toml is missing while an AOI state tree already exists; restore the "
+            "approved configuration instead of using unauthenticated init"
+        )
+
+
 def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if not (paths.root / ".git").exists():
         raise HarnessError("aoi init requires a Git repository root")
@@ -2961,6 +4240,11 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     candidate: ProjectConfig | None = None
     candidate_raw: bytes | None = None
     expected_config_sha256 = (args.expected_config_sha256 or "").lower()
+    replace_policy_sha256 = (args.replace_policy_sha256 or "").lower()
+    if replace_policy_sha256 and not re.fullmatch(r"[0-9a-f]{64}", replace_policy_sha256):
+        raise HarnessError("--replace-policy-sha256 must be a full SHA-256")
+    if not paths.config.exists():
+        _require_pristine_bootstrap_state(paths)
     if expected_config_sha256 and not args.config:
         raise HarnessError("--expected-config-sha256 requires --config")
     if args.config and not expected_config_sha256:
@@ -2975,8 +4259,16 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             raise HarnessError(
                 "candidate configuration SHA-256 differs from the approved digest"
             )
+    initialized_at_dispatch = bool(
+        getattr(args, "_aoi_initialized_at_dispatch", paths.config.is_file())
+    )
     created_config = False
     if paths.config.exists():
+        if not initialized_at_dispatch:
+            raise HarnessError(
+                "aoi.toml appeared after unauthenticated init was dispatched; rerun "
+                "the command with the active Chief credential"
+            )
         if candidate is not None and candidate.sha256 != paths.project.sha256:
             raise HarnessError(
                 "AOI is already initialized with a different configuration; refusing to overwrite"
@@ -2987,10 +4279,15 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             )
         initialized = paths
     else:
+        if initialized_at_dispatch:
+            raise HarnessError(
+                "aoi.toml disappeared after authenticated init was dispatched; restore "
+                "the approved configuration"
+            )
         if candidate is not None:
             initialized = paths_for_project(paths.root, candidate)
             assert candidate_raw is not None
-            preflight_layout(initialized)
+            _require_pristine_bootstrap_state(initialized)
             atomic_create_bytes(paths.config, candidate_raw)
         else:
             project_name = args.project_name or paths.root.name or "AOI Project"
@@ -2998,29 +4295,61 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 config_text = default_config_text(project_name)
             except ValueError as exc:
                 raise HarnessError(str(exc)) from exc
-            preflight_layout(paths)
             atomic_create_text(paths.config, config_text)
             initialized = get_paths(paths.root)
         created_config = True
     # Establish the selected state lock domain only after the candidate profile
     # has passed strict parsing and non-clobber checks.
-    ensure_layout(initialized)
-    for name in ("plan.md", "packet.md", "checkpoint.md", "source_receipt.example.json"):
-        destination = initialized.templates / name
-        if not destination.exists():
-            atomic_write_text(destination, _resource_text(f"templates/{name}"))
-    policy = initialized.harness / "POLICY.md"
-    if not policy.exists():
-        atomic_write_text(policy, _resource_text("policy.md"))
-    ignore_entry = f"/{initialized.project.state_dir.rstrip('/')}/"
-    current_ignore = ignore_path.read_text(encoding="utf-8") if ignore_path.exists() else ""
-    if ignore_entry not in {line.strip() for line in current_ignore.splitlines()}:
-        updated = current_ignore
-        if updated and not updated.endswith("\n"):
-            updated += "\n"
-        updated += ignore_entry + "\n"
-        atomic_write_text(ignore_path, updated)
-    write_index(initialized)
+    with state_lock(initialized):
+        initialized = _reload_locked_paths(initialized)
+        if created_config and load_chief_authority(
+            initialized, allow_missing=True
+        ) is not None:
+            raise HarnessError(
+                "Chief authority appeared during first initialization; rerun init "
+                "with that Chief credential"
+            )
+        for name in (
+            "plan.md",
+            "packet.md",
+            "checkpoint.md",
+            "source_receipt.example.json",
+        ):
+            destination = initialized.templates / name
+            if not destination.exists():
+                atomic_write_text(destination, _resource_text(f"templates/{name}"))
+        policy = initialized.harness / "POLICY.md"
+        packaged_policy = _resource_text("policy.md").encode("utf-8")
+        policy_updated = False
+        if not policy.exists():
+            atomic_write_bytes(policy, packaged_policy)
+            policy_updated = True
+        else:
+            current_policy = policy.read_bytes()
+            current_policy_sha256 = hashlib.sha256(current_policy).hexdigest()
+            if current_policy != packaged_policy:
+                if (
+                    current_policy_sha256 not in KNOWN_MANAGED_POLICY_SHA256
+                    and replace_policy_sha256 != current_policy_sha256
+                ):
+                    raise HarnessError(
+                        "existing AOI policy differs from the packaged contract; rerun "
+                        "authenticated init with --replace-policy-sha256 "
+                        f"{current_policy_sha256} after reviewing the replacement"
+                    )
+                atomic_write_bytes(policy, packaged_policy)
+                policy_updated = True
+        ignore_entry = f"/{initialized.project.state_dir.rstrip('/')}/"
+        current_ignore = (
+            ignore_path.read_text(encoding="utf-8") if ignore_path.exists() else ""
+        )
+        if ignore_entry not in {line.strip() for line in current_ignore.splitlines()}:
+            updated = current_ignore
+            if updated and not updated.endswith("\n"):
+                updated += "\n"
+            updated += ignore_entry + "\n"
+            atomic_write_text(ignore_path, updated)
+        write_index(initialized)
     emit(
         {
             "initialized": True,
@@ -3030,6 +4359,7 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "state_dir": str(initialized.harness),
             "config_sha256": initialized.project.sha256,
             "hooks_enabled": initialized.project.codex_hooks_enabled,
+            "policy_updated": policy_updated,
             "platform": platform_capabilities(),
         },
         args.json,
@@ -3037,11 +4367,152 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
-def cmd_pilot_init(args: argparse.Namespace, _paths: HarnessPaths | None) -> int:
+def _chief_identity(args: argparse.Namespace) -> tuple[str | None, int | None]:
+    raw_epoch = args.chief_epoch
+    if raw_epoch in {None, ""}:
+        epoch = None
+    else:
+        try:
+            epoch = int(raw_epoch)
+        except (TypeError, ValueError) as exc:
+            raise HarnessError("Chief credential epoch must be a positive integer") from exc
+    return args.chief_session_id, epoch
+
+
+def _chief_credential(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> tuple[str | None, int | None, str | None, Path | None]:
+    session_id, epoch = _chief_identity(args)
+    token = args.chief_token
+    raw_file = args.chief_credential_file
+    if token and raw_file:
+        raise HarnessError("use either a Chief credential file or explicit token, not both")
+    if token:
+        return session_id, epoch, token, None
+    credential_file = Path(raw_file) if raw_file else None
+    loaded_token, loaded_path = load_chief_credential(
+        paths,
+        session_id=session_id,
+        epoch=epoch,
+        credential_file=credential_file,
+    )
+    return session_id, epoch, loaded_token, loaded_path
+
+
+def _chief_acquisition_payload(
+    paths: HarnessPaths, credential_path: Path
+) -> dict[str, Any]:
+    return {
+        "authority": chief_authority_summary(paths),
+        "credential_file": str(credential_path),
+        "credential_environment": [
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+        ],
+        "credential_notice": (
+            "The plaintext token is stored only in the private repo-external file. "
+            "Do not copy that file into shared state, logs, checkpoints, or artifacts."
+        ),
+        "credential_protection": (
+            "windows-dpapi-current-user" if os.name == "nt" else "posix-owner-mode-0600"
+        ),
+    }
+
+
+def cmd_chief_acquire(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    bootstrap_chief_state_lock(paths)
+    with state_lock(paths, create_layout=False):
+        paths = _reload_locked_paths(paths)
+        _record, credential_path = acquire_chief_authority(
+            paths,
+            session_id=args.session_id,
+            ttl_seconds=args.ttl_seconds,
+            credential_home=(
+                Path(args.credential_home) if args.credential_home else None
+            ),
+        )
+        payload = _chief_acquisition_payload(paths, credential_path)
+    emit(payload, args.json)
+    return 0
+
+
+def cmd_chief_renew(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths, create_layout=False):
+        paths = _reload_locked_paths(paths)
+        session_id, epoch, token, _credential_path = _chief_credential(args, paths)
+        renew_chief_authority(
+            paths,
+            session_id=session_id,
+            epoch=epoch,
+            token=token,
+            ttl_seconds=args.ttl_seconds,
+        )
+        payload = {"authority": chief_authority_summary(paths)}
+    emit(payload, args.json)
+    return 0
+
+
+def cmd_chief_release(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths, create_layout=False):
+        paths = _reload_locked_paths(paths)
+        session_id, epoch, token, credential_path = _chief_credential(args, paths)
+        release_chief_authority(
+            paths,
+            session_id=session_id,
+            epoch=epoch,
+            token=token,
+            reason=args.reason,
+        )
+        cleanup: dict[str, Any]
+        try:
+            removed = remove_chief_credential(credential_path)
+        except (HarnessError, OSError) as exc:
+            cleanup = {
+                "removed": False,
+                "warning": f"inactive authority committed; credential cleanup failed: {exc}",
+            }
+        else:
+            cleanup = {"removed": removed}
+        payload = {
+            "authority": chief_authority_summary(paths),
+            "credential_cleanup": cleanup,
+        }
+    emit(payload, args.json)
+    return 0
+
+
+def cmd_chief_takeover(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths, create_layout=False):
+        paths = _reload_locked_paths(paths)
+        _record, credential_path = takeover_chief_authority(
+            paths,
+            session_id=args.session_id,
+            expected_epoch=args.expected_epoch,
+            reason=args.reason,
+            force_live=args.force_live,
+            ttl_seconds=args.ttl_seconds,
+            credential_home=(
+                Path(args.credential_home) if args.credential_home else None
+            ),
+        )
+        payload = _chief_acquisition_payload(paths, credential_path)
+    emit(payload, args.json)
+    return 0
+
+
+def cmd_chief_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    require_complete_layout(paths)
+    emit(chief_authority_summary(paths), args.json)
+    return 0
+
+
+def cmd_pilot_init(args: argparse.Namespace, paths: HarnessPaths | None) -> int:
     result = initialize_kit(
         Path(args.output),
         force=args.force,
         allow_unverified_windows_acl=args.allow_unverified_windows_acl,
+        authorized_project_root=paths.root if paths is not None else None,
     )
     emit(result, args.json)
     return 0
@@ -3066,13 +4537,14 @@ def cmd_pilot_validate(args: argparse.Namespace, _paths: HarnessPaths | None) ->
     return 0
 
 
-def cmd_pilot_summary(args: argparse.Namespace, _paths: HarnessPaths | None) -> int:
+def cmd_pilot_summary(args: argparse.Namespace, paths: HarnessPaths | None) -> int:
     records = [load_record(Path(value)) for value in args.record]
     result = write_summary(
         records,
         Path(args.output),
         output_format=args.format,
         force=args.force,
+        authorized_project_root=paths.root if paths is not None else None,
     )
     emit(result, args.json)
     return 0
@@ -3112,7 +4584,14 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "next_action": args.next_action or "Complete the plan and acquire minimum claims.",
             "claims": [],
             "session_ids": [],
+            "subagent_parent_session_ids": [],
             "packets": [],
+            "dispatch_model_version": 1,
+            "subagent_incidents": [],
+            "task_execution_schema_version": TASK_EXECUTION_SCHEMA_VERSION,
+            "execution_policy_version": EXECUTION_POLICY_VERSION,
+            "legacy_execution_policy": False,
+            "execution_briefs": [],
             "facts": [],
             "decisions": [],
             "rejected_paths": [],
@@ -3229,7 +4708,14 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "next_action": args.next_action or "Perform the exact mini edit and verification.",
             "claims": [token],
             "session_ids": [session_id],
+            "subagent_parent_session_ids": [],
             "packets": [],
+            "dispatch_model_version": 1,
+            "subagent_incidents": [],
+            "task_execution_schema_version": TASK_EXECUTION_SCHEMA_VERSION,
+            "execution_policy_version": EXECUTION_POLICY_VERSION,
+            "legacy_execution_policy": False,
+            "execution_briefs": [],
             "facts": ["Mini lifecycle atomically initialized, approved, bound, and claimed."],
             "decisions": [],
             "rejected_paths": [],
@@ -3775,6 +5261,29 @@ def _capacity_records(
             or packet.get("status") not in TERMINAL_PACKET_STATUSES
         ):
             continue
+        schema_version = _packet_schema_version(packet)
+        dispatch_provenance = str(
+            packet.get("dispatch_provenance")
+            or ("legacy_unverified" if (schema_version or 0) < 5 else "none")
+        )
+        observed_starts = [
+            attempt.get("observation")
+            for attempt in packet.get("dispatch_attempts", [])
+            if isinstance(attempt, dict)
+            and attempt.get("status") == "consumed"
+            and isinstance(attempt.get("observation"), dict)
+        ]
+        subagent_start_observed_at = (
+            str(observed_starts[0].get("observed_at", ""))
+            if dispatch_provenance == "codex_subagent_start_observed"
+            and len(observed_starts) == 1
+            else ""
+        )
+        legacy_started_at = (
+            str(packet.get("dispatched_at", ""))
+            if (schema_version or 0) < 5
+            else ""
+        )
         records.append(
             {
                 "packet_id": packet.get("packet_id"),
@@ -3790,7 +5299,12 @@ def _capacity_records(
                 "routing_verified": bool(packet.get("routing_verified")),
                 "retry_of_packet_id": packet.get("retry_of_packet_id", ""),
                 "result_sha256": packet.get("result_sha256", ""),
-                "orchestration_started_at": packet.get("dispatched_at", ""),
+                "dispatch_provenance": dispatch_provenance,
+                "dispatch_recorded_at": str(
+                    packet.get("dispatch_recorded_at", "") or legacy_started_at
+                ),
+                "subagent_start_observed_at": subagent_start_observed_at,
+                "orchestration_started_at": legacy_started_at,
                 "orchestration_completed_at": packet.get("completed_at", ""),
                 "token_usage": "unavailable",
                 "cost": "unavailable",
@@ -5111,6 +6625,139 @@ def cmd_skill_adoption_record(args: argparse.Namespace, paths: HarnessPaths) -> 
     return 0
 
 
+def _selection_terminal_packet_bindings(
+    state: dict[str, Any], selection_id: str
+) -> list[dict[str, Any]]:
+    return sorted(
+        [
+            {
+                "packet_id": str(packet.get("packet_id", "")),
+                "lane_id": str(packet.get("lane_id", "")),
+                "status": str(packet.get("status", "")),
+                "result_sha256": str(packet.get("result_sha256", "")),
+                "dispatch_provenance": str(
+                    packet.get("dispatch_provenance") or "legacy_unverified"
+                ),
+            }
+            for packet in state.get("packets", [])
+            if packet.get("execution_selection_id") == selection_id
+            and not _is_steward_synthesis_packet(packet)
+            and packet.get("status") in TERMINAL_PACKET_STATUSES
+        ],
+        key=lambda item: item["packet_id"],
+    )
+
+
+def _steward_packet_binding(
+    state: dict[str, Any], selection_id: str, packet_id: str
+) -> dict[str, Any]:
+    packet = _packet_by_id(state, packet_id)
+    if (
+        not _is_steward_synthesis_packet(packet)
+        or packet.get("execution_selection_id") != selection_id
+        or packet.get("status") != "done"
+        or not re.fullmatch(r"[0-9a-f]{64}", str(packet.get("result_sha256", "")))
+        or packet.get("steward_input_bindings")
+        != _selection_terminal_packet_bindings(state, selection_id)
+    ):
+        raise HarnessError(
+            "execution brief requires a done Steward synthesis packet bound to current specialist results"
+        )
+    return {
+        "packet_id": packet_id,
+        "lane_id": str(packet.get("lane_id", "")),
+        "agent_id": str(packet.get("agent_id", "")),
+        "result_sha256": str(packet.get("result_sha256", "")),
+        "dispatch_provenance": str(
+            packet.get("dispatch_provenance") or "legacy_unverified"
+        ),
+        "steward_selection_snapshot": copy.deepcopy(
+            packet.get("steward_selection_snapshot", {})
+        ),
+        "steward_execution_snapshot": copy.deepcopy(
+            packet.get("steward_execution_snapshot", {})
+        ),
+        "steward_input_bindings": copy.deepcopy(
+            packet.get("steward_input_bindings", [])
+        ),
+    }
+
+
+def _execution_brief_coverage_error(
+    state: dict[str, Any], selection: dict[str, Any]
+) -> str | None:
+    # A v2 Steward brief cannot be retroactively asserted for a legacy selection.
+    # Preserve those results as legacy evidence and allow an exact supersession or
+    # task close instead of creating a migration deadlock.
+    try:
+        policy_v2 = _execution_policy_v2_enabled(state)
+    except HarnessError as exc:
+        return str(exc)
+    if policy_v2 and not _is_exact_int(
+        selection.get("execution_selection_version"), 2
+    ):
+        return (
+            f"execution selection {selection.get('selection_id', '')} is not sealed as "
+            "version 2 under task execution policy v2"
+        )
+    if selection.get("execution_selection_version") is None and "steward_snapshot" in selection:
+        return (
+            f"execution selection {selection.get('selection_id', '')} has v2-only "
+            "fields without a selection version"
+        )
+    if not _is_exact_int(selection.get("execution_selection_version"), 2):
+        return None
+    selection_id = str(selection.get("selection_id", ""))
+    bindings = _selection_terminal_packet_bindings(state, selection_id)
+    if not bindings:
+        return None
+    briefs = [
+        item
+        for item in state.get("execution_briefs", [])
+        if item.get("execution_selection_id") == selection_id
+    ]
+    if not briefs:
+        return f"execution selection {selection_id} lacks a Steward result brief"
+    brief = briefs[-1]
+    if brief.get("packet_bindings") != bindings:
+        return f"execution selection {selection_id} Steward result brief is stale"
+    if brief.get("steward_snapshot") != selection.get("steward_snapshot"):
+        return f"execution selection {selection_id} Steward result brief lost authority binding"
+    if policy_v2:
+        if not _is_exact_int(brief.get("brief_version"), 3):
+            return (
+                f"execution selection {selection_id} brief lacks a terminal "
+                "Steward synthesis packet"
+            )
+        stored_binding = brief.get("steward_packet_binding")
+        if not isinstance(stored_binding, dict):
+            return f"execution selection {selection_id} Steward packet binding is malformed"
+        try:
+            current_binding = _steward_packet_binding(
+                state, selection_id, str(stored_binding.get("packet_id", ""))
+            )
+        except HarnessError as exc:
+            return f"execution selection {selection_id} Steward packet binding is invalid: {exc}"
+        if stored_binding != current_binding:
+            return f"execution selection {selection_id} Steward packet binding is stale"
+    stored_sha = str(brief.get("brief_sha256", ""))
+    preimage = copy.deepcopy(brief)
+    preimage.pop("brief_sha256", None)
+    if stored_sha != canonical_record_sha256(preimage):
+        return f"execution selection {selection_id} Steward result brief lost integrity"
+    if selection.get("mode") == "hybrid":
+        referenced = set(brief.get("cross_lane_session_ids", []))
+        valid_closed = {
+            str(item.get("cross_lane_session_id", ""))
+            for item in state.get("cross_lane_sessions", [])
+            if item.get("execution_selection_id") == selection_id
+            and item.get("status") == "closed"
+        }
+        if not referenced or not referenced <= valid_closed:
+            return f"hybrid selection {selection_id} brief lacks closed cross-lane evidence"
+    return None
+
+
 def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
     selection_id = validate_id(args.selection_id, "execution selection id")
     work_unit_id = validate_id(args.work_unit_id, "execution work-unit id")
@@ -5125,10 +6772,15 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         raise HarnessError(
             "centralized_parallel is not allowed for high sequential dependency or shared context"
         )
+    if args.mode == "single" and args.steward_lane_id:
+        raise HarnessError("single execution mode may not bind a Steward lane")
+    if args.mode in {"centralized_parallel", "hybrid"} and not args.steward_lane_id:
+        raise HarnessError(f"{args.mode} execution mode requires --steward-lane-id")
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "select execution topology for")
         require_plan_ready(paths, state, "select execution topology")
+        _adopt_execution_policy_v2_for_new_work(state)
         session_id = require_root_session(paths, state, args.session_id)
         if any(
             item.get("selection_id") == selection_id
@@ -5184,6 +6836,10 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     "cannot supersede execution selection with active/unconsumed work; "
                     f"cancel, complete, or arbitrate first: {detail}"
                 )
+            if prior_selection.get("mode") in {"centralized_parallel", "hybrid"}:
+                brief_error = _execution_brief_coverage_error(state, prior_selection)
+                if brief_error:
+                    raise HarnessError(brief_error)
             prior_selection["status"] = "superseded"
             prior_selection["superseded_by"] = selection_id
             prior_selection["superseded_at"] = now_iso()
@@ -5192,22 +6848,29 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         lanes = [lane_by_id(state, lane_id) for lane_id in lane_ids]
         if any(lane.get("status") in {"done", "parked"} for lane in lanes):
             raise HarnessError("execution selection may not use done or parked lanes")
+        steward_snapshot: dict[str, Any] = {}
+        if args.mode in {"centralized_parallel", "hybrid"}:
+            steward = _engaged_steward_lane(state)
+            if steward.get("lane_id") != args.steward_lane_id:
+                raise HarnessError(
+                    "--steward-lane-id must name the one engaged coordination_steward lane"
+                )
+            if any(lane.get("lane_id") == steward.get("lane_id") for lane in lanes):
+                raise HarnessError("parallel specialist lanes may not include the Steward lane")
+            steward_snapshot = _lane_authority_snapshot(steward)
         recorded = now_iso()
         selection = {
             "integrity_version": 1,
+            "execution_selection_version": 2,
             "selection_id": selection_id,
             "work_unit_id": work_unit_id,
             "scope": require_evidence_detail(args.scope, "execution selection scope"),
             "mode": args.mode,
             "lane_snapshots": [
-                {
-                    "lane_id": lane["lane_id"],
-                    "revision": lane["revision"],
-                    "authority_commit": lane["authority_commit"],
-                    "contract_version": lane["contract_version"],
-                }
+                _lane_authority_snapshot(lane)
                 for lane in sorted(lanes, key=lambda item: item["lane_id"])
             ],
+            "steward_snapshot": steward_snapshot,
             "task_characteristics": {
                 "sequential_dependency": args.sequential_dependency,
                 "tool_density": args.tool_density,
@@ -5235,6 +6898,154 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         write_task(paths, state)
         write_index(paths)
     emit(selection, args.json)
+    return 0
+
+
+def cmd_execution_brief_record(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    brief_id = validate_id(args.brief_id, "execution brief id")
+    packet_ids = sorted(set(args.packet_id))
+    cross_session_ids = sorted(set(args.cross_lane_session_id))
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "record execution brief for")
+        require_plan_ready(paths, state, "record execution brief")
+        if any(
+            item.get("brief_id") == brief_id
+            for item in state.get("execution_briefs", [])
+        ):
+            raise HarnessError(f"execution brief already exists: {brief_id}")
+        selection = execution_selection_by_id(state, args.execution_selection_id)
+        if (
+            selection.get("status") != "active"
+            or not _is_exact_int(selection.get("execution_selection_version"), 2)
+            or selection.get("mode") not in {"centralized_parallel", "hybrid"}
+        ):
+            raise HarnessError(
+                "execution brief requires an active parallel/hybrid selection v2"
+            )
+        steward = _engaged_steward_lane(state)
+        selection_steward = selection.get("steward_snapshot", {})
+        if (
+            steward.get("lane_id") != args.steward_lane_id
+            or not isinstance(selection_steward, dict)
+            or selection_steward.get("lane_id") != steward.get("lane_id")
+        ):
+            raise HarnessError("execution brief Steward identity is missing or mismatched")
+        root_session_id = require_root_session(paths, state, args.session_id)
+        steward_packet_binding: dict[str, Any] | None = None
+        brief_version = 2
+        if _execution_policy_v2_enabled(state):
+            if not args.steward_packet_id:
+                raise HarnessError(
+                    "execution policy v2 requires --steward-packet-id for a terminal synthesis packet"
+                )
+            steward_packet_binding = _steward_packet_binding(
+                state, args.execution_selection_id, args.steward_packet_id
+            )
+            synthesis_packet = _packet_by_id(state, args.steward_packet_id)
+            authority_errors = packet_authority_integrity_errors(
+                paths, state, synthesis_packet, require_origin=False
+            )
+            if authority_errors:
+                raise HarnessError(
+                    "Steward synthesis packet authority is missing or tampered: "
+                    + "; ".join(authority_errors)
+                )
+            brief_version = 3
+        elif args.steward_packet_id:
+            steward_packet_binding = _steward_packet_binding(
+                state, args.execution_selection_id, args.steward_packet_id
+            )
+            brief_version = 3
+        active_packets = [
+            str(packet.get("packet_id", ""))
+            for packet in state.get("packets", [])
+            if packet.get("execution_selection_id") == args.execution_selection_id
+            and packet.get("status") in ACTIVE_PACKET_STATUSES
+        ]
+        if active_packets:
+            raise HarnessError(
+                "execution brief requires terminal selected packets: "
+                + ", ".join(active_packets)
+            )
+        active_jobs = [
+            str(job.get("run_id", ""))
+            for job in state.get("jobs", [])
+            if job.get("execution_selection_id") == args.execution_selection_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+        ]
+        if active_jobs:
+            raise HarnessError(
+                "execution brief requires terminal selected jobs: "
+                + ", ".join(active_jobs)
+            )
+        bindings = _selection_terminal_packet_bindings(
+            state, args.execution_selection_id
+        )
+        expected_packet_ids = [item["packet_id"] for item in bindings]
+        if not bindings or packet_ids != expected_packet_ids:
+            raise HarnessError(
+                "execution brief --packet-id set must equal all terminal packets for the selection"
+            )
+        if selection.get("mode") == "centralized_parallel":
+            if cross_session_ids:
+                raise HarnessError(
+                    "centralized_parallel brief may not claim direct cross-lane sessions"
+                )
+            selected_lanes = {
+                str(item.get("lane_id", ""))
+                for item in selection.get("lane_snapshots", [])
+            }
+            result_lanes = {item["lane_id"] for item in bindings}
+            if result_lanes != selected_lanes:
+                raise HarnessError(
+                    "centralized_parallel brief requires terminal packet evidence from every selected lane"
+                )
+        else:
+            valid_closed = {
+                str(item.get("cross_lane_session_id", ""))
+                for item in state.get("cross_lane_sessions", [])
+                if item.get("execution_selection_id") == args.execution_selection_id
+                and item.get("status") == "closed"
+            }
+            if not cross_session_ids or not set(cross_session_ids) <= valid_closed:
+                raise HarnessError(
+                    "hybrid execution brief requires at least one exact closed cross-lane session"
+                )
+        brief = {
+            "integrity_version": 1,
+            "brief_version": brief_version,
+            "brief_id": brief_id,
+            "execution_selection_id": args.execution_selection_id,
+            "mode": selection["mode"],
+            "steward_snapshot": copy.deepcopy(selection["steward_snapshot"]),
+            "recording_steward_snapshot": _lane_authority_snapshot(steward),
+            "packet_bindings": bindings,
+            **(
+                {"steward_packet_binding": steward_packet_binding}
+                if steward_packet_binding is not None
+                else {}
+            ),
+            "cross_lane_session_ids": cross_session_ids,
+            "summary": require_evidence_detail(
+                args.summary, "execution brief summary"
+            ),
+            "dissent": require_text(args.dissent, "execution brief dissent"),
+            "blockers": require_text(args.blocker, "execution brief blockers"),
+            "recommendation": require_evidence_detail(
+                args.recommendation, "execution brief recommendation"
+            ),
+            "root_session_id": root_session_id,
+            "recorded_at": now_iso(),
+        }
+        brief["brief_sha256"] = canonical_record_sha256(brief)
+        state.setdefault("execution_briefs", []).append(brief)
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(brief, args.json)
     return 0
 
 
@@ -6681,6 +8492,14 @@ def critical_projection(paths: HarnessPaths, state: dict[str, Any]) -> dict[str,
         ],
         key=lambda item: str(item.get("escalation_id", "")),
     )
+    open_spawn_incidents = sorted(
+        [
+            item
+            for item in state.get("subagent_incidents", [])
+            if item.get("status") == "open"
+        ],
+        key=lambda item: str(item.get("incident_id", "")),
+    )
     baseline = state.get("integration_baselines", [])[-1:] or []
     payload: dict[str, Any] = {
         "view_version": 1,
@@ -6805,6 +8624,25 @@ def critical_projection(paths: HarnessPaths, state: dict[str, Any]) -> dict[str,
             }
             for item in needs_user[:8]
         ],
+        "subagent_spawn_incidents": [
+            {
+                "incident_id": item.get("incident_id"),
+                "reason_code": item.get("reason_code"),
+                "agent_id": item.get("agent_id"),
+                "agent_type": item.get("agent_type"),
+                "observed_at": item.get("observed_at"),
+            }
+            for item in open_spawn_incidents[:8]
+        ],
+        "execution_briefs": [
+            {
+                "brief_id": item.get("brief_id"),
+                "execution_selection_id": item.get("execution_selection_id"),
+                "packet_count": len(item.get("packet_bindings", [])),
+                "recommendation": _clip_critical(item.get("recommendation")),
+            }
+            for item in state.get("execution_briefs", [])[-4:]
+        ],
         "open_hard_gates": sorted(
             dependency.get("dependency_id")
             for dependency in state.get("lane_dependencies", [])
@@ -6830,6 +8668,12 @@ def critical_projection(paths: HarnessPaths, state: dict[str, Any]) -> dict[str,
             "improvement_requests": max(0, len(active_improvements) - 8),
             "cross_lane_sessions": max(0, len(open_cross_sessions) - 6),
             "needs_user": max(0, len(needs_user) - 8),
+            "subagent_spawn_incidents": max(
+                0, len(open_spawn_incidents) - 8
+            ),
+            "execution_briefs": max(
+                0, len(state.get("execution_briefs", [])) - 4
+            ),
         },
         "full_state": {"path": str(state_path), "sha256": sha256_file(state_path)},
     }
@@ -7775,9 +9619,692 @@ def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) ->
     return 0
 
 
+def _upgrade_packet_dispatch_schema(packet: dict[str, Any]) -> None:
+    schema_version = _packet_schema_version(packet)
+    if schema_version is None:
+        raise HarnessError(
+            f"packet {packet.get('packet_id')} schema version is invalid"
+        )
+    if schema_version == 5:
+        if (
+            not _is_exact_int(packet.get("dispatch_version"), 1)
+            or not isinstance(packet.get("dispatch_attempts"), list)
+        ):
+            raise HarnessError("packet dispatch schema v5 is malformed")
+        return
+    if schema_version != 4 or packet.get("status") != "ready":
+        raise HarnessError(
+            "only a ready legacy packet may be upgraded to dispatch schema v5"
+        )
+    packet["packet_schema_version"] = 5
+    packet["dispatch_version"] = 1
+    packet["dispatch_provenance"] = "none"
+    packet["dispatch_attempts"] = []
+    packet["dispatch_schema_origin"] = "legacy_v4_migration"
+
+
+def _dispatch_attempt_authority_sha256(attempt: dict[str, Any]) -> str:
+    immutable_fields = (
+        "attempt",
+        "arm_id",
+        "chief_session_id",
+        "chief_epoch",
+        "parent_session_id",
+        "parent_packet_id",
+        "expected_agent_type",
+        "plan_sha256",
+        "packet_contract_sha256",
+        "execution_selection_id",
+        "lane_snapshot",
+        "steward_snapshot",
+        "armed_at",
+        "expires_at",
+        "authority_sha256",
+    )
+    return canonical_record_sha256(
+        {field: copy.deepcopy(attempt.get(field)) for field in immutable_fields}
+    )
+
+
+def _active_dispatch_attempt(packet: dict[str, Any]) -> dict[str, Any]:
+    attempts = packet.get("dispatch_attempts", [])
+    matches = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, dict) and attempt.get("status") == "armed"
+    ]
+    if len(matches) != 1:
+        raise HarnessError(
+            f"armed packet {packet.get('packet_id')} must have exactly one active arm"
+        )
+    return matches[0]
+
+
+def _selection_lane_snapshot(
+    selection: dict[str, Any] | None, lane_id: str
+) -> dict[str, Any]:
+    if selection is None:
+        return {}
+    matches = [
+        item
+        for item in selection.get("lane_snapshots", [])
+        if item.get("lane_id") == lane_id
+    ]
+    if len(matches) != 1:
+        raise HarnessError("execution selection lacks the packet lane snapshot")
+    return copy.deepcopy(matches[0])
+
+
+def _packet_execution_lane_snapshot(
+    selection: dict[str, Any] | None, packet: dict[str, Any]
+) -> dict[str, Any]:
+    if _is_steward_synthesis_packet(packet):
+        snapshot = packet.get("steward_execution_snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            raise HarnessError("Steward synthesis packet lacks an execution snapshot")
+        return copy.deepcopy(snapshot)
+    return _selection_lane_snapshot(selection, str(packet.get("lane_id", "")))
+
+
+def _validate_hook_identity(value: Any, label: str) -> str:
+    text = str(value or "")
+    if not HOOK_ID_RE.fullmatch(text) or "\x00" in text or "\n" in text or "\r" in text:
+        raise HarnessError(f"{label} is missing or unsafe")
+    return text
+
+
+def _safe_hook_observation_text(value: Any) -> str:
+    text = str(value or "")
+    if len(text) > 512 or any(character in text for character in ("\x00", "\n", "\r")):
+        return ""
+    return text
+
+
+def _expire_dispatch_arms(
+    state: dict[str, Any], *, current: dt.datetime
+) -> list[dict[str, str]]:
+    expired: list[dict[str, str]] = []
+    closed_at = current.isoformat(timespec="microseconds")
+    for packet in state.get("packets", []):
+        if packet.get("status") != "armed":
+            continue
+        attempt = _active_dispatch_attempt(packet)
+        expires_at = parse_time(str(attempt.get("expires_at", "")))
+        if expires_at is None or expires_at > current:
+            continue
+        attempt["status"] = "expired"
+        attempt["closed_at"] = closed_at
+        attempt["reason"] = "Arm expired before an observed SubagentStart event."
+        packet["status"] = "ready"
+        packet["updated_at"] = closed_at
+        expired.append(
+            {
+                "packet_id": str(packet.get("packet_id", "")),
+                "parent_session_id": str(attempt.get("parent_session_id", "")),
+                "expected_agent_type": str(attempt.get("expected_agent_type", "")),
+            }
+        )
+    return expired
+
+
+def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    expected_agent_type = _validate_hook_identity(
+        args.expected_agent_type, "expected Codex agent type"
+    )
+    expires_at = parse_time(args.expires_at)
+    current = dt.datetime.now().astimezone()
+    if expires_at is None or expires_at <= current:
+        raise HarnessError("packet arm expiry must be a future timezone-aware timestamp")
+    if expires_at > current + dt.timedelta(seconds=DISPATCH_ARM_MAX_SECONDS):
+        raise HarnessError(
+            f"packet arm expiry may be at most {DISPATCH_ARM_MAX_SECONDS} seconds ahead"
+        )
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "arm packet for")
+        require_plan_ready(paths, state, "arm packet")
+        _expire_dispatch_arms(state, current=current)
+        packet = _packet_by_id(state, args.packet_id)
+        if packet.get("status") != "ready":
+            raise HarnessError("only a ready packet can be armed")
+        if _packet_schema_version(packet) == 4:
+            legacy_contract_error = packet_contract_integrity_error(paths, state, packet)
+            if legacy_contract_error:
+                raise HarnessError(legacy_contract_error)
+            _adopt_legacy_execution_provenance_for_v4_migration(state)
+        _upgrade_packet_dispatch_schema(packet)
+        authority = load_chief_authority(paths)
+        assert authority is not None
+        chief_session_id = str(authority.get("session_id", ""))
+        parent_session_id = str(args.parent_session_id or chief_session_id)
+        parent_session_id = _validate_hook_identity(
+            parent_session_id, "parent session id"
+        )
+        depth = int(packet.get("delegation_depth", 1))
+        parent: dict[str, Any] | None = None
+        if depth == 1:
+            require_root_session(paths, state, parent_session_id)
+        if depth == 2:
+            parent = _packet_by_id(
+                state, str(packet.get("parent_packet_id", ""))
+            )
+            if parent.get("agent_id") != parent_session_id:
+                raise HarnessError(
+                    "depth-two packet arm parent session must equal its dispatched parent agent id"
+                )
+        collisions: list[str] = []
+        for other in state.get("packets", []):
+            if other.get("status") != "armed":
+                continue
+            attempt = _active_dispatch_attempt(other)
+            if (
+                attempt.get("parent_session_id") == parent_session_id
+                and attempt.get("expected_agent_type") == expected_agent_type
+            ):
+                collisions.append(str(other.get("packet_id", "")))
+        if collisions:
+            raise HarnessError(
+                "an armed packet already occupies this parent-session/agent-type slot: "
+                + ", ".join(collisions)
+            )
+        authority_errors = packet_authority_integrity_errors(
+            paths, state, packet, require_origin=True
+        )
+        if authority_errors:
+            raise HarnessError(
+                "packet authority is missing or tampered: "
+                + "; ".join(authority_errors)
+            )
+        selection = _validate_packet_activation_topology(state, packet)
+        _validate_skill_canary_work_unit_binding(
+            state,
+            str(packet.get("skill_release_id", "")),
+            str(packet.get("skill_canary_event_id", "")),
+            require_live_canary=True,
+        )
+        if parent is not None:
+            ensure_subagent_parent_mapping_unlocked(paths, state, parent)
+        attempt_number = len(packet["dispatch_attempts"]) + 1
+        armed_at = now_iso()
+        attempt = {
+            "attempt": attempt_number,
+            "arm_id": f"{packet['packet_id']}-a{attempt_number}",
+            "status": "armed",
+            "chief_session_id": chief_session_id,
+            "chief_epoch": authority["epoch"],
+            "parent_session_id": parent_session_id,
+            "parent_packet_id": str(packet.get("parent_packet_id", "")),
+            "expected_agent_type": expected_agent_type,
+            "plan_sha256": state.get("plan_sha256", ""),
+            "packet_contract_sha256": packet.get("packet_contract_sha256", ""),
+            "execution_selection_id": packet.get("execution_selection_id", ""),
+            "lane_snapshot": _packet_execution_lane_snapshot(selection, packet),
+            "steward_snapshot": copy.deepcopy(
+                selection.get("steward_snapshot", {}) if selection else {}
+            ),
+            "armed_at": armed_at,
+            "expires_at": expires_at.isoformat(timespec="microseconds"),
+            "authority_sha256": canonical_record_sha256(authority),
+            "observation": None,
+            "closed_at": "",
+            "reason": "",
+        }
+        attempt["arm_authority_sha256"] = _dispatch_attempt_authority_sha256(
+            attempt
+        )
+        packet["dispatch_attempts"].append(attempt)
+        packet["status"] = "armed"
+        packet["updated_at"] = armed_at
+        state["dispatch_model_version"] = 1
+        state.setdefault("subagent_incidents", [])
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "packet_id": args.packet_id,
+            "status": "armed",
+            "arm_id": attempt["arm_id"],
+            "parent_session_id": parent_session_id,
+            "expected_agent_type": expected_agent_type,
+            "expires_at": attempt["expires_at"],
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_packet_disarm(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "disarm packet for")
+        packet = _packet_by_id(state, args.packet_id)
+        if packet.get("status") != "armed":
+            raise HarnessError("only an armed packet can be disarmed")
+        attempt = _active_dispatch_attempt(packet)
+        recorded = now_iso()
+        attempt["status"] = "disarmed"
+        attempt["closed_at"] = recorded
+        attempt["reason"] = require_evidence_detail(
+            args.reason, "packet disarm reason"
+        )
+        packet["status"] = "ready"
+        packet["updated_at"] = recorded
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {"task_id": args.task, "packet_id": args.packet_id, "status": "ready"},
+        args.json,
+    )
+    return 0
+
+
+def _subagent_event_id(payload: dict[str, Any]) -> str:
+    identity = {
+        "session_id": _safe_hook_observation_text(payload.get("session_id", "")),
+        "turn_id": _safe_hook_observation_text(payload.get("turn_id", "")),
+        "agent_id": _safe_hook_observation_text(payload.get("agent_id", "")),
+        "agent_type": _safe_hook_observation_text(payload.get("agent_type", "")),
+        "hook_protocol_version": int(HOOK_PROTOCOL_VERSION),
+    }
+    return "spawn-" + canonical_record_sha256(identity)[:32]
+
+
+def _record_subagent_incident(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    reason_code: str,
+    candidate_packet_ids: list[str],
+    observed_at: str,
+) -> dict[str, Any]:
+    incident_id = _subagent_event_id(payload)
+    existing = [
+        item
+        for item in state.get("subagent_incidents", [])
+        if item.get("incident_id") == incident_id
+    ]
+    if existing:
+        return existing[0]
+    incident = {
+        "incident_id": incident_id,
+        "kind": "unmanaged_subagent_start",
+        "status": "open",
+        "parent_session_id": _safe_hook_observation_text(
+            payload.get("session_id", "")
+        ),
+        "turn_id": _safe_hook_observation_text(payload.get("turn_id", "")),
+        "agent_id": _safe_hook_observation_text(payload.get("agent_id", "")),
+        "agent_type": _safe_hook_observation_text(payload.get("agent_type", "")),
+        "observed_at": observed_at,
+        "reason_code": reason_code,
+        "candidate_packet_ids": sorted(set(candidate_packet_ids)),
+        "hook_protocol_version": int(HOOK_PROTOCOL_VERSION),
+        "resolution": None,
+    }
+    state["dispatch_model_version"] = 1
+    state.setdefault("subagent_incidents", []).append(incident)
+    return incident
+
+
+def _validate_current_dispatch_arm(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    current: dt.datetime,
+) -> None:
+    if packet.get("status") != "armed" or _packet_schema_version(packet) != 5:
+        raise HarnessError("matching packet is not armed under schema v5")
+    if attempt.get("arm_authority_sha256") != _dispatch_attempt_authority_sha256(
+        attempt
+    ):
+        raise HarnessError("packet arm authority digest is invalid")
+    expires_at = parse_time(str(attempt.get("expires_at", "")))
+    if expires_at is None or expires_at <= current:
+        raise HarnessError("packet arm expired before dispatch")
+    authority = load_chief_authority(paths)
+    if (
+        authority is None
+        or authority.get("status") != "active"
+        or is_expired(str(authority.get("expires_at", "")))
+        or attempt.get("chief_session_id") != authority.get("session_id")
+        or attempt.get("chief_epoch") != authority.get("epoch")
+        or attempt.get("authority_sha256") != canonical_record_sha256(authority)
+    ):
+        raise HarnessError("packet arm Chief authority is no longer current")
+    require_plan_ready(paths, state, "consume packet arm")
+    if (
+        attempt.get("plan_sha256") != state.get("plan_sha256")
+        or attempt.get("packet_contract_sha256")
+        != packet.get("packet_contract_sha256")
+        or attempt.get("execution_selection_id")
+        != packet.get("execution_selection_id", "")
+    ):
+        raise HarnessError("packet arm authority changed after it was issued")
+    authority_errors = packet_authority_integrity_errors(
+        paths, state, packet, require_origin=True
+    )
+    if authority_errors:
+        raise HarnessError("packet authority is invalid: " + "; ".join(authority_errors))
+    selection = _validate_packet_activation_topology(state, packet)
+    if attempt.get("lane_snapshot") != _packet_execution_lane_snapshot(
+        selection, packet
+    ) or attempt.get("steward_snapshot") != (
+        selection.get("steward_snapshot", {}) if selection else {}
+    ):
+        raise HarnessError("packet arm topology snapshot is stale")
+    _validate_skill_canary_work_unit_binding(
+        state,
+        str(packet.get("skill_release_id", "")),
+        str(packet.get("skill_canary_event_id", "")),
+        require_live_canary=True,
+    )
+
+
+def _validate_observed_arm(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    parent_session_id: str,
+    agent_type: str,
+    current: dt.datetime,
+) -> None:
+    if (
+        attempt.get("parent_session_id") != parent_session_id
+        or attempt.get("expected_agent_type") != agent_type
+    ):
+        raise HarnessError("packet arm no longer matches the observed parent/type")
+    _validate_current_dispatch_arm(
+        paths, state, packet, attempt, current=current
+    )
+
+
+def _refresh_index_after_hook_commit(paths: HarnessPaths) -> bool:
+    """Refresh the derived index without hiding an already committed hook result."""
+
+    try:
+        write_index(paths)
+    except Exception:
+        # The target task mutation is already durable. INDEX.md is derived and may
+        # depend on unrelated task state, so its failure must not erase the packet
+        # contract or stop-without-work context returned to the new sub-agent.
+        return False
+    return True
+
+
+def observe_subagent_start(
+    paths: HarnessPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Consume one exact arm or durably record an unmanaged start incident."""
+
+    parent_session_id = str(payload.get("session_id", ""))
+    if not HOOK_ID_RE.fullmatch(parent_session_id):
+        return {"status": "unbound", "reason_code": "invalid_parent_session"}
+    mapping_path = session_path(paths, parent_session_id)
+    if not mapping_path.exists():
+        return {"status": "unbound", "reason_code": "no_task_mapping"}
+    with state_lock(paths, create_layout=False):
+        try:
+            mapping = load_json(mapping_path)
+            if mapping.get("session_id") != parent_session_id:
+                raise HarnessError("session mapping identity mismatch")
+            state = load_task(paths, str(mapping.get("task_id", "")))
+            mapping_kind = mapping.get(
+                "mapping_kind", ROOT_SESSION_MAPPING_KIND
+            )
+            if mapping_kind == ROOT_SESSION_MAPPING_KIND:
+                if parent_session_id not in state.get("session_ids", []):
+                    raise HarnessError("root session mapping lacks task backlink")
+            elif mapping_kind == SUBAGENT_PARENT_MAPPING_KIND:
+                if parent_session_id not in state.get(
+                    "subagent_parent_session_ids", []
+                ):
+                    raise HarnessError(
+                        "subagent parent mapping lacks task backlink"
+                    )
+                parent_packet = _packet_by_id(
+                    state, str(mapping.get("packet_id", ""))
+                )
+                if (
+                    int(parent_packet.get("delegation_depth", 1)) != 1
+                    or parent_packet.get("agent_id") != parent_session_id
+                ):
+                    raise HarnessError(
+                        "subagent parent mapping lost packet identity"
+                    )
+            else:
+                raise HarnessError("session mapping kind is invalid")
+        except HarnessError:
+            return {"status": "corrupt", "reason_code": "corrupt_task_mapping"}
+        event_id = _subagent_event_id(payload)
+        for packet in state.get("packets", []):
+            for attempt in packet.get("dispatch_attempts", []):
+                observation = attempt.get("observation")
+                if isinstance(observation, dict) and observation.get("event_id") == event_id:
+                    return {
+                        "status": "authorized",
+                        "task_id": state["task_id"],
+                        "packet_id": packet.get("packet_id"),
+                        "packet_path": packet.get("path"),
+                        "event_id": event_id,
+                        "idempotent": True,
+                    }
+        existing_incident = next(
+            (
+                item
+                for item in state.get("subagent_incidents", [])
+                if item.get("incident_id") == event_id
+            ),
+            None,
+        )
+        if existing_incident is not None:
+            return {
+                "status": "incident",
+                "task_id": state["task_id"],
+                "incident_id": event_id,
+                "reason_code": existing_incident.get("reason_code"),
+                "idempotent": True,
+            }
+        observed_at = now_iso()
+        current = dt.datetime.now().astimezone()
+        agent_type = str(payload.get("agent_type", ""))
+        agent_id = str(payload.get("agent_id", ""))
+        expired_arms = _expire_dispatch_arms(state, current=current)
+        valid_event = bool(
+            HOOK_ID_RE.fullmatch(agent_type) and HOOK_ID_RE.fullmatch(agent_id)
+        )
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if valid_event:
+            for packet in state.get("packets", []):
+                if packet.get("status") != "armed":
+                    continue
+                attempt = _active_dispatch_attempt(packet)
+                if (
+                    attempt.get("parent_session_id") == parent_session_id
+                    and attempt.get("expected_agent_type") == agent_type
+                ):
+                    candidates.append((packet, attempt))
+        matched_expired_packet_ids = [
+            item["packet_id"]
+            for item in expired_arms
+            if item["parent_session_id"] == parent_session_id
+            and item["expected_agent_type"] == agent_type
+        ]
+        reason_code = ""
+        if not valid_event:
+            reason_code = "invalid_event"
+        elif any(
+            packet.get("agent_id") == agent_id
+            for packet in state.get("packets", [])
+            if packet.get("status") in EXECUTING_PACKET_STATUSES
+        ):
+            reason_code = "duplicate_agent"
+        elif len(candidates) > 1:
+            reason_code = "ambiguous_arm"
+        elif not candidates:
+            reason_code = (
+                "expired_arm" if matched_expired_packet_ids else "no_matching_arm"
+            )
+        if not reason_code:
+            packet, attempt = candidates[0]
+            try:
+                _validate_observed_arm(
+                    paths,
+                    state,
+                    packet,
+                    attempt,
+                    parent_session_id=parent_session_id,
+                    agent_type=agent_type,
+                    current=current,
+                )
+            except HarnessError as exc:
+                reason_code = (
+                    "topology_rejected"
+                    if any(
+                        marker in str(exc).lower()
+                        for marker in ("topology", "selection", "depth-one", "depth-two", "lane")
+                    )
+                    else "authority_invalid"
+                )
+        if reason_code:
+            incident = _record_subagent_incident(
+                state,
+                payload,
+                reason_code=reason_code,
+                candidate_packet_ids=[
+                    str(packet.get("packet_id", "")) for packet, _ in candidates
+                ]
+                or matched_expired_packet_ids,
+                observed_at=observed_at,
+            )
+            bump_task(state)
+            write_task(paths, state)
+            index_refreshed = _refresh_index_after_hook_commit(paths)
+            return {
+                "status": "incident",
+                "task_id": state["task_id"],
+                "incident_id": incident["incident_id"],
+                "reason_code": reason_code,
+                "idempotent": False,
+                "index_refresh_deferred": not index_refreshed,
+            }
+        packet, attempt = candidates[0]
+        observation = {
+            "event_id": event_id,
+            "hook_protocol_version": int(HOOK_PROTOCOL_VERSION),
+            "parent_session_id": parent_session_id,
+            "turn_id": _safe_hook_observation_text(payload.get("turn_id", "")),
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "permission_mode": _safe_hook_observation_text(
+                payload.get("permission_mode", "")
+            ),
+            "observed_at": observed_at,
+        }
+        attempt["status"] = "consumed"
+        attempt["observation"] = observation
+        attempt["closed_at"] = observed_at
+        packet["status"] = "dispatched"
+        packet["dispatch_provenance"] = "codex_subagent_start_observed"
+        packet["dispatch_recorded_at"] = observed_at
+        packet["agent_id"] = agent_id
+        packet["updated_at"] = observed_at
+        state["dispatch_model_version"] = 1
+        parent_mapping_deferred = False
+        if int(packet.get("delegation_depth", 1)) == 1:
+            try:
+                ensure_subagent_parent_mapping_unlocked(paths, state, packet)
+            except HarnessError:
+                # The observed dispatch remains valid. Nested delegation stays
+                # fail-closed until the Chief can repair the parent-only mapping.
+                parent_mapping_deferred = True
+        bump_task(state)
+        write_task(paths, state)
+        index_refreshed = _refresh_index_after_hook_commit(paths)
+        return {
+            "status": "authorized",
+            "task_id": state["task_id"],
+            "packet_id": packet["packet_id"],
+            "packet_path": packet["path"],
+            "event_id": event_id,
+            "idempotent": False,
+            "index_refresh_deferred": not index_refreshed,
+            "parent_mapping_deferred": parent_mapping_deferred,
+        }
+
+
+def cmd_subagent_incident_account(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "account sub-agent incident for")
+        session_id = require_root_session(paths, state, args.session_id)
+        matches = [
+            item
+            for item in state.get("subagent_incidents", [])
+            if item.get("incident_id") == args.incident_id
+        ]
+        if len(matches) != 1:
+            raise HarnessError("incident id does not name exactly one spawn incident")
+        incident = matches[0]
+        if incident.get("status") != "open":
+            raise HarnessError("only an open spawn incident can be accounted")
+        incident["status"] = "accounted"
+        incident["resolution"] = {
+            "disposition": args.disposition,
+            "reason": require_evidence_detail(
+                args.reason, "spawn incident accounting reason"
+            ),
+            "evidence": require_evidence_detail(
+                args.evidence, "spawn incident accounting evidence"
+            ),
+            "root_session_id": session_id,
+            "recorded_at": now_iso(),
+        }
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(incident, args.json)
+    return 0
+
+
 def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
     packet_id = validate_id(args.packet_id, "packet id")
     task_type = validate_id(args.task_type, "packet task type")
+    synthesis_selection_id = str(args.steward_synthesis_for_selection_id or "")
+    if synthesis_selection_id:
+        synthesis_selection_id = validate_id(
+            synthesis_selection_id, "Steward synthesis selection id"
+        )
+        task_type = "steward-synthesis"
+        if args.execution_selection_id and (
+            args.execution_selection_id != synthesis_selection_id
+        ):
+            raise HarnessError(
+                "Steward synthesis selection must match --execution-selection-id when both are given"
+            )
+        if args.delegation_depth != 1 or args.packet_mode != "read_only":
+            raise HarnessError("Steward synthesis must be a depth-one read_only packet")
+        if any(
+            (
+                args.skill_release_id,
+                args.skill_canary_event_id,
+                args.capacity_review_source_id,
+                args.input_artifact,
+                args.command_artifact,
+                args.command_sha256,
+            )
+        ):
+            raise HarnessError(
+                "Steward synthesis consumes only its immutable specialist result bindings"
+            )
     if args.packet_mode not in {"read_only", "bounded_mutation", "exact_command"}:
         raise HarnessError(f"invalid packet mode: {args.packet_mode}")
     if args.packet_mode == "exact_command":
@@ -7820,11 +10347,109 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if state.get("profile") == "mini":
             raise HarnessError("mini task may not create delegation packets")
         require_plan_ready(paths, state, "create packet")
-        if args.lane_id:
-            lane_by_id(state, args.lane_id)
-        selection = _validate_active_execution_selection(
-            state, args.lane_id or "", args.execution_selection_id or ""
-        )
+        _adopt_execution_policy_v2_for_new_work(state)
+        packet_purpose = "work"
+        steward_input_bindings: list[dict[str, Any]] = []
+        steward_selection_snapshot: dict[str, Any] = {}
+        steward_execution_snapshot: dict[str, Any] = {}
+        if synthesis_selection_id:
+            packet_purpose = "steward_synthesis"
+            if not args.lane_id:
+                raise HarnessError("Steward synthesis requires --lane-id")
+            selection = execution_selection_by_id(state, synthesis_selection_id)
+            if (
+                selection.get("status") != "active"
+                or not _is_exact_int(
+                    selection.get("execution_selection_version"), 2
+                )
+                or selection.get("mode")
+                not in {"centralized_parallel", "hybrid"}
+            ):
+                raise HarnessError(
+                    "Steward synthesis requires an active parallel/hybrid selection v2"
+                )
+            steward = _engaged_steward_lane(state)
+            selected_steward = selection.get("steward_snapshot", {})
+            if (
+                not isinstance(selected_steward, dict)
+                or selected_steward.get("lane_id") != steward.get("lane_id")
+                or args.lane_id != steward.get("lane_id")
+                or args.agent_role != steward.get("role")
+            ):
+                raise HarnessError(
+                    "Steward synthesis role/lane must match the engaged selected Steward"
+                )
+            unfinished = [
+                str(item.get("packet_id", ""))
+                for item in state.get("packets", [])
+                if item.get("execution_selection_id") == synthesis_selection_id
+                and not _is_steward_synthesis_packet(item)
+                and item.get("status") in ACTIVE_PACKET_STATUSES
+            ]
+            active_jobs = [
+                str(item.get("run_id", ""))
+                for item in state.get("jobs", [])
+                if item.get("execution_selection_id") == synthesis_selection_id
+                and item.get("status") in ACTIVE_JOB_STATUSES
+            ]
+            if unfinished or active_jobs:
+                raise HarnessError(
+                    "Steward synthesis requires terminal specialist work: "
+                    + ", ".join(unfinished + active_jobs)
+                )
+            steward_input_bindings = _selection_terminal_packet_bindings(
+                state, synthesis_selection_id
+            )
+            selected_lane_ids = {
+                str(item.get("lane_id", ""))
+                for item in selection.get("lane_snapshots", [])
+            }
+            if not steward_input_bindings or {
+                item["lane_id"] for item in steward_input_bindings
+            } != selected_lane_ids:
+                raise HarnessError(
+                    "Steward synthesis requires terminal packet evidence from every selected lane"
+                )
+            prior_synthesis = [
+                item
+                for item in state.get("packets", [])
+                if item.get("execution_selection_id") == synthesis_selection_id
+                and _is_steward_synthesis_packet(item)
+            ]
+            blocking_synthesis = [
+                str(item.get("packet_id", ""))
+                for item in prior_synthesis
+                if item.get("status") not in {"failed", "cancelled"}
+            ]
+            if blocking_synthesis:
+                raise HarnessError(
+                    "selection already has a live or successful Steward synthesis packet: "
+                    + ", ".join(blocking_synthesis)
+                )
+            if prior_synthesis and args.retry_of_packet_id not in {
+                str(item.get("packet_id", "")) for item in prior_synthesis
+            }:
+                raise HarnessError(
+                    "retrying Steward synthesis requires --retry-of-packet-id"
+                )
+            steward_selection_snapshot = copy.deepcopy(selected_steward)
+            steward_execution_snapshot = _lane_authority_snapshot(steward)
+        else:
+            if args.lane_id:
+                lane_by_id(state, args.lane_id)
+            selection = _validate_active_execution_selection(
+                state, args.lane_id or "", args.execution_selection_id or ""
+            )
+            if selection is not None:
+                frozen_by = _selection_synthesis_freeze_packet_ids(
+                    state, str(selection.get("selection_id", ""))
+                )
+                if frozen_by:
+                    raise HarnessError(
+                        "specialist packet creation is frozen after Steward synthesis "
+                        "begins: "
+                        + ", ".join(frozen_by)
+                    )
         skill_binding = _validate_skill_canary_work_unit_binding(
             state,
             args.skill_release_id or "",
@@ -7995,6 +10620,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or "- Parent task plan and only the relevant source/evidence.",
             },
         )
+        text += f"\n## AOI dispatch authority\n\n{NATIVE_V5_PACKET_CONTRACT_MARKER}\n"
         if command_record:
             text += (
                 "\n## Exact command authority\n\n"
@@ -8011,8 +10637,23 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"  SHA-256: `{artifact['sha256']}`\n"
                     f"  Size: `{artifact['size_bytes']}` bytes\n"
                 )
+        if synthesis_selection_id:
+            text += (
+                "\n## Steward synthesis authority\n\n"
+                f"- Execution selection: `{synthesis_selection_id}`\n"
+                f"- Selected Steward snapshot: `{json.dumps(steward_selection_snapshot, sort_keys=True)}`\n"
+                f"- Dispatch Steward snapshot: `{json.dumps(steward_execution_snapshot, sort_keys=True)}`\n"
+                "- Immutable specialist result bindings:\n"
+            )
+            for binding in steward_input_bindings:
+                text += (
+                    f"  - `{binding['packet_id']}` / `{binding['lane_id']}` / "
+                    f"`{binding['status']}` / `{binding['result_sha256']}`\n"
+                )
         atomic_write_text(destination, text)
         packet_contract_sha256 = sha256_file(destination)
+        state["dispatch_model_version"] = 1
+        state.setdefault("subagent_incidents", [])
         state.setdefault("packets", []).append(
             {
                 "packet_id": packet_id,
@@ -8024,8 +10665,22 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "execution_selection_id": selection.get("selection_id", "")
                 if selection
                 else "",
+                "packet_purpose": packet_purpose,
+                **(
+                    {
+                        "steward_selection_snapshot": steward_selection_snapshot,
+                        "steward_execution_snapshot": steward_execution_snapshot,
+                        "steward_input_bindings": steward_input_bindings,
+                    }
+                    if synthesis_selection_id
+                    else {}
+                ),
                 **(skill_binding or {}),
-                "packet_schema_version": 4,
+                "packet_schema_version": 5,
+                "dispatch_version": 1,
+                "dispatch_provenance": "none",
+                "dispatch_attempts": [],
+                "dispatch_schema_origin": "native_v5",
                 "packet_mode": args.packet_mode,
                 "task_type": task_type,
                 "delegation_depth": args.delegation_depth,
@@ -8063,18 +10718,30 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "update packet for")
-        matches = [
-            packet
-            for packet in state.get("packets", [])
-            if packet.get("packet_id") == args.packet_id
-        ]
-        if len(matches) != 1:
-            raise HarnessError(
-                f"expected exactly one packet named {args.packet_id}, found {len(matches)}"
-            )
-        packet = matches[0]
+        packet = _packet_by_id(state, args.packet_id)
         previous_status = packet.get("status")
+        previous_schema_version = _packet_schema_version(packet)
         if args.status == "dispatched":
+            if previous_status in {"ready", "armed"}:
+                if previous_schema_version == 4:
+                    legacy_contract_error = packet_contract_integrity_error(
+                        paths, state, packet
+                    )
+                    if legacy_contract_error:
+                        raise HarnessError(legacy_contract_error)
+                    _adopt_legacy_execution_provenance_for_v4_migration(state)
+                _upgrade_packet_dispatch_schema(packet)
+            if (_packet_schema_version(packet) or 0) >= 5:
+                state["dispatch_model_version"] = 1
+                state.setdefault("subagent_incidents", [])
+            if previous_status == "armed":
+                _validate_current_dispatch_arm(
+                    paths,
+                    state,
+                    packet,
+                    _active_dispatch_attempt(packet),
+                    current=dt.datetime.now().astimezone(),
+                )
             authority_errors = packet_authority_integrity_errors(
                 paths,
                 state,
@@ -8086,21 +10753,23 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     "packet authority is missing or tampered: "
                     + "; ".join(authority_errors)
                 )
-            _validate_active_execution_selection(
-                state,
-                str(packet.get("lane_id", "")),
-                str(packet.get("execution_selection_id", "")),
-            )
+            _validate_packet_activation_topology(state, packet)
             _validate_skill_canary_work_unit_binding(
                 state,
                 str(packet.get("skill_release_id", "")),
                 str(packet.get("skill_canary_event_id", "")),
                 require_live_canary=True,
             )
+            if previous_status == "ready" and previous_schema_version == 5:
+                raise HarnessError(
+                    "schema-v5 manual dispatch requires a prior packet-arm; "
+                    "ready-to-dispatched registration is not allowed"
+                )
         if previous_status in TERMINAL_PACKET_STATUSES:
             raise HarnessError(f"packet {args.packet_id} is already terminal")
         allowed_transitions = {
             "ready": {"dispatched", "cancelled"},
+            "armed": {"dispatched", "cancelled"},
             "dispatched": {"dispatched", "done", "failed", "cancelled"},
         }
         if args.status not in allowed_transitions.get(str(previous_status), set()):
@@ -8140,6 +10809,30 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     "done packet authority is missing or tampered: "
                     + "; ".join(authority_errors)
                 )
+        if (
+            args.status in TERMINAL_PACKET_STATUSES
+            and int(packet.get("delegation_depth", 1)) == 1
+        ):
+            active_children = [
+                str(item.get("packet_id", ""))
+                for item in state.get("packets", [])
+                if item.get("parent_packet_id") == args.packet_id
+                and item.get("status") in EXECUTING_PACKET_STATUSES
+            ]
+            active_owned_jobs = [
+                str(item.get("run_id", ""))
+                for item in state.get("jobs", [])
+                if item.get("owner_packet_id") == args.packet_id
+                and item.get("status") in ACTIVE_JOB_STATUSES
+            ]
+            if active_children or active_owned_jobs:
+                raise HarnessError(
+                    "depth-one packet cannot become terminal while child work is active: "
+                    + ", ".join(
+                        active_children
+                        + [f"job:{run_id}" for run_id in active_owned_jobs]
+                    )
+                )
         if args.status in TERMINAL_PACKET_STATUSES:
             summary = require_text(args.summary or "", "terminal packet summary")
             if args.status in {"done", "failed"} and not args.evidence:
@@ -8153,10 +10846,41 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
         packet["status"] = args.status
         packet["updated_at"] = now_iso()
-        if args.status == "dispatched" and not packet.get("dispatched_at"):
-            packet["dispatched_at"] = packet["updated_at"]
+        if args.status == "dispatched" and previous_status in {"ready", "armed"}:
+            reason = args.manual_unverified_reason or (
+                "Manual CLI registration; agent start timing was not observed by AOI."
+            )
+            packet["dispatch_provenance"] = "manual_unverified"
+            packet["dispatch_recorded_at"] = packet["updated_at"]
+            packet["manual_unverified_reason"] = require_evidence_detail(
+                reason, "manual dispatch reason"
+            )
+            if previous_status == "ready" and previous_schema_version == 4:
+                packet["legacy_manual_dispatch_migration"] = True
+            if previous_status == "armed":
+                attempt = _active_dispatch_attempt(packet)
+                attempt["status"] = "disarmed"
+                attempt["closed_at"] = packet["updated_at"]
+                attempt["reason"] = packet["manual_unverified_reason"]
+        elif args.status == "cancelled" and previous_status == "armed":
+            attempt = _active_dispatch_attempt(packet)
+            attempt["status"] = "disarmed"
+            attempt["closed_at"] = packet["updated_at"]
+            attempt["reason"] = "Packet was cancelled before observed dispatch."
+        if (
+            args.status in TERMINAL_PACKET_STATUSES
+            and _packet_schema_version(packet) is not None
+            and _packet_schema_version(packet) < 5
+            and not packet.get("dispatch_provenance")
+        ):
+            packet["dispatch_provenance"] = "legacy_unverified"
         if agent_id:
             packet["agent_id"] = agent_id
+        if (
+            args.status == "dispatched"
+            and int(packet.get("delegation_depth", 1)) == 1
+        ):
+            ensure_subagent_parent_mapping_unlocked(paths, state, packet)
         if args.actual_role:
             packet["actual_role"] = args.actual_role
         if args.actual_model_tier:
@@ -8182,6 +10906,7 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 f"`{packet.get('actual_model_tier') or 'unverified'}`\n"
                 f"- Routing verified: `{str(packet['routing_verified']).lower()}`\n\n"
                 f"- Routing evidence: {packet.get('routing_evidence') or 'Not exposed by platform.'}\n\n"
+                f"- Dispatch provenance: `{packet.get('dispatch_provenance') or 'legacy_unverified'}`\n\n"
                 "## Summary\n\n"
                 f"{summary}\n\n"
                 "## Evidence\n\n"
@@ -8259,6 +10984,10 @@ def _job_launch_authority_record(
         if selection
         else "",
         "lane_id": str(job.get("lane_id", "")),
+        "owner_packet_id": str(job.get("owner_packet_id", "")),
+        "owner_packet_contract_sha256": str(
+            job.get("owner_packet_contract_sha256", "")
+        ),
         "lane_snapshot": lane_snapshot,
         "skill_binding": dict(skill_binding or {}),
         "recorded_at": now_iso(),
@@ -8301,6 +11030,10 @@ def _job_launch_authority_errors(
             event.get("lane_id") != job.get("lane_id", "")
             or event.get("execution_selection_id")
             != job.get("execution_selection_id", "")
+            or str(event.get("owner_packet_id", ""))
+            != str(job.get("owner_packet_id", ""))
+            or str(event.get("owner_packet_contract_sha256", ""))
+            != str(job.get("owner_packet_contract_sha256", ""))
         ):
             errors.append(f"job {job.get('run_id')} launch event {index} changed authority")
             continue
@@ -8369,10 +11102,65 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if state.get("profile") == "mini":
             raise HarnessError("mini task may not launch or register external jobs")
         require_plan_ready(paths, state, "start external job")
+        _adopt_execution_policy_v2_for_new_work(state)
         if args.lane_id:
             lane_by_id(state, args.lane_id)
         selection = _validate_active_execution_selection(
             state, args.lane_id or "", args.execution_selection_id or ""
+        )
+        if selection is not None:
+            frozen_by = _selection_synthesis_freeze_packet_ids(
+                state, str(selection.get("selection_id", ""))
+            )
+            if frozen_by:
+                raise HarnessError(
+                    "external job creation is frozen after Steward synthesis begins: "
+                    + ", ".join(frozen_by)
+                )
+        active_synthesis_packets = [
+            str(packet.get("packet_id", ""))
+            for packet in state.get("packets", [])
+            if _is_steward_synthesis_packet(packet)
+            and packet.get("status") in EXECUTING_PACKET_STATUSES
+        ]
+        if active_synthesis_packets:
+            raise HarnessError(
+                "external job cannot start during the sequential Steward synthesis phase: "
+                + ", ".join(active_synthesis_packets)
+            )
+        owner_packet = (
+            _packet_by_id(state, args.owner_packet_id)
+            if args.owner_packet_id
+            else None
+        )
+        namespace = paths.project.external_lock_namespace
+        required_output_locks = [
+            f"{namespace}:tree:{work_root}",
+            f"{namespace}:file:{log}",
+        ]
+        command_authority_sha = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        _validate_job_activation_topology(
+            state,
+            {
+                "run_id": run_id,
+                "lane_id": args.lane_id or "",
+                "execution_selection_id": selection.get("selection_id", "")
+                if selection
+                else "",
+                "owner_packet_id": args.owner_packet_id or "",
+                "owner_packet_contract_sha256": (
+                    owner_packet.get("packet_contract_sha256", "")
+                    if owner_packet is not None
+                    else ""
+                ),
+                "external_lock_namespace": namespace,
+                "required_output_locks": required_output_locks,
+                "work_root": work_root,
+                "log": log,
+                "command_sha256": command_authority_sha,
+            },
+            selection,
+            paths=paths,
         )
         skill_binding = _validate_skill_canary_work_unit_binding(
             state,
@@ -8387,11 +11175,6 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             for claim in claims_owned_by_task(paths, state["task_id"])
             if claim.get("status") in RESERVING_CLAIM_STATUSES
             for lock in claim.get("locks", [])
-        ]
-        namespace = paths.project.external_lock_namespace
-        required_output_locks = [
-            f"{namespace}:tree:{work_root}",
-            f"{namespace}:file:{log}",
         ]
         unowned = [
             lock
@@ -8415,9 +11198,12 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         atomic_write_text(command_snapshot, command)
         os.chmod(command_snapshot, 0o600)
         command_sha = sha256_file(command_snapshot)
+        if command_sha != command_authority_sha:
+            raise HarnessError("external job command snapshot changed during copy")
         job = {
             "integrity_version": 1,
             "job_schema_version": 2,
+            "task_execution_policy_version": EXECUTION_POLICY_VERSION,
             "launch_authority_version": 1,
             "launch_authority_events": [],
             "run_id": run_id,
@@ -8425,6 +11211,14 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_selection_id": selection.get("selection_id", "")
             if selection
             else "",
+            "owner_packet_id": args.owner_packet_id or "",
+            "owner_packet_contract_sha256": (
+                owner_packet.get("packet_contract_sha256", "")
+                if owner_packet is not None
+                else ""
+            ),
+            "external_lock_namespace": namespace,
+            "required_output_locks": required_output_locks,
             **(skill_binding or {}),
             "host": require_text(args.host, "host"),
             "tool": require_text(args.tool, "tool"),
@@ -8482,6 +11276,13 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 state,
                 str(job.get("lane_id", "")),
                 str(job.get("execution_selection_id", "")),
+            )
+            _validate_job_activation_topology(
+                state,
+                job,
+                selection,
+                paths=paths,
+                exclude_run_id=str(job.get("run_id", "")),
             )
             skill_binding = _validate_skill_canary_work_unit_binding(
                 state,
@@ -8735,10 +11536,17 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     if active_packets:
         failures.append("unfinished delegation packets: " + ", ".join(active_packets))
     failures.extend(packet_integrity_errors(paths, state))
+    failures.extend(subagent_incident_integrity_errors(state))
     failures.extend(packet_recovery_integrity_errors(paths, state))
     failures.extend(job_integrity_errors(paths, state))
     failures.extend(verification_integrity_errors(paths, state))
     failures.extend(portfolio_integrity_errors(state, paths))
+    for selection in state.get("execution_selections", []):
+        if selection.get("mode") not in {"centralized_parallel", "hybrid"}:
+            continue
+        brief_error = _execution_brief_coverage_error(state, selection)
+        if brief_error:
+            failures.append(brief_error)
     unresolved_coordination = [
         str(request.get("request_id"))
         for request in state.get("coordination_requests", [])
@@ -8784,6 +11592,16 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     if open_user_escalations:
         failures.append(
             "unresolved needs-user escalations: " + ", ".join(open_user_escalations)
+        )
+    open_spawn_incidents = [
+        str(item.get("incident_id"))
+        for item in state.get("subagent_incidents", [])
+        if item.get("status") == "open"
+    ]
+    if open_spawn_incidents:
+        failures.append(
+            "unaccounted sub-agent spawn incidents: "
+            + ", ".join(open_spawn_incidents)
         )
     worktree_errors, _ = worktree_integrity_errors(paths, state)
     failures.extend(worktree_errors)
@@ -8899,9 +11717,20 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "unresolved needs-user escalations: "
                 + ", ".join(open_user_escalations)
             )
+        open_spawn_incidents = [
+            str(item.get("incident_id"))
+            for item in state.get("subagent_incidents", [])
+            if item.get("status") == "open"
+        ]
+        if open_spawn_incidents:
+            failures.append(
+                "unaccounted sub-agent spawn incidents: "
+                + ", ".join(open_spawn_incidents)
+            )
         if state.get("delivery", {}).get("mode") == "pending":
             failures.append("delivery disposition is pending")
         failures.extend(packet_integrity_errors(paths, state))
+        failures.extend(subagent_incident_integrity_errors(state))
         failures.extend(packet_recovery_integrity_errors(paths, state))
         failures.extend(job_integrity_errors(paths, state))
         worktree_errors, _ = worktree_integrity_errors(paths, state)
@@ -8980,13 +11809,14 @@ def cmd_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if args.task:
         emit(task_summary(load_task(paths, args.task)), args.json)
         return 0
-    ensure_layout(paths)
+    require_complete_layout(paths)
     tasks = load_all_tasks(paths)
     claims = load_all_claims(paths)
     structured = [claim for claim in claims if not claim.get("legacy")]
     legacy = [claim for claim in claims if claim.get("legacy")]
     payload: dict[str, Any] = {
         "root": str(paths.root),
+        "chief_authority": chief_authority_summary(paths),
         "tasks": [task_summary(task) for task in tasks],
         "structured_claims": [
             {
@@ -9257,9 +12087,41 @@ def cmd_verify_backup(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    ensure_layout(paths)
+    preflight_layout(paths)
     errors: list[str] = []
     warnings: list[str] = []
+    try:
+        require_complete_layout(paths)
+    except HarnessError as exc:
+        errors.append(str(exc))
+    policy_path = paths.harness / "POLICY.md"
+    if policy_path.is_file():
+        current_policy_sha256 = hashlib.sha256(policy_path.read_bytes()).hexdigest()
+        packaged_policy_sha256 = hashlib.sha256(
+            _resource_text("policy.md").encode("utf-8")
+        ).hexdigest()
+        if current_policy_sha256 != packaged_policy_sha256:
+            errors.append(
+                "managed AOI policy differs from the packaged contract; run "
+                "authenticated `aoi init` after reviewing the exact policy digest "
+                f"{current_policy_sha256}"
+            )
+    try:
+        authority = chief_authority_summary(paths)
+    except HarnessError as exc:
+        authority = {"status": "invalid"}
+        errors.append(str(exc))
+    else:
+        if authority["status"] == "uninitialized":
+            warnings.append(
+                "Chief authority is uninitialized; lifecycle mutations require chief-acquire"
+            )
+        elif authority["status"] == "inactive":
+            warnings.append("Chief authority is inactive; lifecycle mutations are fenced")
+        elif authority["expired"]:
+            warnings.append(
+                "Chief authority is expired; lifecycle mutations require explicit takeover"
+            )
     scoped = bool(args.task)
     if scoped:
         try:
@@ -9352,6 +12214,16 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         errors.extend(
             f"task {task_id}: {item}" for item in portfolio_integrity_errors(task, paths)
         )
+        errors.extend(
+            f"task {task_id}: {item}"
+            for item in subagent_incident_integrity_errors(task)
+        )
+        for incident in task.get("subagent_incidents", []):
+            if incident.get("status") == "open":
+                errors.append(
+                    f"task {task_id}: open sub-agent spawn incident "
+                    f"{incident.get('incident_id')} ({incident.get('reason_code')})"
+                )
         warnings.extend(
             f"task {task_id}: {item}" for item in packet_integrity_warnings(task)
         )
@@ -9472,7 +12344,11 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if scoped:
         mapping_paths = []
         for task in tasks:
-            for session_id in task.get("session_ids", []):
+            scoped_session_ids = [
+                *task.get("session_ids", []),
+                *task.get("subagent_parent_session_ids", []),
+            ]
+            for session_id in dict.fromkeys(scoped_session_ids):
                 candidate = session_path(paths, session_id)
                 if task.get("status") in {"active", "blocked"} or candidate.exists():
                     mapping_paths.append(candidate)
@@ -9501,9 +12377,43 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     errors.append(
                         f"session {session_id} remains mapped to closed task {task['task_id']}"
                     )
-                if session_id not in task.get("session_ids", []):
+                mapping_kind = mapping.get(
+                    "mapping_kind", ROOT_SESSION_MAPPING_KIND
+                )
+                if mapping_kind == ROOT_SESSION_MAPPING_KIND:
+                    if session_id not in task.get("session_ids", []):
+                        errors.append(
+                            f"root session {session_id} mapping lacks backlink in task {task['task_id']}"
+                        )
+                    if session_id in task.get("subagent_parent_session_ids", []):
+                        errors.append(
+                            f"root session {session_id} also has a subagent-parent backlink"
+                        )
+                elif mapping_kind == SUBAGENT_PARENT_MAPPING_KIND:
+                    if session_id not in task.get(
+                        "subagent_parent_session_ids", []
+                    ):
+                        errors.append(
+                            f"subagent parent {session_id} mapping lacks backlink in task {task['task_id']}"
+                        )
+                    if session_id in task.get("session_ids", []):
+                        errors.append(
+                            f"subagent parent {session_id} is incorrectly root-authorized"
+                        )
+                    packet_matches = [
+                        packet
+                        for packet in task.get("packets", [])
+                        if packet.get("packet_id") == mapping.get("packet_id")
+                        and packet.get("agent_id") == session_id
+                        and int(packet.get("delegation_depth", 1)) == 1
+                    ]
+                    if len(packet_matches) != 1:
+                        errors.append(
+                            f"subagent parent {session_id} mapping lacks its depth-one packet"
+                        )
+                else:
                     errors.append(
-                        f"session {session_id} mapping lacks backlink in task {task['task_id']}"
+                        f"session {session_id} has invalid mapping kind {mapping_kind!r}"
                     )
         except HarnessError as exc:
             errors.append(str(exc))
@@ -9512,9 +12422,23 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if task.get("status") not in {"active", "blocked"}:
             continue
         for session_id in task.get("session_ids", []):
-            if mappings.get(session_id, {}).get("task_id") != task["task_id"]:
+            mapping = mappings.get(session_id, {})
+            if (
+                mapping.get("task_id") != task["task_id"]
+                or mapping.get("mapping_kind", ROOT_SESSION_MAPPING_KIND)
+                != ROOT_SESSION_MAPPING_KIND
+            ):
                 errors.append(
                     f"task {task['task_id']} backlink has no matching session mapping: {session_id}"
+                )
+        for session_id in task.get("subagent_parent_session_ids", []):
+            mapping = mappings.get(session_id, {})
+            if (
+                mapping.get("task_id") != task["task_id"]
+                or mapping.get("mapping_kind") != SUBAGENT_PARENT_MAPPING_KIND
+            ):
+                errors.append(
+                    f"task {task['task_id']} subagent-parent backlink has no matching mapping: {session_id}"
                 )
 
     if paths.project.codex_hooks_enabled:
@@ -9582,6 +12506,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     payload = {
         "ok": not errors,
         "scope": args.task or "global",
+        "chief_authority": authority,
         "errors": errors,
         "warnings": warnings,
         "task_count": len(tasks),
@@ -9596,12 +12521,49 @@ def add_json_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def build_parser(
+    chief_defaults: dict[str, str | None] | None = None,
+) -> argparse.ArgumentParser:
+    if chief_defaults is None:
+        chief_defaults = {
+            "session_id": os.environ.get("AOI_CHIEF_SESSION_ID"),
+            "epoch": os.environ.get("AOI_CHIEF_EPOCH"),
+            "token": os.environ.get("AOI_CHIEF_TOKEN"),
+            "credential_file": os.environ.get("AOI_CHIEF_CREDENTIAL_FILE"),
+        }
+    parser = AOIArgumentParser(
         description="AOI governed multi-agent organization infrastructure"
     )
     parser.add_argument("--version", action="version", version=f"AOI {__version__}")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--chief-session-id",
+        default=chief_defaults.get("session_id"),
+        help=(
+            "Chief lease session id (or AOI_CHIEF_SESSION_ID); Chief global "
+            "options are accepted before or after the command"
+        ),
+    )
+    parser.add_argument(
+        "--chief-epoch",
+        default=chief_defaults.get("epoch"),
+        help="Chief lease epoch (or AOI_CHIEF_EPOCH)",
+    )
+    parser.add_argument(
+        "--chief-token",
+        default=chief_defaults.get("token"),
+        help=(
+            "deprecated explicit Chief token fallback; prefer the private credential file"
+        ),
+    )
+    parser.add_argument(
+        "--chief-credential-file",
+        default=chief_defaults.get("credential_file"),
+        help=(
+            "private repo-external Chief credential file (or "
+            "AOI_CHIEF_CREDENTIAL_FILE); defaults to the user credential store"
+        ),
+    )
+    sub = parser.add_subparsers(dest="_aoi_command", required=True)
 
     p = sub.add_parser("init", help="initialize AOI in the current Git repository")
     source = p.add_mutually_exclusive_group()
@@ -9617,6 +12579,13 @@ def build_parser() -> argparse.ArgumentParser:
             "approved full SHA-256"
         ),
     )
+    p.add_argument(
+        "--replace-policy-sha256",
+        help=(
+            "replace a reviewed non-packaged managed policy only if its current "
+            "full SHA-256 still matches"
+        ),
+    )
     add_json_argument(p)
     p.set_defaults(handler=cmd_init)
 
@@ -9627,6 +12596,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", required=True)
     add_json_argument(p)
     p.set_defaults(handler=cmd_config_check)
+
+    p = sub.add_parser("chief-acquire", help="acquire the project Chief lease")
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--ttl-seconds", type=int, default=CHIEF_DEFAULT_TTL_SECONDS)
+    p.add_argument(
+        "--credential-home",
+        help="optional absolute repo-external credential store root",
+    )
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_chief_acquire)
+
+    p = sub.add_parser("chief-renew", help="renew the current Chief lease")
+    p.add_argument("--ttl-seconds", type=int, default=CHIEF_DEFAULT_TTL_SECONDS)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_chief_renew)
+
+    p = sub.add_parser("chief-release", help="release the current Chief lease")
+    p.add_argument("--reason", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_chief_release)
+
+    p = sub.add_parser(
+        "chief-takeover",
+        help="replace an expired lease or explicitly force replacement of a live lease",
+    )
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--expected-epoch", type=int, required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--force-live", action="store_true")
+    p.add_argument("--ttl-seconds", type=int, default=CHIEF_DEFAULT_TTL_SECONDS)
+    p.add_argument(
+        "--credential-home",
+        help="optional absolute repo-external credential store root",
+    )
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_chief_takeover)
+
+    p = sub.add_parser("chief-status", help="show non-secret Chief lease status")
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_chief_status)
 
     p = sub.add_parser(
         "pilot-init",
@@ -9926,6 +12935,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--supersedes-selection-id")
     p.add_argument("--mode", choices=sorted(EXECUTION_MODES), required=True)
     p.add_argument("--lane", action="append", default=[], required=True)
+    p.add_argument("--steward-lane-id")
     p.add_argument("--scope", required=True)
     p.add_argument(
         "--sequential-dependency", choices=sorted(DEPENDENCY_LEVELS), required=True
@@ -9938,6 +12948,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", required=True)
     add_json_argument(p)
     p.set_defaults(handler=cmd_execution_select)
+
+    p = sub.add_parser("execution-brief-record")
+    p.add_argument("--task", required=True)
+    p.add_argument("--brief-id", required=True)
+    p.add_argument("--execution-selection-id", required=True)
+    p.add_argument("--steward-lane-id", required=True)
+    p.add_argument("--steward-packet-id")
+    p.add_argument("--packet-id", action="append", default=[], required=True)
+    p.add_argument("--cross-lane-session-id", action="append", default=[])
+    p.add_argument("--summary", required=True)
+    p.add_argument("--dissent", required=True)
+    p.add_argument("--blocker", required=True)
+    p.add_argument("--recommendation", required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_execution_brief_record)
 
     p = sub.add_parser("cross-lane-open")
     p.add_argument("--task", required=True)
@@ -10260,6 +13286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--read-first", action="append", default=[])
     p.add_argument("--lane-id")
     p.add_argument("--execution-selection-id")
+    p.add_argument("--steward-synthesis-for-selection-id")
     p.add_argument("--skill-release-id")
     p.add_argument("--skill-canary-event-id")
     p.add_argument("--task-type", default="general")
@@ -10280,14 +13307,35 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_argument(p)
     p.set_defaults(handler=cmd_create_packet)
 
+    p = sub.add_parser("packet-arm")
+    p.add_argument("--task", required=True)
+    p.add_argument("--packet-id", required=True)
+    p.add_argument("--expected-agent-type", required=True)
+    p.add_argument("--expires-at", required=True)
+    p.add_argument("--parent-session-id")
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_packet_arm)
+
+    p = sub.add_parser("packet-disarm")
+    p.add_argument("--task", required=True)
+    p.add_argument("--packet-id", required=True)
+    p.add_argument("--reason", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_packet_disarm)
+
     p = sub.add_parser("packet-update")
     p.add_argument("--task", required=True)
     p.add_argument("--packet-id", required=True)
-    p.add_argument("--status", choices=sorted(PACKET_STATUSES - {"ready"}), required=True)
+    p.add_argument(
+        "--status",
+        choices=sorted(PACKET_STATUSES - {"ready", "armed"}),
+        required=True,
+    )
     p.add_argument("--agent-id")
     p.add_argument("--actual-role", choices=sorted(ROLE_TIER_MAP))
     p.add_argument("--actual-model-tier", choices=sorted(set(ROLE_TIER_MAP.values())))
     p.add_argument("--routing-evidence")
+    p.add_argument("--manual-unverified-reason")
     p.add_argument("--summary")
     p.add_argument("--evidence", action="append", default=[])
     add_json_argument(p)
@@ -10299,6 +13347,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--evidence", required=True)
     add_json_argument(p)
     p.set_defaults(handler=cmd_packet_attest_result)
+
+    p = sub.add_parser("subagent-incident-account")
+    p.add_argument("--task", required=True)
+    p.add_argument("--incident-id", required=True)
+    p.add_argument(
+        "--disposition",
+        choices=["no_material_work", "work_discarded", "manual_unverified"],
+        required=True,
+    )
+    p.add_argument("--reason", required=True)
+    p.add_argument("--evidence", required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_subagent_incident_account)
 
     p = sub.add_parser("job-start")
     p.add_argument("--task", required=True)
@@ -10319,6 +13381,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--success-exit-code", type=int, default=0)
     p.add_argument("--lane-id")
     p.add_argument("--execution-selection-id")
+    p.add_argument("--owner-packet-id")
     p.add_argument("--skill-release-id")
     p.add_argument("--skill-canary-event-id")
     add_json_argument(p)
@@ -10404,25 +13467,160 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_CHIEF_GLOBAL_VALUE_OPTIONS = {
+    "--chief-session-id",
+    "--chief-epoch",
+    "--chief-token",
+    "--chief-credential-file",
+}
+
+
+def _normalize_chief_global_options(raw_argv: list[str]) -> list[str]:
+    """Accept Chief globals anywhere without exposing their values in errors."""
+
+    global_items: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(raw_argv):
+        item = raw_argv[index]
+        if item in _CHIEF_GLOBAL_VALUE_OPTIONS:
+            global_items.append(item)
+            if index + 1 < len(raw_argv):
+                global_items.append(raw_argv[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if any(item.startswith(option + "=") for option in _CHIEF_GLOBAL_VALUE_OPTIONS):
+            global_items.append(item)
+            index += 1
+            continue
+        remaining.append(item)
+        index += 1
+    return [*global_items, *remaining]
+
+
+def _command_from_normalized_argv(raw_argv: list[str]) -> str:
+    """Locate the command after exact Chief globals have been normalized."""
+
+    index = 0
+    while index < len(raw_argv):
+        item = raw_argv[index]
+        if item in _CHIEF_GLOBAL_VALUE_OPTIONS:
+            index += 2
+            continue
+        if any(item.startswith(option + "=") for option in _CHIEF_GLOBAL_VALUE_OPTIONS):
+            index += 1
+            continue
+        if item == "--":
+            return raw_argv[index + 1] if index + 1 < len(raw_argv) else ""
+        if item.startswith("-"):
+            index += 1
+            continue
+        return item
+    return ""
+
+
+def _take_chief_environment_defaults() -> dict[str, str | None]:
+    mapping = {
+        "session_id": "AOI_CHIEF_SESSION_ID",
+        "epoch": "AOI_CHIEF_EPOCH",
+        "token": "AOI_CHIEF_TOKEN",
+        "credential_file": "AOI_CHIEF_CREDENTIAL_FILE",
+    }
+    defaults = {key: os.environ.get(name) for key, name in mapping.items()}
+    for name in mapping.values():
+        os.environ.pop(name, None)
+    return defaults
+
+
+def _reload_locked_paths(paths: HarnessPaths) -> HarnessPaths:
+    if not paths.config.is_file():
+        raise HarnessError(
+            "aoi.toml disappeared while acquiring the project state lock"
+        )
+    current = get_paths(paths.root)
+    if not paths.config.is_file():
+        raise HarnessError(
+            "aoi.toml disappeared while acquiring the project state lock"
+        )
+    if (
+        current.project.sha256 != paths.project.sha256
+        or current.harness != paths.harness
+        or current.lock != paths.lock
+    ):
+        raise HarnessError("aoi.toml changed while acquiring the project state lock")
+    return current
+
+
+def _execute_project_command(
+    args: argparse.Namespace, paths: HarnessPaths, *, initialized: bool
+) -> int:
+    command = str(args._aoi_command)
+    args._aoi_initialized_at_dispatch = initialized
+    if not command_requires_chief(command, initialized=initialized):
+        return int(args.handler(args, paths))
+    with state_lock(paths, create_layout=False):
+        paths = _reload_locked_paths(paths)
+        session_id, epoch, token, _credential_path = _chief_credential(args, paths)
+        require_chief_authority(
+            paths,
+            session_id=session_id,
+            epoch=epoch,
+            token=token,
+        )
+        return int(args.handler(args, paths))
+
+
 def main(argv: list[str] | None = None) -> int:
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    raw_argv = _normalize_chief_global_options(
+        list(sys.argv[1:] if argv is None else argv)
+    )
+    chief_defaults = _take_chief_environment_defaults()
     try:
-        if "--version" in raw_argv or "--help" in raw_argv or "-h" in raw_argv:
-            parser = build_parser()
+        command = _command_from_normalized_argv(raw_argv)
+        if not command:
+            parser = build_parser(chief_defaults)
+            parser.parse_args(raw_argv)
+            return 0
+        if any(argument in {"-h", "--help"} for argument in raw_argv):
+            paths = get_paths()
+            if paths.config.is_file():
+                apply_project_config(paths.project)
+            parser = build_parser(chief_defaults)
+            parser.parse_args(raw_argv)
+            return 0
+        if command in CHIEF_STANDALONE_COMMANDS:
+            parser = build_parser(chief_defaults)
             args = parser.parse_args(raw_argv)
-            return int(args.handler(args, get_paths()))
-        command = next((item for item in raw_argv if not item.startswith("-")), "")
-        if command in {"pilot-init", "pilot-validate", "pilot-summary", "config-check"}:
-            parser = build_parser()
-            args = parser.parse_args(raw_argv)
+            if args._aoi_command != command:
+                raise HarnessError("parsed command differs from normalized command routing")
+            if command in CHIEF_STANDALONE_WRITER_COMMANDS:
+                projects = _pilot_output_projects(
+                    Path(args.output), kit_destinations=command == "pilot-init"
+                )
+                if len(projects) > 1:
+                    raise HarnessError(
+                        "pilot output overlaps multiple initialized AOI projects"
+                    )
+                if projects:
+                    project_paths = projects[0]
+                    apply_project_config(project_paths.project)
+                    return _execute_project_command(
+                        args, project_paths, initialized=True
+                    )
             return int(args.handler(args, None))
         paths = get_paths()
-        if command not in {"init", "config-check", ""} and not paths.config.is_file():
+        initialized = paths.config.is_file()
+        if command not in {"init", ""} and not initialized:
             raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
-        apply_project_config(paths.project)
-        parser = build_parser()
+        if initialized:
+            apply_project_config(paths.project)
+        parser = build_parser(chief_defaults)
         args = parser.parse_args(raw_argv)
-        return int(args.handler(args, paths))
+        if args._aoi_command != command:
+            raise HarnessError("parsed command differs from normalized command routing")
+        return _execute_project_command(args, paths, initialized=initialized)
     except (HarnessError, PilotError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.resources
@@ -13,15 +14,23 @@ import os
 import re
 import statistics
 import tempfile
-from pathlib import Path
+import time
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from . import __version__
-from .harnesslib import HarnessError, canonicalize_no_link_traversal, replace_file
+from .harnesslib import (
+    HarnessError,
+    HarnessPaths,
+    WINDOWS_REPLACE_RETRY_SECONDS,
+    canonicalize_no_link_traversal,
+    fsync_directory,
+    get_paths,
+)
 
 
 PILOT_SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "closed-alpha-v1"
+PROTOCOL_VERSION = "closed-alpha-v2"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 TASK_KINDS = {"bugfix", "feature", "refactor", "documentation", "analysis", "other"}
@@ -301,7 +310,7 @@ def validate_record(payload: Any) -> dict[str, Any]:
     if record["task_kind"] not in TASK_KINDS:
         raise PilotError(f"task_kind must be one of: {', '.join(sorted(TASK_KINDS))}")
     if record["variant"] not in VARIANTS:
-        raise PilotError("closed-alpha-v1 accepts only 'single' or 'aoi'")
+        raise PilotError("closed-alpha-v2 accepts only 'single' or 'aoi'")
     if record["run_status"] not in RUN_STATUSES:
         raise PilotError(f"run_status must be one of: {', '.join(sorted(RUN_STATUSES))}")
     started = _timestamp(record["started_at"], "started_at")
@@ -439,18 +448,241 @@ def _resource_files() -> list[tuple[str, bytes]]:
     return result
 
 
-def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o644) -> None:
+def _pilot_target_projects(
+    output: Path, *, directory_target: bool
+) -> tuple[HarnessPaths, ...]:
+    """Return every initialized AOI project containing a pilot write target."""
+
     try:
-        path = canonicalize_no_link_traversal(path, "pilot write destination")
+        target = canonicalize_no_link_traversal(output, "pilot output")
     except HarnessError as exc:
         raise PilotError(str(exc)) from exc
-    path.parent.mkdir(parents=True, exist_ok=True)
+    probe = target if directory_target else target.parent
+    projects: dict[str, HarnessPaths] = {}
+    for ancestor in (probe, *probe.parents):
+        config = ancestor / "aoi.toml"
+        if not config.exists():
+            continue
+        try:
+            paths = get_paths(ancestor)
+        except HarnessError as exc:
+            raise PilotError(str(exc)) from exc
+        if target == paths.root or paths.root in target.parents:
+            projects[os.path.normcase(str(paths.root))] = paths
+    return tuple(projects.values())
+
+
+def _looks_like_managed_state_directory(directory: Path) -> bool:
+    chief = directory / "chief-authority.json"
+    lock = directory / ".state.lock"
+    platform = directory / "platform.json"
+    structured = (
+        (directory / "POLICY.md").exists()
+        and (directory / "INDEX.md").exists()
+        and any((directory / name).exists() for name in ("tasks", "claims", "sessions"))
+    )
+    return chief.exists() or (lock.exists() and platform.exists()) or structured
+
+
+def _configured_orphan_state_candidates(project_root: Path) -> tuple[Path, ...]:
+    candidates = {project_root / ".aoi"}
+    ignore = project_root / ".gitignore"
     try:
-        path = canonicalize_no_link_traversal(path, "pilot write destination")
+        if ignore.is_file() and ignore.stat().st_size <= 1024 * 1024:
+            for raw_line in ignore.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if (
+                    len(line) < 3
+                    or not line.startswith("/")
+                    or not line.endswith("/")
+                    or any(character in line for character in "*?[]\\")
+                ):
+                    continue
+                relative = PurePosixPath(line[1:-1])
+                if relative.is_absolute() or ".." in relative.parts:
+                    continue
+                candidates.add(project_root.joinpath(*relative.parts))
+    except (OSError, UnicodeDecodeError):
+        pass
+    return tuple(candidates)
+
+
+def _orphan_managed_state_root(
+    output: Path,
+    *,
+    directory_target: bool,
+    known_projects: tuple[HarnessPaths, ...],
+) -> Path | None:
+    """Detect AOI managed state even when its project config is missing."""
+
+    known_roots = {project.root for project in known_projects}
+    known_state_roots = {project.harness for project in known_projects}
+    probe = output if directory_target else output.parent
+    for ancestor in (probe, *probe.parents):
+        if (
+            ancestor not in known_state_roots
+            and _looks_like_managed_state_directory(ancestor)
+        ):
+            return ancestor
+        if (ancestor / ".git").exists() and ancestor not in known_roots:
+            for candidate in _configured_orphan_state_candidates(ancestor):
+                if _looks_like_managed_state_directory(candidate):
+                    return candidate
+    return None
+
+
+def _pilot_output_projects(
+    output: Path, *, kit_destinations: bool
+) -> tuple[HarnessPaths, ...]:
+    """Find every initialized AOI project touched by one pilot write set."""
+
+    targets: list[tuple[Path, bool]]
+    if kit_destinations:
+        targets = [(output, True)] + [
+            (output / relative, False)
+            for relative in (*PILOT_RESOURCE_PATHS, "MANIFEST.json")
+        ]
+    else:
+        targets = [(output, False)]
+    projects: dict[str, HarnessPaths] = {}
+    for target, directory_target in targets:
+        for project in _pilot_target_projects(
+            target, directory_target=directory_target
+        ):
+            projects[os.path.normcase(str(project.root))] = project
+    return tuple(projects.values())
+
+
+def _validate_pilot_write_target(
+    output: Path,
+    *,
+    directory_target: bool,
+    authorized_project_root: Path | None,
+) -> Path:
+    try:
+        target = canonicalize_no_link_traversal(output, "pilot output")
     except HarnessError as exc:
         raise PilotError(str(exc)) from exc
+    if target == Path(target.anchor).resolve():
+        raise PilotError("pilot output may not be a filesystem root")
+    if target == Path.home().resolve():
+        raise PilotError("pilot output may not be the user home directory")
+    projects = _pilot_target_projects(target, directory_target=directory_target)
+    if len(projects) > 1:
+        raise PilotError("pilot output overlaps multiple initialized AOI projects")
+    orphan_state = _orphan_managed_state_root(
+        target,
+        directory_target=directory_target,
+        known_projects=projects,
+    )
+    if orphan_state is not None:
+        raise PilotError(
+            "pilot output may not overlap AOI managed state when aoi.toml is missing: "
+            f"{orphan_state}"
+        )
+    if projects:
+        project = projects[0]
+        if target == project.root:
+            raise PilotError("pilot output may not replace an initialized AOI project root")
+        if target == project.harness or project.harness in target.parents:
+            raise PilotError("pilot output may not enter AOI managed state")
+        authorized = (
+            canonicalize_no_link_traversal(
+                authorized_project_root, "authorized AOI project root"
+            )
+            if authorized_project_root is not None
+            else None
+        )
+        if authorized != project.root:
+            raise PilotError(
+                "pilot output is inside an initialized AOI project; use the AOI CLI "
+                "with the active Chief credential"
+            )
+    return target
+
+
+def _ensure_pilot_directory(
+    directory: Path,
+    *,
+    write_target: Path,
+    directory_target: bool,
+    authorized_project_root: Path | None,
+) -> list[Path]:
+    """Create missing parents one-by-one with authority checks and rollback."""
+
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    if current.exists() and not current.is_dir():
+        raise PilotError(f"pilot destination parent is not a directory: {current}")
+
+    created: list[Path] = []
+    try:
+        for candidate in reversed(missing):
+            _validate_pilot_write_target(
+                write_target,
+                directory_target=directory_target,
+                authorized_project_root=authorized_project_root,
+            )
+            try:
+                candidate.mkdir()
+                created.append(candidate)
+                if os.name != "nt":
+                    candidate.chmod(0o700)
+            except FileExistsError:
+                if not candidate.is_dir():
+                    raise PilotError(
+                        f"pilot destination parent is not a directory: {candidate}"
+                    )
+            except OSError as exc:
+                raise PilotError(
+                    f"cannot create pilot output directory {candidate}: {exc}"
+                ) from exc
+            _validate_pilot_write_target(
+                write_target,
+                directory_target=directory_target,
+                authorized_project_root=authorized_project_root,
+            )
+    except BaseException:
+        for candidate in reversed(created):
+            with contextlib.suppress(OSError):
+                candidate.rmdir()
+        raise
+    return created
+
+
+def _atomic_write(
+    path: Path,
+    payload: bytes,
+    *,
+    mode: int = 0o644,
+    force: bool,
+    authorized_project_root: Path | None,
+) -> None:
+    created_parents: list[Path] = []
     temp_name = ""
+    published = False
     try:
+        path = canonicalize_no_link_traversal(path, "pilot write destination")
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
+    try:
+        path = _validate_pilot_write_target(
+            path,
+            directory_target=False,
+            authorized_project_root=authorized_project_root,
+        )
+        created_parents = _ensure_pilot_directory(
+            path.parent,
+            write_target=path,
+            directory_target=False,
+            authorized_project_root=authorized_project_root,
+        )
+        path = canonicalize_no_link_traversal(path, "pilot write destination")
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
             if os.name != "nt":
                 os.fchmod(handle.fileno(), mode)
@@ -458,30 +690,67 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o644) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temp_name = handle.name
-        try:
-            if (
-                canonicalize_no_link_traversal(path, "pilot write destination")
-                != path
-            ):
-                raise PilotError("pilot write destination changed before publication")
-        except HarnessError as exc:
-            raise PilotError(str(exc)) from exc
-        try:
-            replace_file(Path(temp_name), path)
-        except HarnessError as exc:
-            raise PilotError(str(exc)) from exc
+
+        if force:
+            deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_SECONDS
+            while True:
+                _validate_pilot_write_target(
+                    path,
+                    directory_target=False,
+                    authorized_project_root=authorized_project_root,
+                )
+                if (
+                    canonicalize_no_link_traversal(
+                        path, "pilot write destination"
+                    )
+                    != path
+                ):
+                    raise PilotError(
+                        "pilot write destination changed before publication"
+                    )
+                try:
+                    os.replace(temp_name, path)
+                    break
+                except PermissionError as exc:
+                    if os.name != "nt" or time.monotonic() >= deadline:
+                        raise PilotError(
+                            f"pilot output remained blocked by another process: {path}"
+                        ) from exc
+                    time.sleep(0.05)
+        else:
+            _validate_pilot_write_target(
+                path,
+                directory_target=False,
+                authorized_project_root=authorized_project_root,
+            )
+            try:
+                if os.name == "nt":
+                    os.rename(temp_name, path)
+                else:
+                    os.link(temp_name, path, follow_symlinks=False)
+                    Path(temp_name).unlink()
+            except FileExistsError as exc:
+                raise PilotError(f"refusing to overwrite pilot output: {path}") from exc
+
+        published = True
         temp_name = ""
-        try:
-            if (
-                canonicalize_no_link_traversal(path, "pilot write destination")
-                != path
-            ):
-                raise PilotError("pilot write destination changed after publication")
-        except HarnessError as exc:
-            raise PilotError(str(exc)) from exc
+        fsync_directory(path.parent)
+        if canonicalize_no_link_traversal(path, "pilot write destination") != path:
+            raise PilotError("pilot write destination changed after publication")
+    except PilotError:
+        raise
+    except HarnessError as exc:
+        raise PilotError(str(exc)) from exc
+    except OSError as exc:
+        raise PilotError(f"could not publish pilot output {path}: {exc}") from exc
     finally:
         if temp_name:
-            Path(temp_name).unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                Path(temp_name).unlink()
+        if not published:
+            for candidate in reversed(created_parents):
+                with contextlib.suppress(OSError):
+                    candidate.rmdir()
 
 
 def initialize_kit(
@@ -489,6 +758,7 @@ def initialize_kit(
     *,
     force: bool = False,
     allow_unverified_windows_acl: bool = False,
+    authorized_project_root: Path | None = None,
 ) -> dict[str, Any]:
     """Copy the packaged tester kit after an all-files no-clobber preflight."""
 
@@ -497,10 +767,11 @@ def initialize_kit(
             "native Windows ACL privacy is not verified by AOI; rerun with "
             "--allow-unverified-windows-acl only after restricting the output directory"
         )
-    try:
-        output = canonicalize_no_link_traversal(output, "pilot output")
-    except HarnessError as exc:
-        raise PilotError(str(exc)) from exc
+    output = _validate_pilot_write_target(
+        output,
+        directory_target=True,
+        authorized_project_root=authorized_project_root,
+    )
     if output.exists() and not output.is_dir():
         raise PilotError(f"pilot output is not a directory: {output}")
     resources = _resource_files()
@@ -512,10 +783,11 @@ def initialize_kit(
             "refusing to overwrite existing pilot files: " + ", ".join(collisions)
         )
     for relative, path in destinations:
-        try:
-            canonicalize_no_link_traversal(path, f"pilot destination {relative}")
-        except HarnessError as exc:
-            raise PilotError(str(exc)) from exc
+        _validate_pilot_write_target(
+            path,
+            directory_target=False,
+            authorized_project_root=authorized_project_root,
+        )
         current = output
         for part in Path(relative).parts[:-1]:
             current = current / part
@@ -524,9 +796,17 @@ def initialize_kit(
                     f"pilot destination parent is not a directory: {relative}"
                 )
 
-    output.mkdir(parents=True, exist_ok=True)
-    if os.name == "posix":
-        output.chmod(0o700)
+    _ensure_pilot_directory(
+        output,
+        write_target=output,
+        directory_target=True,
+        authorized_project_root=authorized_project_root,
+    )
+    _validate_pilot_write_target(
+        output,
+        directory_target=True,
+        authorized_project_root=authorized_project_root,
+    )
 
     file_entries: list[dict[str, str]] = []
     for relative, payload in resources:
@@ -536,7 +816,13 @@ def initialize_kit(
             in {"feedback-private.template.md", "withdrawal-private.template.csv"}
             else 0o644
         )
-        _atomic_write(output / relative, payload, mode=mode)
+        _atomic_write(
+            output / relative,
+            payload,
+            mode=mode,
+            force=force,
+            authorized_project_root=authorized_project_root,
+        )
         file_entries.append(
             {"path": relative, "sha256": hashlib.sha256(payload).hexdigest()}
         )
@@ -548,7 +834,12 @@ def initialize_kit(
     manifest_bytes = (
         json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     ).encode("utf-8")
-    _atomic_write(output / "MANIFEST.json", manifest_bytes)
+    _atomic_write(
+        output / "MANIFEST.json",
+        manifest_bytes,
+        force=force,
+        authorized_project_root=authorized_project_root,
+    )
     return {
         "created": True,
         "output": str(output.resolve()),
@@ -794,11 +1085,13 @@ def write_summary(
     *,
     output_format: str,
     force: bool = False,
+    authorized_project_root: Path | None = None,
 ) -> dict[str, Any]:
-    try:
-        output = canonicalize_no_link_traversal(output, "pilot summary output")
-    except HarnessError as exc:
-        raise PilotError(str(exc)) from exc
+    output = _validate_pilot_write_target(
+        output,
+        directory_target=False,
+        authorized_project_root=authorized_project_root,
+    )
     if output.exists() and output.is_dir():
         raise PilotError(f"pilot summary output is a directory: {output}")
     if output.exists() and not force:
@@ -810,7 +1103,12 @@ def write_summary(
         payload = summary_csv(summary)
     else:
         raise PilotError("pilot summary format must be json or csv")
-    _atomic_write(output, payload)
+    _atomic_write(
+        output,
+        payload,
+        force=force,
+        authorized_project_root=authorized_project_root,
+    )
     return {
         "created": True,
         "output": str(output.resolve()),

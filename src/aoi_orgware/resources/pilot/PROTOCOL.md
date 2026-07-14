@@ -47,6 +47,11 @@ baseline ID in the run record; do not publish the repository path or commit ID.
    time limit, stopping rule, and oracle ID.
 5. Confirm the participant understands consent and withdrawal in `PRIVACY.md`.
 
+For the `aoi` variant, initialize the fresh worktree if needed, acquire a new
+Chief lease dedicated to that run, and keep its credential outside the
+worktree. Lease setup is part of workflow/setup observation. Never force
+takeover of an unexpected live lease. Release the lease when the run ends.
+
 ## During and after each run
 
 Do not alter the variant after starting. Record interventions only when the

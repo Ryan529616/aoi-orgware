@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -32,11 +33,15 @@ CLI_MODULE = "aoi_orgware.cli"
 class NativeWindowsCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.credential_temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.env = os.environ.copy()
         self.env["AOI_ROOT"] = str(self.root)
         self.env["PYTHONPATH"] = str(SRC)
         self.env["PYTHONDONTWRITEBYTECODE"] = "1"
+        self.env["AOI_CHIEF_CREDENTIAL_HOME"] = str(
+            Path(self.credential_temp.name) / "aoi-chief-credentials"
+        )
         subprocess.run(
             ["git", "init", "-b", "main", str(self.root)],
             check=True,
@@ -63,9 +68,21 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
             capture_output=True,
         )
         self.cli("init", "--project-name", "Native Windows Test")
+        acquired = json.loads(
+            self.cli(
+                "chief-acquire",
+                "--session-id",
+                "native-windows-test-chief",
+                "--json",
+            ).stdout
+        )
+        self.env["AOI_CHIEF_SESSION_ID"] = "native-windows-test-chief"
+        self.env["AOI_CHIEF_EPOCH"] = str(acquired["authority"]["epoch"])
+        self.env["AOI_CHIEF_CREDENTIAL_FILE"] = acquired["credential_file"]
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+        self.credential_temp.cleanup()
 
     def cli(self, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -94,6 +111,14 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
         self.assertTrue(
             any("windows_acl_unverified" in item for item in doctor["warnings"])
         )
+
+    def test_dpapi_credential_rejects_non_ascii_plaintext_without_traceback(self) -> None:
+        protected = h._windows_dpapi_transform(b"\xff", protect=True)
+        encoded = base64.b64encode(protected).decode("ascii")
+        with self.assertRaisesRegex(
+            h.HarnessError, "Chief credential DPAPI payload is malformed"
+        ):
+            h._decode_chief_secret("dpapi-current-user-v1", encoded)
 
     def test_ntfs_short_alias_is_canonicalized_without_link_false_positive(self) -> None:
         import ctypes
@@ -217,6 +242,7 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
                     kit,
                     force=True,
                     allow_unverified_windows_acl=True,
+                    authorized_project_root=self.root,
                 )
             self.assertEqual(list(outside.iterdir()), [])
         finally:

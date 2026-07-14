@@ -1,8 +1,8 @@
 # Closed-alpha pilot guide
 
-AOI v0.1.3 includes an executable pilot kit for letting 3–5 classmates try the
-workflow without turning their private Codex traces into public data. This is a
-feasibility and onboarding study, not a benchmark result.
+AOI v0.2.0 includes an executable `closed-alpha-v2` pilot kit for letting 3–5
+classmates try the workflow without turning their private Codex traces into
+public data. This is a feasibility and onboarding study, not a benchmark result.
 
 ## Generate the kit
 
@@ -21,9 +21,17 @@ local non-shared filesystem, and acknowledge the boundary explicitly:
 aoi pilot-init --output .\aoi-pilot-kit --allow-unverified-windows-acl --json
 ```
 
-`pilot-init` performs a complete collision preflight and refuses to overwrite
-its files unless `--force` is explicit. `MANIFEST.json` binds the generated
-files and AOI version.
+`pilot-init` performs a complete collision preflight and uses atomic
+no-replace publication unless `--force` is explicit. Every destination is
+revalidated immediately before publication. All containing AOI projects are
+considered; nested/multi-project output and managed state with a missing
+`aoi.toml` fail closed. `MANIFEST.json` binds the generated files and AOI
+version.
+
+Pilot writers refuse filesystem root, the user's home, an initialized AOI
+project root, managed state, and write sets spanning multiple AOI projects.
+Writing elsewhere inside one initialized AOI project requires that exact
+project's active Chief lease; `--force` is not an authority bypass.
 
 The kit is portable and contains:
 

@@ -124,6 +124,19 @@ may repair missing AOI-managed directories, templates, policy, index, or
 path is linked or unsafe, or its platform lock domain does not match the current
 writer.
 
+Recovery of an initialized project is Chief-fenced in AOI v0.2. Inspect
+`aoi chief-status --json` when the layout is readable. If first init published
+`aoi.toml` before the lock/layout, `chief-status` may report an incomplete tree;
+run `aoi chief-acquire --session-id <bootstrap-session-id> --json`. AOI may
+repair only the exact pre-lock structural prefix: no authority, lifecycle
+payload, managed resource, or unknown entry may exist. Then set the returned
+session, epoch, and credential-file reference in the controlling process before
+repeating `aoi init`. For a complete layout whose authority is uninitialized or
+explicitly inactive, use the same non-force acquire flow. If authority is
+active, require its current credential; never use live takeover as an implicit
+bootstrap shortcut. If narrow validation fails, stop and report the incomplete
+state instead of deleting or inventing recovery files.
+
 ## 6. Verify
 
 Run this command with the repository root as the process working directory:
@@ -141,6 +154,9 @@ right organization or that hooks are installed or trusted.
 ## Safety boundaries
 
 - AOI is an alpha governance layer, not a security boundary.
+- Chief credentials are repo-external secrets. Never copy their plaintext,
+  credential file, or deprecated token argument into the candidate, target
+  repository, transcript, packet, checkpoint, or shared artifact.
 - Chief authority means formal technical arbitration, not every reversible local
   implementation choice.
 - Steward is the system-of-record and coordination role, not a technical

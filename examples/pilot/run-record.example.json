@@ -31,7 +31,7 @@
     "status": "pass"
   },
   "participant_id": "pilotexample",
-  "protocol_version": "closed-alpha-v1",
+  "protocol_version": "closed-alpha-v2",
   "questionnaire": {
     "cognitive_load": 3,
     "completion_confidence": 4,

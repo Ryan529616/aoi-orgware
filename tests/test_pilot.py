@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -20,6 +21,8 @@ SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import __version__  # noqa: E402
+from aoi_orgware import pilot as pilot_impl  # noqa: E402
+from aoi_orgware.config import default_config_text  # noqa: E402
 from aoi_orgware.pilot import (  # noqa: E402
     PilotError,
     _private_text_reason,
@@ -56,7 +59,7 @@ def record(
     aoi = variant == "aoi"
     return {
         "schema_version": 1,
-        "protocol_version": "closed-alpha-v1",
+        "protocol_version": "closed-alpha-v2",
         "run_id": f"run{suffix}",
         "participant_id": participant,
         "task_pair_id": "pair001",
@@ -275,7 +278,7 @@ class PilotRecordTests(unittest.TestCase):
         single = record(variant="single", order=1, task_id="taskalpha")
         aoi = record(variant="aoi", order=2, task_id="taskbeta")
         rendered = summary_csv(summarize_records([single, aoi])).decode("utf-8")
-        self.assertIn("metadata,,protocol_version,closed-alpha-v1", rendered)
+        self.assertIn("metadata,,protocol_version,closed-alpha-v2", rendered)
         self.assertIn(
             "metadata,,analysis_boundary,descriptive_closed_alpha_only", rendered
         )
@@ -361,6 +364,20 @@ class PilotKitTests(unittest.TestCase):
         self.assertEqual(unknown.read_text(encoding="utf-8"), "private note\n")
         self.assertIn("randomcode", private_mapping.read_text(encoding="utf-8"))
 
+    def test_initialize_rejects_dangerous_roots_and_preserves_existing_mode(self) -> None:
+        with self.assertRaisesRegex(PilotError, "filesystem root"):
+            self.initialize(Path(self.root.anchor))
+        with self.assertRaisesRegex(PilotError, "user home"):
+            self.initialize(Path.home())
+
+        existing = self.root / "existing-kit"
+        existing.mkdir()
+        if os.name == "posix":
+            existing.chmod(0o755)
+        self.initialize(existing)
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o755)
+
     def test_template_requires_fill_and_sample_oracle_starts_failing(self) -> None:
         kit = self.root / "kit"
         self.initialize(kit)
@@ -425,6 +442,101 @@ class PilotKitTests(unittest.TestCase):
             (self.root / "summary-a.json").read_bytes(),
             (self.root / "summary-b.json").read_bytes(),
         )
+
+    def test_writer_revalidates_authority_and_nonforce_is_atomic_no_replace(self) -> None:
+        target = self.root / "raced-summary.json"
+        real_validate = pilot_impl._validate_pilot_write_target
+        calls = 0
+
+        def publish_racer(
+            output: Path,
+            *,
+            directory_target: bool,
+            authorized_project_root: Path | None,
+        ) -> Path:
+            nonlocal calls
+            result = real_validate(
+                output,
+                directory_target=directory_target,
+                authorized_project_root=authorized_project_root,
+            )
+            calls += 1
+            if calls == 2:
+                target.write_bytes(b"racer-owned\n")
+            return result
+
+        with mock.patch.object(
+            pilot_impl, "_validate_pilot_write_target", side_effect=publish_racer
+        ):
+            with self.assertRaisesRegex(PilotError, "refusing to overwrite"):
+                write_summary(
+                    [record()], target, output_format="json", force=False
+                )
+        self.assertEqual(target.read_bytes(), b"racer-owned\n")
+
+        activation_root = self.root / "activation-race"
+        activation_root.mkdir()
+        managed_target = activation_root / ".aoi" / "platform.json"
+        calls = 0
+
+        def activate_project(
+            output: Path,
+            *,
+            directory_target: bool,
+            authorized_project_root: Path | None,
+        ) -> Path:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (activation_root / "aoi.toml").write_text(
+                    default_config_text("Activation Race"), encoding="utf-8"
+                )
+            return real_validate(
+                output,
+                directory_target=directory_target,
+                authorized_project_root=authorized_project_root,
+            )
+
+        with mock.patch.object(
+            pilot_impl, "_validate_pilot_write_target", side_effect=activate_project
+        ):
+            with self.assertRaisesRegex(PilotError, "may not enter AOI managed state"):
+                write_summary(
+                    [record()], managed_target, output_format="json", force=True
+                )
+        self.assertFalse(managed_target.exists())
+        self.assertFalse(managed_target.parent.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing retry boundary")
+    def test_force_retry_revalidates_before_every_replace_attempt(self) -> None:
+        activation_root = self.root / "force-retry-race"
+        activation_root.mkdir()
+        target = activation_root / ".aoi" / "platform.json"
+        replace_calls = 0
+
+        def block_then_activate(source: object, destination: object) -> None:
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls == 1:
+                (activation_root / "aoi.toml").write_text(
+                    default_config_text("Force Retry Race"), encoding="utf-8"
+                )
+                target.write_bytes(b"managed-sentinel\n")
+                (target.parent / ".state.lock").write_bytes(b"\0")
+                raise PermissionError("injected Windows sharing violation")
+            raise AssertionError(
+                f"unexpected second replace attempt: {source!r} -> {destination!r}"
+            )
+
+        with mock.patch.object(
+            pilot_impl.os, "replace", side_effect=block_then_activate
+        ):
+            with self.assertRaisesRegex(PilotError, "may not enter AOI managed state"):
+                write_summary(
+                    [record()], target, output_format="json", force=True
+                )
+        self.assertEqual(replace_calls, 1)
+        self.assertEqual(target.read_bytes(), b"managed-sentinel\n")
 
     def test_pilot_help_works_outside_initialized_project(self) -> None:
         result = self.cli("pilot-init", "--help")

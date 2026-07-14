@@ -9,7 +9,7 @@ It is not another chat router. It sits above an agent runtime and records what
 the organization is allowed to do, what it decided, what changed, and what was
 actually verified.
 
-> Status: **v0.1.3 alpha**. The core lifecycle is tested, but AOI has not yet been
+> Status: **v0.2.0 alpha**. The core lifecycle is tested, but AOI has not yet been
 > proven better than a simpler single-agent or supervisor topology. Benchmark it
 > on your own workload before relying on it.
 
@@ -38,12 +38,21 @@ The organization is stable; execution topology is task-contingent. AOI records
 single-lane, centralized-parallel, and controlled hybrid work instead of forcing
 every request through every lane.
 
-## What v0.1 contains
+## What v0.2 contains
 
 - Git-bound tasks, plans, claims, checkpoints, delivery records, and close gates
 - exact file/tree/contract locks with conflict detection and SHA-bound baselines
-- bounded delegation packets and external-job ownership, with task-local
+- bounded delegation packets and external-job ownership (`--owner-packet-id`), with task-local
   content-addressed snapshots for packet and verification artifacts
+- packet dispatch provenance: short-lived Chief-issued arms, protocol-v6
+  `SubagentStart` observation, pre-armed manual-unverified fallback, and
+  durable unmanaged-start incidents
+- task-global execution epochs: unselected work is implicit single, explicit
+  single selections cannot run across work units, and parallel chains must share
+  one centralized/hybrid selection; standalone external jobs occupy the same
+  epoch and owned jobs remain inside their dispatched packet chain
+- sequential Steward synthesis packets whose terminal result is required by a
+  parallel/hybrid execution brief
 - lanes, dependencies, coordination requests, Chief decisions, directives, and
   independent verification before resolution
 - `needs_user` escalation for goal, risk, budget, and preference decisions
@@ -51,8 +60,14 @@ every request through every lane.
 - a bottom-up Improvement Pipeline with qualification, canary, rollback, and
   deprecation records for reusable skills
 - deterministic state backup and integrity checks
-- optional Codex lifecycle hooks that remain procedural guardrails, not a
-  security boundary
+- one durable Chief lease per project with monotonic epochs, explicit takeover,
+  and default fencing of lifecycle mutations
+- repo-external Chief credentials: owner-only POSIX files or CurrentUser DPAPI
+  on native Windows; plaintext tokens never enter shared AOI state or stdout
+- deterministic checkpoint compaction at 16 KiB with a fail-closed 32 KiB hard
+  ceiling; the separate critical-status view remains capped at 12 KiB
+- optional Codex lifecycle hooks that consume one-time packet arms or record
+  incidents; they remain post-start procedural guardrails, not a security boundary
 - strict, model-agnostic project configuration in `aoi.toml`
 
 AOI deliberately does **not** launch an LLM provider, choose a model brand,
@@ -63,16 +78,23 @@ turn an acknowledgement into proof of implementation.
 
 - Python 3.11+
 - Git
-- Linux/WSL or native Windows on a local filesystem
+- Linux, WSL on its native filesystem (or a mount with reliable POSIX metadata),
+  or native Windows on an ordinary local filesystem
 
 AOI binds each `.aoi/` state tree to one lock domain on first use: POSIX/WSL
 uses `fcntl`, while native Windows uses `msvcrt` byte-range locking. Do not
 alternate or concurrently write the same state tree from WSL and native
 Windows; their locks do not interoperate. Native Windows support is limited to
 ordinary local filesystems. UNC/network shares and case-sensitive NTFS are not
-supported in the v0.1 line. Benign NTFS 8.3 aliases are canonicalized after
+supported in the v0.2 line. Benign NTFS 8.3 aliases are canonicalized after
 component-level reparse inspection; actual symlink/junction traversal is
 rejected.
+
+On WSL, metadata-less DrvFs mounts such as a default `/mnt/c` or `/mnt/d` may
+report every file as broadly accessible. AOI intentionally fails closed instead
+of claiming `0600` privacy there. Prefer the distribution's native filesystem
+(for example `/home/<user>/project`) or enable DrvFs `metadata`, remount, and
+verify the effective modes before initializing or migrating AOI state.
 
 ## Install from source
 
@@ -98,12 +120,29 @@ Run this in an existing Git repository:
 ```bash
 cd /path/to/project
 aoi init --project-name "My Project"
+aoi chief-acquire --session-id my-chief-session --json
 aoi status
 aoi doctor
 ```
 
 Initialization creates and tracks `aoi.toml`, adds `/.aoi/` to `.gitignore`,
 and creates private runtime state under `.aoi/`. It does not install hooks.
+
+The first `aoi init` is the only unauthenticated lifecycle write. Copy the
+`authority.epoch` and `credential_file` returned by `chief-acquire` into the
+controlling session environment before running mutating commands:
+
+```bash
+export AOI_CHIEF_SESSION_ID=my-chief-session
+export AOI_CHIEF_EPOCH=<epoch-from-acquire>
+export AOI_CHIEF_CREDENTIAL_FILE=<absolute-path-from-acquire>
+```
+
+Use `aoi chief-renew` before a long turn and `aoi chief-release --reason
+"handoff complete"` when ownership ends. An expired lease requires
+`chief-takeover --expected-epoch ... --reason ...`; replacing a live lease also
+requires `--force-live`. AOI never auto-steals a lease. A bounded five-second
+clock-skew allowance is clamped to the last renewal; larger rollback fails.
 
 ### Bootstrap from project requirements
 
@@ -136,6 +175,16 @@ malformed. `init --config` requires the full approved SHA-256, copies the exact
 validated bytes, refuses a different existing profile, and preflights the
 selected state tree's lock domain, managed paths, and project `.gitignore`
 before writing the configuration.
+
+Re-running `aoi init` on an initialized project is a fenced mutation. Known
+AOI-managed v0.1.3 policy bytes upgrade automatically; a custom policy requires
+its exact reviewed digest through `--replace-policy-sha256`.
+
+If first initialization stops after publishing `aoi.toml` but before the state
+lock is initialized, `chief-acquire` can recover only the exact structural prefix: no
+authority, lifecycle payload, managed resource, or unknown entry may exist. It
+repairs the platform/lock, acquires the first Chief, and then requires an
+authenticated rerun of `aoi init` to finish POLICY, templates, and INDEX.
 
 ## Minimal governed task
 
@@ -179,6 +228,78 @@ aoi checkpoint --task docs-fix --next-action "Close the task"
 aoi close-task --task docs-fix --summary "Setup guide is reproducible"
 ```
 
+## Dispatch a bounded Codex sub-agent
+
+Create the packet first. Immediately before the corresponding Codex spawn,
+issue a permit that expires within 15 minutes:
+
+```bash
+aoi create-packet \
+  --task <task-id> \
+  --packet-id <packet-id> \
+  --agent-role explorer \
+  --model-tier standard \
+  --objective "Inspect one bounded evidence question" \
+  --scope "Read only the named source and report one conclusion" \
+  --deliverable "Conclusion, exact evidence paths, risks, and next action" \
+  --validation "Chief checks every cited path"
+
+aoi packet-arm \
+  --task <task-id> \
+  --packet-id <packet-id> \
+  --expected-agent-type explorer \
+  --expires-at <timezone-aware-timestamp-within-15-minutes>
+
+# Spawn exactly one matching Codex sub-agent now.
+```
+
+If the task-bound parent Codex session differs from the Chief credential's
+session assertion, add `--parent-session-id <task-bound-session-id>`.
+
+A trusted protocol-v6 `SubagentStart` hook consumes that arm and records the
+actual agent id as `codex_subagent_start_observed`. If no unique arm exists, AOI
+records an open incident and tells the already-created agent to stop without
+material work. The hook observes the start; it does not prevent the spawn.
+
+When hooks are unavailable, use the same already-issued arm and register the
+fallback honestly:
+
+```bash
+aoi packet-update --task <task-id> --packet-id <packet-id> \
+  --status dispatched --agent-id <actual-agent-id> \
+  --manual-unverified-reason "Codex hook was not installed or trusted for this start"
+```
+
+For schema-v5 packets, this command succeeds only from `armed`. Direct
+`ready -> dispatched` registration is rejected; a ready v4 packet has a
+separately marked migration exception only when its immutable contract does not
+carry the native-v5 marker and its task has pre-marker legacy provenance. A
+native policy-v2 task cannot invoke that exception. Manual fallback also
+revalidates arm expiry, Chief epoch, plan, packet, topology, lane/Steward, and
+skill authority before it can consume the permit.
+
+For parallel work, first select `centralized_parallel` or `hybrid` with distinct
+specialist `--lane` values and `--steward-lane-id`. Unselected work is an
+implicit `single`; an explicit `single` occupies the task-global execution
+epoch even when another work unit has a different selection. Parallel modes
+permit one active chain per specialist lane only inside the same selection.
+Queued/running/unknown jobs obey the same epoch. Pass `--owner-packet-id` when a
+job is launched by an already-dispatched depth-one mutation packet; its locks
+must cover the job outputs (and an exact-command owner must bind the same
+command), and that packet must stay active until the job is terminal. AOI
+revalidates the physical owner contract plus canonical lock/command authority at
+job creation, each transition to running, and doctor. Independent centralized
+work does not require fake coordination records.
+
+After all selected specialist packets are terminal, create one read-only packet
+on the Steward lane with
+`--steward-synthesis-for-selection-id <selection-id>`, arm and dispatch it, and
+record its terminal result. Once a live/successful synthesis packet exists, AOI
+freezes new specialist packets and jobs for that selection so the bound result
+set cannot change underneath it. Then `execution-brief-record` must name that exact
+result with `--steward-packet-id <packet-id>` and bind every terminal specialist
+packet before selection supersession or task close.
+
 For a one-to-three-file, low-risk edit, `aoi start-mini` creates the task, plan,
 session binding, and exact-file claim atomically. It intentionally rejects tree
 claims, high-risk paths, delegation, and external jobs.
@@ -191,7 +312,8 @@ paths, external lock namespace, and optional integrations. Tasks bind the exact
 configuration SHA-256; changing governance while a task is active fails closed.
 
 See [configuration](docs/configuration.md), [architecture](docs/architecture.md),
-and the [operating policy](docs/POLICY.md).
+the [v0.2 migration runbook](docs/v0.2-migration.md), and the
+[operating policy](docs/POLICY.md).
 
 ## Run a small closed alpha
 
@@ -225,6 +347,10 @@ aoi pilot-summary \
   --format json \
   --json
 ```
+
+Inside an initialized AOI project, pilot writers require that project's Chief
+lease. They refuse the project root, managed state, and a write set spanning
+multiple AOI projects even with `--force`.
 
 The validator fails closed on unknown fields, missing measurement provenance,
 unregistered oracles, and common private-path/credential patterns. The summary

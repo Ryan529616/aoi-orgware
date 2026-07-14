@@ -15,14 +15,26 @@ an Agents SDK application, a custom supervisor, or a human-operated workflow.
 
 ## Durable objects
 
-- `Task`: objective, plan digest, worktree identity, configuration digest, phase
+- `Chief authority`: active/inactive lease, monotonic epoch, token digest,
+  bounded transition audit, renewal and expiry timestamps
+- `Task`: objective, plan digest, worktree identity, configuration digest,
+  phase, and task-global execution-policy generation
 - `Claim`: cooperative ownership over exact project/host/external/contract scope
 - `Checkpoint`: bounded semantic reconstruction of current state
 - `Lane`: owner, role, revision, authority commit, contract, next action
-- `Packet`: delegated objective, scope, route request, evidence, terminal result
-- `External job`: exact command, source receipt, owner, log, terminal evidence
+- `Packet`: delegated objective, scope, route request, purpose, one-time
+  dispatch arms, dispatch provenance, evidence, terminal result; a Steward
+  synthesis packet additionally binds every specialist result
+- `Sub-agent incident`: idempotent record of an observed start without one
+  current, unique arm and its later Chief accounting disposition
+- `External job`: exact command, source receipt, optional depth-one packet owner,
+  standalone-or-nested execution-chain identity, log, and terminal evidence
 - `Coordination request`: cross-lane question, Chief decision, directives,
   acknowledgements, implementation evidence, independent verification
+- `Execution brief`: exact specialist result set plus a terminal Steward
+  synthesis packet/result, dissent, blockers, and recommendation for a
+  parallel/hybrid selection; a live/successful synthesis freezes new specialist
+  packets and jobs in that selection so its immutable input set cannot drift
 - `Capacity review`: observed demand and single-use routing recommendation
 - `Improvement request`: observed pain through qualified skill adoption or reject
 - `Needs-user escalation`: explicit boundary that AI authority cannot cross
@@ -37,6 +49,27 @@ state, not substitutes for source control.
 Task records include the exact configuration SHA-256. This prevents a task from
 being interpreted under a different role map, evidence vocabulary, receipt
 contract, or risk policy after it starts.
+
+Chief authority is deliberately bound to the project root, state directory,
+and lock domain rather than one configuration digest. A reviewed configuration
+change therefore does not strand lease recovery, while every task still fails
+closed on digest drift. Changing `state_dir` remains an explicit state migration.
+
+## Chief fencing
+
+The first initialization of a pristine project is the sole unauthenticated
+lifecycle write. Acquisition stages a high-entropy credential in a repo-external
+user store before atomically publishing authority. Every non-exempt project
+mutation then holds the exact project state lock, reloads `aoi.toml`, validates
+session/epoch/token/expiry, and only then enters its handler. Acquire/takeover
+increment the epoch; renew/release do not. Expired takeover uses expected-epoch
+CAS, and live takeover additionally requires an explicit force acknowledgement
+and audit reason.
+
+The outer command lock is reentrant only for the same thread and exact lock-file
+identity so existing transactional handlers can nest safely. A five-second
+wall-clock jitter allowance is clamped to the previous renewal timestamp;
+larger rollback fails rather than producing a backward audit chain.
 
 ## Bootstrap boundary
 
@@ -69,6 +102,8 @@ decisions.
 - state writes use same-directory replacement after flushing the new file;
 - writers are serialized with `fcntl.flock` on POSIX/WSL or a one-byte
   `msvcrt` lock on native Windows;
+- project mutations hold that lock across Chief validation and the complete
+  handler; lock path/inode changes fail before nested layout repair;
 - immutable packet/verification blobs are completed and flushed before atomic
   no-replace publication, and every managed ancestor is checked for links;
 - `.aoi/platform.json` permanently binds the tree to one lock domain so
@@ -78,17 +113,38 @@ decisions.
   closed before ownership is recorded;
 - generated state is private (`0700` directories, `0600` files where
   supported). Native Windows ACL equivalence is reported as unverified.
+- Chief secrets live outside the repository. POSIX validates owner-only
+  directories/files and safe ancestors; native Windows uses CurrentUser DPAPI.
 
 ## Integrations
 
-The core has no provider dependency. Optional `aoi-codex-hook` integration only
-translates Codex lifecycle events into checkpoint reminders and guardrails.
-Other runtimes should integrate through the CLI or the JSON state contract
-without bypassing AOI authority rules.
+The core has no provider dependency. Optional protocol-v6 `aoi-codex-hook`
+integration translates Codex lifecycle events into checkpoint reminders and
+guardrails. On `SubagentStart`, it also performs one narrow state mutation: it
+atomically consumes one exact Chief-issued packet arm or records an unmanaged
+start incident. The hook never receives a Chief secret and cannot create a
+packet, choose an ambiguous arm, resolve an incident, or terminalize work.
 
-## Known v0.1 boundaries
+`SubagentStart` is an observation after Codex has created the sub-agent. Hook
+output cannot terminate that agent, so AOI records provenance and injects a
+stop-without-work instruction rather than claiming a pre-spawn hard block.
+Manual dispatch remains available as explicit `manual_unverified` provenance,
+but a schema-v5 fallback must consume a permit that was armed before the CLI
+registration and is still current for expiry, Chief epoch, plan, packet,
+topology, lane/Steward, and skill authority. Direct ready-to-dispatched
+registration is rejected. A native-v5 marker is sealed into the packet contract,
+so changing only state schema to v4 cannot invoke the legacy exception; the task
+must also carry pre-marker legacy provenance. Other runtimes should integrate
+through equivalent observed-event adapters or the CLI/JSON contract without
+bypassing AOI authority rules.
+
+## Known v0.2 boundaries
 
 - One state tree may be written from POSIX/WSL or native Windows, not both.
+  WSL support assumes its native filesystem or a mount that reliably exposes
+  POSIX ownership and mode bits. Metadata-less DrvFs mounts fail closed on the
+  required `0700`/`0600` checks; move the project under the WSL distribution or
+  enable and verify DrvFs metadata before migration.
 - Native Windows support is limited to ordinary local filesystems; UNC/network
   shares and case-sensitive NTFS are unsupported. Project-file and Git-branch
   locks therefore use case-insensitive canonical identities in that domain.
@@ -97,12 +153,37 @@ without bypassing AOI authority rules.
   ACL enforcement through the Python standard library.
 - Nonexistent planned trees have no filesystem identity to inspect and retain
   only AOI's cooperative lexical reservation until a later claim/release audit.
-- One cooperative root writer; the state lock covers one CLI transaction, not
-  a cross-command Chief lease or stale-turn fencing credential. Overlapping
-  Chief turns remain prohibited until the planned v0.2 fencing architecture.
+- The Chief lease fences cooperative AOI CLI lifecycle writes, including pilot
+  writers that overlap an initialized project. It cannot stop the same OS user
+  from bypassing AOI and directly changing source, Git, EDA, or `.aoi/` files.
+- Session IDs are assertions, not authenticated identities. A process under the
+  same OS account may be able to use that account's credential store; mutually
+  untrusted writers require an external broker, sandbox, or identity boundary.
 - Initialization is resumable and non-clobbering, but its multiple filesystem
-  writes are not one atomic transaction; rerun the same profile after an
-  interruption.
+  writes are not one atomic transaction. If `aoi.toml` was published before the
+  first lock, `chief-acquire` repairs only an exact structural prefix with no
+  authority, lifecycle payload, managed resource, or unknown entry. It then
+  acquires the first Chief; rerun the identical profile with that credential.
 - Capability tiers are policy labels, not calibrated cross-provider scores.
+- Hook-observed dispatch authenticates a permit/epoch/state transition, not the
+  human identity behind a session id or the provider's actual model routing.
+- Legacy execution-selection v1 records are not silently reinterpreted and
+  cannot authorize new v0.2 packet activation. Finish already-authorized legacy
+  work and start a new task; legacy terminal packet timing remains
+  `legacy_unverified`.
+- New tasks bind `task_execution_schema_version=2` to
+  `execution_policy_version=2` plus `legacy_execution_policy=false`; that
+  independent provenance and remaining v2 artifacts prevent ordinary missing
+  markers from being interpreted as legacy. Existing legacy work retains
+  cooperative concurrency, but only a quiescent task without legacy selections
+  can adopt v2 for new packets/selections/jobs. Under v2, unselected work is implicit single,
+  explicit single is task-global, and concurrency exists only within one exact
+  centralized/hybrid selection. Standalone active jobs consume the same epoch;
+  an owned job stays inside one dispatched depth-one mutation-packet chain,
+  whose physical contract and canonical locks/command authority are recomputed
+  at creation, running, and doctor.
+- AOI has no external append-only witness for task execution provenance. A
+  same-OS writer that removes every policy/provenance field and v2 artifact can
+  still manufacture a legacy-looking cooperative state.
 - Legacy import exists for the originating harness but is disabled by default.
 - No proof yet that AOI's added process pays for itself on every workload.

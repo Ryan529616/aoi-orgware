@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import datetime as dt
 import errno
+import hmac
 import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -42,13 +46,13 @@ RESERVING_CLAIM_STATUSES = {"active", "blocked"}
 TERMINAL_CLAIM_STATUSES = {"done", "released", "stale"}
 JOB_STATUSES = {"queued", "running", "pass", "fail", "stopped", "unknown"}
 ACTIVE_JOB_STATUSES = {"queued", "running", "unknown"}
-PACKET_STATUSES = {"ready", "dispatched", "done", "failed", "cancelled"}
-ACTIVE_PACKET_STATUSES = {"ready", "dispatched"}
+PACKET_STATUSES = {"ready", "armed", "dispatched", "done", "failed", "cancelled"}
+ACTIVE_PACKET_STATUSES = {"ready", "armed", "dispatched"}
 VERIFICATION_STATUSES = {"pending", "pass", "fail", "blocked", "skipped"}
 ACCOUNTED_VERIFICATION_STATUSES = VERIFICATION_STATUSES - {"pending"}
 DELIVERY_MODES = {"pending", "pushed", "local-only", "blocked", "none"}
-CHECKPOINT_COMPACT_THRESHOLD_BYTES = 12 * 1024
-CHECKPOINT_MAX_BYTES = 24 * 1024
+CHECKPOINT_COMPACT_THRESHOLD_BYTES = 16 * 1024
+CHECKPOINT_MAX_BYTES = 32 * 1024
 MANAGED_JSON_MAX_BYTES = 16 * 1024 * 1024
 COMPACT_CLAIM_HISTORY_THRESHOLD = 16
 COMPACT_CLAIM_RECENT_TAIL = 3
@@ -64,6 +68,16 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
 EXTERNAL_LOCK_NAMESPACE = "external"
 PLATFORM_MARKER_SCHEMA_VERSION = 1
+CHIEF_AUTHORITY_SCHEMA_VERSION = 1
+CHIEF_TOKEN_BYTES = 32
+CHIEF_DEFAULT_TTL_SECONDS = 60 * 60
+CHIEF_MIN_TTL_SECONDS = 60
+CHIEF_MAX_TTL_SECONDS = 24 * 60 * 60
+CHIEF_CLOCK_SKEW_TOLERANCE_SECONDS = 5
+CHIEF_AUDIT_TAIL_MAX = 32
+CHIEF_AUTHORITY_STATUSES = {"active", "inactive"}
+CHIEF_CREDENTIAL_SCHEMA_VERSION = 1
+CHIEF_CREDENTIAL_MAX_BYTES = 8 * 1024
 WINDOWS_REPLACE_RETRY_SECONDS = 2.0
 TREE_IDENTITY_SCAN_MAX_ENTRIES = 100_000
 WINDOWS_RESERVED_BASENAMES = {
@@ -84,12 +98,14 @@ TASK_STRING_LIST_FIELDS = {
     "rejected_paths",
     "risks",
     "session_ids",
+    "subagent_parent_session_ids",
 }
 TASK_OBJECT_LIST_FIELDS = {
     "branch_adoptions",
     "capacity_reviews",
     "coordination_requests",
     "cross_lane_sessions",
+    "execution_briefs",
     "execution_selections",
     "improvement_requests",
     "integration_baselines",
@@ -100,6 +116,7 @@ TASK_OBJECT_LIST_FIELDS = {
     "packets",
     "skill_adoption_events",
     "skill_releases",
+    "subagent_incidents",
     "verification",
 }
 
@@ -125,12 +142,20 @@ class HarnessPaths:
     index: Path
     lock: Path
     platform: Path
+    chief_authority: Path
 
 
 def discover_root(start: Path | None = None) -> Path:
     configured = os.environ.get("AOI_ROOT")
-    raw_candidate = Path(configured).expanduser() if configured else (start or Path.cwd())
-    explicit = configured is not None or start is not None
+    if start is not None:
+        raw_candidate = start
+        explicit = True
+    elif configured is not None:
+        raw_candidate = Path(configured).expanduser()
+        explicit = True
+    else:
+        raw_candidate = Path.cwd()
+        explicit = False
     candidate = (
         canonicalize_no_link_traversal(raw_candidate, "explicit AOI root")
         if explicit
@@ -181,6 +206,7 @@ def paths_for_project(root: Path, project: ProjectConfig) -> HarnessPaths:
         index=harness / "INDEX.md",
         lock=harness / ".state.lock",
         platform=harness / "platform.json",
+        chief_authority=harness / "chief-authority.json",
     )
 
 
@@ -242,6 +268,7 @@ def preflight_layout(paths: HarnessPaths) -> None:
         paths.platform,
         paths.lock,
         paths.index,
+        paths.chief_authority,
         paths.harness / "POLICY.md",
         *(
             paths.templates / name
@@ -385,8 +412,39 @@ def validate_existing_regular_file(path: Path, label: str) -> None:
 
     if _path_is_link_like(path):
         raise HarnessError(f"{label} must be a regular non-linked file: {path}")
-    if path.exists() and not path.is_file():
-        raise HarnessError(f"{label} must be a regular non-linked file: {path}")
+    if path.exists():
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise HarnessError(f"cannot inspect {label} {path}: {exc}") from exc
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise HarnessError(
+                f"{label} must be one private regular non-linked file: {path}"
+            )
+
+
+def _read_regular_file_snapshot(
+    path: Path, label: str, *, max_bytes: int
+) -> tuple[tuple[int, int], bytes]:
+    """Read a bounded regular file while pinning its filesystem identity."""
+
+    path = canonicalize_no_link_traversal(path, label)
+    validate_existing_regular_file(path, label)
+    try:
+        before = path.lstat()
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if _lock_identity(before) != _lock_identity(opened):
+                raise HarnessError(f"{label} changed while being opened: {path}")
+            payload = handle.read(max_bytes + 1)
+        after = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot read {label} {path}: {exc}") from exc
+    if _lock_identity(after) != _lock_identity(before):
+        raise HarnessError(f"{label} changed while being read: {path}")
+    if len(payload) > max_bytes:
+        raise HarnessError(f"{label} exceeds {max_bytes} bytes: {path}")
+    return _lock_identity(before), payload
 
 
 def _platform_marker_payload() -> dict[str, Any]:
@@ -443,6 +501,109 @@ def _create_platform_marker(path: Path) -> bool:
     return True
 
 
+def _platform_marker_partial_prefix(payload: bytes) -> bool:
+    """Recognize only a byte prefix emitted by this platform-marker writer."""
+
+    marker = "__AOI_CREATED_AT__"
+    template = _platform_marker_payload()
+    template["created_at"] = marker
+    rendered = (
+        json.dumps(template, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    before, after = rendered.split(marker.encode("ascii"), 1)
+    if len(payload) <= len(before):
+        return before.startswith(payload)
+    if not payload.startswith(before):
+        return False
+    remainder = payload[len(before) :]
+    if b'"' not in remainder:
+        return bool(
+            len(remainder) <= 64
+            and re.fullmatch(rb"[0-9T:+.\-Z]*", remainder) is not None
+        )
+    timestamp, suffix_tail = remainder.split(b'"', 1)
+    try:
+        timestamp_text = timestamp.decode("ascii")
+        normalized = (
+            timestamp_text[:-1] + "+00:00"
+            if timestamp_text.endswith("Z")
+            else timestamp_text
+        )
+        parsed = dt.datetime.fromisoformat(normalized)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return False
+    observed_suffix = b'"' + suffix_tail
+    return len(observed_suffix) < len(after) and after.startswith(observed_suffix)
+
+
+def _torn_platform_marker_snapshot(
+    path: Path,
+) -> tuple[tuple[int, int], bytes] | None:
+    """Return a provable current-writer prefix; reject valid future schemas."""
+
+    identity, payload = _read_regular_file_snapshot(
+        path, "AOI platform marker", max_bytes=4096
+    )
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        if not _platform_marker_partial_prefix(payload):
+            raise HarnessError(
+                f"invalid AOI platform marker is not a recoverable current-schema prefix: {path}"
+            )
+        return identity, payload
+    if not isinstance(decoded, dict):
+        raise HarnessError(f"AOI platform marker must contain an object: {path}")
+    # Preserve unsupported/future schemas and wrong lock domains. Only malformed
+    # byte prefixes from this exact writer are eligible for in-place recovery.
+    _read_platform_marker(path)
+    return None
+
+
+def _rewrite_torn_platform_marker(
+    path: Path, snapshot: tuple[tuple[int, int], bytes]
+) -> None:
+    """Rewrite the pinned torn inode without unlinking a concurrent replacement."""
+
+    expected_identity, expected_payload = snapshot
+    path = canonicalize_no_link_traversal(path, "AOI platform marker")
+    validate_existing_regular_file(path, "AOI platform marker")
+    payload = (
+        json.dumps(_platform_marker_payload(), indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    try:
+        before = path.lstat()
+        with path.open("r+b") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                _lock_identity(before) != expected_identity
+                or _lock_identity(opened) != expected_identity
+            ):
+                raise HarnessError(
+                    "AOI platform marker changed before interrupted-init recovery"
+                )
+            current_payload = handle.read(4097)
+            if current_payload != expected_payload:
+                raise HarnessError(
+                    "AOI platform marker bytes changed before interrupted-init recovery"
+                )
+            handle.seek(0)
+            handle.truncate(0)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        after = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot recover AOI platform marker {path}: {exc}") from exc
+    if _lock_identity(after) != expected_identity:
+        raise HarnessError(
+            "AOI platform marker path changed during interrupted-init recovery"
+        )
+    fsync_directory(path.parent)
+
+
 def _ensure_platform_domain(paths: HarnessPaths) -> None:
     existed = paths.harness.exists()
     if existed and (_path_is_link_like(paths.harness) or not paths.harness.is_dir()):
@@ -469,16 +630,191 @@ def _ensure_platform_domain(paths: HarnessPaths) -> None:
         )
 
 
+_STATE_LOCK_LOCAL = threading.local()
+
+
+def _held_state_locks() -> dict[str, dict[str, int]]:
+    held = getattr(_STATE_LOCK_LOCAL, "held", None)
+    if held is None:
+        held = {}
+        _STATE_LOCK_LOCAL.held = held
+    return held
+
+
+def _lock_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _validate_state_lock_metadata(
+    metadata: os.stat_result, path: Path, *, require_private_mode: bool
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise HarnessError(
+            f"AOI state lock must be one private regular non-linked file: {path}"
+        )
+    if (
+        require_private_mode
+        and os.name != "nt"
+        and stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise HarnessError(
+            f"AOI state lock permissions are not private (expected 0600): {path}"
+        )
+
+
+def _validate_held_state_lock(paths: HarnessPaths, entry: dict[str, int]) -> None:
+    if entry.get("pid") != os.getpid():
+        raise HarnessError(
+            "AOI state lock context was inherited across a process boundary; "
+            "forked children must not reenter the parent lock"
+        )
+    path = canonicalize_no_link_traversal(paths.lock, "AOI state lock")
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect held AOI state lock {path}: {exc}") from exc
+    _validate_state_lock_metadata(metadata, path, require_private_mode=True)
+    if _lock_identity(metadata) != (entry["st_dev"], entry["st_ino"]):
+        raise HarnessError("AOI state lock path changed while the lock was held")
+
+
 @contextlib.contextmanager
-def state_lock(paths: HarnessPaths) -> Iterator[None]:
-    ensure_layout(paths)
-    with paths.lock.open("a+b") as handle:
-        _chmod_private(paths.lock, 0o600)
-        _acquire_state_lock(handle)
+def state_lock(
+    paths: HarnessPaths,
+    *,
+    create_layout: bool = True,
+    bootstrap_empty_lock: bool = False,
+) -> Iterator[None]:
+    """Hold one project state lock, with exact-path same-thread reentrancy.
+
+    Central Chief fencing wraps a complete command while existing handlers keep
+    their narrower ``state_lock`` scopes.  Only a nested acquisition by the same
+    thread for the exact canonical lock path is reentrant; other threads,
+    processes, and project paths still acquire the platform lock normally.
+    """
+
+    if create_layout and bootstrap_empty_lock:
+        raise HarnessError("bootstrap_empty_lock requires an existing validated layout")
+    lock_path = canonicalize_no_link_traversal(paths.lock, "AOI state lock")
+    key = os.path.normcase(str(lock_path))
+    held = _held_state_locks()
+    entry = held.get(key)
+    if entry is not None:
+        _validate_held_state_lock(paths, entry)
+        if create_layout:
+            ensure_layout(paths)
+        else:
+            preflight_layout(paths)
+        _validate_held_state_lock(paths, entry)
+        entry["depth"] += 1
         try:
             yield
         finally:
-            _release_state_lock(handle)
+            entry["depth"] -= 1
+        return
+
+    if create_layout:
+        ensure_layout(paths)
+        if not paths.lock.exists():
+            try:
+                atomic_create_bytes(paths.lock, b"\0")
+            except HarnessError:
+                # Atomic publication can report a post-publication durability
+                # failure. Continue only if the exact destination now exists;
+                # the opened-file checks below still reject every other result.
+                if not paths.lock.exists():
+                    raise
+    else:
+        preflight_layout(paths)
+        if not paths.lock.is_file():
+            raise HarnessError(
+                "AOI state lock is missing; initialize or repair Chief authority first"
+            )
+    current_lock_path = canonicalize_no_link_traversal(paths.lock, "AOI state lock")
+    if current_lock_path != lock_path:
+        raise HarnessError("AOI state lock path changed during layout validation")
+    mode = "r+b" if create_layout or bootstrap_empty_lock or os.name == "nt" else "rb"
+    with lock_path.open(mode) as handle:
+        before = lock_path.lstat()
+        opened = os.fstat(handle.fileno())
+        _validate_state_lock_metadata(
+            before,
+            lock_path,
+            require_private_mode=not (create_layout or bootstrap_empty_lock),
+        )
+        _validate_state_lock_metadata(
+            opened,
+            lock_path,
+            require_private_mode=not (create_layout or bootstrap_empty_lock),
+        )
+        if _lock_identity(before) != _lock_identity(opened):
+            raise HarnessError("AOI state lock changed while being opened")
+        if create_layout or bootstrap_empty_lock:
+            _chmod_private(lock_path, 0o600)
+            before = lock_path.lstat()
+            opened = os.fstat(handle.fileno())
+            _validate_state_lock_metadata(before, lock_path, require_private_mode=True)
+            _validate_state_lock_metadata(opened, lock_path, require_private_mode=True)
+            if _lock_identity(before) != _lock_identity(opened):
+                raise HarnessError("AOI state lock changed while permissions were set")
+        initialized_empty_lock = False
+        lock_size = int(opened.st_size)
+        if lock_size == 0 and bootstrap_empty_lock:
+            handle.seek(0)
+            handle.write(b"\0")
+            handle.truncate(1)
+            handle.flush()
+            os.fsync(handle.fileno())
+            initialized_empty_lock = True
+        elif lock_size != 1:
+            raise HarnessError(
+                "AOI state lock payload is invalid; expected one NUL sentinel byte"
+            )
+        acquired = False
+        _acquire_state_lock(handle)
+        acquired = True
+        acquisition_pid = os.getpid()
+        try:
+            current = lock_path.lstat()
+            locked = os.fstat(handle.fileno())
+            _validate_state_lock_metadata(current, lock_path, require_private_mode=True)
+            _validate_state_lock_metadata(locked, lock_path, require_private_mode=True)
+            identity = _lock_identity(locked)
+            if _lock_identity(current) != identity:
+                raise HarnessError("AOI state lock path changed during lock acquisition")
+            if canonicalize_no_link_traversal(lock_path, "AOI state lock") != lock_path:
+                raise HarnessError("AOI state lock path changed during lock acquisition")
+            handle.seek(0)
+            if handle.read(2) != b"\0":
+                raise HarnessError("AOI state lock payload changed during lock acquisition")
+            held[key] = {
+                "depth": 1,
+                "st_dev": identity[0],
+                "st_ino": identity[1],
+                "pid": acquisition_pid,
+            }
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+        except BaseException:
+            if (
+                bootstrap_empty_lock
+                and initialized_empty_lock
+                and os.getpid() == acquisition_pid
+            ):
+                handle.seek(0)
+                handle.truncate(0)
+                handle.flush()
+                os.fsync(handle.fileno())
+            raise
+        finally:
+            # A forked child inherits both this Python frame and the same flock
+            # open-file description.  Calling LOCK_UN from the child would
+            # silently release the parent's lock.  Closing the child's copied
+            # descriptor is safe; only the acquiring process may unlock it.
+            if acquired and os.getpid() == acquisition_pid:
+                _release_state_lock(handle)
 
 
 def _acquire_state_lock(handle: Any) -> None:
@@ -489,11 +825,6 @@ def _acquire_state_lock(handle: Any) -> None:
     # msvcrt locks a byte range rather than the whole file. Keep one durable
     # byte at offset zero and retry the non-blocking operation so Windows has
     # the same wait-until-exclusive behavior as POSIX flock.
-    handle.seek(0, os.SEEK_END)
-    if handle.tell() == 0:
-        handle.write(b"\0")
-        handle.flush()
-        os.fsync(handle.fileno())
     handle.seek(0)
     while True:
         try:
@@ -551,6 +882,1471 @@ def parse_time(value: str | None) -> dt.datetime | None:
 def is_expired(value: str | None) -> bool:
     parsed = parse_time(value)
     return parsed is not None and parsed < dt.datetime.now().astimezone()
+
+
+def chief_utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _chief_now(value: dt.datetime | None = None) -> dt.datetime:
+    current = chief_utc_now() if value is None else value
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise HarnessError("Chief authority time must be timezone-aware")
+    return current.astimezone(dt.timezone.utc)
+
+
+def _chief_not_before(
+    current: dt.datetime, reference: dt.datetime, *, label: str
+) -> dt.datetime:
+    """Clamp sub-second wall-clock jitter without accepting real rollback."""
+
+    if current >= reference:
+        return current
+    if reference - current > dt.timedelta(
+        seconds=CHIEF_CLOCK_SKEW_TOLERANCE_SECONDS
+    ):
+        delta = (reference - current).total_seconds()
+        raise HarnessError(
+            f"system clock precedes the {label} by {delta:.6f}s "
+            f"(tolerance {CHIEF_CLOCK_SKEW_TOLERANCE_SECONDS}s)"
+        )
+    return reference
+
+
+def _chief_iso(value: dt.datetime) -> str:
+    return _chief_now(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _chief_exact_int(value: Any, minimum: int = 0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def validate_chief_ttl(value: int) -> int:
+    if (
+        not _chief_exact_int(value, CHIEF_MIN_TTL_SECONDS)
+        or value > CHIEF_MAX_TTL_SECONDS
+    ):
+        raise HarnessError(
+            "Chief lease TTL must be an integer between "
+            f"{CHIEF_MIN_TTL_SECONDS} and {CHIEF_MAX_TTL_SECONDS} seconds"
+        )
+    return value
+
+
+def _validate_chief_session_id(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or value != value.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise HarnessError(
+            "Chief session id must be 1-512 trimmed characters with no control characters"
+        )
+    return value
+
+
+def _validate_chief_reason(value: str, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2048
+        or value != value.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise HarnessError(
+            f"{label} must be 1-2048 trimmed characters with no control characters"
+        )
+    return value
+
+
+def new_chief_token() -> str:
+    return secrets.token_urlsafe(CHIEF_TOKEN_BYTES)
+
+
+def chief_token_sha256(token: str) -> str:
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise HarnessError("Chief lease credential is missing or malformed")
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _chief_time(value: Any, label: str) -> dt.datetime:
+    if not isinstance(value, str):
+        raise HarnessError(f"Chief authority {label} must be an ISO-8601 string")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise HarnessError(
+            f"Chief authority {label} must be timezone-aware ISO-8601"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HarnessError(f"Chief authority {label} must be timezone-aware ISO-8601")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+_CHIEF_RECORD_FIELDS = {
+    "schema_version",
+    "epoch",
+    "status",
+    "session_id",
+    "token_sha256",
+    "issued_at",
+    "renewed_at",
+    "expires_at",
+    "renewal_count",
+    "transition_seq",
+    "omitted_transition_count",
+    "audit_tail",
+    "updated_at",
+}
+_CHIEF_EVENT_FIELDS = {
+    "seq",
+    "action",
+    "at",
+    "old_epoch",
+    "new_epoch",
+    "session_id",
+    "previous_session_id",
+    "reason",
+    "forced_live",
+}
+_CHIEF_EVENT_ACTIONS = {"acquire", "renew", "release", "takeover"}
+
+
+def validate_chief_authority_record(
+    paths: HarnessPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != _CHIEF_RECORD_FIELDS:
+        raise HarnessError("Chief authority record has an unsupported field set")
+    if not _chief_exact_int(payload.get("schema_version"), 1) or payload.get(
+        "schema_version"
+    ) != CHIEF_AUTHORITY_SCHEMA_VERSION:
+        raise HarnessError("unsupported Chief authority schema version")
+    epoch = payload.get("epoch")
+    if not _chief_exact_int(epoch, 1):
+        raise HarnessError("Chief authority epoch must be a positive integer")
+    status = payload.get("status")
+    if not isinstance(status, str) or status not in CHIEF_AUTHORITY_STATUSES:
+        raise HarnessError("Chief authority status is invalid")
+    renewal_count = payload.get("renewal_count")
+    transition_seq = payload.get("transition_seq")
+    omitted_count = payload.get("omitted_transition_count")
+    if not _chief_exact_int(renewal_count) or not _chief_exact_int(transition_seq, 1):
+        raise HarnessError("Chief authority counters are invalid")
+    if not _chief_exact_int(omitted_count):
+        raise HarnessError("Chief authority omitted transition count is invalid")
+    audit_tail = payload.get("audit_tail")
+    if (
+        not isinstance(audit_tail, list)
+        or not audit_tail
+        or len(audit_tail) > CHIEF_AUDIT_TAIL_MAX
+        or transition_seq != omitted_count + len(audit_tail)
+        or epoch > transition_seq
+    ):
+        raise HarnessError("Chief authority audit tail is invalid")
+    previous_time: dt.datetime | None = None
+    previous_event: dict[str, Any] | None = None
+    for offset, event in enumerate(audit_tail, start=omitted_count + 1):
+        if not isinstance(event, dict) or set(event) != _CHIEF_EVENT_FIELDS:
+            raise HarnessError("Chief authority audit event has an invalid field set")
+        action = event.get("action")
+        if (
+            not _chief_exact_int(event.get("seq"), 1)
+            or event.get("seq") != offset
+            or not isinstance(action, str)
+            or action not in _CHIEF_EVENT_ACTIONS
+        ):
+            raise HarnessError("Chief authority audit event sequence/action is invalid")
+        event_time = _chief_time(event.get("at"), "audit event time")
+        if previous_time is not None and event_time < previous_time:
+            raise HarnessError("Chief authority audit event time moved backwards")
+        previous_time = event_time
+        old_epoch = event.get("old_epoch")
+        new_epoch = event.get("new_epoch")
+        if not _chief_exact_int(old_epoch) or not _chief_exact_int(new_epoch, 1):
+            raise HarnessError("Chief authority audit event epoch is invalid")
+        action = event["action"]
+        if action in {"acquire", "takeover"}:
+            if new_epoch != old_epoch + 1:
+                raise HarnessError("Chief acquire/takeover must increment the epoch")
+        elif new_epoch != old_epoch:
+            raise HarnessError("Chief renew/release must preserve the epoch")
+        if omitted_count == 0 and offset == 1 and (
+            action != "acquire" or old_epoch != 0 or new_epoch != 1
+        ):
+            raise HarnessError(
+                "complete Chief authority history must begin with acquire epoch 0 -> 1"
+            )
+        session_id = _validate_chief_session_id(event.get("session_id"))
+        previous_session = event.get("previous_session_id")
+        if previous_session:
+            _validate_chief_session_id(previous_session)
+        elif previous_session != "":
+            raise HarnessError("Chief authority previous session id is invalid")
+        _validate_chief_reason(event.get("reason"), "Chief authority audit reason")
+        if not isinstance(event.get("forced_live"), bool):
+            raise HarnessError("Chief authority forced-live marker is invalid")
+        if action != "takeover" and event["forced_live"]:
+            raise HarnessError("only a Chief takeover may carry forced_live=true")
+        if action == "acquire" and previous_session != "":
+            raise HarnessError("Chief acquire audit event has a previous holder")
+        if action in {"renew", "release"} and previous_session != session_id:
+            raise HarnessError("Chief renew/release audit holder chain is invalid")
+        if action == "takeover" and previous_session == "":
+            raise HarnessError("Chief takeover audit event lacks the previous holder")
+        if previous_event is not None:
+            if old_epoch != previous_event["new_epoch"]:
+                raise HarnessError("Chief authority audit epoch chain is discontinuous")
+            if previous_event["action"] == "release":
+                if action != "acquire":
+                    raise HarnessError("inactive Chief authority must next be acquired")
+            elif action == "acquire":
+                raise HarnessError("active Chief authority cannot be acquired again")
+            elif previous_session != previous_event["session_id"]:
+                raise HarnessError("Chief authority audit session chain is discontinuous")
+        previous_event = event
+    last_event = audit_tail[-1]
+    if last_event["new_epoch"] != epoch or payload.get("updated_at") != last_event["at"]:
+        raise HarnessError("Chief authority record differs from its audit tail")
+    updated_at = _chief_time(payload.get("updated_at"), "updated_at")
+    if previous_time != updated_at:
+        raise HarnessError("Chief authority updated_at is not the latest audit time")
+    if status == "active":
+        session_id = _validate_chief_session_id(payload.get("session_id"))
+        if session_id != last_event["session_id"]:
+            raise HarnessError("Chief authority holder differs from its latest audit event")
+        token_digest = payload.get("token_sha256")
+        if not isinstance(token_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", token_digest):
+            raise HarnessError("Chief authority token digest is invalid")
+        issued_at = _chief_time(payload.get("issued_at"), "issued_at")
+        renewed_at = _chief_time(payload.get("renewed_at"), "renewed_at")
+        expires_at = _chief_time(payload.get("expires_at"), "expires_at")
+        if issued_at > renewed_at or renewed_at >= expires_at:
+            raise HarnessError("Chief authority lease timestamps are inconsistent")
+        lease_ttl_seconds = (expires_at - renewed_at).total_seconds()
+        if not (
+            lease_ttl_seconds.is_integer()
+            and CHIEF_MIN_TTL_SECONDS
+            <= lease_ttl_seconds
+            <= CHIEF_MAX_TTL_SECONDS
+        ):
+            raise HarnessError(
+                "Chief authority lease duration is outside the supported TTL bounds"
+            )
+        if renewed_at != updated_at:
+            raise HarnessError("active Chief authority renewed_at differs from updated_at")
+        if last_event["action"] not in {"acquire", "renew", "takeover"}:
+            raise HarnessError("active Chief authority has a terminal audit action")
+        origin_index = next(
+            (
+                index
+                for index in range(len(audit_tail) - 1, -1, -1)
+                if audit_tail[index]["action"] in {"acquire", "takeover"}
+                and audit_tail[index]["new_epoch"] == epoch
+            ),
+            None,
+        )
+        visible_renewals = sum(
+            event["action"] == "renew" and event["new_epoch"] == epoch
+            for event in audit_tail[
+                origin_index + 1 if origin_index is not None else 0:
+            ]
+        )
+        if origin_index is not None:
+            origin_time = _chief_time(
+                audit_tail[origin_index]["at"], "current epoch origin time"
+            )
+            if issued_at != origin_time:
+                raise HarnessError(
+                    "Chief authority issued_at differs from its current epoch origin"
+                )
+            if renewal_count != visible_renewals:
+                raise HarnessError(
+                    "Chief authority renewal count differs from its visible epoch history"
+                )
+        elif renewal_count < visible_renewals:
+            raise HarnessError(
+                "Chief authority renewal count is below its visible epoch history"
+            )
+    else:
+        if any(
+            payload.get(field) != ""
+            for field in ("session_id", "token_sha256", "issued_at", "renewed_at", "expires_at")
+        ) or renewal_count != 0:
+            raise HarnessError("inactive Chief authority retains live lease material")
+        if last_event["action"] != "release":
+            raise HarnessError("inactive Chief authority lacks a release audit action")
+    return payload
+
+
+def load_chief_authority(
+    paths: HarnessPaths, *, allow_missing: bool = False
+) -> dict[str, Any] | None:
+    if not paths.chief_authority.exists():
+        if allow_missing:
+            return None
+        raise HarnessError(
+            "Chief authority is not initialized; run `aoi chief-acquire --session-id <id>`"
+        )
+    payload = load_json(paths.chief_authority)
+    return validate_chief_authority_record(paths, payload)
+
+
+def _chief_lock_is_held(paths: HarnessPaths) -> bool:
+    lock_path = canonicalize_no_link_traversal(paths.lock, "AOI state lock")
+    entry = _held_state_locks().get(os.path.normcase(str(lock_path)))
+    if entry is None:
+        return False
+    _validate_held_state_lock(paths, entry)
+    return True
+
+
+def _require_chief_lock(paths: HarnessPaths) -> None:
+    if not _chief_lock_is_held(paths):
+        raise HarnessError("Chief authority transition requires the project state lock")
+
+
+def _append_chief_event(
+    previous: dict[str, Any] | None,
+    *,
+    action: str,
+    at: str,
+    old_epoch: int,
+    new_epoch: int,
+    session_id: str,
+    previous_session_id: str,
+    reason: str,
+    forced_live: bool,
+) -> tuple[int, int, list[dict[str, Any]]]:
+    transition_seq = int(previous.get("transition_seq", 0) if previous else 0) + 1
+    omitted = int(previous.get("omitted_transition_count", 0) if previous else 0)
+    tail = list(previous.get("audit_tail", []) if previous else [])
+    tail.append(
+        {
+            "seq": transition_seq,
+            "action": action,
+            "at": at,
+            "old_epoch": old_epoch,
+            "new_epoch": new_epoch,
+            "session_id": session_id,
+            "previous_session_id": previous_session_id,
+            "reason": reason.strip(),
+            "forced_live": forced_live,
+        }
+    )
+    if len(tail) > CHIEF_AUDIT_TAIL_MAX:
+        removed = len(tail) - CHIEF_AUDIT_TAIL_MAX
+        tail = tail[removed:]
+        omitted += removed
+    return transition_seq, omitted, tail
+
+
+def _write_chief_authority(paths: HarnessPaths, record: dict[str, Any]) -> None:
+    _require_chief_lock(paths)
+    validate_chief_authority_record(paths, record)
+    atomic_write_json(paths.chief_authority, record)
+
+
+def _chief_authority_definitely_not_published(
+    paths: HarnessPaths, record: dict[str, Any]
+) -> bool:
+    """Return true only when the canonical authority is provably not ``record``.
+
+    A post-replace canonicalization or directory-fsync failure is ambiguous: the
+    new authority may already be live.  Its matching credential must survive so
+    the published lease cannot be stranded without a usable secret.
+    """
+
+    try:
+        current = load_chief_authority(paths, allow_missing=True)
+    except (HarnessError, OSError):
+        return False
+    return current != record
+
+
+def _chief_summary_from_record(
+    record: dict[str, Any] | None, *, now: dt.datetime | None = None
+) -> dict[str, Any]:
+    current = _chief_now(now)
+    if record is None:
+        return {
+            "status": "uninitialized",
+            "epoch": 0,
+            "session_id": "",
+            "issued_at": "",
+            "renewed_at": "",
+            "expires_at": "",
+            "expired": False,
+            "renewal_count": 0,
+            "transition_seq": 0,
+            "omitted_transition_count": 0,
+            "latest_action": "",
+        }
+    expires = _chief_time(record["expires_at"], "expires_at") if record["status"] == "active" else None
+    return {
+        "status": record["status"],
+        "epoch": record["epoch"],
+        "session_id": record["session_id"],
+        "issued_at": record["issued_at"],
+        "renewed_at": record["renewed_at"],
+        "expires_at": record["expires_at"],
+        "expired": bool(expires is not None and expires <= current),
+        "renewal_count": record["renewal_count"],
+        "transition_seq": record["transition_seq"],
+        "omitted_transition_count": record["omitted_transition_count"],
+        "latest_action": record["audit_tail"][-1]["action"],
+    }
+
+
+def chief_authority_summary(
+    paths: HarnessPaths, *, now: dt.datetime | None = None
+) -> dict[str, Any]:
+    return _chief_summary_from_record(
+        load_chief_authority(paths, allow_missing=True), now=now
+    )
+
+
+def required_layout_entries(
+    paths: HarnessPaths, *, include_lock: bool = True
+) -> tuple[Path, ...]:
+    directories = [
+        paths.harness,
+        paths.claims,
+        paths.tasks,
+        paths.claims_active,
+        paths.claims_archive,
+        paths.sessions,
+        paths.templates,
+    ]
+    if paths.project.legacy_enabled:
+        directories.extend((paths.legacy_pending, paths.legacy_decisions))
+    files = [
+        paths.platform,
+        paths.index,
+        paths.harness / "POLICY.md",
+        *(paths.templates / name for name in (
+            "plan.md",
+            "packet.md",
+            "checkpoint.md",
+            "source_receipt.example.json",
+        )),
+    ]
+    if include_lock:
+        files.append(paths.lock)
+    return tuple((*directories, *files))
+
+
+def require_complete_layout(paths: HarnessPaths, *, include_lock: bool = True) -> None:
+    preflight_layout(paths)
+    missing = [
+        str(path)
+        for path in required_layout_entries(paths, include_lock=include_lock)
+        if not path.exists()
+    ]
+    if missing:
+        raise HarnessError("AOI layout is incomplete; missing: " + ", ".join(missing))
+
+
+def _validate_interrupted_initialization_prefix(
+    paths: HarnessPaths, *, initialized_lock: bool
+) -> tuple[tuple[int, int], bytes] | None:
+    """Validate the exact pre-lock init prefix and return a pinned torn marker."""
+
+    validate_existing_regular_file(paths.config, "AOI configuration")
+    if not paths.config.is_file():
+        raise HarnessError("interrupted initialization recovery requires aoi.toml")
+    if paths.chief_authority.exists():
+        raise HarnessError("interrupted initialization recovery found Chief authority")
+
+    allowed_directories = {
+        paths.harness,
+        paths.claims,
+        paths.tasks,
+        paths.claims_active,
+        paths.claims_archive,
+        paths.sessions,
+        paths.templates,
+    }
+    if paths.project.legacy_enabled:
+        allowed_directories.update((paths.legacy_pending, paths.legacy_decisions))
+    allowed_files = {paths.platform, paths.lock}
+
+    if paths.harness.exists():
+        validate_existing_regular_directory(paths.harness, "AOI state directory")
+        pending = [paths.harness]
+        while pending:
+            directory = pending.pop()
+            try:
+                entries = list(directory.iterdir())
+            except OSError as exc:
+                raise HarnessError(
+                    f"cannot inspect interrupted AOI initialization prefix {directory}: {exc}"
+                ) from exc
+            for entry in entries:
+                if _path_is_link_like(entry):
+                    raise HarnessError(
+                        f"interrupted initialization prefix contains a linked entry: {entry}"
+                    )
+                try:
+                    metadata = entry.lstat()
+                except OSError as exc:
+                    raise HarnessError(
+                        f"cannot inspect interrupted AOI initialization entry {entry}: {exc}"
+                    ) from exc
+                if stat.S_ISDIR(metadata.st_mode):
+                    if entry not in allowed_directories:
+                        raise HarnessError(
+                            f"interrupted initialization prefix contains an unknown directory: {entry}"
+                        )
+                    pending.append(entry)
+                    continue
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or entry not in allowed_files
+                ):
+                    raise HarnessError(
+                        f"interrupted initialization prefix contains material or unknown state: {entry}"
+                    )
+
+    if paths.lock.exists():
+        expected_lock_payload = b"\0" if initialized_lock else b""
+        if initialized_lock and _chief_lock_is_held(paths):
+            # Windows byte-range locking prevents a second handle from reading
+            # the locked byte. state_lock already pinned the inode and exact NUL
+            # payload; repeat the path/size checks through the held entry.
+            metadata = paths.lock.lstat()
+            if metadata.st_size != len(expected_lock_payload):
+                raise HarnessError(
+                    "interrupted initialization recovery found an unexpected state lock payload"
+                )
+        else:
+            identity, lock_payload = _read_regular_file_snapshot(
+                paths.lock, "AOI state lock", max_bytes=2
+            )
+            metadata = paths.lock.lstat()
+            if _lock_identity(metadata) != identity:
+                raise HarnessError(
+                    "interrupted initialization state lock changed during validation"
+                )
+            _validate_state_lock_metadata(
+                metadata, paths.lock, require_private_mode=initialized_lock
+            )
+            if lock_payload != expected_lock_payload:
+                raise HarnessError(
+                    "interrupted initialization recovery found an unexpected state lock payload"
+                )
+    elif initialized_lock:
+        raise HarnessError("interrupted initialization recovery lost its state lock")
+
+    torn_platform: tuple[tuple[int, int], bytes] | None = None
+    if paths.platform.exists():
+        torn_platform = _torn_platform_marker_snapshot(paths.platform)
+        if torn_platform is not None:
+            if initialized_lock:
+                raise HarnessError(
+                    "initialized interrupted-init prefix retains a torn platform marker"
+                )
+        else:
+            marker = _read_platform_marker(paths.platform)
+            if marker.get("lock_domain") != runtime_lock_domain():
+                raise HarnessError(
+                    "interrupted initialization prefix belongs to another lock domain"
+                )
+    elif initialized_lock:
+        raise HarnessError("interrupted initialization recovery lost its platform marker")
+    return torn_platform
+
+
+def _repair_interrupted_initialization_prefix(paths: HarnessPaths) -> None:
+    """Repair only the structural prefix that first ``aoi init`` may leave.
+
+    Before the first state lock is initialized, ``aoi init`` can only have
+    created the state directory, platform marker, structural directories, and
+    an empty lock.  Any authority, lifecycle payload, managed resource, or
+    unknown entry means this is an established/ambiguous tree and must not be
+    repaired without a Chief. The exact scan is repeated while holding the new
+    lock so two cooperative recovery attempts cannot widen the prefix.
+    """
+
+    torn_platform = _validate_interrupted_initialization_prefix(
+        paths, initialized_lock=False
+    )
+    if torn_platform is not None:
+        _rewrite_torn_platform_marker(paths.platform, torn_platform)
+
+    # This is the one narrow unauthenticated repair. It creates only structural
+    # directories/platform/empty lock. The sentinel is committed only while
+    # holding that same lock after an exact second scan; a failed scan restores
+    # the empty, untrusted legacy/bootstrap state.
+    paths.harness.mkdir(parents=True, exist_ok=True)
+    _chmod_private(paths.harness, 0o700)
+    if not paths.platform.exists():
+        _create_platform_marker(paths.platform)
+    ensure_layout(paths)
+    if not paths.lock.exists():
+        try:
+            atomic_create_bytes(paths.lock, b"")
+        except HarnessError:
+            if not paths.lock.exists():
+                raise
+    _identity, lock_payload = _read_regular_file_snapshot(
+        paths.lock, "AOI state lock", max_bytes=2
+    )
+    if lock_payload == b"":
+        with state_lock(
+            paths, create_layout=False, bootstrap_empty_lock=True
+        ):
+            _validate_interrupted_initialization_prefix(
+                paths, initialized_lock=True
+            )
+    elif lock_payload == b"\0":
+        # A concurrent cooperative recovery may have committed the sentinel.
+        # It is trusted only after this process locks and repeats the exact scan.
+        with state_lock(paths, create_layout=False):
+            _validate_interrupted_initialization_prefix(
+                paths, initialized_lock=True
+            )
+    else:
+        raise HarnessError(
+            "interrupted initialization recovery found an invalid state lock collision"
+        )
+
+
+def bootstrap_chief_state_lock(paths: HarnessPaths) -> bool:
+    """Create only a missing lock for a complete pre-v0.2/inactive state tree.
+
+    This is the narrow migration exception used by ``chief-acquire``.  It must
+    not repair directories, policies, or other state before a Chief exists.
+    """
+
+    if paths.lock.exists():
+        identity, lock_payload = _read_regular_file_snapshot(
+            paths.lock, "AOI state lock", max_bytes=2
+        )
+        metadata = paths.lock.lstat()
+        if _lock_identity(metadata) != identity:
+            raise HarnessError("AOI state lock changed during Chief bootstrap")
+        _validate_state_lock_metadata(
+            metadata,
+            paths.lock,
+            require_private_mode=lock_payload == b"\0",
+        )
+        if lock_payload == b"\0":
+            # A committed sentinel is not a blanket fast path. Revalidate either
+            # the complete layout or the exact resumable prefix under the lock
+            # so a prior failed repair cannot authorize later material state.
+            with state_lock(paths, create_layout=False):
+                previous = load_chief_authority(paths, allow_missing=True)
+                try:
+                    require_complete_layout(paths)
+                except HarnessError as complete_exc:
+                    if previous is not None:
+                        raise HarnessError(
+                            "Chief lock bootstrap found incomplete established state: "
+                            f"{complete_exc}"
+                        ) from complete_exc
+                    try:
+                        _validate_interrupted_initialization_prefix(
+                            paths, initialized_lock=True
+                        )
+                    except HarnessError as recovery_exc:
+                        raise HarnessError(
+                            "Chief lock bootstrap requires a complete existing AOI layout or "
+                            "an exact interrupted-init prefix: "
+                            f"complete-layout check failed ({complete_exc}); "
+                            f"recovery refused ({recovery_exc})"
+                        ) from recovery_exc
+            return False
+        if lock_payload != b"":
+            raise HarnessError(
+                "AOI state lock payload is invalid; expected empty legacy lock or one NUL sentinel"
+            )
+        try:
+            preflight_layout(paths)
+            previous = load_chief_authority(paths, allow_missing=True)
+            if previous is not None and previous["status"] == "active":
+                raise HarnessError("active Chief authority has an empty state lock")
+            require_complete_layout(paths)
+        except HarnessError as complete_exc:
+            try:
+                _repair_interrupted_initialization_prefix(paths)
+            except HarnessError as recovery_exc:
+                raise HarnessError(
+                    "Chief lock bootstrap requires a complete existing AOI layout or "
+                    "an exact interrupted-init prefix: "
+                    f"complete-layout check failed ({complete_exc}); "
+                    f"recovery refused ({recovery_exc})"
+                ) from recovery_exc
+        else:
+            # POSIX AOI v0.1.3 used a legitimate zero-byte flock file. Convert
+            # it to the cross-platform one-byte sentinel only after validating
+            # the complete legacy layout and inactive/uninitialized authority,
+            # then repeat those checks while holding the converted lock.
+            with state_lock(
+                paths, create_layout=False, bootstrap_empty_lock=True
+            ):
+                previous = load_chief_authority(paths, allow_missing=True)
+                if previous is not None and previous["status"] == "active":
+                    raise HarnessError("active Chief authority has an empty state lock")
+                require_complete_layout(paths)
+        return True
+
+    try:
+        preflight_layout(paths)
+        previous = load_chief_authority(paths, allow_missing=True)
+        if previous is not None and previous["status"] == "active":
+            raise HarnessError("active Chief authority has a missing state lock")
+        require_complete_layout(paths, include_lock=False)
+    except HarnessError as exc:
+        try:
+            _repair_interrupted_initialization_prefix(paths)
+        except HarnessError as recovery_exc:
+            raise HarnessError(
+                "Chief lock bootstrap requires a complete existing AOI layout or "
+                "an exact interrupted-init prefix: "
+                f"complete-layout check failed ({exc}); recovery refused ({recovery_exc})"
+            ) from recovery_exc
+        return True
+    try:
+        atomic_create_bytes(paths.lock, b"")
+    except HarnessError:
+        if not paths.lock.exists():
+            raise
+    _identity, lock_payload = _read_regular_file_snapshot(
+        paths.lock, "AOI state lock", max_bytes=2
+    )
+    if lock_payload == b"":
+        with state_lock(
+            paths, create_layout=False, bootstrap_empty_lock=True
+        ):
+            previous = load_chief_authority(paths, allow_missing=True)
+            if previous is not None and previous["status"] == "active":
+                raise HarnessError("active Chief authority appeared during lock migration")
+            require_complete_layout(paths)
+    elif lock_payload == b"\0":
+        with state_lock(paths, create_layout=False):
+            previous = load_chief_authority(paths, allow_missing=True)
+            if previous is not None and previous["status"] == "active":
+                raise HarnessError("active Chief authority appeared during lock migration")
+            require_complete_layout(paths)
+    else:
+        raise HarnessError(
+            "AOI state lock collision produced neither an empty legacy lock nor the NUL sentinel"
+        )
+    return True
+
+
+_CHIEF_CREDENTIAL_FIELDS = {
+    "schema_version",
+    "project_key",
+    "lock_domain",
+    "session_id",
+    "epoch",
+    "token_sha256",
+    "created_at",
+    "secret_scheme",
+    "secret_value",
+}
+
+
+def chief_project_key(paths: HarnessPaths) -> str:
+    identity = (
+        runtime_lock_domain()
+        + "\0"
+        + os.path.normcase(str(paths.root.resolve()))
+        + "\0"
+        + paths.project.state_dir
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _chief_credential_root(
+    paths: HarnessPaths, credential_home: Path | None = None
+) -> Path:
+    if credential_home is not None:
+        raw = credential_home.expanduser()
+        if not raw.is_absolute():
+            raise HarnessError("Chief credential directory must be an absolute path")
+    else:
+        configured = os.environ.get("AOI_CHIEF_CREDENTIAL_HOME")
+        if configured:
+            raw = Path(configured).expanduser()
+            if not raw.is_absolute():
+                raise HarnessError("AOI_CHIEF_CREDENTIAL_HOME must be an absolute path")
+        elif os.name == "nt":
+            local = os.environ.get("LOCALAPPDATA")
+            if local and not Path(local).expanduser().is_absolute():
+                raise HarnessError("LOCALAPPDATA must be an absolute path")
+            raw = (
+                Path(local).expanduser()
+                if local
+                else Path.home() / "AppData" / "Local"
+            ) / "AOI" / "credentials" / "v1"
+        else:
+            state_home = os.environ.get("XDG_STATE_HOME")
+            if state_home and not Path(state_home).expanduser().is_absolute():
+                raise HarnessError("XDG_STATE_HOME must be an absolute path")
+            raw = (
+                Path(state_home).expanduser()
+                if state_home
+                else Path.home() / ".local" / "state"
+            ) / "aoi" / "credentials" / "v1"
+    root = canonicalize_no_link_traversal(raw, "Chief credential directory")
+    project_root = paths.root.resolve()
+    filesystem_root = Path(root.anchor).resolve()
+    user_home = Path.home().resolve()
+    if root == filesystem_root:
+        raise HarnessError("Chief credential directory may not be a filesystem root")
+    if root == user_home:
+        raise HarnessError("Chief credential directory may not be the user home directory")
+    if (
+        root == project_root
+        or project_root in root.parents
+        or root in project_root.parents
+    ):
+        raise HarnessError(
+            "Chief credential directory must be separate from the project repository "
+            "and its ancestors"
+        )
+    _validate_credential_ancestor_chain(root)
+    return root
+
+
+def _validate_credential_ancestor_chain(path: Path) -> None:
+    """Reject link-like or non-sticky group/world-writable credential ancestors."""
+
+    current = canonicalize_no_link_traversal(path, "Chief credential directory").parent
+    while True:
+        validate_existing_regular_directory(current, "Chief credential ancestor")
+        if current.exists() and os.name != "nt":
+            try:
+                metadata = current.stat()
+            except OSError as exc:
+                raise HarnessError(
+                    f"cannot inspect Chief credential ancestor {current}: {exc}"
+                ) from exc
+            if metadata.st_uid not in {0, os.geteuid()}:
+                raise HarnessError(
+                    f"Chief credential ancestor has an untrusted owner: {current}"
+                )
+            mode = stat.S_IMODE(metadata.st_mode)
+            if mode & 0o022 and not mode & stat.S_ISVTX:
+                raise HarnessError(
+                    "Chief credential ancestor is group/world-writable without the "
+                    f"sticky bit: {current}"
+                )
+        if current.parent == current:
+            break
+        current = current.parent
+
+
+def _validate_private_credential_directory(path: Path) -> None:
+    validate_existing_regular_directory(path, "Chief credential directory")
+    if not path.is_dir():
+        raise HarnessError(f"Chief credential directory is missing: {path}")
+    metadata = path.stat()
+    if os.name != "nt":
+        if metadata.st_uid != os.geteuid():
+            raise HarnessError(f"Chief credential directory has a different owner: {path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise HarnessError(
+                f"Chief credential directory permissions are not private (expected 0700): {path}"
+            )
+
+
+def _ensure_private_credential_directory(path: Path) -> Path:
+    canonical = canonicalize_no_link_traversal(path, "Chief credential directory")
+    _validate_credential_ancestor_chain(canonical)
+    missing: list[Path] = []
+    current = canonical
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            raise HarnessError(
+                f"cannot find an existing ancestor for Chief credential directory {canonical}"
+            )
+        current = current.parent
+    validate_existing_regular_directory(current, "Chief credential ancestor")
+    for directory in reversed(missing):
+        created = False
+        try:
+            directory.mkdir(mode=0o700, exist_ok=False)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot create Chief credential directory {directory}: {exc}"
+            ) from exc
+        if created:
+            _chmod_private(directory, 0o700)
+        _validate_private_credential_directory(directory)
+        _validate_credential_ancestor_chain(directory)
+    if canonicalize_no_link_traversal(canonical, "Chief credential directory") != canonical:
+        raise HarnessError("Chief credential directory changed during creation")
+    _validate_private_credential_directory(canonical)
+    return canonical
+
+
+def _validate_private_credential_file(path: Path) -> None:
+    path = canonicalize_no_link_traversal(path, "Chief credential file")
+    validate_existing_regular_file(path, "Chief credential file")
+    if not path.is_file():
+        raise HarnessError(f"Chief credential file is missing: {path}")
+    metadata = path.stat()
+    if metadata.st_size > CHIEF_CREDENTIAL_MAX_BYTES:
+        raise HarnessError("Chief credential file exceeds the 8 KiB size bound")
+    if os.name != "nt":
+        if metadata.st_uid != os.geteuid():
+            raise HarnessError(f"Chief credential file has a different owner: {path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise HarnessError(
+                f"Chief credential file permissions are not private (expected 0600): {path}"
+            )
+
+
+def _windows_dpapi_transform(data: bytes, *, protect: bool) -> bytes:
+    if os.name != "nt":
+        raise HarnessError("Windows DPAPI is unavailable on this platform")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+            ]
+
+        buffer = ctypes.create_string_buffer(data)
+        incoming = DataBlob(
+            len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
+        )
+        outgoing = DataBlob()
+        flags = 0x1  # CRYPTPROTECT_UI_FORBIDDEN
+        if protect:
+            ok = ctypes.windll.crypt32.CryptProtectData(
+                ctypes.byref(incoming),
+                "AOI Chief credential",
+                None,
+                None,
+                None,
+                flags,
+                ctypes.byref(outgoing),
+            )
+        else:
+            ok = ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(incoming),
+                None,
+                None,
+                None,
+                None,
+                flags,
+                ctypes.byref(outgoing),
+            )
+        if not ok:
+            raise ctypes.WinError()
+        try:
+            return ctypes.string_at(outgoing.pbData, outgoing.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(outgoing.pbData)
+    except (OSError, ValueError) as exc:
+        operation = "protect" if protect else "unprotect"
+        raise HarnessError(f"Windows DPAPI could not {operation} Chief credential") from exc
+
+
+def _encode_chief_secret(token: str) -> tuple[str, str]:
+    if os.name == "nt":
+        protected = _windows_dpapi_transform(token.encode("ascii"), protect=True)
+        return "dpapi-current-user-v1", base64.b64encode(protected).decode("ascii")
+    return "plain-posix-mode-v1", token
+
+
+def _decode_chief_secret(scheme: Any, value: Any) -> str:
+    if not isinstance(scheme, str) or not isinstance(value, str):
+        raise HarnessError("Chief credential secret encoding is malformed")
+    if scheme == "plain-posix-mode-v1" and os.name != "nt":
+        token = value
+    elif scheme == "dpapi-current-user-v1" and os.name == "nt":
+        try:
+            protected = base64.b64decode(value.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise HarnessError("Chief credential DPAPI payload is malformed") from exc
+        try:
+            token = _windows_dpapi_transform(protected, protect=False).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HarnessError("Chief credential DPAPI payload is malformed") from exc
+    else:
+        raise HarnessError("Chief credential secret scheme is unsupported here")
+    chief_token_sha256(token)
+    return token
+
+
+def chief_credential_path(
+    paths: HarnessPaths,
+    *,
+    session_id: str,
+    epoch: int,
+    token_sha256: str,
+    credential_home: Path | None = None,
+    create_directories: bool = False,
+) -> Path:
+    session_id = _validate_chief_session_id(session_id)
+    if not _chief_exact_int(epoch, 1):
+        raise HarnessError("Chief credential epoch must be a positive integer")
+    if not isinstance(token_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", token_sha256
+    ):
+        raise HarnessError("Chief credential token digest is malformed")
+    root = _chief_credential_root(paths, credential_home)
+    project = root / chief_project_key(paths)[:32]
+    session = project / hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    if create_directories:
+        _ensure_private_credential_directory(root)
+        _ensure_private_credential_directory(project)
+        _ensure_private_credential_directory(session)
+    destination = canonicalize_no_link_traversal(
+        session / f"e{epoch}-{token_sha256[:16]}.json", "Chief credential file"
+    )
+    project_root = paths.root.resolve()
+    if destination == project_root or project_root in destination.parents:
+        raise HarnessError("Chief credential file must remain outside the project repository")
+    return destination
+
+
+def stage_chief_credential(
+    paths: HarnessPaths,
+    record: dict[str, Any],
+    token: str,
+    *,
+    credential_home: Path | None = None,
+) -> Path:
+    _require_chief_lock(paths)
+    digest = chief_token_sha256(token)
+    if record.get("status") != "active" or record.get("token_sha256") != digest:
+        raise HarnessError("Chief credential candidate differs from the authority record")
+    destination = chief_credential_path(
+        paths,
+        session_id=str(record.get("session_id", "")),
+        epoch=int(record.get("epoch", 0)),
+        token_sha256=digest,
+        credential_home=credential_home,
+        create_directories=True,
+    )
+    scheme, secret_value = _encode_chief_secret(token)
+    payload = {
+        "schema_version": CHIEF_CREDENTIAL_SCHEMA_VERSION,
+        "project_key": chief_project_key(paths),
+        "lock_domain": runtime_lock_domain(),
+        "session_id": record["session_id"],
+        "epoch": record["epoch"],
+        "token_sha256": digest,
+        "created_at": record["issued_at"],
+        "secret_scheme": scheme,
+        "secret_value": secret_value,
+    }
+    encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(encoded) > CHIEF_CREDENTIAL_MAX_BYTES:
+        raise HarnessError("Chief credential payload exceeds the 8 KiB size bound")
+    existed_before = destination.exists()
+    try:
+        atomic_create_bytes(destination, encoded)
+        _validate_private_credential_file(destination)
+    except BaseException:
+        if not existed_before:
+            _remove_exact_chief_credential_candidate(destination, encoded)
+        raise
+    return destination
+
+
+def _remove_exact_chief_credential_candidate(path: Path, expected: bytes) -> bool:
+    """Best-effort cleanup after an ambiguous credential create failure.
+
+    Only unlink a single-link, current-user regular file whose descriptor,
+    pathname identity, and complete bytes still match this invocation's random
+    candidate.  A pre-existing destination is never routed here.
+    """
+
+    try:
+        target = canonicalize_no_link_traversal(path, "Chief credential candidate")
+        before = target.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            return False
+        if os.name != "nt" and before.st_uid != os.geteuid():
+            return False
+        with target.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if _lock_identity(before) != _lock_identity(opened):
+                return False
+            actual = handle.read(CHIEF_CREDENTIAL_MAX_BYTES + 1)
+        after = target.lstat()
+        if _lock_identity(after) != _lock_identity(opened) or after.st_nlink != 1:
+            return False
+        if not hmac.compare_digest(actual, expected):
+            return False
+        target.unlink()
+        fsync_directory(target.parent)
+        return True
+    except (HarnessError, OSError):
+        return False
+
+
+def load_chief_credential(
+    paths: HarnessPaths,
+    *,
+    session_id: str | None,
+    epoch: int | None,
+    credential_file: Path | None = None,
+) -> tuple[str, Path]:
+    _require_chief_lock(paths)
+    if session_id is None or epoch is None:
+        raise HarnessError("Chief session id and epoch are required to load a credential")
+    session_id = _validate_chief_session_id(session_id)
+    if not _chief_exact_int(epoch, 1):
+        raise HarnessError("Chief credential epoch must be a positive integer")
+    authority = load_chief_authority(paths)
+    if (
+        authority["status"] != "active"
+        or authority["session_id"] != session_id
+        or authority["epoch"] != epoch
+    ):
+        raise HarnessError("Chief credential does not match the current authority")
+    if credential_file is None:
+        credential_root = _chief_credential_root(paths)
+        path = chief_credential_path(
+            paths,
+            session_id=session_id,
+            epoch=epoch,
+            token_sha256=authority["token_sha256"],
+        )
+        for directory in (credential_root, path.parent.parent, path.parent):
+            _validate_private_credential_directory(directory)
+    else:
+        raw = credential_file.expanduser()
+        if not raw.is_absolute():
+            raise HarnessError("Chief credential file must be an absolute path")
+        path = canonicalize_no_link_traversal(raw, "Chief credential file")
+        project_root = paths.root.resolve()
+        if path == project_root or project_root in path.parents:
+            raise HarnessError("Chief credential file must remain outside the project repository")
+        _validate_credential_ancestor_chain(path)
+        _validate_private_credential_directory(path.parent)
+    _validate_private_credential_file(path)
+    payload = load_json(path)
+    if set(payload) != _CHIEF_CREDENTIAL_FIELDS:
+        raise HarnessError("Chief credential file has an unsupported field set")
+    if payload.get("schema_version") != CHIEF_CREDENTIAL_SCHEMA_VERSION:
+        raise HarnessError("Chief credential file has an unsupported schema version")
+    if (
+        payload.get("project_key") != chief_project_key(paths)
+        or payload.get("lock_domain") != runtime_lock_domain()
+        or payload.get("session_id") != session_id
+        or payload.get("epoch") != epoch
+        or payload.get("token_sha256") != authority["token_sha256"]
+    ):
+        raise HarnessError("Chief credential file does not match the current authority")
+    _chief_time(payload.get("created_at"), "credential created_at")
+    token = _decode_chief_secret(
+        payload.get("secret_scheme"), payload.get("secret_value")
+    )
+    if not hmac.compare_digest(chief_token_sha256(token), authority["token_sha256"]):
+        raise HarnessError("Chief credential secret does not match its digest")
+    return token, path
+
+
+def remove_chief_credential(path: Path | None) -> bool:
+    if path is None:
+        return False
+    target = canonicalize_no_link_traversal(path, "Chief credential file")
+    if not target.exists():
+        return False
+    _validate_credential_ancestor_chain(target)
+    _validate_private_credential_directory(target.parent)
+    _validate_private_credential_file(target)
+    target.unlink()
+    fsync_directory(target.parent)
+    return True
+
+
+def require_chief_authority(
+    paths: HarnessPaths,
+    *,
+    session_id: str | None,
+    epoch: int | None,
+    token: str | None,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    _require_chief_lock(paths)
+    if session_id is None or epoch is None or token is None:
+        raise HarnessError(
+            "Chief credential is required; set AOI_CHIEF_SESSION_ID, "
+            "AOI_CHIEF_EPOCH, and AOI_CHIEF_TOKEN or use the global options"
+        )
+    session_id = _validate_chief_session_id(session_id)
+    if not _chief_exact_int(epoch, 1):
+        raise HarnessError("Chief credential epoch must be a positive integer")
+    supplied_digest = chief_token_sha256(token)
+    record = load_chief_authority(paths)
+    if record["status"] != "active":
+        raise HarnessError("Chief authority is inactive; acquire a new lease")
+    current = _chief_now(now)
+    renewed_at = _chief_time(record["renewed_at"], "renewed_at")
+    current = _chief_not_before(
+        current, renewed_at, label="Chief lease renewal time"
+    )
+    if _chief_time(record["expires_at"], "expires_at") <= current:
+        raise HarnessError(
+            "Chief lease is expired; use chief-takeover with the expected epoch"
+        )
+    if (
+        record["session_id"] != session_id
+        or record["epoch"] != epoch
+        or not hmac.compare_digest(record["token_sha256"], supplied_digest)
+    ):
+        raise HarnessError("Chief credential does not match the current authority")
+    return record
+
+
+def acquire_chief_authority(
+    paths: HarnessPaths,
+    *,
+    session_id: str,
+    ttl_seconds: int = CHIEF_DEFAULT_TTL_SECONDS,
+    credential_home: Path | None = None,
+    now: dt.datetime | None = None,
+) -> tuple[dict[str, Any], Path]:
+    _require_chief_lock(paths)
+    session_id = _validate_chief_session_id(session_id)
+    ttl_seconds = validate_chief_ttl(ttl_seconds)
+    current = _chief_now(now)
+    previous = load_chief_authority(paths, allow_missing=True)
+    if previous is not None and previous["status"] == "active":
+        if _chief_time(previous["expires_at"], "expires_at") <= current:
+            raise HarnessError(
+                "expired Chief authority requires explicit chief-takeover with expected epoch"
+            )
+        raise HarnessError("an active Chief lease already exists")
+    if previous is not None:
+        current = _chief_not_before(
+            current,
+            _chief_time(previous["updated_at"], "updated_at"),
+            label="last Chief authority transition",
+        )
+    old_epoch = int(previous["epoch"] if previous else 0)
+    epoch = old_epoch + 1
+    at = _chief_iso(current)
+    token = new_chief_token()
+    transition_seq, omitted, tail = _append_chief_event(
+        previous,
+        action="acquire",
+        at=at,
+        old_epoch=old_epoch,
+        new_epoch=epoch,
+        session_id=session_id,
+        previous_session_id="",
+        reason="explicit Chief lease acquisition",
+        forced_live=False,
+    )
+    record = {
+        "schema_version": CHIEF_AUTHORITY_SCHEMA_VERSION,
+        "epoch": epoch,
+        "status": "active",
+        "session_id": session_id,
+        "token_sha256": chief_token_sha256(token),
+        "issued_at": at,
+        "renewed_at": at,
+        "expires_at": _chief_iso(current + dt.timedelta(seconds=ttl_seconds)),
+        "renewal_count": 0,
+        "transition_seq": transition_seq,
+        "omitted_transition_count": omitted,
+        "audit_tail": tail,
+        "updated_at": at,
+    }
+    credential_path = stage_chief_credential(
+        paths, record, token, credential_home=credential_home
+    )
+    try:
+        _write_chief_authority(paths, record)
+    except BaseException:
+        if _chief_authority_definitely_not_published(paths, record):
+            with contextlib.suppress(HarnessError, OSError):
+                remove_chief_credential(credential_path)
+        raise
+    return record, credential_path
+
+
+def renew_chief_authority(
+    paths: HarnessPaths,
+    *,
+    session_id: str | None,
+    epoch: int | None,
+    token: str | None,
+    ttl_seconds: int = CHIEF_DEFAULT_TTL_SECONDS,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    _require_chief_lock(paths)
+    ttl_seconds = validate_chief_ttl(ttl_seconds)
+    current = _chief_now(now)
+    previous = require_chief_authority(
+        paths, session_id=session_id, epoch=epoch, token=token, now=current
+    )
+    current = _chief_not_before(
+        current,
+        _chief_time(previous["renewed_at"], "renewed_at"),
+        label="Chief lease renewal time",
+    )
+    at = _chief_iso(current)
+    transition_seq, omitted, tail = _append_chief_event(
+        previous,
+        action="renew",
+        at=at,
+        old_epoch=previous["epoch"],
+        new_epoch=previous["epoch"],
+        session_id=previous["session_id"],
+        previous_session_id=previous["session_id"],
+        reason="explicit Chief lease renewal",
+        forced_live=False,
+    )
+    record = {
+        **previous,
+        "renewed_at": at,
+        "expires_at": _chief_iso(current + dt.timedelta(seconds=ttl_seconds)),
+        "renewal_count": previous["renewal_count"] + 1,
+        "transition_seq": transition_seq,
+        "omitted_transition_count": omitted,
+        "audit_tail": tail,
+        "updated_at": at,
+    }
+    _write_chief_authority(paths, record)
+    return record
+
+
+def release_chief_authority(
+    paths: HarnessPaths,
+    *,
+    session_id: str | None,
+    epoch: int | None,
+    token: str | None,
+    reason: str,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    _require_chief_lock(paths)
+    reason = _validate_chief_reason(reason, "Chief release reason")
+    current = _chief_now(now)
+    previous = require_chief_authority(
+        paths, session_id=session_id, epoch=epoch, token=token, now=current
+    )
+    current = _chief_not_before(
+        current,
+        _chief_time(previous["renewed_at"], "renewed_at"),
+        label="Chief lease renewal time",
+    )
+    at = _chief_iso(current)
+    transition_seq, omitted, tail = _append_chief_event(
+        previous,
+        action="release",
+        at=at,
+        old_epoch=previous["epoch"],
+        new_epoch=previous["epoch"],
+        session_id=previous["session_id"],
+        previous_session_id=previous["session_id"],
+        reason=reason,
+        forced_live=False,
+    )
+    record = {
+        **previous,
+        "status": "inactive",
+        "session_id": "",
+        "token_sha256": "",
+        "issued_at": "",
+        "renewed_at": "",
+        "expires_at": "",
+        "renewal_count": 0,
+        "transition_seq": transition_seq,
+        "omitted_transition_count": omitted,
+        "audit_tail": tail,
+        "updated_at": at,
+    }
+    _write_chief_authority(paths, record)
+    return record
+
+
+def takeover_chief_authority(
+    paths: HarnessPaths,
+    *,
+    session_id: str,
+    expected_epoch: int,
+    reason: str,
+    force_live: bool = False,
+    ttl_seconds: int = CHIEF_DEFAULT_TTL_SECONDS,
+    credential_home: Path | None = None,
+    now: dt.datetime | None = None,
+) -> tuple[dict[str, Any], Path]:
+    _require_chief_lock(paths)
+    session_id = _validate_chief_session_id(session_id)
+    if not _chief_exact_int(expected_epoch, 1):
+        raise HarnessError("Chief takeover expected epoch must be a positive integer")
+    reason = _validate_chief_reason(reason, "Chief takeover reason")
+    if not isinstance(force_live, bool):
+        raise HarnessError("Chief takeover force_live must be a boolean")
+    ttl_seconds = validate_chief_ttl(ttl_seconds)
+    current = _chief_now(now)
+    previous = load_chief_authority(paths)
+    if previous["status"] != "active":
+        raise HarnessError("inactive Chief authority must use chief-acquire, not takeover")
+    if previous["epoch"] != expected_epoch:
+        raise HarnessError("Chief takeover expected epoch CAS failed")
+    renewed_at = _chief_time(previous["renewed_at"], "renewed_at")
+    current = _chief_not_before(
+        current, renewed_at, label="Chief lease renewal time"
+    )
+    live = _chief_time(previous["expires_at"], "expires_at") > current
+    if live and not force_live:
+        raise HarnessError("live Chief authority requires --force-live for takeover")
+    old_epoch = previous["epoch"]
+    epoch = old_epoch + 1
+    at = _chief_iso(current)
+    token = new_chief_token()
+    transition_seq, omitted, tail = _append_chief_event(
+        previous,
+        action="takeover",
+        at=at,
+        old_epoch=old_epoch,
+        new_epoch=epoch,
+        session_id=session_id,
+        previous_session_id=previous["session_id"],
+        reason=reason,
+        forced_live=bool(live and force_live),
+    )
+    record = {
+        **previous,
+        "epoch": epoch,
+        "status": "active",
+        "session_id": session_id,
+        "token_sha256": chief_token_sha256(token),
+        "issued_at": at,
+        "renewed_at": at,
+        "expires_at": _chief_iso(current + dt.timedelta(seconds=ttl_seconds)),
+        "renewal_count": 0,
+        "transition_seq": transition_seq,
+        "omitted_transition_count": omitted,
+        "audit_tail": tail,
+        "updated_at": at,
+    }
+    credential_path = stage_chief_credential(
+        paths, record, token, credential_home=credential_home
+    )
+    try:
+        _write_chief_authority(paths, record)
+    except BaseException:
+        if _chief_authority_definitely_not_published(paths, record):
+            with contextlib.suppress(HarnessError, OSError):
+                remove_chief_credential(credential_path)
+        raise
+    return record, credential_path
 
 
 def validate_id(value: str, label: str = "identifier") -> str:
@@ -1820,6 +3616,24 @@ def render_checkpoint(
             ),
         )
 
+    incidents = list(state.get("subagent_incidents", []))
+    open_incidents = [
+        item for item in incidents if item.get("status") == "open"
+    ]
+    incident_lines = [
+        f"{item.get('incident_id')} [open]: reason={item.get('reason_code')}; "
+        f"agent={item.get('agent_id') or 'n/a'}; type={item.get('agent_type') or 'n/a'}; "
+        f"observed={item.get('observed_at') or 'n/a'}"
+        for item in open_incidents
+    ]
+    accounted_incidents = sum(
+        item.get("status") == "accounted" for item in incidents
+    )
+    if accounted_incidents:
+        incident_lines.append(
+            f"Accounted spawn incidents: {accounted_incidents}; complete records are in state.json"
+        )
+
     engaged_lanes = [
         lane
         for lane in state.get("lanes", [])
@@ -1858,7 +3672,8 @@ def render_checkpoint(
     control_plane_lines = [
         f"Steward inbox: coordination={active_coordination}, capacity={active_capacity}, "
         f"improvement={active_improvements}, cross_lane={active_cross_sessions}; "
-        f"needs_user={needs_user}; complete records are in state.json"
+        f"needs_user={needs_user}; execution_briefs={len(state.get('execution_briefs', []))}; "
+        "complete records are in state.json"
     ]
 
     blockers_and_risks = [
@@ -1907,6 +3722,8 @@ def render_checkpoint(
         f"{_markdown_list(job_lines)}\n\n"
         "## Delegation packets\n\n"
         f"{_markdown_list(packet_lines)}\n\n"
+        "## Sub-agent spawn incidents\n\n"
+        f"{_markdown_list(incident_lines)}\n\n"
         "## Blockers and risks\n\n"
         f"{_markdown_list(blockers_and_risks)}\n\n"
         "## Delivery\n\n"
@@ -1927,7 +3744,7 @@ def prepare_checkpoint(
         text = render_checkpoint(paths, state, compact_terminal_detail=True)
     if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
         raise HarnessError(
-            "checkpoint exceeds 24 KiB hard ceiling; summarize facts/evidence and keep raw logs outside state"
+            "checkpoint exceeds 32 KiB hard ceiling; summarize facts/evidence and keep raw logs outside state"
         )
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return destination, text, digest
@@ -2471,6 +4288,11 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
                 item.get("status") == "needs_user"
                 for item in state.get("needs_user_escalations", [])
             ),
+            "open_subagent_incident_count": sum(
+                item.get("status") == "open"
+                for item in state.get("subagent_incidents", [])
+            ),
+            "execution_brief_count": len(state.get("execution_briefs", [])),
         },
         "packets": [
             {
@@ -2479,6 +4301,12 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
                 "agent_role": packet.get("agent_role"),
                 "model_tier": packet.get("model_tier"),
                 "routing_verified": packet.get("routing_verified"),
+                "dispatch_provenance": packet.get("dispatch_provenance")
+                or (
+                    "legacy_unverified"
+                    if packet.get("status") in {"dispatched", "done", "failed", "cancelled"}
+                    else "none"
+                ),
             }
             for packet in state.get("packets", [])
         ],

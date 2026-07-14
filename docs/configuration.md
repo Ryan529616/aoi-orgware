@@ -19,6 +19,12 @@ before writing the config. A review workflow must bind approval to
 `config_sha256` and revalidate that digest immediately before init; apply fails
 if the candidate changes after approval.
 
+The first init of a pristine state location is the sole unauthenticated
+lifecycle write. Any later `aoi init` is Chief-fenced. Authenticated init may
+replace the exact known v0.1.3 managed policy automatically; an unrecognized or
+locally customized policy requires `--replace-policy-sha256` with its reviewed
+current digest.
+
 ```toml
 schema_version = 1
 profile_id = "generic-v1"
@@ -43,8 +49,8 @@ default = "standard"
 batch = "economical"
 
 [evidence]
-categories = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "doctor", "independent_review", "documentation_check", "historical_terminal_readback", "resource_governance", "delivery_check", "engineering_inference"]
-close_qualifying = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "doctor", "independent_review", "documentation_check", "resource_governance", "delivery_check"]
+categories = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "hook_smoke", "skill_validation", "doctor", "independent_review", "documentation_check", "historical_terminal_readback", "citation_hygiene_review", "resource_governance", "delivery_check", "engineering_inference"]
+close_qualifying = ["static_check", "unit_test", "integration_test", "compile_acceptance", "runtime_test", "external_runtime", "system_evidence", "hook_smoke", "skill_validation", "doctor", "independent_review", "documentation_check", "citation_hygiene_review", "resource_governance", "delivery_check"]
 
 [receipts]
 components = ["source", "runner", "config", "dependencies", "other"]
@@ -78,7 +84,11 @@ enabled = false
   convenience flow. The configured `state_dir` must be covered by one entry.
   At least one entry must cover the configured `state_dir`.
 - `external_lock_namespace`: prefix for external file/tree locks.
-- `hooks.codex.enabled`: opt-in declaration; it does not install hooks.
+- `hooks.codex.enabled`: opt-in declaration; it does not install or trust hooks.
+  AOI doctor expects protocol v6 when enabled. The user must review the command
+  through Codex `/hooks`; without that trust, arm the exact packet first and
+  then use explicit manual-unverified packet dispatch before that short-lived
+  arm expires. AOI revalidates the same authority snapshot at consumption.
 - `legacy.enabled`: enables compatibility-ledger import and reporting.
 
 The full default file is available at `examples/aoi.toml`.
@@ -86,10 +96,18 @@ The full default file is available at `examples/aoi.toml`.
 ## Change discipline
 
 Tasks bind both `profile_id` and the file's SHA-256. Change configuration only
-when no active task depends on the previous digest. v0.1 intentionally has no
-automatic migration command.
+when no active task depends on the previous digest. Chief authority does not
+bind one config digest, so a reviewed same-`state_dir` change does not strand
+lease recovery; each fenced command reloads the config while holding the state
+lock. Changing `state_dir` is a separate state migration and must not be
+simulated by swapping `aoi.toml` under a live lease.
 
-Initialization is idempotent and non-clobbering, but it is not a distributed
-multi-file transaction. If the process is interrupted while creating templates
-or the index, rerun the same `aoi init --config ...` command; do not substitute a
-different candidate.
+Initialization is resumable and non-clobbering, but it is not a distributed
+multi-file transaction. If the first process stops after publishing `aoi.toml`
+but before initializing the state lock, `chief-acquire` accepts only the exact
+structural prefix (no authority, lifecycle payload, managed resource, or unknown
+entry), repairs the platform/lock, and acquires the first Chief. Use that
+credential to rerun the same digest-bound `aoi init --config ...` command. If
+the interruption happened later while creating templates or the index, acquire
+or use the project Chief credential and rerun the same command. Never substitute
+a different candidate.

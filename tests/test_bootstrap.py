@@ -39,15 +39,20 @@ def init_git(root: Path) -> None:
 class BootstrapCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.credential_temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         init_git(self.root)
         self.env = os.environ.copy()
         self.env["AOI_ROOT"] = str(self.root)
         self.env["PYTHONPATH"] = str(SRC)
         self.env["PYTHONDONTWRITEBYTECODE"] = "1"
+        self.env["AOI_CHIEF_CREDENTIAL_HOME"] = str(
+            Path(self.credential_temp.name) / "credentials"
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+        self.credential_temp.cleanup()
 
     def cli(self, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -376,6 +381,17 @@ class BootstrapCliTests(unittest.TestCase):
         original = self.candidate("Original")
         self.init_candidate(original)
         installed = (self.root / "aoi.toml").read_bytes()
+        acquired = json.loads(
+            self.cli(
+                "chief-acquire",
+                "--session-id",
+                "bootstrap-config-chief",
+                "--json",
+            ).stdout
+        )
+        self.env["AOI_CHIEF_SESSION_ID"] = "bootstrap-config-chief"
+        self.env["AOI_CHIEF_EPOCH"] = str(acquired["authority"]["epoch"])
+        self.env["AOI_CHIEF_CREDENTIAL_FILE"] = acquired["credential_file"]
         replacement = self.candidate("Replacement")
         result = self.init_candidate(replacement, ok=False)
         self.assertIn("different configuration", result.stderr)

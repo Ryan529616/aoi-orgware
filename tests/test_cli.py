@@ -3,15 +3,22 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import copy
+import datetime as dt
 import hashlib
 import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import tarfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -148,6 +155,9 @@ class HarnessTestCase(unittest.TestCase):
         self.env["TMPDIR"] = str(self.root / "tmp")
         self.env["AOI_HOST_MOUNT_ROOT"] = str(self.root / "host-mount")
         self.env["AOI_BACKUP_ROOT"] = self.backup_temp.name
+        self.env["AOI_CHIEF_CREDENTIAL_HOME"] = str(
+            Path(self.backup_temp.name) / "aoi-chief-credentials"
+        )
         (self.root / "tmp").mkdir()
         subprocess.run(
             ["git", "init", "-b", "main", str(self.root)],
@@ -174,6 +184,19 @@ class HarnessTestCase(unittest.TestCase):
             capture_output=True,
         )
         self.cli("init", "--project-name", "AOI Test Project")
+        acquired = json.loads(
+            self.cli(
+                "chief-acquire",
+                "--session-id",
+                "harness-test-chief",
+                "--json",
+            ).stdout
+        )
+        self.chief_credential_file = acquired["credential_file"]
+        self.chief_epoch = int(acquired["authority"]["epoch"])
+        self.env["AOI_CHIEF_SESSION_ID"] = "harness-test-chief"
+        self.env["AOI_CHIEF_EPOCH"] = str(self.chief_epoch)
+        self.env["AOI_CHIEF_CREDENTIAL_FILE"] = self.chief_credential_file
         subprocess.run(
             ["git", "-C", str(self.root), "add", "aoi.toml", ".gitignore"], check=True
         )
@@ -210,6 +233,34 @@ class HarnessTestCase(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
         return result
 
+    def cli_in_process(
+        self, *args: str, ok: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """Exercise the full CLI without the Windows CreateProcess argv ceiling."""
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch(
+            "sys.stdout", captured_stdout
+        ), mock.patch("sys.stderr", captured_stderr):
+            returncode = cli_impl.main(list(args))
+        result = subprocess.CompletedProcess(
+            [sys.executable, "-m", CLI_MODULE, *args],
+            returncode,
+            captured_stdout.getvalue(),
+            captured_stderr.getvalue(),
+        )
+        if ok and result.returncode != 0:
+            self.fail(
+                f"in-process CLI failed ({result.returncode})\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
+        if not ok:
+            if result.returncode == 0:
+                self.fail("in-process CLI unexpectedly succeeded")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        return result
+
     def init_task(self, task_id: str, session_id: str | None = None) -> None:
         args = [
             "init-task",
@@ -233,6 +284,72 @@ class HarnessTestCase(unittest.TestCase):
             task_id,
             "--note",
             "Test plan records evidence, exclusions, claims, packets, and verification",
+        )
+
+    def arm_packet(
+        self,
+        task_id: str,
+        packet_id: str,
+        *,
+        expected_agent_type: str | None = None,
+        parent_session_id: str | None = None,
+    ) -> None:
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        packet = next(
+            item for item in state["packets"] if item["packet_id"] == packet_id
+        )
+        if int(packet.get("delegation_depth", 1)) == 1:
+            if parent_session_id is None:
+                suffix = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
+                parent_session_id = f"dispatch-parent-{suffix}"
+            if parent_session_id not in state.get("session_ids", []):
+                self.cli(
+                    "bind-session",
+                    "--task",
+                    task_id,
+                    "--session-id",
+                    parent_session_id,
+                )
+        else:
+            parent = next(
+                item
+                for item in state["packets"]
+                if item["packet_id"] == packet["parent_packet_id"]
+            )
+            parent_session_id = str(parent["agent_id"])
+        expires_at = (
+            dt.datetime.now().astimezone() + dt.timedelta(minutes=5)
+        ).isoformat()
+        self.cli(
+            "packet-arm",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--parent-session-id",
+            str(parent_session_id),
+            "--expected-agent-type",
+            expected_agent_type or str(packet.get("agent_role", "default")),
+            "--expires-at",
+            expires_at,
+        )
+
+    def dispatch_packet(
+        self, task_id: str, packet_id: str, agent_id: str, *extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        self.arm_packet(task_id, packet_id)
+        return self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            agent_id,
+            *extra,
         )
 
     def add_passing_verification(
@@ -309,7 +426,7 @@ class HarnessTestCase(unittest.TestCase):
         if bom:
             raw = b"\xef\xbb\xbf" + raw
         result = subprocess.run(
-            [sys.executable, "-m", HOOK_MODULE, "--hook-version", "5"],
+            [sys.executable, "-m", HOOK_MODULE, "--hook-version", "6"],
             cwd=self.root,
             env=self.env,
             input=raw,
@@ -336,8 +453,8 @@ class HarnessTestCase(unittest.TestCase):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "aoi-codex-hook --hook-version 5",
-                            "commandWindows": "wsl aoi-codex-hook --hook-version 5",
+                            "command": "aoi-codex-hook --hook-version 6",
+                            "commandWindows": "wsl aoi-codex-hook --hook-version 6",
                             "timeout": 30,
                         }
                     ]
@@ -359,6 +476,1424 @@ class HarnessTestCase(unittest.TestCase):
         )
 
 
+class ChiefAuthorityTests(HarnessTestCase):
+    def managed_state_bytes(self) -> dict[str, bytes]:
+        state = self.root / ".aoi"
+        return {
+            path.relative_to(state).as_posix(): path.read_bytes()
+            for path in sorted(state.rglob("*"))
+            if path.is_file() and path.name != ".state.lock"
+        }
+
+    def load_credential_token(
+        self, session_id: str, epoch: int, credential_file: str
+    ) -> str:
+        paths = h.get_paths(self.root)
+        with h.state_lock(paths, create_layout=False):
+            token, loaded_path = h.load_chief_credential(
+                paths,
+                session_id=session_id,
+                epoch=epoch,
+                credential_file=Path(credential_file),
+            )
+        self.assertEqual(loaded_path, Path(credential_file))
+        return token
+
+    def test_epoch_lifecycle_stale_writer_and_secret_non_disclosure(self) -> None:
+        old_token = self.load_credential_token(
+            "harness-test-chief", self.chief_epoch, self.chief_credential_file
+        )
+        credential_path = Path(self.chief_credential_file)
+        credential_bytes = credential_path.read_bytes()
+        credential_payload = json.loads(credential_bytes)
+        if os.name == "nt":
+            self.assertEqual(
+                credential_payload["secret_scheme"], "dpapi-current-user-v1"
+            )
+            self.assertNotIn(old_token.encode("ascii"), credential_bytes)
+        else:
+            self.assertEqual(
+                credential_payload["secret_scheme"], "plain-posix-mode-v1"
+            )
+            self.assertEqual(stat.S_IMODE(credential_path.stat().st_mode), 0o600)
+            credential_root = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+            for directory in (
+                credential_root,
+                credential_path.parent.parent,
+                credential_path.parent,
+            ):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+
+        credential_alias = Path(self.backup_temp.name) / "credential-hardlink.json"
+        before = self.managed_state_bytes()
+        os.link(credential_path, credential_alias)
+        try:
+            rejected = self.cli("render-index", ok=False)
+            self.assertIn("private regular", rejected.stderr)
+            self.assertEqual(self.managed_state_bytes(), before)
+        finally:
+            credential_alias.unlink(missing_ok=True)
+        if os.name != "nt":
+            credential_path.chmod(0o644)
+            try:
+                rejected = self.cli("render-index", ok=False)
+                self.assertIn("permissions are not private", rejected.stderr)
+                self.assertEqual(self.managed_state_bytes(), before)
+            finally:
+                credential_path.chmod(0o600)
+            credential_path.parent.chmod(0o755)
+            try:
+                rejected = self.cli("render-index", ok=False)
+                self.assertIn("permissions are not private", rejected.stderr)
+                self.assertEqual(self.managed_state_bytes(), before)
+            finally:
+                credential_path.parent.chmod(0o700)
+
+        renewed = json.loads(self.cli("chief-renew", "--json").stdout)
+        self.assertEqual(renewed["authority"]["epoch"], self.chief_epoch)
+        self.assertEqual(renewed["authority"]["renewal_count"], 1)
+
+        released = json.loads(
+            self.cli(
+                "chief-release", "--reason", "rotate Chief test fixture", "--json"
+            ).stdout
+        )
+        self.assertEqual(released["authority"]["status"], "inactive")
+        self.assertEqual(released["authority"]["epoch"], self.chief_epoch)
+        self.assertTrue(released["credential_cleanup"]["removed"])
+        self.assertFalse(Path(self.chief_credential_file).exists())
+
+        acquisition = self.cli(
+            "chief-acquire", "--session-id", "replacement-chief", "--json"
+        )
+        acquired = json.loads(acquisition.stdout)
+        self.assertNotIn("chief_token", acquired)
+        new_epoch = int(acquired["authority"]["epoch"])
+        self.assertEqual(new_epoch, self.chief_epoch + 1)
+        new_file = acquired["credential_file"]
+        new_token = self.load_credential_token(
+            "replacement-chief", new_epoch, new_file
+        )
+        self.assertNotIn(new_token, acquisition.stdout)
+        self.env["AOI_CHIEF_SESSION_ID"] = "replacement-chief"
+        self.env["AOI_CHIEF_EPOCH"] = str(new_epoch)
+        self.env["AOI_CHIEF_CREDENTIAL_FILE"] = new_file
+
+        before = self.managed_state_bytes()
+        rejected = self.cli(
+            "init-task",
+            "--task-id",
+            "stale-chief-write",
+            "--title",
+            "Stale Chief must fail",
+            "--objective",
+            "Prove stale epoch fencing",
+            "--owner",
+            "stale",
+            "--completion-boundary",
+            "No state mutation",
+            "--chief-session-id",
+            "harness-test-chief",
+            "--chief-epoch",
+            str(self.chief_epoch),
+            "--chief-token",
+            old_token,
+            ok=False,
+        )
+        self.assertNotIn(old_token, rejected.stderr)
+        self.assertEqual(self.managed_state_bytes(), before)
+
+        for path in (self.root / ".aoi").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(new_token.encode("ascii"), path.read_bytes(), path)
+        status = self.cli("status", "--json").stdout
+        doctor = self.cli("doctor", "--json").stdout
+        self.assertNotIn(new_token, status)
+        self.assertNotIn(new_token, doctor)
+        backup = json.loads(self.cli("backup-state", "--json").stdout)
+        with tarfile.open(backup["archive"], mode="r:gz") as archive:
+            for member in archive.getmembers():
+                handle = archive.extractfile(member)
+                self.assertIsNotNone(handle)
+                assert handle is not None
+                self.assertNotIn(new_token.encode("ascii"), handle.read(), member.name)
+
+    def test_expired_and_live_takeover_require_cas_and_force(self) -> None:
+        paths = h.get_paths(self.root)
+        current = dt.datetime.now(dt.timezone.utc)
+        renewed_at = current - dt.timedelta(minutes=2)
+        expires_at = current - dt.timedelta(minutes=1)
+
+        def iso(value: dt.datetime) -> str:
+            return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+        with h.state_lock(paths, create_layout=False):
+            authority = h.load_chief_authority(paths)
+            authority["issued_at"] = iso(renewed_at)
+            authority["renewed_at"] = iso(renewed_at)
+            authority["expires_at"] = iso(expires_at)
+            authority["updated_at"] = iso(renewed_at)
+            authority["audit_tail"][-1]["at"] = iso(renewed_at)
+            h.validate_chief_authority_record(paths, authority)
+            h.atomic_write_json(paths.chief_authority, authority)
+
+        expired_renew = self.cli("chief-renew", ok=False)
+        self.assertIn("expired", expired_renew.stderr)
+        before = paths.chief_authority.read_bytes()
+        wrong_cas = self.cli(
+            "chief-takeover",
+            "--session-id",
+            "takeover-chief",
+            "--expected-epoch",
+            str(self.chief_epoch + 9),
+            "--reason",
+            "exercise expected epoch CAS",
+            ok=False,
+        )
+        self.assertIn("CAS failed", wrong_cas.stderr)
+        self.assertEqual(paths.chief_authority.read_bytes(), before)
+
+        takeover = json.loads(
+            self.cli(
+                "chief-takeover",
+                "--session-id",
+                "takeover-chief",
+                "--expected-epoch",
+                str(self.chief_epoch),
+                "--reason",
+                "recover expired Chief lease",
+                "--json",
+            ).stdout
+        )
+        takeover_epoch = int(takeover["authority"]["epoch"])
+        self.assertEqual(takeover_epoch, self.chief_epoch + 1)
+        live_rejected = self.cli(
+            "chief-takeover",
+            "--session-id",
+            "forced-chief",
+            "--expected-epoch",
+            str(takeover_epoch),
+            "--reason",
+            "test live takeover acknowledgement",
+            ok=False,
+        )
+        self.assertIn("--force-live", live_rejected.stderr)
+        forced = json.loads(
+            self.cli(
+                "chief-takeover",
+                "--session-id",
+                "forced-chief",
+                "--expected-epoch",
+                str(takeover_epoch),
+                "--reason",
+                "explicitly replace live test lease",
+                "--force-live",
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(forced["authority"]["epoch"], takeover_epoch + 1)
+        record = h.load_chief_authority(paths)
+        self.assertTrue(record["audit_tail"][-1]["forced_live"])
+
+    def test_two_concurrent_acquires_have_exactly_one_winner(self) -> None:
+        self.cli("chief-release", "--reason", "prepare acquisition race")
+        race_env = self.env.copy()
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            race_env.pop(name, None)
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    CLI_MODULE,
+                    "chief-acquire",
+                    "--session-id",
+                    session_id,
+                    "--json",
+                ],
+                cwd=self.root,
+                env=race_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for session_id in ("race-chief-a", "race-chief-b")
+        ]
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            results.append((process.returncode, stdout, stderr))
+        self.assertEqual(sorted(result[0] for result in results), [0, 2])
+        winner = next(json.loads(stdout) for code, stdout, _ in results if code == 0)
+        self.assertNotIn("chief_token", winner)
+        status = json.loads(self.cli("chief-status", "--json").stdout)
+        self.assertEqual(status["session_id"], winner["authority"]["session_id"])
+
+    def test_authority_and_lock_path_tampering_fail_closed(self) -> None:
+        paths = h.get_paths(self.root)
+        alias = Path(self.backup_temp.name) / "authority-hardlink.json"
+        os.link(paths.chief_authority, alias)
+        rejected = self.cli("status", "--json", ok=False)
+        self.assertIn("private regular", rejected.stderr)
+        self.assertFalse((paths.tasks / "tamper-write").exists())
+        alias.unlink()
+
+        lock_alias = Path(self.backup_temp.name) / "state-lock-hardlink"
+        before = self.managed_state_bytes()
+        os.link(paths.lock, lock_alias)
+        try:
+            lock_rejected = self.cli(
+                "init-task",
+                "--task-id",
+                "hardlinked-lock-write",
+                "--title",
+                "Hardlinked lock must fail",
+                "--objective",
+                "Reject ambiguous lock identity",
+                "--owner",
+                "test",
+                "--completion-boundary",
+                "No state mutation",
+                ok=False,
+            )
+            self.assertIn("private regular", lock_rejected.stderr)
+            self.assertEqual(self.managed_state_bytes(), before)
+            self.assertFalse((paths.tasks / "hardlinked-lock-write").exists())
+        finally:
+            lock_alias.unlink(missing_ok=True)
+
+        payload = json.loads(paths.chief_authority.read_text(encoding="utf-8"))
+        payload["unexpected"] = True
+        paths.chief_authority.write_text(json.dumps(payload), encoding="utf-8")
+        malformed = self.cli(
+            "init-task",
+            "--task-id",
+            "tamper-write",
+            "--title",
+            "Malformed authority",
+            "--objective",
+            "Fail closed",
+            "--owner",
+            "test",
+            "--completion-boundary",
+            "No write",
+            ok=False,
+        )
+        self.assertIn("unsupported field set", malformed.stderr)
+        self.assertFalse((paths.tasks / "tamper-write").exists())
+
+    def test_state_lock_is_exact_path_reentrant_and_other_threads_block(self) -> None:
+        paths = h.get_paths(self.root)
+        with h.state_lock(paths, create_layout=False):
+            with h.state_lock(paths, create_layout=False):
+                pass
+
+        entered = threading.Event()
+
+        def contender() -> None:
+            with h.state_lock(paths, create_layout=False):
+                entered.set()
+
+        with h.state_lock(paths, create_layout=False):
+            thread = threading.Thread(target=contender, daemon=True)
+            thread.start()
+            time.sleep(0.1)
+            self.assertFalse(entered.is_set())
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(entered.is_set())
+
+        if os.name != "nt":
+            displaced = paths.lock.with_name(".state.lock.displaced")
+            with h.state_lock(paths, create_layout=False):
+                os.replace(paths.lock, displaced)
+                h.atomic_create_bytes(paths.lock, b"\0")
+                try:
+                    with self.assertRaisesRegex(
+                        h.HarnessError, "lock path changed while the lock was held"
+                    ):
+                        h._require_chief_lock(paths)
+                finally:
+                    paths.lock.unlink(missing_ok=True)
+                    os.replace(displaced, paths.lock)
+
+    def test_registered_command_classification_defaults_to_fenced(self) -> None:
+        parser = cli_impl.build_parser({})
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        commands = set(subparsers.choices)
+        explicit = (
+            cli_impl.CHIEF_AUTHORITY_CONTROL_COMMANDS
+            | cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS
+            | cli_impl.CHIEF_STANDALONE_COMMANDS
+            | {"init"}
+        )
+        self.assertTrue(explicit <= commands)
+        for command in commands - explicit:
+            self.assertTrue(
+                cli_impl.command_requires_chief(command, initialized=True), command
+            )
+        self.assertFalse(cli_impl.command_requires_chief("init", initialized=False))
+        self.assertTrue(cli_impl.command_requires_chief("init", initialized=True))
+        self.assertTrue(
+            cli_impl.command_requires_chief("future-mutator", initialized=True)
+        )
+        for command in cli_impl.CHIEF_STANDALONE_WRITER_COMMANDS:
+            self.assertTrue(
+                cli_impl.command_requires_chief(command, initialized=True), command
+            )
+
+    def test_unauthorized_command_does_not_repair_layout_or_lock_mode(self) -> None:
+        paths = h.get_paths(self.root)
+        shutil.rmtree(paths.sessions)
+        unauthorized_env = self.env.copy()
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            unauthorized_env.pop(name, None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "init-task",
+                "--task-id",
+                "no-layout-repair",
+                "--title",
+                "No layout repair",
+                "--objective",
+                "Fail before handler side effects",
+                "--owner",
+                "unauthorized",
+                "--completion-boundary",
+                "Missing layout remains missing",
+            ],
+            cwd=self.root,
+            env=unauthorized_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(paths.sessions.exists())
+        self.assertFalse((paths.tasks / "no-layout-repair").exists())
+
+        if os.name != "nt":
+            paths.sessions.mkdir(mode=0o700)
+            paths.lock.chmod(0o666)
+            mode_result = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, "render-index"],
+                cwd=self.root,
+                env=unauthorized_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(mode_result.returncode, 2, mode_result.stderr)
+            self.assertIn("permissions are not private", mode_result.stderr)
+            self.assertEqual(paths.lock.stat().st_mode & 0o777, 0o666)
+
+    def test_missing_config_cannot_rebootstrap_existing_state(self) -> None:
+        paths = h.get_paths(self.root)
+        before = self.managed_state_bytes()
+        paths.config.unlink()
+        env = self.env.copy()
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            env.pop(name, None)
+        result = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "init", "--project-name", "Bypass"],
+            cwd=self.root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("aoi.toml is missing", result.stderr)
+        self.assertFalse(paths.config.exists())
+        self.assertEqual(self.managed_state_bytes(), before)
+
+    def test_authority_validator_rejects_naive_time_and_invalid_audit_semantics(self) -> None:
+        paths = h.get_paths(self.root)
+        record = h.load_chief_authority(paths)
+        naive = copy.deepcopy(record)
+        naive["expires_at"] = "2099-01-01T00:00:00"
+        with self.assertRaisesRegex(h.HarnessError, "timezone-aware"):
+            h.validate_chief_authority_record(paths, naive)
+        invalid_force = copy.deepcopy(record)
+        invalid_force["audit_tail"][-1]["forced_live"] = True
+        with self.assertRaisesRegex(h.HarnessError, "only a Chief takeover"):
+            h.validate_chief_authority_record(paths, invalid_force)
+        invalid_ttl = copy.deepcopy(record)
+        renewed_at = dt.datetime.fromisoformat(
+            invalid_ttl["renewed_at"].replace("Z", "+00:00")
+        )
+        invalid_ttl["expires_at"] = h._chief_iso(
+            renewed_at + dt.timedelta(seconds=h.CHIEF_MAX_TTL_SECONDS + 1)
+        )
+        with self.assertRaisesRegex(h.HarnessError, "TTL bounds"):
+            h.validate_chief_authority_record(paths, invalid_ttl)
+        invalid_status = copy.deepcopy(record)
+        invalid_status["status"] = []
+        with self.assertRaisesRegex(h.HarnessError, "status is invalid"):
+            h.validate_chief_authority_record(paths, invalid_status)
+        invalid_sequence = copy.deepcopy(record)
+        invalid_sequence["audit_tail"][-1]["seq"] = True
+        with self.assertRaisesRegex(h.HarnessError, "sequence/action"):
+            h.validate_chief_authority_record(paths, invalid_sequence)
+        with h.state_lock(paths, create_layout=False):
+            with self.assertRaisesRegex(h.HarnessError, "must be a boolean"):
+                h.takeover_chief_authority(
+                    paths,
+                    session_id="invalid-force-chief",
+                    expected_epoch=self.chief_epoch,
+                    reason="reject truthy non-boolean force",
+                    force_live="yes",  # type: ignore[arg-type]
+                    credential_home=Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"]),
+                )
+
+    def test_authority_validator_rejects_impossible_epoch_history_metadata(self) -> None:
+        paths = h.get_paths(self.root)
+        record = h.load_chief_authority(paths)
+
+        takeover_genesis = copy.deepcopy(record)
+        takeover_genesis["audit_tail"][0]["action"] = "takeover"
+        takeover_genesis["audit_tail"][0]["previous_session_id"] = "prior-chief"
+        takeover_genesis["audit_tail"][0]["forced_live"] = True
+        with self.assertRaisesRegex(h.HarnessError, "must begin with acquire"):
+            h.validate_chief_authority_record(paths, takeover_genesis)
+
+        early_issue = copy.deepcopy(record)
+        origin_time = dt.datetime.fromisoformat(
+            early_issue["audit_tail"][0]["at"].replace("Z", "+00:00")
+        )
+        early_issue["issued_at"] = h._chief_iso(
+            origin_time - dt.timedelta(seconds=1)
+        )
+        with self.assertRaisesRegex(h.HarnessError, "current epoch origin"):
+            h.validate_chief_authority_record(paths, early_issue)
+
+        fractional_ttl = copy.deepcopy(record)
+        renewed_at = dt.datetime.fromisoformat(
+            fractional_ttl["renewed_at"].replace("Z", "+00:00")
+        )
+        fractional_ttl["expires_at"] = h._chief_iso(
+            renewed_at
+            + dt.timedelta(seconds=h.CHIEF_MIN_TTL_SECONDS, microseconds=1)
+        )
+        with self.assertRaisesRegex(h.HarnessError, "TTL bounds"):
+            h.validate_chief_authority_record(paths, fractional_ttl)
+
+        self.cli("chief-renew")
+        renewed = h.load_chief_authority(paths)
+        inflated_count = copy.deepcopy(renewed)
+        inflated_count["renewal_count"] = 99
+        with self.assertRaisesRegex(h.HarnessError, "visible epoch history"):
+            h.validate_chief_authority_record(paths, inflated_count)
+
+        truncated = copy.deepcopy(renewed)
+        truncated["audit_tail"] = truncated["audit_tail"][1:]
+        truncated["omitted_transition_count"] = 1
+        truncated["renewal_count"] = 0
+        with self.assertRaisesRegex(h.HarnessError, "below its visible epoch history"):
+            h.validate_chief_authority_record(paths, truncated)
+
+    def test_bounded_clock_skew_is_clamped_but_real_rollback_fails(self) -> None:
+        paths = h.get_paths(self.root)
+        token = self.load_credential_token(
+            "harness-test-chief", self.chief_epoch, self.chief_credential_file
+        )
+        record = h.load_chief_authority(paths)
+        renewed_at = dt.datetime.fromisoformat(
+            record["renewed_at"].replace("Z", "+00:00")
+        )
+        with h.state_lock(paths, create_layout=False):
+            accepted = h.require_chief_authority(
+                paths,
+                session_id="harness-test-chief",
+                epoch=self.chief_epoch,
+                token=token,
+                now=renewed_at - dt.timedelta(milliseconds=500),
+            )
+            self.assertEqual(accepted, record)
+            with self.assertRaisesRegex(
+                h.HarnessError, "system clock precedes the Chief lease renewal time"
+            ):
+                h.require_chief_authority(
+                    paths,
+                    session_id="harness-test-chief",
+                    epoch=self.chief_epoch,
+                    token=token,
+                    now=renewed_at
+                    - dt.timedelta(
+                        seconds=h.CHIEF_CLOCK_SKEW_TOLERANCE_SECONDS + 1
+                    ),
+                )
+
+    def test_credential_candidate_is_removed_if_authority_commit_fails(self) -> None:
+        self.cli("chief-release", "--reason", "prepare authority fault injection")
+        paths = h.get_paths(self.root)
+        before = paths.chief_authority.read_bytes()
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+        with h.state_lock(paths, create_layout=False):
+            with mock.patch.object(
+                h,
+                "_write_chief_authority",
+                side_effect=h.HarnessError("injected authority write failure"),
+            ):
+                with self.assertRaisesRegex(h.HarnessError, "injected"):
+                    h.acquire_chief_authority(
+                        paths,
+                        session_id="fault-injected-chief",
+                        credential_home=credential_home,
+                    )
+        self.assertEqual(paths.chief_authority.read_bytes(), before)
+        remaining = [path for path in credential_home.rglob("*.json") if path.is_file()]
+        self.assertEqual(remaining, [])
+
+    def test_credential_candidate_is_removed_after_ambiguous_create_failure(
+        self,
+    ) -> None:
+        self.cli("chief-release", "--reason", "prepare credential create fault")
+        paths = h.get_paths(self.root)
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+        real_create = h.atomic_create_bytes
+
+        def publish_then_fail(destination: Path, payload: bytes) -> None:
+            real_create(destination, payload)
+            raise h.HarnessError("injected post-create durability failure")
+
+        with h.state_lock(paths, create_layout=False):
+            with mock.patch.object(h, "atomic_create_bytes", publish_then_fail):
+                with self.assertRaisesRegex(h.HarnessError, "post-create"):
+                    h.acquire_chief_authority(
+                        paths,
+                        session_id="credential-create-fault-chief",
+                        credential_home=credential_home,
+                    )
+        remaining = [path for path in credential_home.rglob("*.json") if path.is_file()]
+        self.assertEqual(remaining, [])
+        self.assertEqual(h.load_chief_authority(paths)["status"], "inactive")
+
+    def test_published_authority_keeps_credential_if_durability_reports_failure(
+        self,
+    ) -> None:
+        self.cli("chief-release", "--reason", "prepare post-publication failure")
+        paths = h.get_paths(self.root)
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+        real_write = h._write_chief_authority
+
+        def publish_then_fail(target: h.HarnessPaths, record: dict[str, object]) -> None:
+            real_write(target, record)
+            raise h.HarnessError("injected post-publication durability failure")
+
+        with h.state_lock(paths, create_layout=False):
+            with mock.patch.object(h, "_write_chief_authority", publish_then_fail):
+                with self.assertRaisesRegex(h.HarnessError, "post-publication"):
+                    h.acquire_chief_authority(
+                        paths,
+                        session_id="published-fault-chief",
+                        credential_home=credential_home,
+                    )
+            authority = h.load_chief_authority(paths)
+            credentials = [
+                path for path in credential_home.rglob("*.json") if path.is_file()
+            ]
+            self.assertEqual(len(credentials), 1)
+            token, loaded_path = h.load_chief_credential(
+                paths,
+                session_id="published-fault-chief",
+                epoch=int(authority["epoch"]),
+                credential_file=credentials[0],
+            )
+            self.assertEqual(loaded_path, credentials[0])
+            h.require_chief_authority(
+                paths,
+                session_id="published-fault-chief",
+                epoch=int(authority["epoch"]),
+                token=token,
+            )
+
+    def test_locked_reload_and_bootstrap_init_fail_on_config_races(self) -> None:
+        paths = h.get_paths(self.root)
+        before = self.managed_state_bytes()
+        parser = cli_impl.build_parser({})
+        args = parser.parse_args(["init"])
+        args._aoi_initialized_at_dispatch = False
+        with self.assertRaisesRegex(h.HarnessError, "appeared after unauthenticated"):
+            cli_impl.cmd_init(args, paths)
+        self.assertEqual(self.managed_state_bytes(), before)
+
+        config_bytes = paths.config.read_bytes()
+        paths.config.unlink()
+        try:
+            with h.state_lock(paths, create_layout=False):
+                with self.assertRaisesRegex(h.HarnessError, "aoi.toml disappeared"):
+                    cli_impl._reload_locked_paths(paths)
+        finally:
+            h.atomic_create_bytes(paths.config, config_bytes)
+
+    def test_credential_home_rejects_dangerous_roots_and_never_chmods_existing(
+        self,
+    ) -> None:
+        paths = h.get_paths(self.root)
+        with self.assertRaisesRegex(h.HarnessError, "filesystem root"):
+            h._chief_credential_root(paths, Path(paths.root.anchor))
+        with self.assertRaisesRegex(h.HarnessError, "project repository"):
+            h._chief_credential_root(paths, paths.root.parent)
+        with self.assertRaisesRegex(h.HarnessError, "user home"):
+            h._chief_credential_root(paths, Path.home())
+
+        existing = Path(self.backup_temp.name) / "existing-private-directory"
+        existing.mkdir()
+        if os.name != "nt":
+            existing.chmod(0o700)
+        with mock.patch.object(h, "_chmod_private") as chmod_private:
+            self.assertEqual(h._ensure_private_credential_directory(existing), existing)
+        chmod_private.assert_not_called()
+
+        unavailable = Path(self.backup_temp.name) / "unavailable-credential-directory"
+        with mock.patch.object(
+            Path, "mkdir", side_effect=PermissionError("injected permission denial")
+        ):
+            with self.assertRaisesRegex(
+                h.HarnessError, "cannot create Chief credential directory"
+            ):
+                h._ensure_private_credential_directory(unavailable)
+        if os.name != "nt":
+            unsafe_ancestor = Path(self.backup_temp.name) / "unsafe-ancestor"
+            unsafe_ancestor.mkdir()
+            unsafe_ancestor.chmod(0o777)
+            with self.assertRaisesRegex(h.HarnessError, "group/world-writable"):
+                h._chief_credential_root(paths, unsafe_ancestor / "credentials")
+
+            trusted_parent = Path(self.backup_temp.name) / "umask-zero-parent"
+            nested_private = trusted_parent / "first" / "second"
+            previous_umask = os.umask(0)
+            try:
+                h._ensure_private_credential_directory(nested_private)
+            finally:
+                os.umask(previous_umask)
+            for directory in (
+                trusted_parent,
+                trusted_parent / "first",
+                nested_private,
+            ):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+
+            if os.geteuid() != 0:
+                with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+                    with self.assertRaisesRegex(h.HarnessError, "untrusted owner"):
+                        h._validate_credential_ancestor_chain(
+                            Path(self.backup_temp.name) / "foreign-owner-probe"
+                        )
+
+    def test_authority_audit_tail_rolls_over_without_breaking_sequence(self) -> None:
+        paths = h.get_paths(self.root)
+        token = self.load_credential_token(
+            "harness-test-chief", self.chief_epoch, self.chief_credential_file
+        )
+        renewals = h.CHIEF_AUDIT_TAIL_MAX + 5
+        base = dt.datetime.now(dt.timezone.utc)
+        with h.state_lock(paths, create_layout=False):
+            record = h.load_chief_authority(paths)
+            for offset in range(renewals):
+                record = h.renew_chief_authority(
+                    paths,
+                    session_id="harness-test-chief",
+                    epoch=self.chief_epoch,
+                    token=token,
+                    now=base + dt.timedelta(microseconds=offset + 1),
+                )
+        self.assertEqual(len(record["audit_tail"]), h.CHIEF_AUDIT_TAIL_MAX)
+        self.assertEqual(record["transition_seq"], renewals + 1)
+        self.assertEqual(
+            record["omitted_transition_count"],
+            record["transition_seq"] - h.CHIEF_AUDIT_TAIL_MAX,
+        )
+        self.assertEqual(
+            record["audit_tail"][0]["seq"],
+            record["omitted_transition_count"] + 1,
+        )
+        self.assertEqual(record["audit_tail"][-1]["seq"], record["transition_seq"])
+        self.assertEqual(h.load_chief_authority(paths), record)
+
+    def test_token_environment_is_removed_before_child_processes(self) -> None:
+        marker = "A" * 43
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AOI_CHIEF_SESSION_ID": "scrub-test",
+                "AOI_CHIEF_EPOCH": "7",
+                "AOI_CHIEF_TOKEN": marker,
+                "AOI_CHIEF_CREDENTIAL_FILE": "C:/private/example.json",
+            },
+            clear=False,
+        ):
+            defaults = cli_impl._take_chief_environment_defaults()
+            self.assertEqual(defaults["token"], marker)
+            for name in (
+                "AOI_CHIEF_SESSION_ID",
+                "AOI_CHIEF_EPOCH",
+                "AOI_CHIEF_TOKEN",
+                "AOI_CHIEF_CREDENTIAL_FILE",
+            ):
+                self.assertNotIn(name, os.environ)
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.environ.get('AOI_CHIEF_TOKEN', 'absent'))",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(child.stdout.strip(), "absent")
+
+    def test_authenticated_init_requires_exact_digest_to_replace_custom_policy(self) -> None:
+        paths = h.get_paths(self.root)
+        custom = b"# locally customized policy\n"
+        paths.harness.joinpath("POLICY.md").write_bytes(custom)
+        doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        self.assertIn("differs from the packaged contract", doctor.stdout)
+        rejected = self.cli("init", ok=False)
+        digest = hashlib.sha256(custom).hexdigest()
+        self.assertIn(digest, rejected.stderr)
+        self.assertEqual(paths.harness.joinpath("POLICY.md").read_bytes(), custom)
+        updated = json.loads(
+            self.cli(
+                "init",
+                "--replace-policy-sha256",
+                digest,
+                "--json",
+            ).stdout
+        )
+        self.assertTrue(updated["policy_updated"])
+        self.assertEqual(
+            paths.harness.joinpath("POLICY.md").read_bytes(),
+            (SRC / "aoi_orgware" / "resources" / "policy.md").read_bytes(),
+        )
+
+    def test_authenticated_init_auto_upgrades_exact_v013_managed_policy(self) -> None:
+        paths = h.get_paths(self.root)
+        legacy_bytes = (HERE / "fixtures" / "policy-v0.1.3.md").read_bytes()
+        legacy_digest = hashlib.sha256(legacy_bytes).hexdigest()
+        self.assertEqual(
+            legacy_digest,
+            "76f116580d535ec33ca19da1e53ec3c3d35c107b05768a55d5ee654f477a3c85",
+        )
+        self.assertIn(legacy_digest, cli_impl.KNOWN_MANAGED_POLICY_SHA256)
+
+        paths.harness.joinpath("POLICY.md").write_bytes(legacy_bytes)
+        updated = json.loads(self.cli("init", "--json").stdout)
+        self.assertTrue(updated["policy_updated"])
+        self.assertEqual(
+            paths.harness.joinpath("POLICY.md").read_bytes(),
+            (SRC / "aoi_orgware" / "resources" / "policy.md").read_bytes(),
+        )
+
+    def test_chief_acquire_bootstraps_only_a_complete_missing_lock(self) -> None:
+        self.cli("chief-release", "--reason", "prepare complete lock migration")
+        paths = h.get_paths(self.root)
+        paths.lock.unlink()
+        acquired = json.loads(
+            self.cli(
+                "chief-acquire",
+                "--session-id",
+                "lock-migration-chief",
+                "--json",
+            ).stdout
+        )
+        self.assertTrue(paths.lock.is_file())
+        self.assertEqual(acquired["authority"]["session_id"], "lock-migration-chief")
+
+    def test_chief_acquire_migrates_complete_zero_byte_legacy_lock(self) -> None:
+        self.cli("chief-release", "--reason", "prepare zero-byte legacy lock")
+        paths = h.get_paths(self.root)
+        paths.chief_authority.unlink()
+        paths.lock.write_bytes(b"")
+        acquired = json.loads(
+            self.cli(
+                "chief-acquire",
+                "--session-id",
+                "zero-byte-legacy-chief",
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(paths.lock.read_bytes(), b"\0")
+        self.assertEqual(
+            acquired["authority"]["session_id"], "zero-byte-legacy-chief"
+        )
+        h.require_complete_layout(paths)
+
+    def test_chief_acquire_recovers_only_an_interrupted_init_prefix(self) -> None:
+        for case, empty_lock in (("config-only", False), ("empty-lock", True)):
+            with self.subTest(case=case):
+                root = Path(self.backup_temp.name) / case
+                root.mkdir()
+                subprocess.run(
+                    ["git", "init", "-b", "main", str(root)],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                config_bytes = cli_impl.default_config_text(
+                    f"Interrupted {case}"
+                ).encode("utf-8")
+                (root / "aoi.toml").write_bytes(config_bytes)
+                if empty_lock:
+                    (root / ".aoi").mkdir()
+                    (root / ".aoi" / ".state.lock").write_bytes(b"")
+
+                environment = os.environ.copy()
+                environment["PYTHONPATH"] = str(SRC)
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
+                environment["AOI_ROOT"] = str(root)
+                environment["AOI_CHIEF_CREDENTIAL_HOME"] = str(
+                    Path(self.backup_temp.name) / f"credentials-{case}"
+                )
+                for name in (
+                    "AOI_CHIEF_SESSION_ID",
+                    "AOI_CHIEF_EPOCH",
+                    "AOI_CHIEF_CREDENTIAL_FILE",
+                    "AOI_CHIEF_TOKEN",
+                ):
+                    environment.pop(name, None)
+                acquired = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        CLI_MODULE,
+                        "chief-acquire",
+                        "--session-id",
+                        f"recovery-{case}",
+                        "--json",
+                    ],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                )
+                self.assertEqual(acquired.returncode, 0, acquired.stderr)
+                payload = json.loads(acquired.stdout)
+                paths = h.get_paths(root)
+                self.assertEqual(paths.lock.read_bytes(), b"\0")
+                self.assertTrue(paths.platform.is_file())
+                self.assertTrue(paths.chief_authority.is_file())
+                self.assertFalse(paths.index.exists())
+                self.assertFalse((paths.harness / "POLICY.md").exists())
+                self.assertEqual((root / "aoi.toml").read_bytes(), config_bytes)
+
+                environment["AOI_CHIEF_SESSION_ID"] = f"recovery-{case}"
+                environment["AOI_CHIEF_EPOCH"] = str(payload["authority"]["epoch"])
+                environment["AOI_CHIEF_CREDENTIAL_FILE"] = payload["credential_file"]
+                resumed = subprocess.run(
+                    [sys.executable, "-m", CLI_MODULE, "init", "--json"],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                h.require_complete_layout(h.get_paths(root))
+                self.assertEqual((root / "aoi.toml").read_bytes(), config_bytes)
+
+        ambiguous = Path(self.backup_temp.name) / "ambiguous-prefix"
+        ambiguous.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(ambiguous)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        (ambiguous / "aoi.toml").write_text(
+            cli_impl.default_config_text("Ambiguous Prefix"), encoding="utf-8"
+        )
+        state = ambiguous / ".aoi"
+        state.mkdir()
+        (state / "unexpected.txt").write_text("material state\n", encoding="utf-8")
+        environment["AOI_ROOT"] = str(ambiguous)
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "chief-acquire",
+                "--session-id",
+                "ambiguous-recovery",
+            ],
+            cwd=ambiguous,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        self.assertIn("exact interrupted-init prefix", rejected.stderr)
+        self.assertFalse((state / ".state.lock").exists())
+        self.assertEqual(
+            (state / "unexpected.txt").read_text(encoding="utf-8"),
+            "material state\n",
+        )
+
+        raced = Path(self.backup_temp.name) / "raced-prefix"
+        raced.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(raced)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        (raced / "aoi.toml").write_text(
+            cli_impl.default_config_text("Raced Prefix"), encoding="utf-8"
+        )
+        raced_paths = h.get_paths(raced)
+        real_create_marker = h._create_platform_marker
+
+        def create_marker_then_inject(path: Path) -> bool:
+            created = real_create_marker(path)
+            raced_paths.tasks.mkdir(parents=True, exist_ok=True)
+            (raced_paths.tasks / "raced.json").write_text(
+                "material race\n", encoding="utf-8"
+            )
+            return created
+
+        with mock.patch.object(
+            h, "_create_platform_marker", side_effect=create_marker_then_inject
+        ):
+            with self.assertRaisesRegex(h.HarnessError, "material or unknown state"):
+                h.bootstrap_chief_state_lock(raced_paths)
+        self.assertFalse(raced_paths.chief_authority.exists())
+        self.assertEqual(
+            (raced_paths.tasks / "raced.json").read_text(encoding="utf-8"),
+            "material race\n",
+        )
+        self.assertEqual(raced_paths.lock.read_bytes(), b"")
+        with self.assertRaisesRegex(h.HarnessError, "material or unknown state"):
+            h.bootstrap_chief_state_lock(raced_paths)
+        self.assertEqual(raced_paths.lock.read_bytes(), b"")
+
+    def test_chief_lock_bootstrap_revalidates_publication_and_exact_sentinels(
+        self,
+    ) -> None:
+        self.cli("chief-release", "--reason", "prepare bootstrap race regression")
+        paths = h.get_paths(self.root)
+        paths.chief_authority.unlink()
+        paths.lock.unlink()
+        real_create = h.atomic_create_bytes
+
+        def publish_empty_then_remove_layout(path: Path, payload: bytes) -> None:
+            real_create(path, payload)
+            if path == paths.lock:
+                shutil.rmtree(paths.sessions)
+
+        with mock.patch.object(
+            h, "atomic_create_bytes", side_effect=publish_empty_then_remove_layout
+        ):
+            with self.assertRaisesRegex(h.HarnessError, "layout is incomplete"):
+                h.bootstrap_chief_state_lock(paths)
+        self.assertFalse(paths.sessions.exists())
+        self.assertEqual(paths.lock.read_bytes(), b"")
+
+        for payload in (b"x", b"\0x"):
+            with self.subTest(payload=payload):
+                paths.lock.write_bytes(payload)
+                with self.assertRaisesRegex(h.HarnessError, "state lock payload"):
+                    h.bootstrap_chief_state_lock(paths)
+                self.assertEqual(paths.lock.read_bytes(), payload)
+
+    def test_interrupted_init_preserves_future_or_replaced_platform_marker(self) -> None:
+        def make_prefix(name: str, marker_payload: bytes) -> tuple[Path, h.HarnessPaths]:
+            root = Path(self.backup_temp.name) / name
+            root.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            (root / "aoi.toml").write_text(
+                cli_impl.default_config_text(name), encoding="utf-8"
+            )
+            paths = h.get_paths(root)
+            paths.harness.mkdir()
+            paths.platform.write_bytes(marker_payload)
+            return root, paths
+
+        future_payload = (
+            json.dumps(
+                {
+                    "schema_version": h.PLATFORM_MARKER_SCHEMA_VERSION + 1,
+                    "lock_domain": h.runtime_lock_domain(),
+                    "lock_backend": "future-backend",
+                    "created_at": h.now_iso(),
+                },
+                indent=2,
+            )
+            + "\n"
+        ).encode("utf-8")
+        _future_root, future_paths = make_prefix("future-marker", future_payload)
+        with self.assertRaisesRegex(h.HarnessError, "unsupported AOI platform marker"):
+            h.bootstrap_chief_state_lock(future_paths)
+        self.assertEqual(future_paths.platform.read_bytes(), future_payload)
+        self.assertFalse(future_paths.lock.exists())
+
+        _raced_root, raced_paths = make_prefix("replaced-marker", b"")
+        snapshot = h._torn_platform_marker_snapshot(raced_paths.platform)
+        self.assertIsNotNone(snapshot)
+        replacement = future_payload.replace(b"future-backend", b"future-backen2")
+        replacement_path = raced_paths.platform.with_suffix(".replacement")
+        replacement_path.write_bytes(replacement)
+        os.replace(replacement_path, raced_paths.platform)
+        with self.assertRaisesRegex(h.HarnessError, "changed before"):
+            assert snapshot is not None
+            h._rewrite_torn_platform_marker(raced_paths.platform, snapshot)
+        self.assertEqual(raced_paths.platform.read_bytes(), replacement)
+
+    def test_first_init_reloads_config_and_refuses_racing_authority(self) -> None:
+        def new_root(name: str) -> tuple[Path, dict[str, str]]:
+            root = Path(self.backup_temp.name) / name
+            root.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            environment = os.environ.copy()
+            environment["AOI_ROOT"] = str(root)
+            environment["PYTHONPATH"] = str(SRC)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment["AOI_CHIEF_CREDENTIAL_HOME"] = str(
+                Path(self.backup_temp.name) / f"credentials-{name}"
+            )
+            for variable in (
+                "AOI_CHIEF_SESSION_ID",
+                "AOI_CHIEF_EPOCH",
+                "AOI_CHIEF_CREDENTIAL_FILE",
+                "AOI_CHIEF_TOKEN",
+            ):
+                environment.pop(variable, None)
+            return root, environment
+
+        config_root, config_environment = new_root("first-init-config-race")
+        real_state_lock = cli_impl.state_lock
+        config_swapped = False
+
+        @contextlib.contextmanager
+        def swap_config_then_lock(
+            paths: h.HarnessPaths, *, create_layout: bool = True
+        ) -> object:
+            nonlocal config_swapped
+            if not config_swapped:
+                paths.config.write_text(
+                    cli_impl.default_config_text("Racing Config"), encoding="utf-8"
+                )
+                config_swapped = True
+            with real_state_lock(paths, create_layout=create_layout):
+                yield
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, config_environment, clear=True), mock.patch.object(
+            cli_impl, "state_lock", swap_config_then_lock
+        ), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            result = cli_impl.main(["init", "--project-name", "Original Config"])
+        self.assertEqual(result, 2)
+        self.assertIn("aoi.toml changed", stderr.getvalue())
+        self.assertFalse((config_root / ".aoi" / "POLICY.md").exists())
+
+        authority_root, authority_environment = new_root("first-init-authority-race")
+        authority_inserted = False
+
+        @contextlib.contextmanager
+        def acquire_authority_then_lock(
+            paths: h.HarnessPaths, *, create_layout: bool = True
+        ) -> object:
+            nonlocal authority_inserted
+            if not authority_inserted:
+                acquired = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        CLI_MODULE,
+                        "chief-acquire",
+                        "--session-id",
+                        "racing-first-chief",
+                    ],
+                    cwd=authority_root,
+                    env=authority_environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                )
+                self.assertEqual(acquired.returncode, 0, acquired.stderr)
+                authority_inserted = True
+            with real_state_lock(paths, create_layout=create_layout):
+                yield
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, authority_environment, clear=True), mock.patch.object(
+            cli_impl, "state_lock", acquire_authority_then_lock
+        ), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            result = cli_impl.main(["init", "--project-name", "Authority Race"])
+        self.assertEqual(result, 2)
+        self.assertIn("Chief authority appeared", stderr.getvalue())
+        authority_paths = h.get_paths(authority_root)
+        self.assertTrue(authority_paths.chief_authority.is_file())
+        self.assertFalse((authority_paths.harness / "POLICY.md").exists())
+        self.assertFalse(authority_paths.index.exists())
+
+    def test_chief_acquire_does_not_repair_incomplete_lock_migration(self) -> None:
+        self.cli("chief-release", "--reason", "prepare incomplete lock migration")
+        paths = h.get_paths(self.root)
+        paths.lock.unlink()
+        shutil.rmtree(paths.sessions)
+        before = self.managed_state_bytes()
+        rejected = self.cli(
+            "chief-acquire",
+            "--session-id",
+            "incomplete-migration-chief",
+            ok=False,
+        )
+        self.assertIn("complete existing AOI layout", rejected.stderr)
+        self.assertFalse(paths.lock.exists())
+        self.assertFalse(paths.sessions.exists())
+        self.assertEqual(self.managed_state_bytes(), before)
+
+    def test_default_credential_home_uses_platform_user_state_location(self) -> None:
+        paths = h.get_paths(self.root)
+        state_home = Path(self.backup_temp.name) / "default-user-state"
+        environment = os.environ.copy()
+        environment.pop("AOI_CHIEF_CREDENTIAL_HOME", None)
+        if os.name == "nt":
+            environment["LOCALAPPDATA"] = str(state_home)
+            expected = state_home / "AOI" / "credentials" / "v1"
+        else:
+            environment["XDG_STATE_HOME"] = str(state_home)
+            expected = state_home / "aoi" / "credentials" / "v1"
+        with mock.patch.dict(os.environ, environment, clear=True):
+            actual = h._chief_credential_root(paths)
+        self.assertEqual(actual, expected.resolve())
+
+        if os.name == "nt":
+            environment["LOCALAPPDATA"] = "relative-user-state"
+            relative_label = "LOCALAPPDATA must be an absolute path"
+        else:
+            environment["XDG_STATE_HOME"] = "relative-user-state"
+            relative_label = "XDG_STATE_HOME must be an absolute path"
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(h.HarnessError, relative_label):
+                h._chief_credential_root(paths)
+
+    def test_pilot_writers_cannot_bypass_project_fence_or_managed_state(self) -> None:
+        paths = h.get_paths(self.root)
+        before = paths.chief_authority.read_bytes()
+        unauthorized = self.env.copy()
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            unauthorized.pop(name, None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "pilot-summary",
+                "--record",
+                str(self.root / "missing-record.json"),
+                "--output",
+                str(paths.chief_authority),
+                "--force",
+            ],
+            cwd=self.root,
+            env=unauthorized,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Chief session id and epoch are required", result.stderr)
+        self.assertEqual(paths.chief_authority.read_bytes(), before)
+
+        init_args = ["pilot-init", "--output", str(paths.harness), "--force"]
+        if os.name == "nt":
+            init_args.append("--allow-unverified-windows-acl")
+        rejected = self.cli(*init_args, ok=False)
+        self.assertIn("may not enter AOI managed state", rejected.stderr)
+        self.assertEqual(paths.chief_authority.read_bytes(), before)
+
+        root_args = ["pilot-init", "--output", str(paths.root), "--force"]
+        if os.name == "nt":
+            root_args.append("--allow-unverified-windows-acl")
+        rejected = self.cli(*root_args, ok=False)
+        self.assertIn("may not replace an initialized AOI project root", rejected.stderr)
+
+        parent = Path(self.backup_temp.name) / "pilot-parent-with-nested-project"
+        nested = parent / "sample_project"
+        nested.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-b", "main", str(nested)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        nested_env = unauthorized.copy()
+        nested_env["AOI_ROOT"] = str(nested)
+        nested_init = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "init", "--project-name", "Nested Pilot"],
+            cwd=nested,
+            env=nested_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(nested_init.returncode, 0, nested_init.stderr)
+        sentinel = nested / "README.md"
+        sentinel.write_text("nested AOI sentinel\n", encoding="utf-8")
+
+        nested_bypass = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "pilot-init",
+                "--output",
+                str(parent),
+                "--force",
+                *(
+                    ["--allow-unverified-windows-acl"]
+                    if os.name == "nt"
+                    else []
+                ),
+            ],
+            cwd=self.root,
+            env=unauthorized,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(nested_bypass.returncode, 2, nested_bypass.stderr)
+        self.assertIn("Chief session id and epoch are required", nested_bypass.stderr)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "nested AOI sentinel\n")
+
+        with self.assertRaisesRegex(cli_impl.PilotError, "active Chief credential"):
+            cli_impl.initialize_kit(
+                parent,
+                force=True,
+                allow_unverified_windows_acl=os.name == "nt",
+                authorized_project_root=self.root,
+            )
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "nested AOI sentinel\n")
+
+        config_bytes = paths.config.read_bytes()
+        paths.config.unlink()
+        try:
+            with self.assertRaisesRegex(
+                cli_impl.PilotError, "aoi.toml is missing"
+            ):
+                cli_impl.initialize_kit(
+                    paths.harness,
+                    force=True,
+                    allow_unverified_windows_acl=os.name == "nt",
+                    authorized_project_root=self.root,
+                )
+        finally:
+            paths.config.write_bytes(config_bytes)
+        self.assertEqual(paths.chief_authority.read_bytes(), before)
+
+    def test_pilot_nested_projects_are_all_discovered_and_refused(self) -> None:
+        nested = self.root / "nested-aoi-project"
+        nested.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(nested)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        environment = self.env.copy()
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            environment.pop(name, None)
+        environment["AOI_ROOT"] = str(nested)
+        initialized = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "init", "--project-name", "Nested AOI"],
+            cwd=nested,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        projects = cli_impl._pilot_output_projects(
+            nested / "pilot-summary.json", kit_destinations=False
+        )
+        self.assertEqual({item.root for item in projects}, {self.root, nested})
+        rejected = self.cli(
+            "pilot-summary",
+            "--record",
+            str(nested / "missing-record.json"),
+            "--output",
+            str(nested / "pilot-summary.json"),
+            ok=False,
+        )
+        self.assertIn("overlaps multiple initialized AOI projects", rejected.stderr)
+
+        sentinel = nested / "README.md"
+        sentinel.write_text("nested orphan sentinel\n", encoding="utf-8")
+        (nested / "aoi.toml").unlink()
+        with self.assertRaisesRegex(cli_impl.PilotError, "aoi.toml is missing"):
+            cli_impl.initialize_kit(
+                nested,
+                force=True,
+                allow_unverified_windows_acl=os.name == "nt",
+                authorized_project_root=self.root,
+            )
+        self.assertEqual(
+            sentinel.read_text(encoding="utf-8"), "nested orphan sentinel\n"
+        )
+
+
 class LockTests(HarnessTestCase):
     def test_initialized_policy_matches_canonical_packaged_resource(self) -> None:
         canonical = (REPO / "docs" / "POLICY.md").read_bytes()
@@ -369,6 +1904,69 @@ class LockTests(HarnessTestCase):
         text = initialized.decode("utf-8")
         self.assertIn("packet-input-recover-from-tar", text)
         self.assertIn("verification-supersession-seal", text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX fork/flock inheritance boundary")
+    def test_forked_child_cannot_reenter_or_unlock_parent_state_lock(self) -> None:
+        import fcntl
+        import select
+
+        paths = h.get_paths(self.root)
+        read_fd, write_fd = os.pipe()
+        child_mode = False
+        child_pid = -1
+        with h.state_lock(paths, create_layout=False):
+            child_pid = os.fork()
+            if child_pid == 0:
+                child_mode = True
+                os.close(read_fd)
+                try:
+                    with h.state_lock(paths, create_layout=False):
+                        pass
+                except h.HarnessError:
+                    os.write(write_fd, b"R")
+                else:
+                    os.write(write_fd, b"F")
+            else:
+                os.close(write_fd)
+                observed = b""
+                deadline = time.monotonic() + 5
+                while len(observed) < 2:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        os.kill(child_pid, 9)
+                        os.waitpid(child_pid, 0)
+                        self.fail("forked lock child did not report before timeout")
+                    ready, _write_ready, _errors = select.select(
+                        [read_fd], [], [], remaining
+                    )
+                    if not ready:
+                        continue
+                    chunk = os.read(read_fd, 2 - len(observed))
+                    if not chunk:
+                        break
+                    observed += chunk
+                _waited, status = os.waitpid(child_pid, 0)
+                os.close(read_fd)
+                self.assertEqual(status, 0)
+                self.assertEqual(observed, b"RL")
+
+        if child_mode:
+            result = b"L"
+            try:
+                with paths.lock.open("rb") as contender:
+                    try:
+                        fcntl.flock(
+                            contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    except BlockingIOError:
+                        pass
+                    else:
+                        result = b"U"
+                        fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+                os.write(write_fd, result)
+            finally:
+                os.close(write_fd)
+                os._exit(0)
 
     def test_overlap_matrix_and_path_escape(self) -> None:
         self.assertTrue(
@@ -951,12 +2549,12 @@ class LifecycleTests(HarnessTestCase):
         checkpoint_path = state_path.parent / "checkpoint.md"
         before_state = state_path.read_bytes()
         before_checkpoint = checkpoint_path.read_bytes()
-        self.cli(
+        self.cli_in_process(
             "checkpoint",
             "--task",
             "rollback-task",
             "--fact",
-            "x" * 26000,
+            "x" * 36000,
             "--next-action",
             "Should fail",
             ok=False,
@@ -983,12 +2581,12 @@ class LifecycleTests(HarnessTestCase):
         )
         before_state = state_path.read_bytes()
         before_checkpoint = checkpoint_path.read_bytes()
-        self.cli(
+        self.cli_in_process(
             "close-task",
             "--task",
             "rollback-task",
             "--summary",
-            "x" * 26000,
+            "x" * 36000,
             ok=False,
         )
         self.assertEqual(state_path.read_bytes(), before_state)
@@ -1718,7 +3316,7 @@ class LifecycleTests(HarnessTestCase):
             / "state.json"
         )
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        active_detail = "ACTIVE-DETAIL-" + "x" * 13000
+        active_detail = "ACTIVE-DETAIL-" + "x" * 18000
         state["jobs"].append(
             {
                 "run_id": "active-above-target-job",
@@ -1764,14 +3362,14 @@ class LifecycleTests(HarnessTestCase):
                 "log": "/runs/active-oversized-job/simv.log",
                 "pid": "1234",
                 "tmux": "active-oversized",
-                "stop_condition": "ACTIVE-DETAIL-" + "x" * 26000,
+                "stop_condition": "ACTIVE-DETAIL-" + "x" * 36000,
                 "source_sha": "c" * 64,
                 "source_scope": "current source",
                 "evidence": "still running",
             }
         )
         with self.assertRaisesRegex(
-            h.HarnessError, "checkpoint exceeds 24 KiB hard ceiling"
+            h.HarnessError, "checkpoint exceeds 32 KiB hard ceiling"
         ):
             h.prepare_checkpoint(h.get_paths(self.root), state)
 
@@ -1796,18 +3394,18 @@ class LifecycleTests(HarnessTestCase):
         ]
         locks = [
             f"repo:file:scripts/verify/active-lock-{index:03d}-{'x' * 80}.py"
-            for index in range(220)
+            for index in range(280)
         ]
         for lock in locks:
             claim_args.extend(["--lock", lock])
-        self.cli(*claim_args)
+        self.cli_in_process(*claim_args)
         paths = h.get_paths(self.root)
         state = h.load_task(paths, "active-claim-oversized-checkpoint")
         compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
         for lock in locks:
             self.assertIn(lock, compact)
         with self.assertRaisesRegex(
-            h.HarnessError, "checkpoint exceeds 24 KiB hard ceiling"
+            h.HarnessError, "checkpoint exceeds 32 KiB hard ceiling"
         ):
             h.prepare_checkpoint(paths, state)
 
@@ -2193,15 +3791,9 @@ class LifecycleTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("invalid packet transition", invalid_transition.stderr)
-        self.cli(
-            "packet-update",
-            "--task",
+        self.dispatch_packet(
             "packet-task",
-            "--packet-id",
             "review",
-            "--status",
-            "dispatched",
-            "--agent-id",
             "agent-1",
             "--actual-role",
             "explorer",
@@ -2740,17 +4332,7 @@ class HardeningTests(HarnessTestCase):
             "--validation",
             "Cite the exact file",
         )
-        self.cli(
-            "packet-update",
-            "--task",
-            "packet-lock-task",
-            "--packet-id",
-            "writer",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "agent-writer",
-        )
+        self.dispatch_packet("packet-lock-task", "writer", "agent-writer")
         blocked = self.cli(
             "release-claim",
             "--token",
@@ -2954,17 +4536,7 @@ class HardeningTests(HarnessTestCase):
             "--validation",
             "Physical SHA is checked",
         )
-        self.cli(
-            "packet-update",
-            "--task",
-            "packet-tamper",
-            "--packet-id",
-            "reader",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "reader-agent",
-        )
+        self.dispatch_packet("packet-tamper", "reader", "reader-agent")
         self.cli(
             "packet-update",
             "--task",
@@ -3046,17 +4618,7 @@ class HardeningTests(HarnessTestCase):
             "--validation",
             "Doctor checks it after close",
         )
-        self.cli(
-            "packet-update",
-            "--task",
-            "post-close-tamper",
-            "--packet-id",
-            "reader",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "reader-agent",
-        )
+        self.dispatch_packet("post-close-tamper", "reader", "reader-agent")
         self.cli(
             "packet-update",
             "--task",
@@ -3765,6 +5327,1000 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             args.extend(["--coord", coord])
         args.append("--json")
         return self.cli(*args, ok=ok)
+
+    def create_selected_packet(
+        self,
+        task_id: str,
+        packet_id: str,
+        lane_id: str,
+        selection_id: str,
+    ) -> None:
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            f"Inspect the bounded {lane_id} evidence question for {packet_id}",
+            "--scope",
+            "Read-only specialist review under the exact execution selection",
+            "--deliverable",
+            "One bounded conclusion with exact source evidence",
+            "--validation",
+            "The Chief checks the result against the selected lane authority",
+            "--lane-id",
+            lane_id,
+            "--execution-selection-id",
+            selection_id,
+        )
+
+    def test_single_mode_allows_only_one_active_depth_one_chain(self) -> None:
+        task_id = "single-chain-fence"
+        self.init_task(task_id, session_id="chief-single-chain")
+        commit = self.git_commit(task_id)
+        self.create_lane(
+            task_id,
+            "rtl",
+            kind="implementation",
+            role="implementation_specialist",
+            authority_commit=commit,
+        )
+        self.cli(
+            "execution-select",
+            "--task",
+            task_id,
+            "--selection-id",
+            "single-review",
+            "--work-unit-id",
+            "single-review-work",
+            "--mode",
+            "single",
+            "--lane",
+            "rtl",
+            "--scope",
+            "One causal RTL review chain with no parallel specialist execution",
+            "--sequential-dependency",
+            "high",
+            "--tool-density",
+            "medium",
+            "--shared-context",
+            "high",
+            "--rationale",
+            "Both reviews consume the same evolving RTL context and must be serialized",
+            "--falsification-condition",
+            "Replace this selection if independent lane authorities are created",
+            "--escalation-condition",
+            "Escalate if the evidence question crosses a numeric contract boundary",
+            "--session-id",
+            "chief-single-chain",
+        )
+        self.create_selected_packet(task_id, "review-one", "rtl", "single-review")
+        self.create_selected_packet(task_id, "review-two", "rtl", "single-review")
+        self.dispatch_packet(task_id, "review-one", "/root/review-one")
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "review-two",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/review-two",
+            ok=False,
+        )
+        self.assertIn("single execution mode already has", rejected.stderr)
+        first = self.task_state(task_id)["packets"][0]
+        self.assertEqual(first["dispatch_provenance"], "manual_unverified")
+        self.assertNotIn("dispatched_at", first)
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "review-one",
+            "--status",
+            "done",
+            "--summary",
+            "The first serialized RTL review completed under its exact selection",
+            "--evidence",
+            "The result records manual-unverified dispatch provenance and exact lane binding",
+        )
+        self.dispatch_packet(task_id, "review-two", "/root/review-two")
+
+    def test_task_global_execution_epoch_blocks_implicit_and_cross_selection_parallelism(
+        self,
+    ) -> None:
+        implicit_task = "implicit-single-epoch"
+        self.init_task(implicit_task)
+
+        def create_unselected(packet_id: str) -> None:
+            self.cli(
+                "create-packet",
+                "--task",
+                implicit_task,
+                "--packet-id",
+                packet_id,
+                "--agent-role",
+                "explorer",
+                "--model-tier",
+                "standard",
+                "--objective",
+                f"Inspect one bounded implicit-single question for {packet_id}",
+                "--scope",
+                "Read-only unselected packet",
+                "--deliverable",
+                "One bounded result",
+                "--validation",
+                "Chief checks the exact result",
+            )
+
+        create_unselected("implicit-one")
+        create_unselected("implicit-two")
+        self.assertEqual(
+            self.task_state(implicit_task)["execution_policy_version"], 2
+        )
+        self.assertIs(
+            self.task_state(implicit_task)["legacy_execution_policy"], False
+        )
+        self.dispatch_packet(implicit_task, "implicit-one", "/root/implicit-one")
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            implicit_task,
+            "--packet-id",
+            "implicit-two",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/implicit-two",
+            ok=False,
+        )
+        self.assertIn("implicit single execution already has", rejected.stderr)
+        implicit_state_path = (
+            self.root / ".aoi" / "tasks" / implicit_task / "state.json"
+        )
+        downgraded = self.task_state(implicit_task)
+        downgraded.pop("execution_policy_version")
+        downgraded.pop("task_execution_schema_version")
+        implicit_state_path.write_text(
+            json.dumps(downgraded, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        downgrade_rejected = self.cli(
+            "packet-update",
+            "--task",
+            implicit_task,
+            "--packet-id",
+            "implicit-two",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/implicit-two",
+            ok=False,
+        )
+        self.assertIn(
+            "native execution-policy task lost or downgraded",
+            downgrade_rejected.stderr,
+        )
+        downgrade_doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", implicit_task, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(downgrade_doctor.returncode, 1, downgrade_doctor.stderr)
+        self.assertIn(
+            "native execution-policy task lost or downgraded",
+            downgrade_doctor.stdout,
+        )
+
+        selected_task = "cross-selection-epoch"
+        self.init_task(selected_task, session_id="chief-cross-selection")
+        commit = self.git_commit(selected_task)
+        self.create_lane(
+            selected_task,
+            "rtl",
+            kind="implementation",
+            role="implementation_specialist",
+            authority_commit=commit,
+        )
+
+        def select_single(selection_id: str, work_unit_id: str) -> None:
+            self.cli(
+                "execution-select",
+                "--task",
+                selected_task,
+                "--selection-id",
+                selection_id,
+                "--work-unit-id",
+                work_unit_id,
+                "--mode",
+                "single",
+                "--lane",
+                "rtl",
+                "--scope",
+                f"One bounded report for {work_unit_id}",
+                "--sequential-dependency",
+                "high",
+                "--tool-density",
+                "low",
+                "--shared-context",
+                "high",
+                "--rationale",
+                "This work unit is explicitly single-chain",
+                "--falsification-condition",
+                "Supersede only if distinct specialist lanes are required",
+                "--escalation-condition",
+                "Escalate if another selection needs concurrent execution",
+                "--session-id",
+                "chief-cross-selection",
+            )
+
+        select_single("single-a", "work-a")
+        select_single("single-b", "work-b")
+        self.create_selected_packet(selected_task, "report-a", "rtl", "single-a")
+        self.create_selected_packet(selected_task, "report-b", "rtl", "single-b")
+        self.dispatch_packet(selected_task, "report-a", "/root/report-a")
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            selected_task,
+            "--packet-id",
+            "report-b",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/report-b",
+            ok=False,
+        )
+        self.assertIn("task-global execution epoch", rejected.stderr)
+
+    def test_legacy_parallel_selection_does_not_require_a_retroactive_v2_brief(self) -> None:
+        selection = {
+            "selection_id": "legacy-parallel",
+            "mode": "centralized_parallel",
+        }
+        state = {
+            "packets": [
+                {
+                    "packet_id": "legacy-result",
+                    "lane_id": "rtl",
+                    "status": "done",
+                    "result_sha256": "a" * 64,
+                    "execution_selection_id": "legacy-parallel",
+                }
+            ],
+            "execution_briefs": [],
+        }
+        self.assertIsNone(cli_impl._execution_brief_coverage_error(state, selection))
+        selection["execution_selection_version"] = 2
+        self.assertIn(
+            "lacks a Steward result brief",
+            cli_impl._execution_brief_coverage_error(state, selection) or "",
+        )
+        selection.pop("execution_selection_version")
+        selection["steward_snapshot"] = {}
+        self.assertIn(
+            "v2-only fields without a selection version",
+            cli_impl._execution_brief_coverage_error(state, selection) or "",
+        )
+
+    def test_task_global_execution_epoch_includes_standalone_jobs(self) -> None:
+        task_id = "job-execution-epoch"
+        self.init_task(task_id, session_id="chief-job-epoch")
+        commit = self.git_commit(task_id)
+        for lane_id in ("rtl", "numeric"):
+            self.create_lane(
+                task_id,
+                lane_id,
+                kind="implementation" if lane_id == "rtl" else "analysis",
+                role=(
+                    "implementation_specialist"
+                    if lane_id == "rtl"
+                    else "analysis_specialist"
+                ),
+                authority_commit=commit,
+            )
+            self.cli(
+                "execution-select",
+                "--task",
+                task_id,
+                "--selection-id",
+                f"{lane_id}-single",
+                "--work-unit-id",
+                f"{lane_id}-work",
+                "--mode",
+                "single",
+                "--lane",
+                lane_id,
+                "--scope",
+                f"One standalone {lane_id} external execution chain",
+                "--sequential-dependency",
+                "high",
+                "--tool-density",
+                "high",
+                "--shared-context",
+                "high",
+                "--rationale",
+                "The external command is one causal execution chain",
+                "--falsification-condition",
+                "Stop if another chain already occupies the task epoch",
+                "--escalation-condition",
+                "Require an explicit parallel topology for concurrent jobs",
+                "--session-id",
+                "chief-job-epoch",
+            )
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "job-epoch-claim",
+            "--owner",
+            "test-root",
+            "--kind",
+            "EDA-RUN",
+            "--lock",
+            "external:tree:/tmp/job-epoch-rtl",
+            "--lock",
+            "external:tree:/tmp/job-epoch-numeric",
+            "--intent",
+            "Exercise task-global job topology without launching a real tool",
+            "--validation",
+            "The second queued job must be rejected before state mutation",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        receipt, receipt_sha = self.write_source_receipt("job-epoch-source.json")
+
+        def start_job(run_id: str, lane_id: str, *, ok: bool = True):
+            root = f"/tmp/job-epoch-{lane_id}"
+            return self.cli(
+                "job-start",
+                "--task",
+                task_id,
+                "--run-id",
+                run_id,
+                "--host",
+                "eda",
+                "--tool",
+                "VCS",
+                "--work-root",
+                root,
+                "--log",
+                f"{root}/driver.log",
+                "--stop-condition",
+                "PASS or first fatal",
+                "--source-sha",
+                receipt_sha,
+                "--source-manifest",
+                str(receipt),
+                "--tool-path",
+                "/tools/vcs",
+                "--tool-version",
+                "VCS-test",
+                "--command",
+                "timeout 1m run.sh",
+                "--lane-id",
+                lane_id,
+                "--execution-selection-id",
+                f"{lane_id}-single",
+                ok=ok,
+            )
+
+        start_job("rtl-run", "rtl")
+        rejected = start_job("numeric-run", "numeric", ok=False)
+        self.assertIn("task-global execution epoch", rejected.stderr)
+        doctor = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(doctor["ok"], doctor)
+
+    def test_external_job_can_be_owned_by_one_dispatched_packet_chain(self) -> None:
+        task_id = "owned-job-chain"
+        self.init_task(task_id, session_id="chief-owned-job")
+        commit = self.git_commit(task_id)
+        self.create_lane(
+            task_id,
+            "rtl",
+            kind="implementation",
+            role="implementation_specialist",
+            authority_commit=commit,
+        )
+        self.cli(
+            "execution-select",
+            "--task",
+            task_id,
+            "--selection-id",
+            "owned-job-single",
+            "--work-unit-id",
+            "owned-job-work",
+            "--mode",
+            "single",
+            "--lane",
+            "rtl",
+            "--scope",
+            "One specialist packet owns one external command lifecycle",
+            "--sequential-dependency",
+            "high",
+            "--tool-density",
+            "high",
+            "--shared-context",
+            "high",
+            "--rationale",
+            "The job is nested in the already-authorized packet chain",
+            "--falsification-condition",
+            "Reject if packet and job authorities diverge",
+            "--escalation-condition",
+            "Stop the job before completing its owner packet",
+            "--session-id",
+            "chief-owned-job",
+        )
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "owned-job-claim",
+            "--owner",
+            "test-root",
+            "--kind",
+            "EDA-RUN",
+            "--lock",
+            "external:tree:/tmp/owned-job-chain",
+            "--intent",
+            "Exercise nested job authority without launching a real tool",
+            "--validation",
+            "Owner packet cannot finish while its job remains active",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "job-owner",
+            "--agent-role",
+            "implementation_specialist",
+            "--model-tier",
+            "expert",
+            "--objective",
+            "Own one bounded external command lifecycle",
+            "--scope",
+            "Run only inside the claimed external output tree",
+            "--deliverable",
+            "Terminal job evidence and one bounded conclusion",
+            "--validation",
+            "The Chief checks job and packet terminal evidence",
+            "--packet-mode",
+            "bounded_mutation",
+            "--lock",
+            "external:tree:/tmp/owned-job-chain",
+            "--lane-id",
+            "rtl",
+            "--execution-selection-id",
+            "owned-job-single",
+        )
+        self.dispatch_packet(task_id, "job-owner", "/root/job-owner")
+        receipt, receipt_sha = self.write_source_receipt("owned-job-source.json")
+        self.cli(
+            "job-start",
+            "--task",
+            task_id,
+            "--run-id",
+            "owned-run",
+            "--host",
+            "eda",
+            "--tool",
+            "VCS",
+            "--work-root",
+            "/tmp/owned-job-chain",
+            "--log",
+            "/tmp/owned-job-chain/driver.log",
+            "--stop-condition",
+            "PASS or first fatal",
+            "--source-sha",
+            receipt_sha,
+            "--source-manifest",
+            str(receipt),
+            "--tool-path",
+            "/tools/vcs",
+            "--tool-version",
+            "VCS-test",
+            "--command",
+            "timeout 1m run.sh",
+            "--lane-id",
+            "rtl",
+            "--execution-selection-id",
+            "owned-job-single",
+            "--owner-packet-id",
+            "job-owner",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = self.task_state(task_id)
+        owner_packet = next(
+            packet for packet in state["packets"] if packet["packet_id"] == "job-owner"
+        )
+        owner_contract = Path(owner_packet["path"])
+        owner_contract_bytes = owner_contract.read_bytes()
+        owner_contract.write_bytes(owner_contract_bytes + b"\nphysical drift\n")
+        drifted_launch = self.cli(
+            "job-update",
+            "--task",
+            task_id,
+            "--run-id",
+            "owned-run",
+            "--status",
+            "running",
+            "--pid",
+            "424242",
+            "--evidence",
+            "Owner contract drift must be rejected at the launch boundary",
+            ok=False,
+        )
+        self.assertIn("owner packet authority is missing or tampered", drifted_launch.stderr)
+        owner_contract.write_bytes(owner_contract_bytes)
+
+        valid_state_bytes = state_path.read_bytes()
+        lock_drift = json.loads(valid_state_bytes)
+        next(
+            packet
+            for packet in lock_drift["packets"]
+            if packet["packet_id"] == "job-owner"
+        )["locks"] = []
+        state_path.write_text(
+            json.dumps(lock_drift, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        lock_doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(lock_doctor.returncode, 1, lock_doctor.stderr)
+        self.assertIn("output paths exceed the owner packet locks", lock_doctor.stdout)
+        state_path.write_bytes(valid_state_bytes)
+
+        self.cli(
+            "job-update",
+            "--task",
+            task_id,
+            "--run-id",
+            "owned-run",
+            "--status",
+            "running",
+            "--pid",
+            "424242",
+            "--evidence",
+            "Physical owner authority and canonical output locks were revalidated",
+        )
+        blocked = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "job-owner",
+            "--status",
+            "done",
+            "--summary",
+            "Owner attempted to finish before its job",
+            "--evidence",
+            "The active owned job must block this transition",
+            ok=False,
+        )
+        self.assertIn("child work is active", blocked.stderr)
+        self.cli(
+            "job-update",
+            "--task",
+            task_id,
+            "--run-id",
+            "owned-run",
+            "--status",
+            "stopped",
+            "--evidence",
+            "The bounded external job was stopped before owner completion",
+            "--exit-code",
+            "143",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "job-owner",
+            "--status",
+            "done",
+            "--summary",
+            "Owner completed after its nested job became terminal",
+            "--evidence",
+            "The job lifecycle and owner packet share one exact chain",
+        )
+        doctor = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(doctor["ok"], doctor)
+
+    def test_centralized_parallel_allows_cross_lane_but_not_same_lane_overlap(self) -> None:
+        task_id = "centralized-lane-fence"
+        self.init_task(task_id, session_id="chief-centralized")
+        commit = self.git_commit(task_id)
+        for lane_id, kind, role in (
+            ("rtl", "implementation", "implementation_specialist"),
+            ("numeric", "analysis", "analysis_specialist"),
+            ("steward", "coordination_steward", "default"),
+        ):
+            self.create_lane(
+                task_id,
+                lane_id,
+                kind=kind,
+                role=role,
+                authority_commit=commit,
+            )
+        self.cli(
+            "execution-select",
+            "--task",
+            task_id,
+            "--selection-id",
+            "parallel-reviews",
+            "--work-unit-id",
+            "parallel-review-work",
+            "--mode",
+            "centralized_parallel",
+            "--lane",
+            "rtl",
+            "--lane",
+            "numeric",
+            "--steward-lane-id",
+            "steward",
+            "--scope",
+            "Independent RTL and numeric reviews reported through one Steward",
+            "--sequential-dependency",
+            "low",
+            "--tool-density",
+            "medium",
+            "--shared-context",
+            "low",
+            "--rationale",
+            "The two evidence questions have distinct authorities and no direct dependency",
+            "--falsification-condition",
+            "Switch to hybrid if either specialist requires direct technical exchange",
+            "--escalation-condition",
+            "Escalate any cross-contract dissent through the Steward and Chief",
+            "--session-id",
+            "chief-centralized",
+        )
+        self.create_selected_packet(task_id, "rtl-one", "rtl", "parallel-reviews")
+        self.create_selected_packet(task_id, "rtl-two", "rtl", "parallel-reviews")
+        self.create_selected_packet(task_id, "numeric-one", "numeric", "parallel-reviews")
+        for packet_id in ("rtl-one", "numeric-one"):
+            self.dispatch_packet(task_id, packet_id, f"/root/{packet_id}")
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "rtl-two",
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/rtl-two",
+            ok=False,
+        )
+        self.assertIn("active depth-one chain in lane rtl", rejected.stderr)
+        for packet_id in ("rtl-one", "numeric-one"):
+            self.cli(
+                "packet-update",
+                "--task",
+                task_id,
+                "--packet-id",
+                packet_id,
+                "--status",
+                "done",
+                "--summary",
+                f"Completed the independent {packet_id} specialist review",
+                "--evidence",
+                f"Canonical result for {packet_id} is bound to the parallel selection",
+            )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "rtl-two",
+            "--status",
+            "cancelled",
+            "--summary",
+            "The redundant same-lane review was cancelled without material work",
+        )
+        missing_brief = self.cli(
+            "execution-select",
+            "--task",
+            task_id,
+            "--selection-id",
+            "after-parallel",
+            "--work-unit-id",
+            "parallel-review-work",
+            "--supersedes-selection-id",
+            "parallel-reviews",
+            "--mode",
+            "single",
+            "--lane",
+            "rtl",
+            "--scope",
+            "Continue one sequential RTL follow-up after result consolidation",
+            "--sequential-dependency",
+            "high",
+            "--tool-density",
+            "medium",
+            "--shared-context",
+            "high",
+            "--rationale",
+            "The independent specialist phase ended and one causal follow-up remains",
+            "--falsification-condition",
+            "Return to parallel only if distinct lane evidence questions reappear",
+            "--escalation-condition",
+            "Escalate if the follow-up changes the numeric contract boundary",
+            "--session-id",
+            "chief-centralized",
+            ok=False,
+        )
+        self.assertIn("lacks a Steward result brief", missing_brief.stderr)
+        revised_steward_commit = self.git_commit("steward-brief-recorder-revision")
+        self.revise_lane(
+            task_id,
+            "steward",
+            authority_commit=revised_steward_commit,
+            change_class="same_contract_implementation",
+            contract_version="cv1",
+            generator_version="gv1",
+            adapter_version="av1",
+        )
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "parallel-review-steward-synthesis",
+            "--agent-role",
+            "default",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Synthesize every immutable specialist result for Chief arbitration",
+            "--scope",
+            "Read-only Steward synthesis after all selected specialist packets are terminal",
+            "--deliverable",
+            "One bounded synthesis with dissent, blockers, and recommendation",
+            "--validation",
+            "Chief checks the result against every bound specialist result SHA-256",
+            "--lane-id",
+            "steward",
+            "--steward-synthesis-for-selection-id",
+            "parallel-reviews",
+        )
+        self.dispatch_packet(
+            task_id,
+            "parallel-review-steward-synthesis",
+            "/root/parallel-review-steward-synthesis",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "parallel-review-steward-synthesis",
+            "--status",
+            "done",
+            "--summary",
+            "Steward synthesized the exact RTL, numeric, and cancelled duplicate results",
+            "--evidence",
+            "The synthesis contract and result bind every specialist result SHA-256",
+        )
+        late_specialist = self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "late-specialist",
+            "--agent-role",
+            "implementation_specialist",
+            "--model-tier",
+            "expert",
+            "--objective",
+            "Attempt to append specialist evidence after synthesis",
+            "--scope",
+            "This packet must be rejected because the selected result set is frozen",
+            "--deliverable",
+            "No packet should be created",
+            "--validation",
+            "Creation fails before any state mutation",
+            "--lane-id",
+            "rtl",
+            "--execution-selection-id",
+            "parallel-reviews",
+            ok=False,
+        )
+        self.assertIn("frozen after Steward synthesis begins", late_specialist.stderr)
+        brief = json.loads(
+            self.cli(
+                "execution-brief-record",
+                "--task",
+                task_id,
+                "--brief-id",
+                "parallel-review-brief",
+                "--execution-selection-id",
+                "parallel-reviews",
+                "--steward-lane-id",
+                "steward",
+                "--steward-packet-id",
+                "parallel-review-steward-synthesis",
+                "--packet-id",
+                "rtl-one",
+                "--packet-id",
+                "rtl-two",
+                "--packet-id",
+                "numeric-one",
+                "--summary",
+                "Steward consolidated the independent RTL and numeric terminal results",
+                "--dissent",
+                "No unresolved specialist dissent was reported",
+                "--blocker",
+                "No remaining blocker was reported for this review phase",
+                "--recommendation",
+                "Chief should continue only the bounded sequential RTL follow-up",
+                "--session-id",
+                "chief-centralized",
+                "--json",
+            ).stdout
+        )
+        self.assertRegex(brief["brief_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(brief["brief_version"], 3)
+        self.assertEqual(brief["steward_snapshot"]["revision"], 1)
+        self.assertEqual(brief["recording_steward_snapshot"]["revision"], 2)
+        self.assertEqual(
+            brief["steward_packet_binding"]["steward_execution_snapshot"][
+                "revision"
+            ],
+            2,
+        )
+        self.cli(
+            "execution-select",
+            "--task",
+            task_id,
+            "--selection-id",
+            "after-parallel",
+            "--work-unit-id",
+            "parallel-review-work",
+            "--supersedes-selection-id",
+            "parallel-reviews",
+            "--mode",
+            "single",
+            "--lane",
+            "rtl",
+            "--scope",
+            "Continue one sequential RTL follow-up after result consolidation",
+            "--sequential-dependency",
+            "high",
+            "--tool-density",
+            "medium",
+            "--shared-context",
+            "high",
+            "--rationale",
+            "The independent specialist phase ended and one causal follow-up remains",
+            "--falsification-condition",
+            "Return to parallel only if distinct lane evidence questions reappear",
+            "--escalation-condition",
+            "Escalate if the follow-up changes the numeric contract boundary",
+            "--session-id",
+            "chief-centralized",
+        )
+        selection = self.task_state(task_id)["execution_selections"][0]
+        self.assertEqual(selection["execution_selection_version"], 2)
+        self.assertEqual(selection["steward_snapshot"]["lane_id"], "steward")
+        doctor = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(doctor["ok"], doctor)
+
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        valid_state_bytes = state_path.read_bytes()
+        downgraded = json.loads(valid_state_bytes)
+        downgraded["execution_selections"][0].pop("execution_selection_version")
+        downgraded["execution_selections"][0].pop("steward_snapshot")
+        state_path.write_text(
+            json.dumps(downgraded, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        downgraded_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                task_id,
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(downgraded_doctor.returncode, 1, downgraded_doctor.stderr)
+        self.assertIn("not sealed as version 2", downgraded_doctor.stdout)
+
+        state_path.write_bytes(valid_state_bytes)
+        compounded_downgrade = json.loads(valid_state_bytes)
+        compounded_downgrade.pop("task_execution_schema_version")
+        compounded_downgrade.pop("execution_policy_version")
+        compounded_downgrade["execution_selections"][0].pop(
+            "execution_selection_version"
+        )
+        compounded_downgrade["execution_selections"][0].pop("steward_snapshot")
+        state_path.write_text(
+            json.dumps(compounded_downgrade, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        compounded_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                task_id,
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(compounded_doctor.returncode, 1, compounded_doctor.stderr)
+        self.assertIn(
+            "native execution-policy task lost or downgraded",
+            compounded_doctor.stdout,
+        )
+
+        state_path.write_bytes(valid_state_bytes)
+        damaged = json.loads(valid_state_bytes)
+        damaged["execution_selections"][0]["steward_snapshot"] = "malformed"
+        state_path.write_text(
+            json.dumps(damaged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        damaged_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                task_id,
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(damaged_doctor.returncode, 1, damaged_doctor.stderr)
+        self.assertNotIn("Traceback", damaged_doctor.stderr)
+        self.assertIn("parallel mode lacks a Steward snapshot", damaged_doctor.stdout)
 
     def test_lean_parallel_lanes_have_lane_local_actions_and_critical_view(self) -> None:
         self.init_task("lane-critical", session_id="root-session")
@@ -4642,17 +7198,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             return Path(packet["command_path"])
 
         worker_snapshot = create_exact("exact-worker", "external_operator", "standard")
-        self.cli(
-            "packet-update",
-            "--task",
-            task_id,
-            "--packet-id",
-            "exact-worker",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "/root/exact-worker",
-        )
+        self.dispatch_packet(task_id, "exact-worker", "/root/exact-worker")
         worker_snapshot.write_text("tampered after dispatch\n", encoding="utf-8")
         before_done = state_path.read_bytes()
         rejected = self.cli(
@@ -4688,15 +7234,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
 
         reviewer_snapshot = create_exact("exact-reviewer", "reviewer", "expert")
-        self.cli(
-            "packet-update",
-            "--task",
+        self.dispatch_packet(
             task_id,
-            "--packet-id",
             "exact-reviewer",
-            "--status",
-            "dispatched",
-            "--agent-id",
             "/root/exact-reviewer",
             "--actual-role",
             "reviewer",
@@ -4822,7 +7362,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         packet = state["packets"][0]
         artifact = packet["input_artifact_refs"][0]
         snapshot = Path(artifact["path"])
-        self.assertEqual(packet["packet_schema_version"], 4)
+        self.assertEqual(packet["packet_schema_version"], 5)
+        self.assertEqual(packet["dispatch_provenance"], "none")
         self.assertEqual(artifact["snapshot_version"], 1)
         self.assertEqual(Path(artifact["source_path"]), source.resolve())
         self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), digest)
@@ -4852,17 +7393,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertEqual(state_path.read_bytes(), before)
 
         source.write_text("approved input\n", encoding="utf-8")
-        self.cli(
-            "packet-update",
-            "--task",
-            task_id,
-            "--packet-id",
-            "reader",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "/root/reader",
-        )
+        self.dispatch_packet(task_id, "reader", "/root/reader")
         source.write_text("legitimate evolution after dispatch\n", encoding="utf-8")
         self.cli(
             "packet-update",
@@ -5034,16 +7565,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "--input-artifact",
                 f"{source}={digest}",
             )
-            self.cli(
-                "packet-update",
-                "--task",
-                task_id,
-                "--packet-id",
-                "legacy-reader",
-                "--status",
-                "dispatched",
-                "--agent-id",
-                "/root/legacy-reader",
+            self.dispatch_packet(
+                task_id, "legacy-reader", f"/root/{task_id}/legacy-reader"
             )
             terminal_args = [
                 "packet-update",
@@ -5427,17 +7950,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--input-artifact",
             f"{carrier}={carrier_sha}",
         )
-        self.cli(
-            "packet-update",
-            "--task",
-            task_id,
-            "--packet-id",
-            "reviewer",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "/root/reviewer",
-        )
+        self.dispatch_packet(task_id, "reviewer", "/root/reviewer")
         self.cli(
             "packet-update",
             "--task",
@@ -6557,16 +9070,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--lane-id",
             "rtl",
         )
-        self.cli(
-            "packet-update",
-            "--task",
-            "reconcile-observed",
-            "--packet-id",
-            "rtl-owner",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "/root/rtl-owner",
+        self.dispatch_packet(
+            "reconcile-observed", "rtl-owner", "/root/rtl-owner"
         )
         observations = self.root / "observations.json"
         observations.write_text(
@@ -6699,17 +9204,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 task_type,
                 *extra,
             )
-            self.cli(
-                "packet-update",
-                "--task",
-                "capacity-flow",
-                "--packet-id",
-                packet_id,
-                "--status",
-                "dispatched",
-                "--agent-id",
-                f"/root/{packet_id}",
-            )
+            self.dispatch_packet("capacity-flow", packet_id, f"/root/{packet_id}")
             self.cli(
                 "packet-update",
                 "--task",
@@ -6748,17 +9243,6 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--task-type",
             "department-owner",
         )
-        self.cli(
-            "packet-update",
-            "--task",
-            "capacity-flow",
-            "--packet-id",
-            "rtl-parent",
-            "--status",
-            "dispatched",
-            "--agent-id",
-            "/root/rtl-parent",
-        )
         review = json.loads(
             self.cli(
                 "capacity-snapshot",
@@ -6780,12 +9264,14 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             ).stdout
         )
         self.assertEqual(review["dataset"]["record_count"], 1)
-        self.assertEqual(
-            json.loads(Path(review["dataset"]["path"]).read_text(encoding="utf-8"))[
-                "records"
-            ][0]["token_usage"],
-            "unavailable",
-        )
+        capacity_record = json.loads(
+            Path(review["dataset"]["path"]).read_text(encoding="utf-8")
+        )["records"][0]
+        self.assertEqual(capacity_record["token_usage"], "unavailable")
+        self.assertEqual(capacity_record["dispatch_provenance"], "manual_unverified")
+        self.assertTrue(capacity_record["dispatch_recorded_at"])
+        self.assertEqual(capacity_record["subagent_start_observed_at"], "")
+        self.assertEqual(capacity_record["orchestration_started_at"], "")
         terminal_packet(
             "capacity-analysis",
             "capacity",
@@ -6819,6 +9305,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "--json",
             ).stdout
         )
+        self.dispatch_packet("capacity-flow", "rtl-parent", "/root/rtl-parent")
         before = self.task_state("capacity-flow")
         unapproved = self.cli(
             "create-packet",
@@ -7061,6 +9548,79 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         leaf = next(item for item in state["packets"] if item["packet_id"] == "expert-leaf")
         self.assertFalse(leaf["routing_verified"] if "routing_verified" in leaf else False)
         self.assertEqual(state["capacity_reviews"][0]["status"], "consumed")
+        expires_at = (
+            dt.datetime.now().astimezone() + dt.timedelta(minutes=5)
+        ).isoformat()
+        parent_state = self.task_state("capacity-flow")
+        self.assertNotIn("/root/rtl-parent", parent_state["session_ids"])
+        self.assertIn(
+            "/root/rtl-parent", parent_state["subagent_parent_session_ids"]
+        )
+        with self.assertRaisesRegex(h.HarnessError, "root arbitration"):
+            cli_impl.require_root_session(
+                h.get_paths(self.root), parent_state, "/root/rtl-parent"
+            )
+        parent_start = self.hook(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "/root/rtl-parent",
+                "source": "startup",
+            }
+        )
+        self.assertIn(
+            "not Chief/root authority",
+            parent_start["hookSpecificOutput"]["additionalContext"],
+        )
+        parent_prompt = self.hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "/root/rtl-parent",
+            }
+        )
+        self.assertIn(
+            "not Chief/root authority",
+            parent_prompt["hookSpecificOutput"]["additionalContext"],
+        )
+        parent_stop = self.hook(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "/root/rtl-parent",
+                "stop_hook_active": False,
+            }
+        )
+        self.assertTrue(parent_stop["continue"])
+        self.cli(
+            "packet-arm",
+            "--task",
+            "capacity-flow",
+            "--packet-id",
+            "expert-leaf",
+            "--parent-session-id",
+            "/root/rtl-parent",
+            "--expected-agent-type",
+            "worker",
+            "--expires-at",
+            expires_at,
+        )
+        nested = self.hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "/root/rtl-parent",
+                "turn_id": "depth-two-turn",
+                "agent_id": "/root/rtl-parent/expert-leaf",
+                "agent_type": "worker",
+            }
+        )
+        self.assertIn(
+            "valid pre-armed dispatch",
+            nested["hookSpecificOutput"]["additionalContext"],
+        )
+        leaf = next(
+            item
+            for item in self.task_state("capacity-flow")["packets"]
+            if item["packet_id"] == "expert-leaf"
+        )
+        self.assertEqual(leaf["dispatch_provenance"], "codex_subagent_start_observed")
         reused = self.cli(
             "create-packet",
             "--task",
@@ -7216,6 +9776,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "rtl",
                 "--lane",
                 "num",
+                "--steward-lane-id",
+                "steward",
                 "--scope",
                 "RTL and numeric lanes need bounded direct evidence clarification",
                 "--sequential-dependency",
@@ -7378,6 +9940,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "rtl",
             "--lane",
             "num",
+            "--steward-lane-id",
+            "steward",
             "--scope",
             "Fresh exact lane authorities for bounded RTL and numeric clarification",
             "--sequential-dependency",
@@ -7441,15 +10005,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--execution-selection-id",
             "rtl-num-hybrid-current",
         )
-        self.cli(
-            "packet-update",
-            "--task",
+        self.dispatch_packet(
             "topology-governance",
-            "--packet-id",
             "topology-bound-investigation",
-            "--status",
-            "dispatched",
-            "--agent-id",
             "/root/topology-bound-investigation",
         )
         self.cli(
@@ -7751,6 +10309,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "rtl",
             "--lane",
             "num",
+            "--steward-lane-id",
+            "steward",
             "--scope",
             "One bounded RTL and numeric clarification",
             "--sequential-dependency",
@@ -8239,16 +10799,6 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--execution-selection-id",
             "unknown-launch-selection",
         )
-        refreshed = self.git_commit("unknown-launch-refreshed")
-        self.revise_lane(
-            "unknown-launch",
-            "rtl",
-            authority_commit=refreshed,
-            change_class="evidence_only",
-            contract_version="cv1",
-            generator_version="gv1",
-            adapter_version="av1",
-        )
         self.cli(
             "job-update",
             "--task",
@@ -8363,16 +10913,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "--task-type",
                 "waveform-classification",
             )
-            self.cli(
-                "packet-update",
-                "--task",
-                "improvement-parent",
-                "--packet-id",
-                packet_id,
-                "--status",
-                "dispatched",
-                "--agent-id",
-                f"/root/{packet_id}",
+            self.dispatch_packet(
+                "improvement-parent", packet_id, f"/root/{packet_id}"
             )
             self.cli(
                 "packet-update",
@@ -8705,15 +11247,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--input-artifact",
             artifact_refs[2],
         )
-        self.cli(
-            "packet-update",
-            "--task",
+        self.dispatch_packet(
             "waveform-skill-project",
-            "--packet-id",
             "skill-independent-review",
-            "--status",
-            "dispatched",
-            "--agent-id",
             "/root/skill-independent-review",
         )
         self.cli(
@@ -8883,16 +11419,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                     ]
                 )
             self.cli(*create_args)
-            self.cli(
-                "packet-update",
-                "--task",
-                "improvement-parent",
-                "--packet-id",
-                packet_id,
-                "--status",
-                "dispatched",
-                "--agent-id",
-                f"/root/{packet_id}",
+            self.dispatch_packet(
+                "improvement-parent", packet_id, f"/root/{packet_id}"
             )
             self.cli(
                 "packet-update",
@@ -9557,9 +12085,35 @@ class ConfigurationTests(HarnessTestCase):
             'external_lock_namespace = "external"',
             'external_lock_namespace = "vendor"',
         )
-        config.write_text(text, encoding="utf-8")
-
-        self.cli("init")
+        self.cli("chief-release", "--reason", "reset isolated profile fixture")
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+        ):
+            self.env.pop(name, None)
+        shutil.rmtree(self.root / ".aoi")
+        config.unlink()
+        candidate = Path(self.backup_temp.name) / "custom-profile.toml"
+        candidate.write_text(text, encoding="utf-8")
+        self.cli(
+            "init",
+            "--config",
+            str(candidate),
+            "--expected-config-sha256",
+            hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        )
+        acquired = json.loads(
+            self.cli(
+                "chief-acquire",
+                "--session-id",
+                "custom-profile-chief",
+                "--json",
+            ).stdout
+        )
+        self.env["AOI_CHIEF_SESSION_ID"] = "custom-profile-chief"
+        self.env["AOI_CHIEF_EPOCH"] = str(acquired["authority"]["epoch"])
+        self.env["AOI_CHIEF_CREDENTIAL_FILE"] = acquired["credential_file"]
         self.assertTrue((self.root / ".org-state" / "INDEX.md").is_file())
         self.assertIn("/.org-state/", (self.root / ".gitignore").read_text())
         self.cli(
@@ -9723,7 +12277,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertEqual(version.stdout.strip(), "AOI 0.1.3")
+            self.assertEqual(version.stdout.strip(), "AOI 0.2.0")
             help_result = subprocess.run(
                 [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
                 cwd=directory,
@@ -9795,7 +12349,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 "-m",
                 HOOK_MODULE,
                 "--hook-version",
-                "5",
+                "6",
             ],
             cwd=clean_root,
             env=clean_env,
@@ -9818,6 +12372,599 @@ class BytecodeHygieneTests(HarnessTestCase):
 
 
 class HookTests(HarnessTestCase):
+    def task_state(self, task_id: str) -> dict:
+        return json.loads(
+            (
+                self.root / ".aoi" / "tasks" / task_id / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+
+    def create_hook_packet(self, task_id: str, packet_id: str) -> None:
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Inspect one bounded source question under an observed dispatch",
+            "--scope",
+            "Read-only packet with no harness mutation authority",
+            "--deliverable",
+            "One evidence-backed conclusion and exact inspected paths",
+            "--validation",
+            "The parent checks the conclusion against the named source paths",
+        )
+
+    def test_schema_v5_manual_dispatch_requires_a_prior_arm(self) -> None:
+        task_id = "manual-dispatch-arm-gate"
+        packet_id = "manual-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/posthoc-agent",
+            ok=False,
+        )
+        self.assertIn("requires a prior packet-arm", rejected.stderr)
+        self.arm_packet(
+            task_id,
+            packet_id,
+            expected_agent_type="explorer",
+            parent_session_id="harness-test-chief",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        expired = self.task_state(task_id)
+        attempt = expired["packets"][0]["dispatch_attempts"][0]
+        attempt["armed_at"] = (
+            dt.datetime.now().astimezone() - dt.timedelta(minutes=2)
+        ).isoformat()
+        attempt["expires_at"] = (
+            dt.datetime.now().astimezone() - dt.timedelta(seconds=1)
+        ).isoformat()
+        attempt["arm_authority_sha256"] = cli_impl._dispatch_attempt_authority_sha256(
+            attempt
+        )
+        state_path.write_text(
+            json.dumps(expired, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        stale = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/stale-manual-agent",
+            ok=False,
+        )
+        self.assertIn("expired before dispatch", stale.stderr)
+        stale_doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(stale_doctor.returncode, 1, stale_doctor.stderr)
+        self.assertIn("active dispatch attempt 1 is expired", stale_doctor.stdout)
+        self.arm_packet(
+            task_id,
+            packet_id,
+            expected_agent_type="explorer",
+            parent_session_id="harness-test-chief",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/manual-fallback-agent",
+            "--manual-unverified-reason",
+            "Trusted hooks were unavailable after the exact packet had been pre-armed",
+        )
+        state = self.task_state(task_id)
+        packet = state["packets"][0]
+        self.assertEqual(packet["dispatch_provenance"], "manual_unverified")
+        self.assertEqual(packet["dispatch_attempts"][0]["status"], "expired")
+        self.assertEqual(packet["dispatch_attempts"][1]["status"], "disarmed")
+        self.assertEqual(
+            cli_impl.packet_integrity_errors(h.get_paths(self.root), state), []
+        )
+
+    def test_unrelated_expired_arm_does_not_pollute_incident_attribution(self) -> None:
+        task_id = "expired-arm-attribution"
+        packet_id = "expired-explorer"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm_packet(
+            task_id,
+            packet_id,
+            expected_agent_type="explorer",
+            parent_session_id="harness-test-chief",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = self.task_state(task_id)
+        attempt = state["packets"][0]["dispatch_attempts"][0]
+        attempt["armed_at"] = (
+            dt.datetime.now().astimezone() - dt.timedelta(minutes=2)
+        ).isoformat()
+        attempt["expires_at"] = (
+            dt.datetime.now().astimezone() - dt.timedelta(seconds=1)
+        ).isoformat()
+        attempt["arm_authority_sha256"] = cli_impl._dispatch_attempt_authority_sha256(
+            attempt
+        )
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        output = self.hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "harness-test-chief",
+                "turn_id": "unrelated-expired-arm-turn",
+                "agent_id": "/root/unarmed-worker",
+                "agent_type": "worker",
+            }
+        )
+        self.assertIn("reason=no_matching_arm", output["hookSpecificOutput"]["additionalContext"])
+        incident = self.task_state(task_id)["subagent_incidents"][0]
+        self.assertEqual(incident["reason_code"], "no_matching_arm")
+        self.assertEqual(incident["candidate_packet_ids"], [])
+
+    def test_subagent_start_consumes_one_prearmed_packet_idempotently(self) -> None:
+        task_id = "hook-observed-dispatch"
+        packet_id = "observed-explorer"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        expires_at = (dt.datetime.now().astimezone() + dt.timedelta(minutes=5)).isoformat()
+        armed = json.loads(
+            self.cli(
+                "packet-arm",
+                "--task",
+                task_id,
+                "--packet-id",
+                packet_id,
+                "--expected-agent-type",
+                "explorer",
+                "--expires-at",
+                expires_at,
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(armed["status"], "armed")
+        self.create_hook_packet(task_id, "colliding-explorer")
+        collision = self.cli(
+            "packet-arm",
+            "--task",
+            task_id,
+            "--packet-id",
+            "colliding-explorer",
+            "--expected-agent-type",
+            "explorer",
+            "--expires-at",
+            expires_at,
+            ok=False,
+        )
+        self.assertIn("parent-session/agent-type slot", collision.stderr)
+        event = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "harness-test-chief",
+            "turn_id": "turn-observed-1",
+            "agent_id": "/root/observed-explorer",
+            "agent_type": "explorer",
+            "permission_mode": "default",
+        }
+        observed = self.hook(event)
+        context = observed["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(packet_id, context)
+        self.assertIn("valid pre-armed dispatch", context)
+        state = self.task_state(task_id)
+        packet = state["packets"][0]
+        self.assertEqual(packet["status"], "dispatched")
+        self.assertEqual(
+            packet["dispatch_provenance"], "codex_subagent_start_observed"
+        )
+        self.assertNotIn("dispatched_at", packet)
+        self.assertEqual(
+            packet["dispatch_attempts"][0]["observation"]["agent_id"],
+            "/root/observed-explorer",
+        )
+        tampered = copy.deepcopy(state)
+        tampered["packets"][0]["agent_id"] = "/root/forged-agent"
+        self.assertTrue(
+            any(
+                "packet/observation binding" in error
+                for error in cli_impl.packet_integrity_errors(
+                    h.get_paths(self.root), tampered
+                )
+            )
+        )
+        revision = state["revision"]
+        replay = self.hook(event)
+        self.assertIn(packet_id, replay["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.task_state(task_id)["revision"], revision)
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "done",
+            "--summary",
+            "The observed read-only packet returned its bounded conclusion",
+            "--evidence",
+            "The result is bound to the consumed SubagentStart observation",
+        )
+        terminal_state = self.task_state(task_id)
+        capacity_record = cli_impl._capacity_records(
+            terminal_state, "", "general"
+        )[0]
+        observed_at = terminal_state["packets"][0]["dispatch_attempts"][0][
+            "observation"
+        ]["observed_at"]
+        self.assertEqual(
+            capacity_record["dispatch_provenance"],
+            "codex_subagent_start_observed",
+        )
+        self.assertEqual(capacity_record["dispatch_recorded_at"], observed_at)
+        self.assertEqual(capacity_record["subagent_start_observed_at"], observed_at)
+        self.assertEqual(capacity_record["orchestration_started_at"], "")
+        second_start = dict(event)
+        second_start["turn_id"] = "turn-observed-2"
+        second_start["agent_id"] = "/root/unarmed-second-explorer"
+        second = self.hook(second_start)
+        self.assertIn(
+            "without one valid, unique pre-armed packet",
+            second["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertEqual(
+            self.task_state(task_id)["subagent_incidents"][0]["reason_code"],
+            "no_matching_arm",
+        )
+
+    def test_legacy_task_packet_creation_and_manual_upgrade_set_dispatch_version(self) -> None:
+        task_id = "hook-progressive-dispatch-migration"
+        packet_id = "legacy-ready-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = self.task_state(task_id)
+        state.pop("dispatch_model_version", None)
+        state.pop("subagent_incidents", None)
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        self.create_hook_packet(task_id, packet_id)
+        state = self.task_state(task_id)
+        self.assertEqual(state["dispatch_model_version"], 1)
+        self.assertEqual(state["subagent_incidents"], [])
+
+        packet = state["packets"][0]
+        packet["packet_schema_version"] = 4
+        packet.pop("dispatch_version", None)
+        packet.pop("dispatch_provenance", None)
+        packet.pop("dispatch_attempts", None)
+        state.pop("dispatch_model_version", None)
+        state.pop("subagent_incidents", None)
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        downgraded = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/forged-legacy-packet",
+            ok=False,
+        )
+        self.assertIn("native-v5 contract was downgraded", downgraded.stderr)
+        downgraded_doctor = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(downgraded_doctor.returncode, 1, downgraded_doctor.stderr)
+        self.assertIn("native-v5 contract was downgraded", downgraded_doctor.stdout)
+
+        state = self.task_state(task_id)
+        packet = state["packets"][0]
+        contract_path = Path(packet["path"])
+        native_block = (
+            "\n## AOI dispatch authority\n\n"
+            f"{cli_impl.NATIVE_V5_PACKET_CONTRACT_MARKER}\n"
+        ).encode("utf-8")
+        legacy_contract = contract_path.read_bytes().replace(native_block, b"")
+        self.assertNotEqual(legacy_contract, contract_path.read_bytes())
+        contract_path.write_bytes(legacy_contract)
+        packet["packet_contract_sha256"] = hashlib.sha256(legacy_contract).hexdigest()
+        packet.pop("dispatch_schema_origin", None)
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        forged_migration = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/forged-policy-v2-migration",
+            ok=False,
+        )
+        self.assertIn(
+            "schema-v4 migration is forbidden for a native execution-policy task",
+            forged_migration.stderr,
+        )
+
+        state = self.task_state(task_id)
+        state.pop("task_execution_schema_version")
+        state.pop("execution_policy_version")
+        state["legacy_execution_policy"] = True
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/manual-legacy-packet",
+        )
+        migrated = self.task_state(task_id)
+        self.assertEqual(migrated["dispatch_model_version"], 1)
+        self.assertEqual(migrated["subagent_incidents"], [])
+        self.assertEqual(migrated["packets"][0]["packet_schema_version"], 5)
+        self.assertEqual(
+            migrated["packets"][0]["dispatch_schema_origin"],
+            "legacy_v4_migration",
+        )
+        self.assertEqual(
+            cli_impl.subagent_incident_integrity_errors(migrated), []
+        )
+
+    def test_hook_keeps_committed_dispatch_context_when_index_refresh_fails(self) -> None:
+        task_id = "hook-index-post-commit"
+        packet_id = "index-safe-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        expires_at = (
+            dt.datetime.now().astimezone() + dt.timedelta(minutes=5)
+        ).isoformat()
+        self.cli(
+            "packet-arm",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--expected-agent-type",
+            "explorer",
+            "--expires-at",
+            expires_at,
+        )
+        event = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "harness-test-chief",
+            "turn_id": "index-failure-turn",
+            "agent_id": "/root/index-safe-packet",
+            "agent_type": "explorer",
+        }
+        with mock.patch.object(
+            cli_impl,
+            "write_index",
+            side_effect=h.HarnessError("unrelated task prevents index rendering"),
+        ):
+            outcome = cli_impl.observe_subagent_start(h.get_paths(self.root), event)
+        self.assertEqual(outcome["status"], "authorized")
+        self.assertTrue(outcome["index_refresh_deferred"])
+        packet = self.task_state(task_id)["packets"][0]
+        self.assertEqual(packet["status"], "dispatched")
+        self.assertEqual(packet["agent_id"], "/root/index-safe-packet")
+
+    def test_unarmed_subagent_start_records_and_accounts_incident(self) -> None:
+        task_id = "hook-unmanaged-dispatch"
+        self.init_task(task_id, session_id="harness-test-chief")
+        event = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "harness-test-chief",
+            "turn_id": "turn-unmanaged-1",
+            "agent_id": "/root/unmanaged-worker",
+            "agent_type": "worker",
+        }
+        output = self.hook(event)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("without one valid, unique pre-armed packet", context)
+        state = self.task_state(task_id)
+        self.assertEqual(len(state["subagent_incidents"]), 1)
+        incident = state["subagent_incidents"][0]
+        self.assertEqual(incident["reason_code"], "no_matching_arm")
+        self.assertEqual(incident["status"], "open")
+        blocked_cancel = self.cli(
+            "cancel-task",
+            "--task",
+            task_id,
+            "--reason",
+            "An open spawn incident must block cancellation",
+            ok=False,
+        )
+        self.assertIn("unaccounted sub-agent spawn incidents", blocked_cancel.stderr)
+        revision = state["revision"]
+        self.hook(event)
+        self.assertEqual(self.task_state(task_id)["revision"], revision)
+        self.cli(
+            "checkpoint",
+            "--task",
+            task_id,
+            "--next-action",
+            "Account the exact unmanaged spawn incident before further work",
+        )
+        open_checkpoint = (
+            self.root / ".aoi" / "tasks" / task_id / "checkpoint.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(incident["incident_id"], open_checkpoint)
+        critical = json.loads(
+            self.cli(
+                "status", "--task", task_id, "--critical", "--json"
+            ).stdout
+        )
+        self.assertEqual(
+            critical["subagent_spawn_incidents"][0]["incident_id"],
+            incident["incident_id"],
+        )
+        doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                task_id,
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(doctor.returncode, 1, doctor.stderr)
+        self.assertIn("open sub-agent spawn incident", doctor.stdout)
+        self.cli(
+            "subagent-incident-account",
+            "--task",
+            task_id,
+            "--incident-id",
+            incident["incident_id"],
+            "--disposition",
+            "no_material_work",
+            "--reason",
+            "The hook instructed the unarmed agent to stop before project inspection",
+            "--evidence",
+            "The repeated identical hook event produced no additional task mutation",
+            "--session-id",
+            "harness-test-chief",
+        )
+        accounted = self.task_state(task_id)["subagent_incidents"][0]
+        self.assertEqual(accounted["status"], "accounted")
+        checkpoint = self.cli(
+            "checkpoint",
+            "--task",
+            task_id,
+            "--next-action",
+            "Continue only with pre-armed delegation packets",
+        )
+        self.assertEqual(checkpoint.returncode, 0)
+        checkpoint_text = (
+            self.root / ".aoi" / "tasks" / task_id / "checkpoint.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Accounted spawn incidents: 1", checkpoint_text)
+
+    def test_concurrent_subagent_starts_consume_one_arm_only(self) -> None:
+        task_id = "hook-concurrent-dispatch"
+        packet_id = "single-permit"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        expires_at = (dt.datetime.now().astimezone() + dt.timedelta(minutes=5)).isoformat()
+        self.cli(
+            "packet-arm",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--expected-agent-type",
+            "explorer",
+            "--expires-at",
+            expires_at,
+        )
+        payloads = [
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "harness-test-chief",
+                "turn_id": f"concurrent-turn-{index}",
+                "agent_id": f"/root/concurrent-{index}",
+                "agent_type": "explorer",
+            }
+            for index in (1, 2)
+        ]
+        barrier = threading.Barrier(3)
+        results: list[subprocess.CompletedProcess[bytes]] = []
+        result_lock = threading.Lock()
+
+        def invoke(payload: dict) -> None:
+            barrier.wait(timeout=10)
+            result = subprocess.run(
+                [sys.executable, "-m", HOOK_MODULE, "--hook-version", "6"],
+                cwd=self.root,
+                env=self.env,
+                input=json.dumps(payload).encode("utf-8"),
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            with result_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=invoke, args=(payload,)) for payload in payloads]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=10)
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.returncode == 0 for result in results))
+        contexts = [
+            json.loads(result.stdout.decode("utf-8"))["hookSpecificOutput"][
+                "additionalContext"
+            ]
+            for result in results
+        ]
+        self.assertEqual(sum("valid pre-armed dispatch" in item for item in contexts), 1)
+        self.assertEqual(
+            sum("without one valid, unique pre-armed packet" in item for item in contexts),
+            1,
+        )
+        state = self.task_state(task_id)
+        self.assertEqual(state["packets"][0]["status"], "dispatched")
+        self.assertEqual(len(state["subagent_incidents"]), 1)
+
     def test_closed_task_unbinds_session(self) -> None:
         self.init_task("closed-hook-task", session_id="closed-session")
         self.cli(
@@ -9858,8 +13005,8 @@ class HookTests(HarnessTestCase):
             {"hook_event_name": "SubagentStart", "agent_type": "explorer"}
         )
         subcontext = subagent["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("root owns task state", subcontext)
-        self.assertIn("never paste raw logs", subcontext)
+        self.assertIn("no task mapping", subcontext)
+        self.assertIn("Stop without material work", subcontext)
 
         blocked = self.hook(
             {

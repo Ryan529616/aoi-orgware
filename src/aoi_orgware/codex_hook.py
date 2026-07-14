@@ -15,9 +15,12 @@ from typing import Any
 from .harnesslib import get_paths
 
 
-SUPPORTED_HOOK_VERSION = "5"
+SUPPORTED_HOOK_VERSION = "6"
 SAFE_DISPLAY_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+HOOK_INPUT_MAX_BYTES = 64 * 1024
+ROOT_SESSION_MAPPING_KIND = "root"
+SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
 
 
 def root_path() -> Path:
@@ -25,7 +28,10 @@ def root_path() -> Path:
 
 
 def read_input() -> dict[str, Any]:
-    raw = sys.stdin.buffer.read().decode("utf-8-sig")
+    payload = sys.stdin.buffer.read(HOOK_INPUT_MAX_BYTES + 1)
+    if len(payload) > HOOK_INPUT_MAX_BYTES:
+        raise ValueError("hook payload exceeds the supported size")
+    raw = payload.decode("utf-8-sig")
     value = json.loads(raw or "{}")
     return value if isinstance(value, dict) else {}
 
@@ -62,10 +68,33 @@ def session_state(
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not isinstance(state, dict) or state.get("task_id") != task_id:
             return "corrupt", None
-        session_ids = state.get("session_ids")
-        if not isinstance(session_ids, list) or session_id not in session_ids:
-            return "corrupt", None
-        return "valid", (state, task_dir)
+        mapping_kind = mapping.get("mapping_kind", ROOT_SESSION_MAPPING_KIND)
+        if mapping_kind == ROOT_SESSION_MAPPING_KIND:
+            session_ids = state.get("session_ids")
+            if not isinstance(session_ids, list) or session_id not in session_ids:
+                return "corrupt", None
+            return "valid", (state, task_dir)
+        if mapping_kind == SUBAGENT_PARENT_MAPPING_KIND:
+            parent_ids = state.get("subagent_parent_session_ids")
+            packets = state.get("packets")
+            if (
+                not isinstance(parent_ids, list)
+                or session_id not in parent_ids
+                or not isinstance(packets, list)
+            ):
+                return "corrupt", None
+            matches = [
+                packet
+                for packet in packets
+                if isinstance(packet, dict)
+                and packet.get("packet_id") == mapping.get("packet_id")
+                and packet.get("agent_id") == session_id
+                and packet.get("delegation_depth", 1) == 1
+            ]
+            if len(matches) != 1:
+                return "corrupt", None
+            return "subagent_parent", (state, task_dir)
+        return "corrupt", None
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return "corrupt", None
 
@@ -81,7 +110,22 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
         "writes AOI state; use bounded sub-agent packets. This hook is a "
         "procedural guardrail, not a security boundary. "
     )
-    if mapping_status == "valid" and mapped:
+    if mapping_status == "subagent_parent" and mapped:
+        state, _ = mapped
+        packet = next(
+            item
+            for item in state.get("packets", [])
+            if isinstance(item, dict) and item.get("agent_id") == session_id
+        )
+        context = (
+            base
+            + f"This is the bounded depth-one agent for task {state.get('task_id')}, "
+            + f"packet {packet.get('packet_id')} at {packet.get('path')}. This mapping "
+            + "permits nested SubagentStart lookup only; it is not Chief/root authority. "
+            + "Stay inside the packet, do not mutate AOI state, and do not reuse this "
+            + "session for unrelated work. "
+        )
+    elif mapping_status == "valid" and mapped:
         state, task_dir = mapped
         checkpoint = task_dir / "checkpoint.md"
         status = state.get("status")
@@ -156,15 +200,51 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
     if not SAFE_DISPLAY_ID.fullmatch(agent_type):
         agent_type = "subagent"
     paths = get_paths(root)
-    context = (
-        f"AOI sub-agent contract for {paths.project.name!r}: repo={paths.root}. "
-        f"Role={agent_type}. Work only inside the packet named by the root. "
-        "The root owns task state, claims, plan, checkpoint, and final completion. "
-        f"Do not edit {paths.harness}; "
-        "and do not launch an unrequested long external job. Return a bounded summary "
-        "with conclusion, exact evidence/artifact paths, files inspected or changed, "
-        "verification, unresolved risks, and one next action; never paste raw logs."
-    )
+    # Import lazily so ordinary hook startup remains tiny and bytecode-free.
+    from .cli import observe_subagent_start
+
+    outcome = observe_subagent_start(paths, payload)
+    status = outcome.get("status")
+    if status == "authorized":
+        context = (
+            f"AOI observed a valid pre-armed dispatch for {paths.project.name!r}: "
+            f"task={outcome.get('task_id')}, packet={outcome.get('packet_id')}, "
+            f"contract={outcome.get('packet_path')}. Role={agent_type}. Read that exact "
+            "packet before work and stay inside its scope. The root owns AOI state, "
+            f"claims, plan, checkpoint, and final completion; do not edit {paths.harness}. "
+            "Return a bounded conclusion with exact evidence/artifact paths, files inspected "
+            "or changed, verification, unresolved risks, and one next action; never paste raw logs."
+        )
+    elif status == "incident":
+        context = (
+            "AOI observed this sub-agent start without one valid, unique pre-armed packet. "
+            f"Incident={outcome.get('incident_id')}; reason={outcome.get('reason_code')}. "
+            "The start already occurred and this hook cannot terminate it. Stop without "
+            "material work, do not inspect or edit project files, and report the incident id "
+            "to the parent so the Chief can account it explicitly."
+        )
+    elif status == "corrupt":
+        context = (
+            "AOI could not validate the parent task mapping for this start. Stop without "
+            "material work and report the corrupt mapping to the parent. This hook observes "
+            "starts but cannot terminate an already-created sub-agent."
+        )
+    else:
+        context = (
+            "AOI found no task mapping for the parent session, so it could not consume a "
+            "packet arm or persist a task incident. Stop without material work and ask the "
+            "parent to bind a task and arm an exact packet before retrying."
+        )
+    if outcome.get("index_refresh_deferred") is True:
+        context += (
+            " AOI committed the target task event but deferred the derived INDEX refresh; "
+            "report this to the parent so the Chief can run doctor/status."
+        )
+    if outcome.get("parent_mapping_deferred") is True:
+        context += (
+            " AOI could not publish this depth-one agent's parent-only mapping; do not "
+            "spawn a child and report the condition to the Chief."
+        )
     write_output(
         {
             "hookSpecificOutput": {
@@ -183,7 +263,20 @@ def user_prompt_submit(root: Path, payload: dict[str, Any]) -> None:
         "work requires one approved plan, explicit claims, bounded packets, and a "
         "semantic checkpoint. Trivial read-only answers do not require a task. "
     )
-    if mapping_status == "unbound":
+    if mapping_status == "subagent_parent" and mapped:
+        state, _ = mapped
+        packet = next(
+            item
+            for item in state.get("packets", [])
+            if isinstance(item, dict) and item.get("agent_id") == session_id
+        )
+        context = (
+            base
+            + f"Continue only bounded packet {packet.get('packet_id')} for task "
+            + f"{state.get('task_id')}. This parent-only mapping is not Chief/root "
+            + "authority; do not mutate AOI lifecycle state."
+        )
+    elif mapping_status == "unbound":
         context = (
             base
             + "This session is not bound to a valid harness task. Before any material "
@@ -231,6 +324,9 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
         return
     session_id = str(payload.get("session_id", ""))
     mapping_status, mapped = session_state(root, session_id)
+    if mapping_status == "subagent_parent":
+        allow()
+        return
     if mapping_status == "unbound":
         allow()
         return
