@@ -4,6 +4,12 @@
 values fail closed. A candidate can be validated without loading or changing
 the installed project configuration:
 
+Phase 1 context-provider receipts are task-local records, not project
+configuration. Do not add an unversioned `[integrations.codebase_memory]` table:
+the schema rejects it. This keeps codebase-memory optional and fail-open while
+receipt/doctor/benchmark behavior is evaluated. A future mandatory integration
+would require an explicit configuration-schema migration.
+
 ```bash
 # Run from the target Git repository root.
 aoi config-check --file /path/to/candidate-aoi.toml --json

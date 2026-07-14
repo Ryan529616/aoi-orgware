@@ -29,6 +29,12 @@ an Agents SDK application, a custom supervisor, or a human-operated workflow.
   current, unique arm and its later Chief accounting disposition
 - `External job`: exact command, source receipt, optional depth-one packet owner,
   standalone-or-nested execution-chain identity, log, and terminal evidence
+- `Context-provider receipt`: immutable provider/source-set identity, explicit
+  freshness profile, optional/required policy, and a non-close-qualifying
+  health boundary; it is separate from external-job source identity and normal
+  technical verification
+- `Context-provider benchmark`: immutable paired navigation observations and a
+  deterministic `engineering_inference` summary; it cannot satisfy closure
 - `Coordination request`: cross-lane question, Chief decision, directives,
   acknowledgements, implementation evidence, independent verification
 - `Execution brief`: exact specialist result set plus a terminal Steward
@@ -138,6 +144,22 @@ must also carry pre-marker legacy provenance. Other runtimes should integrate
 through equivalent observed-event adapters or the CLI/JSON contract without
 bypassing AOI authority rules.
 
+The optional codebase-memory Phase 1 adapter is a second, deliberately narrower
+integration. A Chief-fenced command imports an exact reviewed receipt into a
+task-local immutable snapshot. `doctor` and a Steward execution brief may
+recompute provider health and, only under an explicit AOI freshness profile,
+repository freshness. Specialists remain outside this mutation path and use
+only read-only graph tools supplied by their runtime. AOI never invokes
+`index_repository`, starts a watcher, copies the graph store into `.aoi/`, or
+turns graph output into technical evidence.
+
+An imported receipt records `refresh_authority=external_unverified`: receipt
+integrity does not prove that the Chief launched the original index operation.
+The optional provider fails open. Only a task that explicitly records the
+active receipt as required treats non-healthy/non-fresh status as a doctor,
+Steward-brief, and close-gate error. See
+[the codebase-memory contract](codebase-memory.md).
+
 ## Known v0.2 boundaries
 
 - One state tree may be written from POSIX/WSL or native Windows, not both.
@@ -186,4 +208,7 @@ bypassing AOI authority rules.
   same-OS writer that removes every policy/provenance field and v2 artifact can
   still manufacture a legacy-looking cooperative state.
 - Legacy import exists for the originating harness but is disabled by default.
+- The Phase 1 codebase-memory adapter supports one reviewed v0.9.0 receipt
+  schema and an explicit Git freshness profile. It is not a general MCP
+  integration layer, refresh scheduler, watcher, or dependency declaration.
 - No proof yet that AOI's added process pays for itself on every workload.

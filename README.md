@@ -9,7 +9,7 @@ It is not another chat router. It sits above an agent runtime and records what
 the organization is allowed to do, what it decided, what changed, and what was
 actually verified.
 
-> Status: **v0.2.0 alpha**. The core lifecycle is tested, but AOI has not yet been
+> Status: **v0.2.1 alpha**. The core lifecycle is tested, but AOI has not yet been
 > proven better than a simpler single-agent or supervisor topology. Benchmark it
 > on your own workload before relying on it.
 
@@ -44,6 +44,9 @@ every request through every lane.
 - exact file/tree/contract locks with conflict detection and SHA-bound baselines
 - bounded delegation packets and external-job ownership (`--owner-packet-id`), with task-local
   content-addressed snapshots for packet and verification artifacts
+- optional, immutable context-provider receipts with tri-state freshness,
+  doctor/Steward health reporting, and navigation-only A/B summaries that can
+  never qualify task closure
 - packet dispatch provenance: short-lived Chief-issued arms, protocol-v6
   `SubagentStart` observation, pre-armed manual-unverified fallback, and
   durable unmanaged-start incidents
@@ -72,7 +75,7 @@ every request through every lane.
 
 AOI deliberately does **not** launch an LLM provider, choose a model brand,
 install hooks silently, prevent non-cooperating processes from editing files, or
-turn an acknowledgement into proof of implementation.
+turn an acknowledgement or code graph into proof of implementation.
 
 ## Requirements
 
@@ -300,6 +303,47 @@ set cannot change underneath it. Then `execution-brief-record` must name that ex
 result with `--steward-packet-id <packet-id>` and bind every terminal specialist
 packet before selection supersession or task close.
 
+### Optional codebase-memory context
+
+Phase 1 can import a reviewed codebase-memory v0.9.0 receipt without launching
+the provider, refreshing an index, or enabling a watcher:
+
+```bash
+aoi context-receipt-record \
+  --task <task-id> --provider codebase-memory \
+  --receipt-id <receipt-id> \
+  --receipt /absolute/path/to/receipt.json \
+  --receipt-sha256 <full-sha256> \
+  --requirement optional \
+  --freshness-profile codebase-memory-git-v1 \
+  --session-id <bound-root-session> --json
+
+aoi doctor --task <task-id> --json
+```
+
+Only the Chief-fenced import mutates AOI state. Specialist access remains
+read-only graph query access, and Steward output is limited to receipt
+integrity, provider health, freshness, dissent, and a brief. Graph searches and
+navigation benchmarks are always `engineering_inference`, never compile,
+simulation, numeric, synthesis, physical, signoff, or other close-qualifying
+evidence. Optional stale/unverifiable receipts warn and fail open; a receipt
+blocks only when the task explicitly records it as `required`.
+
+The separate A/B protocol compares `rg_open` with
+`codebase_memory_assisted` using externally captured, mutation-free run records:
+
+```bash
+aoi codebase-memory-benchmark-validate --record run.json --json
+aoi codebase-memory-benchmark-record \
+  --task <task-id> --benchmark-id <benchmark-id> \
+  --receipt-id <receipt-id> \
+  --record rg-open.json --record graph-assisted.json \
+  --record-sha256 <rg-sha256> --record-sha256 <graph-sha256> \
+  --session-id <bound-root-session> --json
+```
+
+See the [codebase-memory integration contract](docs/codebase-memory.md).
+
 For a one-to-three-file, low-risk edit, `aoi start-mini` creates the task, plan,
 session binding, and exact-file claim atomically. It intentionally rejects tree
 claims, high-risk paths, delegation, and external jobs.
@@ -307,8 +351,9 @@ claims, high-risk paths, delegation, and external jobs.
 ## Configuration
 
 `aoi.toml` defines the project name, private state directory, departments,
-role-to-capability-tier map, evidence vocabulary, receipt schema, high-risk
-paths, external lock namespace, and optional integrations. Tasks bind the exact
+role-to-capability-tier map, evidence vocabulary, external-job receipt schema,
+high-risk paths, external lock namespace, and optional hooks. Task-local
+context-provider receipts do not alter this strict configuration schema. Tasks bind the exact
 configuration SHA-256; changing governance while a task is active fails closed.
 
 See [configuration](docs/configuration.md), [architecture](docs/architecture.md),

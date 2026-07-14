@@ -289,6 +289,44 @@ Hybrid communication does not create private authority. The Steward records the
 baseline, participants, topic, evidence boundary, expiry, conclusion, dissent,
 and blockers. Decision-relevant results return to the system of record.
 
+## Optional context providers
+
+Context-provider receipts use a separate immutable ledger. They are not
+external-job source receipts and never create technical verification records.
+Provider health may be system evidence in the descriptive sense, but AOI must
+not automatically place it in a configured close-qualifying `system_evidence`
+category. Query and benchmark output is always `engineering_inference` with
+`close_qualifying=false`.
+
+The Phase 1 codebase-memory adapter is optional and fail-open. Only the Chief
+may import an exact SHA-bound receipt. Import does not launch or prove Chief
+authority over the earlier refresh, so the record remains
+`refresh_authority=external_unverified`. Specialists may use only read-only
+graph queries. Steward validates and summarizes receipt integrity, supported
+version, provider health, freshness, missingness, and dissent; Steward cannot
+modify the index or issue a technical PASS.
+
+Live provider-health validation rechecks the exact provider binary, graph
+artifact, store/config databases, and recorded client configurations. A client
+configuration that drifts from the receipt cannot remain healthy, including a
+change that removes the Specialist-side `index_repository` disablement.
+
+AOI never guesses a receipt's hash algorithm. `receipt-only` freshness is
+unverifiable. The explicit `codebase-memory-git-v1` profile defines the branch,
+HEAD, NUL-delimited porcelain status, indexed manifest, discovery-input, binary,
+store, and graph-artifact comparisons. Optional stale, degraded, unavailable,
+or unverifiable context produces warnings and falls back to repository truth.
+Only an active receipt explicitly recorded as required may make provider health
+or freshness a doctor, brief, or close-gate error. Terminal task receipts remain
+integrity-checked but are not reclassified when the external source later
+evolves.
+
+Navigation A/B records are externally measured and mutation-free. The `rg_open`
+baseline cannot query the graph; neither arm can index, watch, or mutate the
+provider; a non-fresh graph arm must fail open before querying. Summaries retain
+missing telemetry and denominators, report descriptive paired differences, and
+make no technical or general-superiority claim.
+
 ## Evidence and closure
 
 Evidence categories and close-qualifying categories come from `aoi.toml`.

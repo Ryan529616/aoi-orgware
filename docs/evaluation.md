@@ -44,6 +44,26 @@ Cost and flow:
 - decision and blocker latency;
 - unacknowledged or unverified directives.
 
+## Optional codebase-memory navigation A/B
+
+Evaluate codebase-memory separately from the AOI topology variants. Pair an
+`rg_open` baseline with a `codebase_memory_assisted` arm under the same corpus,
+pre-registered navigation oracle, assignment, source-set, receipt, runtime,
+model, and time limit. Neither arm may mutate the provider; the baseline may not
+query the graph. A non-fresh graph arm must fail open without a graph query.
+
+Report descriptive paired differences for time to first relevant source, time
+to final answer, wrong paths before the first relevant source, fallback calls,
+checked/stale/uncheckable graph results, and tokens/cost. Keep timeout and failed
+runs in the operational denominator. Missing latency or token telemetry remains
+`null` with provenance and a reason; never substitute zero. Do not collapse the
+metrics into a technical score.
+
+These records and summaries are `engineering_inference` about navigation
+efficiency. They do not establish compile, simulation, numeric, synthesis,
+physical, signoff, or general AOI superiority. See
+[the codebase-memory integration contract](codebase-memory.md).
+
 ## Reporting
 
 Publish consented, sanitized aggregates and bounded failure-case descriptions.

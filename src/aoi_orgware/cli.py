@@ -27,6 +27,26 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from . import __version__
+from .codebase_memory import (
+    FRESHNESS_PROFILES as CODEBASE_MEMORY_FRESHNESS_PROFILES,
+    QUERY_EVIDENCE_CATEGORY as CODEBASE_MEMORY_QUERY_EVIDENCE_CATEGORY,
+    RECEIPT_MAX_BYTES as CODEBASE_MEMORY_RECEIPT_MAX_BYTES,
+    active_receipt_records as active_context_receipt_records,
+    canonical_json_sha256 as context_record_sha256,
+    evaluate_live_receipt,
+    make_receipt_record,
+    parse_receipt_bytes,
+    receipt_chain_errors,
+    receipt_record_preimage,
+    steward_binding as codebase_memory_steward_binding,
+    validate_receipt_record,
+    validate_steward_binding_set as validate_codebase_memory_steward_binding_set,
+)
+from .codebase_memory_benchmark import (
+    EVIDENCE_CLASS as CODEBASE_MEMORY_BENCHMARK_EVIDENCE_CLASS,
+    summarize_records as summarize_codebase_memory_benchmark_records,
+    validate_record as validate_codebase_memory_benchmark_record,
+)
 from .config import ProjectConfig, default_config_text, load_config_path
 from .pilot import (
     PilotError,
@@ -345,6 +365,7 @@ CHIEF_AUTHORITY_CONTROL_COMMANDS = {
 CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "chief-status",
     "check-locks",
+    "codebase-memory-benchmark-validate",
     "inspect-legacy",
     "reconcile",
     "resume",
@@ -3446,6 +3467,282 @@ def validate_source_receipt(
     return payload, source_data
 
 
+def context_receipt_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    """Validate every immutable context-provider receipt and its chain."""
+
+    errors = receipt_chain_errors(state)
+    for index, record in enumerate(state.get("context_provider_receipts", []), start=1):
+        try:
+            validate_receipt_record(paths, state, record)
+        except (HarnessError, OSError, TypeError, ValueError) as exc:
+            receipt_id = (
+                str(record.get("receipt_id", index))
+                if isinstance(record, dict)
+                else str(index)
+            )
+            errors.append(f"context receipt {receipt_id} is invalid: {exc}")
+    return errors
+
+
+def context_receipt_reports(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    evaluate_live: bool,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Return machine-readable Steward health data plus doctor messages."""
+
+    reports: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    integrity_errors = context_receipt_integrity_errors(paths, state)
+    errors.extend(integrity_errors)
+    if integrity_errors:
+        return reports, errors, warnings
+    for record in active_context_receipt_records(state):
+        payload = validate_receipt_record(paths, state, record)
+        if evaluate_live:
+            live = evaluate_live_receipt(
+                payload,
+                freshness_profile=record["freshness_profile"],
+                project_root=record["project_root"],
+            )
+        else:
+            live = {
+                "provider": "codebase-memory",
+                "provider_health": "historical_not_rechecked",
+                "freshness": "historical_not_rechecked",
+                "freshness_profile": record["freshness_profile"],
+                "health_findings": [],
+                "freshness_findings": [],
+                "diagnostics": [],
+                "query_evidence_category": CODEBASE_MEMORY_QUERY_EVIDENCE_CATEGORY,
+                "close_qualifying": False,
+            }
+        report = {
+            "task_id": state["task_id"],
+            "receipt_id": record["receipt_id"],
+            "receipt_integrity": "valid",
+            "receipt_sha256": record["receipt_sha256"],
+            "source_set_id": record["source_set_id"],
+            "requirement": record["requirement"],
+            "refresh_authority": record["refresh_authority"],
+            **live,
+            "technical_verdict_authority": "none",
+        }
+        reports.append(report)
+        if not evaluate_live:
+            continue
+        unhealthy = live["provider_health"] != "healthy"
+        nonfresh = live["freshness"] != "fresh"
+        if not unhealthy and not nonfresh:
+            continue
+        details = [
+            *(item["detail"] for item in live["health_findings"]),
+            *(item["detail"] for item in live["freshness_findings"]),
+        ]
+        rendered_details = "; ".join(details[:8])
+        if len(details) > 8:
+            rendered_details += f"; ... {len(details) - 8} more findings"
+        message = (
+            f"codebase-memory receipt {record['receipt_id']} is "
+            f"health={live['provider_health']}, freshness={live['freshness']}: "
+            + (rendered_details if details else "no qualifying live receipt")
+        )
+        (errors if record["requirement"] == "required" else warnings).append(message)
+    return reports, errors, warnings
+
+
+def context_provider_brief_bindings(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Evaluate active receipts for a Steward brief without technical verdicts."""
+
+    bindings: list[dict[str, Any]] = []
+    integrity_errors = context_receipt_integrity_errors(paths, state)
+    if integrity_errors:
+        raise HarnessError("context-provider receipt integrity failed: " + "; ".join(integrity_errors))
+    for record in active_context_receipt_records(state):
+        payload = validate_receipt_record(paths, state, record)
+        report = evaluate_live_receipt(
+            payload,
+            freshness_profile=record["freshness_profile"],
+            project_root=record["project_root"],
+        )
+        if record["requirement"] == "required" and (
+            report["provider_health"] != "healthy"
+            or report["freshness"] != "fresh"
+        ):
+            raise HarnessError(
+                f"required codebase-memory receipt {record['receipt_id']} is not healthy and fresh"
+            )
+        bindings.append(codebase_memory_steward_binding(record, report))
+    return bindings
+
+
+def benchmark_ledger_preimage(record: dict[str, Any]) -> dict[str, Any]:
+    preimage = copy.deepcopy(record)
+    preimage.pop("record_sha256", None)
+    return preimage
+
+
+def validate_benchmark_ledger_record(
+    paths: HarnessPaths, state: dict[str, Any], record: Any
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise HarnessError("codebase-memory benchmark ledger entry must be an object")
+    expected_fields = {
+        "integrity_version",
+        "record_version",
+        "benchmark_id",
+        "provider",
+        "receipt_id",
+        "receipt_sha256",
+        "source_set_id",
+        "input_snapshots",
+        "summary_path",
+        "summary_sha256",
+        "summary_size_bytes",
+        "evidence_class",
+        "close_qualifying",
+        "recorded_by_session_id",
+        "recorded_at",
+        "record_sha256",
+    }
+    if set(record) != expected_fields:
+        raise HarnessError("codebase-memory benchmark ledger fields are invalid")
+    if record.get("integrity_version") != 1 or record.get("record_version") != 1:
+        raise HarnessError("codebase-memory benchmark ledger version is invalid")
+    benchmark_id = validate_id(str(record.get("benchmark_id", "")), "benchmark id")
+    if record.get("provider") != "codebase-memory":
+        raise HarnessError("codebase-memory benchmark provider changed")
+    if record.get("evidence_class") != CODEBASE_MEMORY_BENCHMARK_EVIDENCE_CLASS:
+        raise HarnessError("codebase-memory benchmark evidence class changed")
+    if record.get("close_qualifying") is not False:
+        raise HarnessError("codebase-memory benchmark became close-qualifying")
+    receipt_id = str(record.get("receipt_id", ""))
+    matching_receipts = [
+        item
+        for item in state.get("context_provider_receipts", [])
+        if item.get("receipt_id") == receipt_id
+    ]
+    if len(matching_receipts) != 1:
+        raise HarnessError("codebase-memory benchmark receipt binding is missing")
+    receipt = matching_receipts[0]
+    if (
+        record.get("receipt_sha256") != receipt.get("receipt_sha256")
+        or record.get("source_set_id") != receipt.get("source_set_id")
+    ):
+        raise HarnessError("codebase-memory benchmark receipt/source-set binding changed")
+    inputs = record.get("input_snapshots")
+    if not isinstance(inputs, list) or not inputs:
+        raise HarnessError("codebase-memory benchmark lacks input snapshots")
+    parsed: list[dict[str, Any]] = []
+    for index, snapshot in enumerate(inputs, start=1):
+        if not isinstance(snapshot, dict):
+            raise HarnessError("codebase-memory benchmark input snapshot is malformed")
+        if set(snapshot) != {"source_path", "path", "sha256", "size_bytes"}:
+            raise HarnessError("codebase-memory benchmark input snapshot fields are invalid")
+        if not Path(str(snapshot.get("source_path", ""))).is_absolute():
+            raise HarnessError("codebase-memory benchmark input source path is not absolute")
+        expected_path = (
+            task_dir(paths, state["task_id"])
+            / "results"
+            / f"codebase-memory-benchmark-{benchmark_id}-input-{index:03}.json"
+        )
+        if Path(str(snapshot.get("path", ""))) != expected_path:
+            raise HarnessError("codebase-memory benchmark input path is not canonical")
+        _, data = read_regular_artifact(
+            expected_path,
+            "codebase-memory benchmark input snapshot",
+            max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+            require_utf8=True,
+        )
+        if (
+            len(data) != snapshot.get("size_bytes")
+            or hashlib.sha256(data).hexdigest() != snapshot.get("sha256")
+        ):
+            raise HarnessError("codebase-memory benchmark input snapshot identity mismatch")
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HarnessError(f"codebase-memory benchmark input JSON is invalid: {exc}") from exc
+        payload = validate_codebase_memory_benchmark_record(payload)
+        if (
+            payload["controls"]["provider_receipt_sha256"]
+            != record["receipt_sha256"]
+            or payload["controls"]["source_set_id"] != record["source_set_id"]
+        ):
+            raise HarnessError("codebase-memory benchmark input lost receipt binding")
+        parsed.append(payload)
+    summary_path = (
+        task_dir(paths, state["task_id"])
+        / "results"
+        / f"codebase-memory-benchmark-{benchmark_id}-summary.json"
+    )
+    if Path(str(record.get("summary_path", ""))) != summary_path:
+        raise HarnessError("codebase-memory benchmark summary path is not canonical")
+    _, summary_data = read_regular_artifact(
+        summary_path,
+        "codebase-memory benchmark summary",
+        max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+        require_utf8=True,
+    )
+    if (
+        len(summary_data) != record.get("summary_size_bytes")
+        or hashlib.sha256(summary_data).hexdigest() != record.get("summary_sha256")
+    ):
+        raise HarnessError("codebase-memory benchmark summary identity mismatch")
+    try:
+        summary = json.loads(summary_data.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"codebase-memory benchmark summary JSON is invalid: {exc}") from exc
+    if summary.get("evidence_class") != CODEBASE_MEMORY_BENCHMARK_EVIDENCE_CLASS:
+        raise HarnessError("codebase-memory benchmark summary evidence class changed")
+    try:
+        parse_time(str(summary.get("generated_at", "")))
+        parse_time(str(record.get("recorded_at", "")))
+    except (TypeError, ValueError) as exc:
+        raise HarnessError(f"codebase-memory benchmark timestamp is invalid: {exc}") from exc
+    require_text(
+        str(record.get("recorded_by_session_id", "")),
+        "codebase-memory benchmark recording session",
+    )
+    expected_summary = summarize_codebase_memory_benchmark_records(
+        parsed, generated_at=str(summary.get("generated_at", ""))
+    )
+    if summary != expected_summary:
+        raise HarnessError("codebase-memory benchmark summary is not reproducible")
+    if record.get("record_sha256") != context_record_sha256(
+        benchmark_ledger_preimage(record)
+    ):
+        raise HarnessError("codebase-memory benchmark ledger integrity mismatch")
+    return summary
+
+
+def context_benchmark_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+    for index, record in enumerate(state.get("context_provider_benchmarks", []), start=1):
+        benchmark_id = (
+            str(record.get("benchmark_id", index))
+            if isinstance(record, dict)
+            else str(index)
+        )
+        if benchmark_id in seen:
+            errors.append(f"codebase-memory benchmark id is duplicated: {benchmark_id}")
+        seen.add(benchmark_id)
+        try:
+            validate_benchmark_ledger_record(paths, state, record)
+        except (HarnessError, OSError, TypeError, ValueError) as exc:
+            errors.append(f"codebase-memory benchmark {benchmark_id} is invalid: {exc}")
+    return errors
+
+
 def job_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     try:
@@ -4592,6 +4889,8 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_policy_version": EXECUTION_POLICY_VERSION,
             "legacy_execution_policy": False,
             "execution_briefs": [],
+            "context_provider_receipts": [],
+            "context_provider_benchmarks": [],
             "facts": [],
             "decisions": [],
             "rejected_paths": [],
@@ -4716,6 +5015,8 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_policy_version": EXECUTION_POLICY_VERSION,
             "legacy_execution_policy": False,
             "execution_briefs": [],
+            "context_provider_receipts": [],
+            "context_provider_benchmarks": [],
             "facts": ["Mini lifecycle atomically initialized, approved, bound, and claimed."],
             "decisions": [],
             "rejected_paths": [],
@@ -6745,6 +7046,14 @@ def _execution_brief_coverage_error(
     preimage.pop("brief_sha256", None)
     if stored_sha != canonical_record_sha256(preimage):
         return f"execution selection {selection_id} Steward result brief lost integrity"
+    context_bindings = brief.get("context_provider_bindings", [])
+    try:
+        validate_codebase_memory_steward_binding_set(state, context_bindings)
+    except HarnessError as exc:
+        return (
+            f"execution selection {selection_id} Steward context-provider "
+            f"binding is stale or invalid: {exc}"
+        )
     if selection.get("mode") == "hybrid":
         referenced = set(brief.get("cross_lane_session_ids", []))
         valid_closed = {
@@ -7014,6 +7323,7 @@ def cmd_execution_brief_record(
                 raise HarnessError(
                     "hybrid execution brief requires at least one exact closed cross-lane session"
                 )
+        context_provider_bindings = context_provider_brief_bindings(paths, state)
         brief = {
             "integrity_version": 1,
             "brief_version": brief_version,
@@ -7029,6 +7339,7 @@ def cmd_execution_brief_record(
                 else {}
             ),
             "cross_lane_session_ids": cross_session_ids,
+            "context_provider_bindings": context_provider_bindings,
             "summary": require_evidence_detail(
                 args.summary, "execution brief summary"
             ),
@@ -11540,6 +11851,11 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     failures.extend(packet_recovery_integrity_errors(paths, state))
     failures.extend(job_integrity_errors(paths, state))
     failures.extend(verification_integrity_errors(paths, state))
+    _provider_reports, provider_errors, _provider_warnings = context_receipt_reports(
+        paths, state, evaluate_live=True
+    )
+    failures.extend(provider_errors)
+    failures.extend(context_benchmark_integrity_errors(paths, state))
     failures.extend(portfolio_integrity_errors(state, paths))
     for selection in state.get("execution_selections", []):
         if selection.get("mode") not in {"centralized_parallel", "hybrid"}:
@@ -12086,6 +12402,261 @@ def cmd_verify_backup(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
+def cmd_context_receipt_record(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    receipt_id = validate_id(args.receipt_id, "context receipt id")
+    expected_sha = require_text(
+        args.receipt_sha256, "codebase-memory receipt SHA-256"
+    ).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        raise HarnessError("codebase-memory receipt SHA-256 must be full 64 hex")
+    supersedes = args.supersedes_receipt_id or ""
+    if supersedes:
+        validate_id(supersedes, "superseded context receipt id")
+    if args.requirement == "required" and args.freshness_profile == "receipt-only":
+        raise HarnessError(
+            "a required codebase-memory receipt needs an independently defined freshness profile"
+        )
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "record context receipt for")
+        require_plan_ready(paths, state, "record context receipt")
+        if state.get("profile") == "mini":
+            raise HarnessError("mini task may not record context-provider receipts")
+        root_session_id = require_root_session(paths, state, args.session_id)
+        existing_errors = context_receipt_integrity_errors(paths, state)
+        if existing_errors:
+            raise HarnessError(
+                "existing context receipt integrity failed: " + "; ".join(existing_errors)
+            )
+        records = state.setdefault("context_provider_receipts", [])
+        if any(item.get("receipt_id") == receipt_id for item in records):
+            raise HarnessError(f"context receipt already exists: {receipt_id}")
+        active = active_context_receipt_records(state)
+        if active:
+            if len(active) != 1 or supersedes != active[0].get("receipt_id"):
+                raise HarnessError(
+                    "a new codebase-memory receipt must supersede the exact active receipt"
+                )
+        elif supersedes:
+            raise HarnessError("context receipt cannot supersede a missing active receipt")
+        _, source_data = read_regular_artifact(
+            args.receipt,
+            "codebase-memory receipt",
+            max_bytes=CODEBASE_MEMORY_RECEIPT_MAX_BYTES,
+            require_utf8=True,
+        )
+        actual_sha = hashlib.sha256(source_data).hexdigest()
+        if actual_sha != expected_sha:
+            raise HarnessError(
+                f"codebase-memory receipt SHA-256 mismatch: expected {expected_sha}, actual {actual_sha}"
+            )
+        payload = parse_receipt_bytes(source_data)
+        snapshot = snapshot_evidence_artifact(
+            paths,
+            state["task_id"],
+            args.receipt,
+            expected_sha,
+            label="codebase-memory receipt",
+            basename=f"codebase-memory-receipt-{receipt_id}.json",
+            max_bytes=CODEBASE_MEMORY_RECEIPT_MAX_BYTES,
+        )
+        record = make_receipt_record(
+            receipt_id=receipt_id,
+            snapshot=snapshot,
+            payload=payload,
+            requirement=args.requirement,
+            freshness_profile=args.freshness_profile,
+            supersedes_receipt_id=supersedes,
+            recorded_by_session_id=root_session_id,
+            recorded_at=now_iso(),
+        )
+        records.append(record)
+        chain_errors = receipt_chain_errors(state)
+        if chain_errors:
+            raise HarnessError("context receipt chain is invalid: " + "; ".join(chain_errors))
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    provider_report = evaluate_live_receipt(
+        payload,
+        freshness_profile=record["freshness_profile"],
+        project_root=record["project_root"],
+    )
+    emit({"record": record, "provider_report": provider_report}, args.json)
+    return 0
+
+
+def cmd_codebase_memory_benchmark_validate(
+    args: argparse.Namespace, _paths: HarnessPaths
+) -> int:
+    _, data = read_regular_artifact(
+        args.record,
+        "codebase-memory benchmark record",
+        max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+        require_utf8=True,
+    )
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"codebase-memory benchmark record JSON is invalid: {exc}") from exc
+    record = validate_codebase_memory_benchmark_record(payload)
+    emit(
+        {
+            "valid": True,
+            "run_id": record["run_id"],
+            "case_pair_id": record["case_pair_id"],
+            "variant": record["variant"],
+            "run_status": record["run_status"],
+            "evidence_class": CODEBASE_MEMORY_BENCHMARK_EVIDENCE_CLASS,
+            "close_qualifying": False,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_codebase_memory_benchmark_record(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    benchmark_id = validate_id(args.benchmark_id, "codebase-memory benchmark id")
+    if len(args.record) != len(args.record_sha256):
+        raise HarnessError("each benchmark --record requires one --record-sha256")
+    if not args.record:
+        raise HarnessError("codebase-memory benchmark requires at least one record")
+    prepared: list[tuple[str, str, bytes, dict[str, Any]]] = []
+    for source_value, expected_value in zip(args.record, args.record_sha256, strict=True):
+        expected = require_text(expected_value, "benchmark record SHA-256").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise HarnessError("benchmark record SHA-256 must be full 64 hex")
+        source, data = read_regular_artifact(
+            source_value,
+            "codebase-memory benchmark record",
+            max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+            require_utf8=True,
+        )
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != expected:
+            raise HarnessError(
+                f"benchmark record SHA-256 mismatch: expected {expected}, actual {actual}"
+            )
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HarnessError(f"benchmark record JSON is invalid: {exc}") from exc
+        prepared.append(
+            (
+                str(source),
+                expected,
+                data,
+                validate_codebase_memory_benchmark_record(payload),
+            )
+        )
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "record codebase-memory benchmark for")
+        require_plan_ready(paths, state, "record codebase-memory benchmark")
+        if state.get("profile") == "mini":
+            raise HarnessError("mini task may not record context-provider benchmarks")
+        root_session_id = require_root_session(paths, state, args.session_id)
+        if any(
+            item.get("benchmark_id") == benchmark_id
+            for item in state.setdefault("context_provider_benchmarks", [])
+        ):
+            raise HarnessError(f"codebase-memory benchmark already exists: {benchmark_id}")
+        integrity_errors = context_receipt_integrity_errors(paths, state)
+        if integrity_errors:
+            raise HarnessError("context receipt integrity failed: " + "; ".join(integrity_errors))
+        active = active_context_receipt_records(state)
+        if len(active) != 1 or active[0].get("receipt_id") != args.receipt_id:
+            raise HarnessError("benchmark must bind the exact active codebase-memory receipt")
+        receipt = active[0]
+        receipt_payload = validate_receipt_record(paths, state, receipt)
+        provider_report = evaluate_live_receipt(
+            receipt_payload,
+            freshness_profile=receipt["freshness_profile"],
+            project_root=receipt["project_root"],
+        )
+        records = [item[3] for item in prepared]
+        graph_query_observed = any(
+            item["variant"] == "codebase_memory_assisted"
+            and item["trace"]["graph_query_calls"] > 0
+            for item in records
+        )
+        if graph_query_observed and (
+            provider_report["provider_health"] != "healthy"
+            or provider_report["freshness"] != "fresh"
+        ):
+            raise HarnessError(
+                "benchmark graph observations require a currently healthy and fresh receipt"
+            )
+        for item in records:
+            controls = item["controls"]
+            if (
+                controls["provider_receipt_sha256"] != receipt["receipt_sha256"]
+                or controls["source_set_id"] != receipt["source_set_id"]
+            ):
+                raise HarnessError("benchmark record differs from the active receipt/source set")
+            if item["freshness"]["profile"] != receipt["freshness_profile"]:
+                raise HarnessError("benchmark record freshness profile differs from AOI receipt")
+            if item["freshness"]["status"] != provider_report["freshness"]:
+                raise HarnessError("benchmark record freshness status differs from AOI doctor")
+        summary = summarize_codebase_memory_benchmark_records(
+            records, generated_at=now_iso()
+        )
+        snapshots: list[dict[str, Any]] = []
+        for index, (source, expected, _data, _payload) in enumerate(prepared, start=1):
+            snapshots.append(
+                snapshot_evidence_artifact(
+                    paths,
+                    state["task_id"],
+                    source,
+                    expected,
+                    label="codebase-memory benchmark record",
+                    basename=(
+                        f"codebase-memory-benchmark-{benchmark_id}-input-{index:03}.json"
+                    ),
+                    max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+                )
+            )
+        summary_path = (
+            task_dir(paths, state["task_id"])
+            / "results"
+            / f"codebase-memory-benchmark-{benchmark_id}-summary.json"
+        )
+        atomic_write_json(summary_path, summary)
+        ledger = {
+            "integrity_version": 1,
+            "record_version": 1,
+            "benchmark_id": benchmark_id,
+            "provider": "codebase-memory",
+            "receipt_id": receipt["receipt_id"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "source_set_id": receipt["source_set_id"],
+            "input_snapshots": snapshots,
+            "summary_path": str(summary_path),
+            "summary_sha256": sha256_file(summary_path),
+            "summary_size_bytes": summary_path.stat().st_size,
+            "evidence_class": CODEBASE_MEMORY_BENCHMARK_EVIDENCE_CLASS,
+            "close_qualifying": False,
+            "recorded_by_session_id": root_session_id,
+            "recorded_at": now_iso(),
+        }
+        ledger["record_sha256"] = context_record_sha256(
+            benchmark_ledger_preimage(ledger)
+        )
+        state["context_provider_benchmarks"].append(ledger)
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {"benchmark": ledger, "summary": summary, "provider_report": provider_report},
+        args.json,
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     preflight_layout(paths)
     errors: list[str] = []
@@ -12162,6 +12733,8 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             structured_by_task.setdefault(task_id, set()).add(token)
 
     task_ids = {task["task_id"] for task in tasks}
+    provider_reports: list[dict[str, Any]] = []
+    benchmark_reports: list[dict[str, Any]] = []
     for task in tasks:
         task_id = task["task_id"]
         referenced = set(task.get("claims", []))
@@ -12230,6 +12803,31 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         warnings.extend(
             f"task {task_id}: {item}" for item in verification_integrity_warnings(task)
         )
+
+        task_provider_reports, task_provider_errors, task_provider_warnings = (
+            context_receipt_reports(
+                paths,
+                task,
+                evaluate_live=task.get("status") in {"active", "blocked"},
+            )
+        )
+        provider_reports.extend(task_provider_reports)
+        errors.extend(f"task {task_id}: {item}" for item in task_provider_errors)
+        warnings.extend(f"task {task_id}: {item}" for item in task_provider_warnings)
+        benchmark_errors = context_benchmark_integrity_errors(paths, task)
+        errors.extend(f"task {task_id}: {item}" for item in benchmark_errors)
+        if not benchmark_errors:
+            benchmark_reports.extend(
+                {
+                    "task_id": task_id,
+                    "benchmark_id": item.get("benchmark_id"),
+                    "receipt_id": item.get("receipt_id"),
+                    "summary_sha256": item.get("summary_sha256"),
+                    "evidence_class": item.get("evidence_class"),
+                    "close_qualifying": item.get("close_qualifying"),
+                }
+                for item in task.get("context_provider_benchmarks", [])
+            )
 
         if task.get("status") in {"active", "blocked"}:
             errors.extend(
@@ -12511,6 +13109,8 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "warnings": warnings,
         "task_count": len(tasks),
         "claim_count": len(claims),
+        "context_providers": provider_reports,
+        "context_provider_benchmarks": benchmark_reports,
         "platform": platform_capabilities(),
     }
     emit(payload, args.json)
@@ -12596,6 +13196,49 @@ def build_parser(
     p.add_argument("--file", required=True)
     add_json_argument(p)
     p.set_defaults(handler=cmd_config_check)
+
+    p = sub.add_parser(
+        "context-receipt-record",
+        help="record an immutable optional context-provider receipt",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--provider", choices=["codebase-memory"], required=True)
+    p.add_argument("--receipt-id", required=True)
+    p.add_argument("--receipt", required=True)
+    p.add_argument("--receipt-sha256", required=True)
+    p.add_argument(
+        "--requirement", choices=["optional", "required"], default="optional"
+    )
+    p.add_argument(
+        "--freshness-profile",
+        choices=sorted(CODEBASE_MEMORY_FRESHNESS_PROFILES),
+        default="receipt-only",
+    )
+    p.add_argument("--supersedes-receipt-id")
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_context_receipt_record)
+
+    p = sub.add_parser(
+        "codebase-memory-benchmark-validate",
+        help="validate one navigation-only codebase-memory A/B record",
+    )
+    p.add_argument("--record", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_codebase_memory_benchmark_validate)
+
+    p = sub.add_parser(
+        "codebase-memory-benchmark-record",
+        help="snapshot and summarize paired navigation-only A/B records",
+    )
+    p.add_argument("--task", required=True)
+    p.add_argument("--benchmark-id", required=True)
+    p.add_argument("--receipt-id", required=True)
+    p.add_argument("--record", action="append", default=[], required=True)
+    p.add_argument("--record-sha256", action="append", default=[], required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_codebase_memory_benchmark_record)
 
     p = sub.add_parser("chief-acquire", help="acquire the project Chief lease")
     p.add_argument("--session-id", required=True)

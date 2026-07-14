@@ -104,6 +104,8 @@ TASK_OBJECT_LIST_FIELDS = {
     "branch_adoptions",
     "capacity_reviews",
     "coordination_requests",
+    "context_provider_benchmarks",
+    "context_provider_receipts",
     "cross_lane_sessions",
     "execution_briefs",
     "execution_selections",
