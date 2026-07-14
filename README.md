@@ -9,7 +9,7 @@ It is not another chat router. It sits above an agent runtime and records what
 the organization is allowed to do, what it decided, what changed, and what was
 actually verified.
 
-> Status: **v0.2.1 alpha**. The core lifecycle is tested, but AOI has not yet been
+> Status: **v0.2.2 alpha**. The core lifecycle is tested, but AOI has not yet been
 > proven better than a simpler single-agent or supervisor topology. Benchmark it
 > on your own workload before relying on it.
 
@@ -63,8 +63,9 @@ every request through every lane.
   agents, total agents across both depths, and delegation depth; envelopes are
   SHA-bound into every new selected packet and revalidated at packet
   arm/dispatch
-- typed, versioned User-to-Chief override proposals with exact target,
-  expiration, Chief rationale/risk/rollback controls, and one-time consumption
+- typed, versioned User-to-Chief override proposals with a SHA-bound semantic
+  target contract, expiration, Chief rationale/risk/rollback controls, and
+  one-time consumption
 - receipt-backed project `.codex/config.toml` and `.codex/agents/*.toml`
   planning, apply, and exact-byte rollback for Codex concurrency, model, and
   reasoning defaults

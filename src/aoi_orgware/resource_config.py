@@ -24,12 +24,14 @@ from .harnesslib import (
     atomic_write_bytes,
     canonicalize_no_link_traversal,
     fsync_directory,
+    validate_id,
 )
 
 
 RESOURCE_PLAN_SCHEMA_VERSION = 1
 RESOURCE_RECEIPT_SCHEMA_VERSION = 2
 RESOURCE_FILE_MAX_BYTES = 512 * 1024
+RESOURCE_FILE_MAX_COUNT = 64
 RESOURCE_TOTAL_MAX_BYTES = 4 * 1024 * 1024
 ARISE_MAX_THREADS_CEILING = 12
 AOI_MAX_DELEGATION_DEPTH = 2
@@ -57,6 +59,14 @@ ENVELOPE_OVERRIDE_KEYS = {
     "envelope.max_delegation_depth",
 }
 OVERRIDE_TARGET_KINDS = {"resource_config", "execution_resource"}
+
+
+class ResourceApplyRollbackError(HarnessError):
+    """Apply failed and the exact automatic rollback could not be completed."""
+
+
+class ResourceRollbackReapplyError(HarnessError):
+    """Rollback failed and the exact applied bytes could not be restored."""
 
 
 def _sha256(payload: bytes) -> str:
@@ -409,6 +419,7 @@ def _dynamic_envelope(
 
 def build_codex_resource_plan(
     *,
+    event_id: str,
     root: Path,
     config: ProjectConfig,
     state: dict[str, Any],
@@ -420,6 +431,10 @@ def build_codex_resource_plan(
     override_id: str = "",
     override_settings: dict[str, str | int] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    event_id = validate_id(event_id, "resource config event id")
+    approved_task_plan_sha256 = str(state.get("plan_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", approved_task_plan_sha256):
+        raise HarnessError("resource plan requires the exact approved task plan SHA-256")
     if (
         not isinstance(platform_max_threads, int)
         or isinstance(platform_max_threads, bool)
@@ -458,6 +473,23 @@ def build_codex_resource_plan(
     if not managed_roles:
         selected_roles.update(_active_roles(state))
     selection_settings = dict(dynamic_envelope.get("role_config_overrides", {}))
+    if selection_settings:
+        canonical_selection_settings = parse_override_settings(
+            [f"{key}={value}" for key, value in selection_settings.items()],
+            roles=config.roles,
+            target_kind="execution_resource",
+        )
+        if canonical_selection_settings != selection_settings:
+            raise HarnessError("execution selection resource settings are not canonical")
+    supplied_override_settings = dict(override_settings or {})
+    if supplied_override_settings:
+        canonical_override_settings = parse_override_settings(
+            [f"{key}={value}" for key, value in supplied_override_settings.items()],
+            roles=config.roles,
+            target_kind="resource_config",
+        )
+        if canonical_override_settings != supplied_override_settings:
+            raise HarnessError("resource override settings are not canonical")
     for key in selection_settings:
         match = AGENT_OVERRIDE_KEY_RE.fullmatch(key)
         if match and match.group(2):
@@ -471,7 +503,7 @@ def build_codex_resource_plan(
             for packet in state.get("packets", [])
         )
     )
-    for key in (override_settings or {}):
+    for key in supplied_override_settings:
         match = AGENT_OVERRIDE_KEY_RE.fullmatch(key)
         if match and match.group(2):
             selected_roles.add(match.group(2))
@@ -515,7 +547,7 @@ def build_codex_resource_plan(
             "profile_source_kind": source_kind,
             "profile_source_sha256": _sha256(source),
         }
-    settings = {**selection_settings, **dict(override_settings or {})}
+    settings = {**selection_settings, **supplied_override_settings}
     for key, value in settings.items():
         if key == "agents.max_threads":
             if not isinstance(value, int) or not 1 <= value <= ARISE_MAX_THREADS_CEILING:
@@ -602,12 +634,18 @@ def build_codex_resource_plan(
                 "source_sha256": _sha256(source),
             }
         )
+    if len(files) > RESOURCE_FILE_MAX_COUNT:
+        raise HarnessError(
+            f"Codex resource plan exceeds the {RESOURCE_FILE_MAX_COUNT}-file limit"
+        )
     total = sum(len(item["after"]) + len(item["before"] or b"") for item in files)
     if total > RESOURCE_TOTAL_MAX_BYTES:
         raise HarnessError("Codex resource plan exceeds the aggregate byte limit")
     view: dict[str, Any] = {
         "schema_version": RESOURCE_PLAN_SCHEMA_VERSION,
+        "event_id": event_id,
         "task_id": state.get("task_id"),
+        "approved_task_plan_sha256": approved_task_plan_sha256,
         "project_root": str(root),
         "aoi_config_sha256": config.sha256,
         "demand": {
@@ -627,7 +665,7 @@ def build_codex_resource_plan(
         },
         "override_id": override_id,
         "selection_role_settings": selection_settings,
-        "override_settings": dict(override_settings or {}),
+        "override_settings": supplied_override_settings,
         "required_locks": [
             f"repo:file:{item['relative_path']}" for item in files
         ],
@@ -672,43 +710,144 @@ def assert_resource_plan_current(files: list[dict[str, Any]]) -> None:
             )
 
 
-def _restore_files(files: list[dict[str, Any]], *, expect_after: bool) -> None:
-    for item in reversed(files):
-        path = Path(item["path"])
+def _assert_resource_state(
+    files: list[dict[str, Any]], *, state_key: str, action: str
+) -> None:
+    """Preflight every target before a multi-file transition mutates any file."""
+
+    for item in files:
         current = _safe_read(
-            path, f"resource target {item['relative_path']}", allow_missing=True
+            Path(item["path"]),
+            f"{action} target {item['relative_path']}",
+            allow_missing=True,
         )
-        expected = item["after"] if expect_after else current
-        if expect_after and current != expected:
-            raise HarnessError(
-                f"resource rollback target drifted: {item['relative_path']}"
+        if current != item[state_key]:
+            raise HarnessError(f"{action} target drifted: {item['relative_path']}")
+
+
+def _write_resource_state(item: dict[str, Any], *, state_key: str) -> None:
+    path = Path(item["path"])
+    payload = item[state_key]
+    if payload is None:
+        canonical = canonicalize_no_link_traversal(path, "resource file removal")
+        canonical.unlink()
+        fsync_directory(canonical.parent)
+    else:
+        atomic_write_bytes(path, payload)
+
+
+def _recover_resource_transition(
+    transitioned: list[dict[str, Any]], *, source_key: str, target_key: str, action: str
+) -> None:
+    """Return an incomplete transition to its exact source state."""
+
+    _assert_resource_state(
+        transitioned,
+        state_key=target_key,
+        action=f"{action} recovery preflight",
+    )
+    for item in reversed(transitioned):
+        try:
+            _write_resource_state(item, state_key=source_key)
+        except BaseException:
+            current = _safe_read(
+                Path(item["path"]),
+                f"{action} recovery target {item['relative_path']}",
+                allow_missing=True,
             )
-        before = item["before"]
-        if before is None:
-            if current is not None:
-                canonical = canonicalize_no_link_traversal(path, "resource rollback")
-                canonical.unlink()
-                fsync_directory(canonical.parent)
-        else:
-            atomic_write_bytes(path, before)
+            if current == item[source_key]:
+                continue
+            raise
+
+
+def _transition_resource_files(
+    files: list[dict[str, Any]],
+    *,
+    source_key: str,
+    target_key: str,
+    action: str,
+    recovery_error: type[HarnessError],
+) -> None:
+    """Apply one recoverable exact-byte multi-file state transition."""
+
+    _assert_resource_state(files, state_key=source_key, action=action)
+    transitioned: list[dict[str, Any]] = []
+    try:
+        for item in files:
+            try:
+                _write_resource_state(item, state_key=target_key)
+            except BaseException as write_exc:
+                try:
+                    current = _safe_read(
+                        Path(item["path"]),
+                        f"failed {action} target {item['relative_path']}",
+                        allow_missing=True,
+                    )
+                except BaseException as inspect_exc:
+                    try:
+                        _recover_resource_transition(
+                            transitioned,
+                            source_key=source_key,
+                            target_key=target_key,
+                            action=action,
+                        )
+                    except BaseException as recovery_exc:
+                        raise recovery_error(
+                            f"{action} target could not be classified and recovery "
+                            f"also failed: {recovery_exc}"
+                        ) from recovery_exc
+                    raise recovery_error(
+                        f"{action} target outcome could not be classified; inspect "
+                        f"{item['relative_path']}"
+                    ) from inspect_exc
+                if current == item[target_key] and current != item[source_key]:
+                    transitioned.append(item)
+                elif current != item[source_key]:
+                    try:
+                        _recover_resource_transition(
+                            transitioned,
+                            source_key=source_key,
+                            target_key=target_key,
+                            action=action,
+                        )
+                    except BaseException as recovery_exc:
+                        raise recovery_error(
+                            f"{action} left an uncertain target and recovery also failed; "
+                            f"inspect {item['relative_path']}: {recovery_exc}"
+                        ) from recovery_exc
+                    raise recovery_error(
+                        f"{action} left a target in neither reviewed state; inspect "
+                        f"{item['relative_path']}"
+                    ) from write_exc
+                raise
+            else:
+                transitioned.append(item)
+    except recovery_error:
+        raise
+    except BaseException:
+        try:
+            _recover_resource_transition(
+                transitioned,
+                source_key=source_key,
+                target_key=target_key,
+                action=action,
+            )
+        except BaseException as recovery_exc:
+            raise recovery_error(
+                f"{action} failed and exact recovery also failed; inspect targets "
+                f"before retry: {recovery_exc}"
+            ) from recovery_exc
+        raise
 
 
 def apply_resource_files(files: list[dict[str, Any]]) -> None:
-    assert_resource_plan_current(files)
-    applied: list[dict[str, Any]] = []
-    try:
-        for item in files:
-            atomic_write_bytes(Path(item["path"]), item["after"])
-            applied.append(item)
-    except BaseException:
-        try:
-            _restore_files(applied, expect_after=True)
-        except BaseException as rollback_exc:
-            raise HarnessError(
-                "resource apply failed and automatic rollback also failed; inspect exact "
-                f"targets before retry: {rollback_exc}"
-            ) from rollback_exc
-        raise
+    _transition_resource_files(
+        files,
+        source_key="before",
+        target_key="after",
+        action="resource apply",
+        recovery_error=ResourceApplyRollbackError,
+    )
 
 
 def make_resource_receipt(
@@ -755,15 +894,53 @@ def receipt_sha256(receipt: dict[str, Any]) -> str:
     return _sha256(_canonical_json(receipt))
 
 
-def rollback_files_from_receipt(*, root: Path, receipt: dict[str, Any]) -> None:
+def validate_resource_receipt(receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate a receipt and return its decoded, still path-relative files."""
+
     if receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION:
         raise HarnessError("unsupported resource receipt schema")
-    root = canonicalize_no_link_traversal(root, "Codex project root")
+    plan = receipt.get("plan")
+    if (
+        not isinstance(plan, dict)
+        or plan.get("schema_version") != RESOURCE_PLAN_SCHEMA_VERSION
+        or receipt.get("event_id") != plan.get("event_id")
+        or receipt.get("plan_sha256") != plan.get("plan_sha256")
+        or resource_plan_sha256(plan) != plan.get("plan_sha256")
+        or receipt.get("task_id") != plan.get("task_id")
+        or receipt.get("override_id", "") != plan.get("override_id", "")
+    ):
+        raise HarnessError("resource receipt plan binding is invalid")
+    raw_files = receipt.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise HarnessError("resource receipt contains no files")
+    if len(raw_files) > RESOURCE_FILE_MAX_COUNT:
+        raise HarnessError("resource receipt contains too many files")
     files: list[dict[str, Any]] = []
-    for record in receipt.get("files", []):
+    seen: set[str] = set()
+    total = 0
+    for record in raw_files:
+        if not isinstance(record, dict):
+            raise HarnessError("resource receipt file record is invalid")
         relative = record.get("relative_path")
-        if not isinstance(relative, str) or not relative.startswith(".codex/"):
+        if not isinstance(relative, str) or not (
+            relative == ".codex/config.toml"
+            or re.fullmatch(
+                r"\.codex/agents/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.toml",
+                relative,
+            )
+        ):
             raise HarnessError("resource receipt contains an invalid project path")
+        if relative in seen:
+            raise HarnessError("resource receipt repeats a project path")
+        seen.add(relative)
+        if not isinstance(record.get("before_exists"), bool):
+            raise HarnessError("resource receipt before_exists must be boolean")
+        if record.get("source_kind") not in {
+            "generated",
+            "project",
+            "user_template",
+        } or not re.fullmatch(r"[0-9a-f]{64}", str(record.get("source_sha256", ""))):
+            raise HarnessError("resource receipt source identity is invalid")
         try:
             before = base64.b64decode(record.get("before_base64", ""), validate=True)
             after = base64.b64decode(record.get("after_base64", ""), validate=True)
@@ -773,14 +950,64 @@ def rollback_files_from_receipt(*, root: Path, receipt: dict[str, Any]) -> None:
             after
         ) != record.get("after_sha256"):
             raise HarnessError("resource receipt backup SHA-256 mismatch")
+        if not record["before_exists"] and before:
+            raise HarnessError("missing resource receipt target has non-empty prior bytes")
+        if len(before) > RESOURCE_FILE_MAX_BYTES or len(after) > RESOURCE_FILE_MAX_BYTES:
+            raise HarnessError("resource receipt file exceeds the byte limit")
+        total += len(before) + len(after)
         files.append(
             {
                 "relative_path": relative,
-                "path": root / Path(relative),
                 "before": before if record.get("before_exists") else None,
                 "after": after,
+                "source_kind": record.get("source_kind"),
+                "source_sha256": record.get("source_sha256"),
             }
         )
-    if not files:
-        raise HarnessError("resource receipt contains no files")
-    _restore_files(files, expect_after=True)
+    if total > RESOURCE_TOTAL_MAX_BYTES:
+        raise HarnessError("resource receipt exceeds the aggregate byte limit")
+    receipt_view = [
+        {
+            "relative_path": record["relative_path"],
+            "before_exists": record["before_exists"],
+            "before_sha256": record["before_sha256"],
+            "after_sha256": record["after_sha256"],
+            "source_kind": record.get("source_kind"),
+            "source_sha256": record.get("source_sha256"),
+        }
+        for record in raw_files
+    ]
+    if receipt_view != plan.get("files"):
+        raise HarnessError("resource receipt file view differs from its reviewed plan")
+    expected_locks = [f"repo:file:{item['relative_path']}" for item in files]
+    if plan.get("required_locks") != expected_locks:
+        raise HarnessError("resource receipt lock view differs from its reviewed plan")
+    return files
+
+
+def _resource_files_from_receipt(
+    *, root: Path, receipt: dict[str, Any]
+) -> list[dict[str, Any]]:
+    root = canonicalize_no_link_traversal(root, "Codex project root")
+    files = validate_resource_receipt(receipt)
+    for item in files:
+        item["path"] = root / Path(item["relative_path"])
+    return files
+
+
+def rollback_files_from_receipt(*, root: Path, receipt: dict[str, Any]) -> None:
+    files = _resource_files_from_receipt(root=root, receipt=receipt)
+    _transition_resource_files(
+        list(reversed(files)),
+        source_key="after",
+        target_key="before",
+        action="resource rollback",
+        recovery_error=ResourceRollbackReapplyError,
+    )
+
+
+def reapply_files_from_receipt(*, root: Path, receipt: dict[str, Any]) -> None:
+    """Restore exact applied bytes after a failed rollback state publication."""
+
+    files = _resource_files_from_receipt(root=root, receipt=receipt)
+    apply_resource_files(files)

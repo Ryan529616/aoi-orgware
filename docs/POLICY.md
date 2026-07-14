@@ -370,11 +370,18 @@ selections do not receive retroactive authority.
 
 A User may propose a typed resource exception, but the proposal has no
 execution authority. It must name one exact future selection or project config
-event, carry direct-User rationale/evidence, a Chief preliminary assessment,
-alternatives, and an expiry. The Chief alone approves or rejects exact settings
-with rationale, risk boundary, rollback condition, and compensating controls.
-Approval uses version CAS and is consumed once by the matching selection or
-config apply. Target mismatch, replay, expiry, or changed version fails closed.
+event, bind the exact deterministic target-contract SHA-256, carry direct-User
+rationale/evidence, a Chief preliminary assessment, alternatives, and an
+expiry. `execution-select-plan` binds the task plan, work unit, topology,
+lane/Steward authority snapshots, scope, task characteristics, rationale, and
+decision conditions. A proposed config plan binds its event, task plan,
+settings, and before/after file view. The Chief alone approves or rejects exact
+settings and the same contract with rationale, risk boundary, rollback
+condition, and compensating controls. Approval uses version CAS and is consumed
+once by the matching selection or config apply. Semantic target mismatch,
+stale snapshots, replay, expiry, or changed version fails closed.
+Phase-one arbitration is exact accept/reject: changing any requested setting
+requires a new target contract and override request.
 Chief lease, task-bound session, approved plan, claim coverage,
 dispatch-before-work, packet/result integrity, evidence strength, project
 trust/sandbox/provider limits, twelve threads, and depth two are not
@@ -383,9 +390,12 @@ overridable.
 AOI may plan and apply project-scoped `.codex/config.toml` concurrency/depth
 ceilings and `.codex/agents/*.toml` model/reasoning defaults under exact claims,
 reviewed plan SHA-256, and a before/after byte receipt. It never edits user-level
-Codex configuration. Apply requires a fresh trusted Codex session and is not
-evidence of actual routing. Rollback restores exact prior bytes and refuses
-drift. Provider model, token, cost, and availability telemetry remain
+Codex configuration. The receipt retains the full reviewed plan preimage so
+event model/reasoning/envelope claims remain verifiable. Apply requires a fresh
+trusted Codex session and is not evidence of actual routing. Rollback
+preflights every target, restores exact prior bytes, refuses drift, and probes
+or exactly reapplies the receipt when task-state publication fails. Provider
+model, token, cost, and availability telemetry remain
 unavailable unless independently observed.
 
 ## Improvement Pipeline

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aoi-orgware"
-version = "0.2.1"
+version = "0.2.2"
 description = "Agent Organization Infrastructure for governed multi-agent engineering work"
 readme = "README.md"
 requires-python = ">=3.11"

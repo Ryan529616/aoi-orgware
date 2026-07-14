@@ -60,12 +60,15 @@ from .resource_config import (
     AOI_MAX_DELEGATION_DEPTH,
     ARISE_MAX_THREADS_CEILING,
     RESOURCE_RECEIPT_SCHEMA_VERSION,
+    ResourceApplyRollbackError,
     apply_resource_files,
     build_codex_resource_plan,
     make_resource_receipt,
     parse_override_settings,
+    reapply_files_from_receipt,
     resource_plan_sha256,
     rollback_files_from_receipt,
+    validate_resource_receipt,
 )
 
 from .harnesslib import (
@@ -1277,6 +1280,24 @@ def _validate_active_execution_selection(
     }
     if lane_id not in snapshots:
         raise HarnessError("packet/job lane is outside the selected execution topology")
+    _require_execution_selection_snapshots_current(state, selection)
+    return selection
+
+
+def _require_execution_selection_snapshots_current(
+    state: dict[str, Any], selection: dict[str, Any], *, include_steward: bool = False
+) -> None:
+    snapshots = {
+        str(item.get("lane_id")): item
+        for item in selection.get("lane_snapshots", [])
+    }
+    steward_snapshot = selection.get("steward_snapshot", {})
+    if (
+        include_steward
+        and isinstance(steward_snapshot, dict)
+        and steward_snapshot.get("lane_id")
+    ):
+        snapshots[str(steward_snapshot["lane_id"])] = steward_snapshot
     for selected_lane_id, snapshot in snapshots.items():
         lane = lane_by_id(state, selected_lane_id)
         if any(
@@ -1286,7 +1307,6 @@ def _validate_active_execution_selection(
             raise HarnessError(
                 "execution selection is stale; select topology again before dispatch"
             )
-    return selection
 
 
 def _lane_authority_snapshot(lane: dict[str, Any]) -> dict[str, Any]:
@@ -1328,7 +1348,7 @@ def _build_execution_resource_envelope(
         for role in sorted(DEPTH_TWO_ROLES)
         if role in ROLE_TIER_MAP
     }
-    configurable_roles = set(ROLE_TIER_MAP)
+    configurable_roles = set(role_model_tiers) | set(depth_two_role_model_tiers)
     role_settings: dict[str, str | int] = {}
     for key, value in override_settings.items():
         if key == "envelope.max_active_first_level_agents":
@@ -1408,6 +1428,15 @@ def _validate_selection_resource_envelope(
         raise HarnessError("execution selection resource envelope schema is unsupported")
     if digest != canonical_record_sha256(envelope):
         raise HarnessError("execution selection resource envelope lost integrity")
+    selection_target_contract_sha256 = str(
+        selection.get("target_contract_sha256", "")
+    )
+    if selection_target_contract_sha256:
+        actual_target_contract_sha256 = canonical_record_sha256(
+            _execution_selection_target_contract_from_record(state, selection)
+        )
+        if selection_target_contract_sha256 != actual_target_contract_sha256:
+            raise HarnessError("execution selection target contract lost integrity")
     mode = str(selection.get("mode", ""))
     lane_count = len(selection.get("lane_snapshots", []))
     max_first_level = envelope.get("max_active_first_level_agents")
@@ -1436,12 +1465,15 @@ def _validate_selection_resource_envelope(
     ):
         raise HarnessError("execution resource delegation-depth limit is invalid")
     expected_roles: dict[str, str] = {}
+    selected_lanes: list[dict[str, Any]] = []
     for snapshot in selection.get("lane_snapshots", []):
         lane = lane_by_id(state, str(snapshot.get("lane_id", "")))
+        selected_lanes.append(lane)
         expected_roles[str(lane.get("role", ""))] = ROLE_TIER_MAP.get(
             str(lane.get("role", "")), ""
         )
     steward_snapshot = selection.get("steward_snapshot", {})
+    steward: dict[str, Any] | None = None
     if isinstance(steward_snapshot, dict) and steward_snapshot.get("lane_id"):
         steward = lane_by_id(state, str(steward_snapshot.get("lane_id", "")))
         expected_roles[str(steward.get("role", ""))] = ROLE_TIER_MAP.get(
@@ -1468,6 +1500,7 @@ def _validate_selection_resource_envelope(
         if canonical != settings:
             raise HarnessError("execution resource role overrides are not canonical")
     override_id = str(envelope.get("override_id", ""))
+    approved_settings: dict[str, str | int] = {}
     if override_id:
         matches = [
             item
@@ -1477,14 +1510,46 @@ def _validate_selection_resource_envelope(
         if len(matches) != 1 or matches[0].get("status") != "consumed":
             raise HarnessError("execution resource envelope lacks consumed override authority")
         consumption = matches[0].get("consumption") or {}
+        target_contract = _execution_selection_target_contract_from_record(
+            state, selection
+        )
+        target_contract_sha256 = canonical_record_sha256(target_contract)
+        decision = matches[0].get("chief_decision") or {}
         if (
             matches[0].get("target_kind") != "execution_resource"
             or matches[0].get("target_id") != selection.get("selection_id")
+            or matches[0].get("task_plan_sha256")
+            != selection.get("task_plan_sha256")
+            or matches[0].get("target_contract_sha256")
+            != target_contract_sha256
+            or decision.get("target_contract_sha256")
+            != target_contract_sha256
+            or selection.get("target_contract_sha256")
+            != target_contract_sha256
             or consumption.get("consumer_command") != "execution-select"
             or consumption.get("selection_id") != selection.get("selection_id")
             or consumption.get("resource_envelope_sha256") != digest
+            or consumption.get("target_contract_sha256")
+            != target_contract_sha256
         ):
             raise HarnessError("execution resource override consumption binding is invalid")
+        decision_settings = (matches[0].get("chief_decision") or {}).get(
+            "approved_settings"
+        )
+        if not isinstance(decision_settings, dict):
+            raise HarnessError("execution resource override lacks exact approved settings")
+        approved_settings = dict(decision_settings)
+    expected_envelope, expected_digest = _build_execution_resource_envelope(
+        mode=mode,
+        lanes=selected_lanes,
+        steward=steward,
+        override_id=override_id,
+        override_settings=approved_settings,
+    )
+    if envelope != expected_envelope or digest != expected_digest:
+        raise HarnessError(
+            "execution resource envelope differs from its topology/Chief authority"
+        )
     return envelope
 
 
@@ -1515,6 +1580,23 @@ def _validate_packet_resource_envelope(
     tier = str(packet.get("model_tier", ""))
     if depth == 1 and ROLE_TIER_MAP.get(role) != tier:
         raise HarnessError("packet role/model tier is outside the selected resource envelope")
+    if depth == 1:
+        lane = lane_by_id(state, str(packet.get("lane_id", "")))
+        selected_lane_ids = {
+            str(snapshot.get("lane_id", ""))
+            for snapshot in selection.get("lane_snapshots", [])
+        }
+        steward_snapshot = selection.get("steward_snapshot", {})
+        if isinstance(steward_snapshot, dict) and steward_snapshot.get("lane_id"):
+            selected_lane_ids.add(str(steward_snapshot["lane_id"]))
+        if lane.get("lane_id") not in selected_lane_ids:
+            raise HarnessError("depth-one packet lane is outside the selected resource envelope")
+        if role != lane.get("role"):
+            raise HarnessError(
+                "depth-one packet role differs from its selected lane authority"
+            )
+        if role not in envelope["role_model_tiers"]:
+            raise HarnessError("depth-one packet role is absent from the selected envelope")
     if depth == 2 and role not in envelope["depth_two_role_model_tiers"]:
         raise HarnessError("packet leaf role is outside the selected resource envelope")
     if enforce_active_limit:
@@ -2133,11 +2215,64 @@ def approved_override_settings(
         raise HarnessError("override is outside the exact requested target")
     if item.get("status") != "approved" or is_expired(item.get("expires_at")):
         raise HarnessError("override is not approved, is already consumed, or has expired")
+    if (
+        item.get("integrity_version") != 1
+        or item.get("version") != 2
+        or item.get("task_plan_sha256") != state.get("plan_sha256")
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(item.get("target_contract_sha256", ""))
+        )
+        or item.get("root_session_id") not in state.get("session_ids", [])
+        or item.get("consumption") is not None
+        or item.get("revocation") is not None
+    ):
+        raise HarnessError("override authority metadata is stale or invalid")
+    try:
+        requested = parse_override_settings(
+            [
+                f"{key}={value}"
+                for key, value in item.get("requested_settings", {}).items()
+            ],
+            roles=ROLE_TIER_MAP,
+            target_kind=target_kind,
+        )
+    except (HarnessError, AttributeError) as exc:
+        raise HarnessError("override requested settings lost integrity") from exc
+    if requested != item.get("requested_settings"):
+        raise HarnessError("override requested settings are not canonical")
     decision = item.get("chief_decision") or {}
     settings = decision.get("approved_settings")
-    if decision.get("decision") != "approved" or not isinstance(settings, dict):
+    if (
+        decision.get("decision") != "approved"
+        or not isinstance(settings, dict)
+        or decision.get("target_contract_sha256")
+        != item.get("target_contract_sha256")
+        or decision.get("root_session_id") not in state.get("session_ids", [])
+    ):
         raise HarnessError("override lacks an exact Chief-approved setting set")
-    return dict(settings)
+    try:
+        canonical = parse_override_settings(
+            [f"{key}={value}" for key, value in settings.items()],
+            roles=ROLE_TIER_MAP,
+            target_kind=target_kind,
+        )
+    except (HarnessError, AttributeError) as exc:
+        raise HarnessError("override approved settings lost integrity") from exc
+    if canonical != settings:
+        raise HarnessError("override approved settings are not canonical")
+    return canonical
+
+
+def require_override_target_contract(
+    state: dict[str, Any], override_id: str, target_contract_sha256: str
+) -> None:
+    if not override_id:
+        return
+    item = override_by_id(state, override_id)
+    if item.get("target_contract_sha256") != target_contract_sha256:
+        raise HarnessError(
+            "Chief-approved override targets a different canonical contract"
+        )
 
 
 def override_integrity_errors(state: dict[str, Any]) -> list[str]:
@@ -2171,12 +2306,17 @@ def override_integrity_errors(state: dict[str, Any]) -> list[str]:
             errors.append(f"override {override_id} lacks a task-bound user/Chief session")
         if item.get("target_task_id") != state.get("task_id"):
             errors.append(f"override {override_id} targets a different task")
+        if item.get("task_plan_sha256") != state.get("plan_sha256"):
+            errors.append(f"override {override_id} targets a different task plan")
+        target_contract_sha256 = str(item.get("target_contract_sha256", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", target_contract_sha256):
+            errors.append(f"override {override_id} target contract SHA-256 is invalid")
         if parse_time(str(item.get("expires_at", ""))) is None:
             errors.append(f"override {override_id} has an invalid expiry")
         try:
             requested = parse_override_settings(
                 [f"{key}={value}" for key, value in item.get("requested_settings", {}).items()],
-                roles=None,
+                roles=ROLE_TIER_MAP,
                 target_kind=target_kind,
             )
         except (HarnessError, AttributeError) as exc:
@@ -2195,13 +2335,17 @@ def override_integrity_errors(state: dict[str, Any]) -> list[str]:
             }:
                 errors.append(f"terminal override {override_id} lacks a Chief decision")
             elif decision.get("decision") == "approved":
+                if decision.get("target_contract_sha256") != target_contract_sha256:
+                    errors.append(
+                        f"override {override_id} Chief decision targets a different contract"
+                    )
                 try:
                     approved = parse_override_settings(
                         [
                             f"{key}={value}"
                             for key, value in decision.get("approved_settings", {}).items()
                         ],
-                        roles=None,
+                        roles=ROLE_TIER_MAP,
                         target_kind=target_kind,
                     )
                 except (HarnessError, AttributeError) as exc:
@@ -2239,6 +2383,12 @@ def override_integrity_errors(state: dict[str, Any]) -> list[str]:
                     errors.append(
                         f"consumed override {override_id} lacks its exact execution selection"
                     )
+                elif consumption.get("target_contract_sha256") != item.get(
+                    "target_contract_sha256"
+                ):
+                    errors.append(
+                        f"consumed override {override_id} lost its target contract binding"
+                    )
             elif consumer == "codex-config-apply":
                 events = [
                     event
@@ -2250,6 +2400,12 @@ def override_integrity_errors(state: dict[str, Any]) -> list[str]:
                 if item.get("target_kind") != "resource_config" or len(events) != 1:
                     errors.append(
                         f"consumed override {override_id} lacks its exact resource config event"
+                    )
+                elif consumption.get("target_contract_sha256") != item.get(
+                    "target_contract_sha256"
+                ):
+                    errors.append(
+                        f"consumed override {override_id} lost its target contract binding"
                     )
             else:
                 errors.append(f"consumed override {override_id} has an unknown consumer")
@@ -2313,6 +2469,12 @@ def resource_config_integrity_errors(
             )
         if not re.fullmatch(r"[0-9a-f]{64}", str(event.get("plan_sha256", ""))):
             errors.append(f"resource config event {event_id} plan SHA-256 is invalid")
+        if not re.fullmatch(
+            r"[0-9a-f]{64}", str(event.get("task_plan_sha256", ""))
+        ):
+            errors.append(
+                f"resource config event {event_id} task plan SHA-256 is invalid"
+            )
         receipt_path = Path(str(event.get("receipt_path", "")))
         expected_receipt_path = (
             task_dir(paths, state["task_id"])
@@ -2336,30 +2498,36 @@ def resource_config_integrity_errors(
                     f"resource config event {event_id} receipt is invalid: {exc}"
                 )
             else:
-                receipt_plan = receipt.get("plan")
-                if (
-                    receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION
-                    or receipt.get("event_id") != event_id
-                    or receipt.get("task_id") != state.get("task_id")
-                    or receipt.get("plan_sha256") != event.get("plan_sha256")
-                    or receipt.get("override_id", "") != event.get("override_id", "")
-                    or receipt.get("root_session_id") != event.get("root_session_id")
-                    or receipt.get("applied_at") != event.get("applied_at")
-                    or receipt.get("restart_required")
-                    != event.get("restart_required")
-                    or not isinstance(receipt_plan, dict)
-                    or receipt_plan.get("plan_sha256") != event.get("plan_sha256")
-                    or resource_plan_sha256(receipt_plan)
-                    != event.get("plan_sha256")
-                    or receipt_plan.get("resolved") != event.get("resolved")
-                    or receipt_plan.get("dynamic_envelope")
-                    != event.get("dynamic_envelope")
-                    or receipt_plan.get("required_locks")
-                    != event.get("required_locks")
-                ):
+                try:
+                    validate_resource_receipt(receipt)
+                except HarnessError as exc:
                     errors.append(
-                        f"resource config event {event_id} receipt binding is invalid"
+                        f"resource config event {event_id} receipt is invalid: {exc}"
                     )
+                else:
+                    receipt_plan = receipt["plan"]
+                    if (
+                        receipt.get("event_id") != event_id
+                        or receipt.get("task_id") != state.get("task_id")
+                        or receipt.get("plan_sha256") != event.get("plan_sha256")
+                        or receipt_plan.get("approved_task_plan_sha256")
+                        != event.get("task_plan_sha256")
+                        or receipt.get("override_id", "")
+                        != event.get("override_id", "")
+                        or receipt.get("root_session_id")
+                        != event.get("root_session_id")
+                        or receipt.get("applied_at") != event.get("applied_at")
+                        or receipt.get("restart_required")
+                        != event.get("restart_required")
+                        or receipt_plan.get("resolved") != event.get("resolved")
+                        or receipt_plan.get("dynamic_envelope")
+                        != event.get("dynamic_envelope")
+                        or receipt_plan.get("required_locks")
+                        != event.get("required_locks")
+                    ):
+                        errors.append(
+                            f"resource config event {event_id} receipt binding is invalid"
+                        )
         if event.get("override_id"):
             matches = [
                 item
@@ -2375,6 +2543,10 @@ def resource_config_integrity_errors(
                 or consumption.get("consumer_command") != "codex-config-apply"
                 or consumption.get("event_id") != event_id
                 or consumption.get("plan_sha256") != event.get("plan_sha256")
+                or matches[0].get("target_contract_sha256")
+                != event.get("plan_sha256")
+                or consumption.get("target_contract_sha256")
+                != event.get("plan_sha256")
             ):
                 errors.append(
                     f"resource config event {event_id} lacks consumed override authority"
@@ -7959,9 +8131,13 @@ def _execution_brief_coverage_error(
     return None
 
 
-def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
+def _validate_execution_selection_arguments(
+    args: argparse.Namespace,
+) -> tuple[str, str, list[str]]:
     selection_id = validate_id(args.selection_id, "execution selection id")
     work_unit_id = validate_id(args.work_unit_id, "execution work-unit id")
+    if args.supersedes_selection_id:
+        validate_id(args.supersedes_selection_id, "superseded execution selection id")
     lane_ids = list(dict.fromkeys(args.lane))
     if args.mode == "single" and len(lane_ids) != 1:
         raise HarnessError("single execution mode requires exactly one lane")
@@ -7977,6 +8153,134 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         raise HarnessError("single execution mode may not bind a Steward lane")
     if args.mode in {"centralized_parallel", "hybrid"} and not args.steward_lane_id:
         raise HarnessError(f"{args.mode} execution mode requires --steward-lane-id")
+    return selection_id, work_unit_id, lane_ids
+
+
+def _build_execution_selection_target_contract(
+    *,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    selection_id: str,
+    work_unit_id: str,
+    lanes: list[dict[str, Any]],
+    steward: dict[str, Any] | None,
+    override_settings: dict[str, str | int],
+) -> tuple[dict[str, Any], str]:
+    resource_envelope, resource_envelope_sha256 = _build_execution_resource_envelope(
+        mode=args.mode,
+        lanes=lanes,
+        steward=steward,
+        override_id=args.override_id,
+        override_settings=override_settings,
+    )
+    contract = {
+        "schema_version": 1,
+        "target_kind": "execution_resource",
+        "target_id": selection_id,
+        "target_task_id": state["task_id"],
+        "task_plan_sha256": state["plan_sha256"],
+        "override_id": args.override_id,
+        "work_unit_id": work_unit_id,
+        "supersedes_selection_id": args.supersedes_selection_id or "",
+        "scope": require_evidence_detail(args.scope, "execution selection scope"),
+        "mode": args.mode,
+        "lane_snapshots": [
+            _lane_authority_snapshot(lane)
+            for lane in sorted(lanes, key=lambda item: item["lane_id"])
+        ],
+        "steward_snapshot": (
+            _lane_authority_snapshot(steward) if steward is not None else {}
+        ),
+        "resource_envelope": resource_envelope,
+        "resource_envelope_sha256": resource_envelope_sha256,
+        "task_characteristics": {
+            "sequential_dependency": args.sequential_dependency,
+            "tool_density": args.tool_density,
+            "shared_context": args.shared_context,
+        },
+        "rationale": require_evidence_detail(
+            args.rationale, "execution topology rationale"
+        ),
+        "falsification_condition": require_evidence_detail(
+            args.falsification_condition,
+            "execution topology falsification condition",
+        ),
+        "escalation_condition": require_evidence_detail(
+            args.escalation_condition, "execution topology escalation condition"
+        ),
+    }
+    return contract, canonical_record_sha256(contract)
+
+
+def _execution_selection_target_contract_from_record(
+    state: dict[str, Any], selection: dict[str, Any]
+) -> dict[str, Any]:
+    envelope = selection.get("resource_envelope") or {}
+    return {
+        "schema_version": 1,
+        "target_kind": "execution_resource",
+        "target_id": selection.get("selection_id"),
+        "target_task_id": state.get("task_id"),
+        "task_plan_sha256": selection.get("task_plan_sha256"),
+        "override_id": envelope.get("override_id", ""),
+        "work_unit_id": selection.get("work_unit_id"),
+        "supersedes_selection_id": selection.get("supersedes_selection_id", ""),
+        "scope": selection.get("scope"),
+        "mode": selection.get("mode"),
+        "lane_snapshots": selection.get("lane_snapshots"),
+        "steward_snapshot": selection.get("steward_snapshot"),
+        "resource_envelope": envelope,
+        "resource_envelope_sha256": selection.get("resource_envelope_sha256"),
+        "task_characteristics": selection.get("task_characteristics"),
+        "rationale": selection.get("rationale"),
+        "falsification_condition": selection.get("falsification_condition"),
+        "escalation_condition": selection.get("escalation_condition"),
+    }
+
+
+def cmd_execution_select_plan(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    selection_id, work_unit_id, lane_ids = _validate_execution_selection_arguments(
+        args
+    )
+    proposed_settings = parse_override_settings(
+        args.proposed_setting,
+        roles=ROLE_TIER_MAP,
+        target_kind="execution_resource",
+    )
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "plan execution resource override for")
+        require_plan_ready(paths, state, "plan execution resource override")
+        require_root_session(paths, state, args.session_id)
+        lanes = [lane_by_id(state, lane_id) for lane_id in lane_ids]
+        if any(lane.get("status") in {"done", "parked"} for lane in lanes):
+            raise HarnessError("execution selection may not use done or parked lanes")
+        steward: dict[str, Any] | None = None
+        if args.mode in {"centralized_parallel", "hybrid"}:
+            steward = _engaged_steward_lane(state)
+            if steward.get("lane_id") != args.steward_lane_id:
+                raise HarnessError(
+                    "--steward-lane-id must name the one engaged coordination_steward lane"
+                )
+            if any(lane.get("lane_id") == steward.get("lane_id") for lane in lanes):
+                raise HarnessError("parallel specialist lanes may not include the Steward lane")
+        contract, digest = _build_execution_selection_target_contract(
+            state=state,
+            args=args,
+            selection_id=selection_id,
+            work_unit_id=work_unit_id,
+            lanes=lanes,
+            steward=steward,
+            override_settings=proposed_settings,
+        )
+    emit({**contract, "target_contract_sha256": digest}, args.json)
+    return 0
+
+
+def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    selection_id, work_unit_id, lane_ids = _validate_execution_selection_arguments(
+        args
+    )
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "select execution topology for")
@@ -8059,7 +8363,6 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         lanes = [lane_by_id(state, lane_id) for lane_id in lane_ids]
         if any(lane.get("status") in {"done", "parked"} for lane in lanes):
             raise HarnessError("execution selection may not use done or parked lanes")
-        steward_snapshot: dict[str, Any] = {}
         steward: dict[str, Any] | None = None
         if args.mode in {"centralized_parallel", "hybrid"}:
             steward = _engaged_steward_lane(state)
@@ -8069,50 +8372,57 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
             if any(lane.get("lane_id") == steward.get("lane_id") for lane in lanes):
                 raise HarnessError("parallel specialist lanes may not include the Steward lane")
-            steward_snapshot = _lane_authority_snapshot(steward)
-        resource_envelope, resource_envelope_sha256 = (
-            _build_execution_resource_envelope(
-                mode=args.mode,
+        target_contract, target_contract_sha256 = (
+            _build_execution_selection_target_contract(
+                state=state,
+                args=args,
+                selection_id=selection_id,
+                work_unit_id=work_unit_id,
                 lanes=lanes,
                 steward=steward,
-                override_id=args.override_id,
                 override_settings=resource_override_settings,
             )
         )
+        require_override_target_contract(
+            state, args.override_id, target_contract_sha256
+        )
+        resource_envelope = target_contract["resource_envelope"]
+        resource_envelope_sha256 = target_contract["resource_envelope_sha256"]
         recorded = now_iso()
         selection = {
             "integrity_version": 1,
             "execution_selection_version": 2,
             "selection_id": selection_id,
             "work_unit_id": work_unit_id,
-            "scope": require_evidence_detail(args.scope, "execution selection scope"),
-            "mode": args.mode,
-            "lane_snapshots": [
-                _lane_authority_snapshot(lane)
-                for lane in sorted(lanes, key=lambda item: item["lane_id"])
-            ],
-            "steward_snapshot": steward_snapshot,
+            "supersedes_selection_id": target_contract["supersedes_selection_id"],
+            "task_plan_sha256": target_contract["task_plan_sha256"],
+            "scope": target_contract["scope"],
+            "mode": target_contract["mode"],
+            "lane_snapshots": target_contract["lane_snapshots"],
+            "steward_snapshot": target_contract["steward_snapshot"],
             "resource_envelope": resource_envelope,
             "resource_envelope_sha256": resource_envelope_sha256,
-            "task_characteristics": {
-                "sequential_dependency": args.sequential_dependency,
-                "tool_density": args.tool_density,
-                "shared_context": args.shared_context,
-            },
-            "rationale": require_evidence_detail(
-                args.rationale, "execution topology rationale"
-            ),
-            "falsification_condition": require_evidence_detail(
-                args.falsification_condition, "execution topology falsification condition"
-            ),
-            "escalation_condition": require_evidence_detail(
-                args.escalation_condition, "execution topology escalation condition"
-            ),
+            "target_contract_sha256": target_contract_sha256,
+            "task_characteristics": target_contract["task_characteristics"],
+            "rationale": target_contract["rationale"],
+            "falsification_condition": target_contract["falsification_condition"],
+            "escalation_condition": target_contract["escalation_condition"],
             "root_owner": state.get("owner"),
             "root_session_id": session_id,
             "status": "active",
             "recorded_at": recorded,
         }
+        if args.override_id:
+            refreshed_settings = approved_override_settings(
+                state,
+                args.override_id,
+                target_kind="execution_resource",
+                target_id=selection_id,
+            )
+            if refreshed_settings != resource_override_settings:
+                raise HarnessError(
+                    "execution resource override changed before consumption"
+                )
         state["execution_model_version"] = 1
         state.setdefault("execution_selections", []).append(selection)
         if args.override_id:
@@ -8125,6 +8435,7 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "consumer_command": "execution-select",
                 "selection_id": selection_id,
                 "resource_envelope_sha256": resource_envelope_sha256,
+                "target_contract_sha256": target_contract_sha256,
                 "root_session_id": session_id,
                 "recorded_at": recorded,
             }
@@ -8603,9 +8914,12 @@ def cmd_needs_user_resolve(args: argparse.Namespace, paths: HarnessPaths) -> int
 def cmd_override_request(args: argparse.Namespace, paths: HarnessPaths) -> int:
     override_id = validate_id(args.override_id, "override id")
     target_id = validate_id(args.target_id, "override target id")
+    target_contract_sha256 = args.target_contract_sha256.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", target_contract_sha256):
+        raise HarnessError("--target-contract-sha256 must be full lowercase SHA-256")
     settings = parse_override_settings(
         args.setting,
-        roles=None,
+        roles=ROLE_TIER_MAP,
         target_kind=args.target_kind,
     )
     expires_at = parse_time(args.expires_at)
@@ -8630,6 +8944,8 @@ def cmd_override_request(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "target_kind": args.target_kind,
             "target_id": target_id,
             "target_task_id": state["task_id"],
+            "task_plan_sha256": state["plan_sha256"],
+            "target_contract_sha256": target_contract_sha256,
             "scope": require_evidence_detail(args.scope, "override scope"),
             "requested_settings": settings,
             "user_position": {
@@ -8688,9 +9004,14 @@ def cmd_override_arbitrate(args: argparse.Namespace, paths: HarnessPaths) -> int
                     f"{key}={value}"
                     for key, value in item["requested_settings"].items()
                 ],
-                roles=None,
+                roles=ROLE_TIER_MAP,
                 target_kind=str(item.get("target_kind", "")),
             )
+            if approved != item.get("requested_settings"):
+                raise HarnessError(
+                    "changing approved settings requires a new target contract and "
+                    "override request"
+                )
             item["status"] = "approved"
         else:
             if args.approved_setting:
@@ -8702,6 +9023,7 @@ def cmd_override_arbitrate(args: argparse.Namespace, paths: HarnessPaths) -> int
         item["chief_decision"] = {
             "decision": args.decision,
             "approved_settings": approved,
+            "target_contract_sha256": item["target_contract_sha256"],
             "rationale": require_evidence_detail(
                 args.rationale, "Chief override rationale"
             ),
@@ -8803,7 +9125,11 @@ def _require_task_lock_coverage(
 
 
 def _resource_plan(
-    args: argparse.Namespace, paths: HarnessPaths, state: dict[str, Any]
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    proposed_override_settings: dict[str, str | int] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     active_selections = [
         item
@@ -8821,14 +9147,23 @@ def _resource_plan(
             "multiple active execution selections exist; pass --execution-selection-id"
         )
     if active_selections:
+        _require_execution_selection_snapshots_current(
+            state, active_selections[0], include_steward=True
+        )
         _validate_selection_resource_envelope(state, active_selections[0])
-    override_settings = approved_override_settings(
-        state,
-        args.override_id,
-        target_kind="resource_config",
-        target_id=args.event_id,
-    )
+    if proposed_override_settings is not None:
+        if not args.override_id:
+            raise HarnessError("proposed resource settings require --override-id")
+        override_settings = proposed_override_settings
+    else:
+        override_settings = approved_override_settings(
+            state,
+            args.override_id,
+            target_kind="resource_config",
+            target_id=args.event_id,
+        )
     return build_codex_resource_plan(
+        event_id=args.event_id,
         root=_task_resource_worktree(paths, state),
         config=paths.project,
         state=state,
@@ -8844,11 +9179,27 @@ def _resource_plan(
 
 def cmd_codex_config_plan(args: argparse.Namespace, paths: HarnessPaths) -> int:
     validate_id(args.event_id, "resource config event id")
+    proposed_settings: dict[str, str | int] | None = None
+    if args.proposed_setting:
+        proposed_settings = parse_override_settings(
+            args.proposed_setting,
+            roles=ROLE_TIER_MAP,
+            target_kind="resource_config",
+        )
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "plan Codex resource configuration for")
         require_plan_ready(paths, state, "plan Codex resource configuration")
-        plan, _files = _resource_plan(args, paths, state)
+        plan, _files = _resource_plan(
+            args,
+            paths,
+            state,
+            proposed_override_settings=proposed_settings,
+        )
+        if args.override_id and proposed_settings is None:
+            require_override_target_contract(
+                state, args.override_id, plan["plan_sha256"]
+            )
     emit(plan, args.json)
     return 0
 
@@ -8869,6 +9220,7 @@ def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int
         ):
             raise HarnessError(f"resource config event already exists: {event_id}")
         plan, files = _resource_plan(args, paths, state)
+        require_override_target_contract(state, args.override_id, plan["plan_sha256"])
         if plan["plan_sha256"] != expected_plan:
             raise HarnessError("Codex resource plan changed after Chief review")
         _require_task_lock_coverage(paths, state, plan["required_locks"])
@@ -8887,17 +9239,36 @@ def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int
             json.dumps(receipt, indent=2, ensure_ascii=False) + "\n"
         ).encode("utf-8")
         receipt_sha = hashlib.sha256(receipt_payload).hexdigest()
+        if args.override_id:
+            refreshed_settings = approved_override_settings(
+                state,
+                args.override_id,
+                target_kind="resource_config",
+                target_id=event_id,
+            )
+            if refreshed_settings != plan["override_settings"]:
+                raise HarnessError("resource override changed before file mutation")
         atomic_create_bytes(receipt_path, receipt_payload)
         applied = False
         state_published = False
         try:
             apply_resource_files(files)
             applied = True
+            if args.override_id:
+                refreshed_settings = approved_override_settings(
+                    state,
+                    args.override_id,
+                    target_kind="resource_config",
+                    target_id=event_id,
+                )
+                if refreshed_settings != plan["override_settings"]:
+                    raise HarnessError("resource override changed during file apply")
             event = {
                 "integrity_version": 1,
                 "event_id": event_id,
                 "status": "applied",
                 "plan_sha256": plan["plan_sha256"],
+                "task_plan_sha256": plan["approved_task_plan_sha256"],
                 "override_id": args.override_id,
                 "receipt_path": str(receipt_path),
                 "receipt_sha256": receipt_sha,
@@ -8923,6 +9294,7 @@ def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int
                     "consumer_command": "codex-config-apply",
                     "event_id": event_id,
                     "plan_sha256": plan["plan_sha256"],
+                    "target_contract_sha256": plan["plan_sha256"],
                     "root_session_id": session_id,
                     "recorded_at": recorded,
                 }
@@ -8940,6 +9312,7 @@ def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int
             write_task(paths, state)
             state_published = True
         except BaseException as exc:
+            rollback_uncertain = isinstance(exc, ResourceApplyRollbackError)
             if applied and not state_published:
                 try:
                     published_state = load_task(paths, args.task)
@@ -8958,11 +9331,16 @@ def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int
                 rollback_files_from_receipt(
                     root=_task_resource_worktree(paths, state), receipt=receipt
                 )
-            if not state_published:
+            if not state_published and not rollback_uncertain:
                 try:
                     receipt_path.unlink()
                 except FileNotFoundError:
                     pass
+            if rollback_uncertain:
+                raise HarnessError(
+                    "Codex resource apply and automatic rollback both failed; "
+                    f"recovery receipt retained at {receipt_path}"
+                ) from exc
             if state_published:
                 raise HarnessError(
                     "Codex resource state and files were published, but the final "
@@ -9017,6 +9395,8 @@ def cmd_codex_config_rollback(args: argparse.Namespace, paths: HarnessPaths) -> 
             receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION
             or receipt.get("event_id") != event.get("event_id")
             or receipt.get("plan_sha256") != event.get("plan_sha256")
+            or receipt_plan.get("approved_task_plan_sha256")
+            != event.get("task_plan_sha256")
             or receipt.get("task_id") != state.get("task_id")
             or receipt.get("root_session_id") != event.get("root_session_id")
             or receipt.get("applied_at") != event.get("applied_at")
@@ -9031,21 +9411,72 @@ def cmd_codex_config_rollback(args: argparse.Namespace, paths: HarnessPaths) -> 
         ):
             raise HarnessError("resource config receipt binding is invalid")
         _require_task_lock_coverage(paths, state, event.get("required_locks", []))
+        rollback_reason = require_evidence_detail(
+            args.reason, "resource config rollback reason"
+        )
+        prior_event = copy.deepcopy(event)
         rollback_files_from_receipt(
             root=_task_resource_worktree(paths, state), receipt=receipt
         )
         recorded = now_iso()
         event["status"] = "rolled_back"
         event["rollback"] = {
-            "reason": require_evidence_detail(
-                args.reason, "resource config rollback reason"
-            ),
+            "reason": rollback_reason,
             "root_session_id": session_id,
             "recorded_at": recorded,
         }
         bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
+        state_published = False
+        try:
+            write_task(paths, state)
+            state_published = True
+            write_index(paths)
+        except BaseException as exc:
+            if not state_published:
+                try:
+                    published_state = load_task(paths, args.task)
+                except (HarnessError, OSError, ValueError) as probe_exc:
+                    raise HarnessError(
+                        "Codex resource files were rolled back, but task-state "
+                        "publication failed and the published state cannot be read; "
+                        f"receipt retained at {receipt_path}"
+                    ) from probe_exc
+                published_events = [
+                    item
+                    for item in published_state.get("resource_config_events", [])
+                    if item == event
+                ]
+                state_published = len(published_events) == 1
+                if not state_published:
+                    prior_events = [
+                        item
+                        for item in published_state.get("resource_config_events", [])
+                        if item == prior_event
+                    ]
+                    if len(prior_events) != 1:
+                        raise HarnessError(
+                            "Codex resource rollback state publication is ambiguous; "
+                            f"receipt retained at {receipt_path}"
+                        ) from exc
+            if state_published:
+                raise HarnessError(
+                    "Codex resource files and rolled-back state were published, but "
+                    "the final durability/index step reported an error"
+                ) from exc
+            try:
+                reapply_files_from_receipt(
+                    root=_task_resource_worktree(paths, state), receipt=receipt
+                )
+            except BaseException as recovery_exc:
+                raise HarnessError(
+                    "Codex resource files were rolled back, task-state publication "
+                    "failed, and exact re-apply also failed; "
+                    f"receipt retained at {receipt_path}"
+                ) from recovery_exc
+            raise HarnessError(
+                "Codex resource rollback state publication failed; exact applied "
+                "bytes were restored and the event remains applied"
+            ) from exc
     emit(event, args.json)
     return 0
 
@@ -12204,6 +12635,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 state,
                 {
                     "packet_id": packet_id,
+                    "lane_id": args.lane_id or "",
                     "agent_role": args.agent_role,
                     "model_tier": args.model_tier,
                     "delegation_depth": args.delegation_depth,
@@ -15140,25 +15572,44 @@ def build_parser(
     add_json_argument(p)
     p.set_defaults(handler=cmd_skill_adoption_record)
 
+    def add_execution_selection_arguments(
+        parser: argparse.ArgumentParser, *, override_required: bool
+    ) -> None:
+        parser.add_argument("--task", required=True)
+        parser.add_argument("--selection-id", required=True)
+        parser.add_argument("--work-unit-id", required=True)
+        parser.add_argument("--supersedes-selection-id")
+        parser.add_argument("--mode", choices=sorted(EXECUTION_MODES), required=True)
+        parser.add_argument("--lane", action="append", default=[], required=True)
+        parser.add_argument("--steward-lane-id")
+        parser.add_argument("--scope", required=True)
+        parser.add_argument(
+            "--sequential-dependency",
+            choices=sorted(DEPENDENCY_LEVELS),
+            required=True,
+        )
+        parser.add_argument(
+            "--tool-density", choices=sorted(TOOL_DENSITIES), required=True
+        )
+        parser.add_argument(
+            "--shared-context", choices=sorted(DEPENDENCY_LEVELS), required=True
+        )
+        parser.add_argument("--rationale", required=True)
+        parser.add_argument("--falsification-condition", required=True)
+        parser.add_argument("--escalation-condition", required=True)
+        parser.add_argument("--session-id", required=True)
+        parser.add_argument(
+            "--override-id", required=override_required, default=""
+        )
+
+    p = sub.add_parser("execution-select-plan")
+    add_execution_selection_arguments(p, override_required=True)
+    p.add_argument("--proposed-setting", action="append", default=[], required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_execution_select_plan)
+
     p = sub.add_parser("execution-select")
-    p.add_argument("--task", required=True)
-    p.add_argument("--selection-id", required=True)
-    p.add_argument("--work-unit-id", required=True)
-    p.add_argument("--supersedes-selection-id")
-    p.add_argument("--mode", choices=sorted(EXECUTION_MODES), required=True)
-    p.add_argument("--lane", action="append", default=[], required=True)
-    p.add_argument("--steward-lane-id")
-    p.add_argument("--scope", required=True)
-    p.add_argument(
-        "--sequential-dependency", choices=sorted(DEPENDENCY_LEVELS), required=True
-    )
-    p.add_argument("--tool-density", choices=sorted(TOOL_DENSITIES), required=True)
-    p.add_argument("--shared-context", choices=sorted(DEPENDENCY_LEVELS), required=True)
-    p.add_argument("--rationale", required=True)
-    p.add_argument("--falsification-condition", required=True)
-    p.add_argument("--escalation-condition", required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--override-id", default="")
+    add_execution_selection_arguments(p, override_required=False)
     add_json_argument(p)
     p.set_defaults(handler=cmd_execution_select)
 
@@ -15240,6 +15691,7 @@ def build_parser(
     p.add_argument("--override-id", required=True)
     p.add_argument("--target-kind", choices=sorted(OVERRIDE_TARGET_KINDS), required=True)
     p.add_argument("--target-id", required=True)
+    p.add_argument("--target-contract-sha256", required=True)
     p.add_argument("--scope", required=True)
     p.add_argument("--setting", action="append", default=[], required=True)
     p.add_argument("--user-rationale", required=True)
@@ -15290,6 +15742,7 @@ def build_parser(
 
     p = sub.add_parser("codex-config-plan")
     add_codex_resource_plan_arguments(p)
+    p.add_argument("--proposed-setting", action="append", default=[])
     add_json_argument(p)
     p.set_defaults(handler=cmd_codex_config_plan)
 

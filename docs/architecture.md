@@ -107,15 +107,22 @@ execution authority. Chief arbitration uses expected-version CAS and records
 exact approved settings. Only `execution-select` or `codex-config-apply` can
 consume the matching target once. The resulting envelope/event points back to
 the consumed authority, so removing either side is an integrity error.
+Execution-resource approval additionally binds a deterministic selection
+proposal covering the task plan, topology, lane/Steward authority snapshots,
+scope, task characteristics, and decision conditions. Config approval binds
+the exact event/task-plan/file plan digest. Consumers recompute these contracts
+before mutation; semantic reuse of an approved identifier fails closed.
 
 Config apply requires claim coverage and the exact reviewed plan SHA. It writes
-a task-local receipt before changing project files, applies each file with
-drift checks and best-effort transactional rollback, then publishes the event.
+a task-local receipt containing the full plan preimage before changing project
+files, applies each file with exact-state transition recovery, then publishes
+the event.
 A post-publication durability error retains the consistent event/files for
 doctor/reconcile instead of rolling back behind an already-published state.
-Explicit rollback requires unchanged applied bytes and restores the receipt's
-exact prior bytes. No operation edits user-level Codex configuration or
-hot-reloads the current session.
+Explicit rollback preflights all unchanged applied bytes, restores the
+receipt's exact prior bytes, and reconciles a failed state publication by
+probing the published event or reapplying the exact postimage. No operation
+edits user-level Codex configuration or hot-reloads the current session.
 
 ## Bootstrap boundary
 

@@ -26,6 +26,9 @@ capacity.
   decision;
 - depth-one role/model tier: still validated against the project AOI role map.
 
+A depth-one packet must also match the exact role of its selected lane. A
+globally valid role cannot be substituted into a different selected lane.
+
 Every packet created under that selection records the exact envelope SHA-256.
 `packet-arm`, trusted hook consumption, manual dispatch registration, doctor,
 and close gates recompute the binding. Ready packets may be prepared in
@@ -44,15 +47,40 @@ assessment, alternatives, expiry, and an exact future target. Only the Chief
 can approve the exact settings, risk boundary, rollback condition, and
 compensating controls.
 
+Phase 1 treats the SHA-bound proposal as exact accept/reject authority. If the
+Chief wants different settings, reject it, generate a new plan/contract, and
+submit a new override request; arbitration cannot silently rewrite the target.
+
 The following proposes raising one future selection from the default four
 active first-level agents to five:
 
 ```bash
+aoi execution-select-plan \
+  --task <task-id> \
+  --selection-id <future-selection-id> \
+  --work-unit-id <work-unit-id> \
+  --mode centralized_parallel \
+  --lane <lane-a> --lane <lane-b> --lane <lane-c> \
+  --lane <lane-d> --lane <lane-e> \
+  --steward-lane-id <steward-lane> \
+  --scope "Only this exact independent selected work unit" \
+  --sequential-dependency low \
+  --tool-density low \
+  --shared-context low \
+  --rationale "Why this topology is appropriate" \
+  --falsification-condition "What invalidates this topology" \
+  --escalation-condition "When the Chief must reduce or stop it" \
+  --session-id <task-bound-root-session> \
+  --override-id <override-id> \
+  --proposed-setting envelope.max_active_first_level_agents=5 \
+  --json
+
 aoi override-request \
   --task <task-id> \
   --override-id <override-id> \
   --target-kind execution_resource \
   --target-id <future-selection-id> \
+  --target-contract-sha256 <execution-select-plan-target-contract-sha256> \
   --scope "Only this independent selected work unit" \
   --setting envelope.max_active_first_level_agents=5 \
   --user-rationale "Why the extra concurrency is worth it" \
@@ -76,8 +104,12 @@ aoi override-arbitrate \
 
 Pass `--override-id <override-id>` to the exact matching
 `execution-select`. That transaction consumes the approval and records the
-resulting envelope digest. A replay, a different target id, an expired
-approval, or a changed version fails closed.
+resulting envelope and target-contract digests. The plan preimage binds the
+task plan, work unit, supersession, mode, sorted lane authority snapshots,
+Steward snapshot, scope, task characteristics, rationale, falsification and
+escalation conditions, and proposed resource envelope. A replay, changed
+semantic field, stale lane snapshot, different target id, expired approval, or
+changed version fails closed.
 
 Supported `execution_resource` settings are:
 
@@ -140,15 +172,24 @@ aoi codex-config-apply \
   --json
 ```
 
+The event id and current approved task-plan SHA are part of the plan digest, so
+a reviewed digest for event A cannot authorize event B or a different task
+plan.
+
 The normal project ceiling is `max_threads = 12` and `max_depth = 2`; the
 selection envelope enforces the smaller active wave. A `resource_config`
 override may approve exact `agents.max_threads`, `agents.max_depth`, or
 role-model/reasoning settings for one event. Its `--target-id` must equal that
-event id, and both plan and apply must name the override.
+event id, and both plan and apply must name the override. Before requesting
+that override, create its exact contract with `codex-config-plan` plus the
+future `--override-id` and one or more `--proposed-setting`; pass the returned
+`plan_sha256` as `override-request --target-contract-sha256`. After Chief
+approval, the ordinary plan/apply path recomputes and must exactly match it.
 
 Apply writes a task-local JSON receipt before changing project files. The
 receipt binds every before/after byte sequence, file hash, plan hash, root
-session, event, and override. After apply, start a fresh trusted Codex session
+session, event, override, and the full reviewed plan preimage. After apply,
+start a fresh trusted Codex session
 and separately verify that its available agent types/configuration match the
 request. Do not report routing as verified merely because the files exist.
 
@@ -167,7 +208,12 @@ aoi codex-config-rollback \
 
 AOI restores the exact previous bytes or removes files that did not previously
 exist. Drift after apply blocks rollback rather than overwriting unrelated
-changes.
+changes. All targets are preflighted before the first rollback mutation. If a
+mid-rollback write fails, AOI attempts to restore the exact applied state; if
+task-state publication fails after file rollback, AOI probes publication and,
+when the old applied state is still authoritative, reapplies the exact receipt
+bytes. Ambiguous or doubly failed recovery retains the receipt and fails
+closed.
 
 ## Current evidence boundary
 

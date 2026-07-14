@@ -2631,6 +2631,7 @@ class LockTests(HarnessTestCase):
                     h.validate_claim_lock_identities(
                         paths,
                         {
+                            "legacy": True,
                             "token": "mounted-case-alias",
                             "worktree": str(mounted_repo),
                             "locks": ["repo:tree:Program Files"],
@@ -3035,10 +3036,13 @@ class LifecycleTests(HarnessTestCase):
         self.assertNotEqual(rendered, changed_rendered)
 
         below_threshold = json.loads(json.dumps(state))
+        retained_terminal_count = h.COMPACT_CLAIM_HISTORY_THRESHOLD - 1
         below_threshold["claims"] = [
-            *state["claims"][: h.COMPACT_CLAIM_HISTORY_THRESHOLD - 1],
+            *state["claims"][:retained_terminal_count],
             "active-claim",
         ]
+        for token in state["claims"][retained_terminal_count:-1]:
+            (paths.claims_archive / f"{token}.json").unlink()
         below_rendered = h.render_checkpoint(
             paths,
             below_threshold,
@@ -3985,6 +3989,7 @@ class LifecycleTests(HarnessTestCase):
                 "created_at": "2026-01-01T00:00:00+00:00",
                 "updated_at": "2026-01-01T00:00:00+00:00",
                 "expires_at": "2099-01-01T00:00:00+00:00",
+                "worktree": str(self.root),
                 "baselines": {},
             },
         )
@@ -5669,6 +5674,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         lane_id: str,
         selection_id: str,
     ) -> None:
+        lane = self.lane_state(task_id, lane_id)
+        role = str(lane["role"])
         self.cli(
             "create-packet",
             "--task",
@@ -5676,9 +5683,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--packet-id",
             packet_id,
             "--agent-role",
-            "explorer",
+            role,
             "--model-tier",
-            "standard",
+            cli_impl.ROLE_TIER_MAP[role],
             "--objective",
             f"Inspect the bounded {lane_id} evidence question for {packet_id}",
             "--scope",
@@ -5918,6 +5925,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertIn("task-global execution epoch", rejected.stderr)
 
     def test_legacy_parallel_selection_does_not_require_a_retroactive_v2_brief(self) -> None:
+        paths = h.get_paths(self.root)
         selection = {
             "selection_id": "legacy-parallel",
             "mode": "centralized_parallel",
@@ -5934,17 +5942,19 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             ],
             "execution_briefs": [],
         }
-        self.assertIsNone(cli_impl._execution_brief_coverage_error(state, selection))
+        self.assertIsNone(
+            cli_impl._execution_brief_coverage_error(paths, state, selection)
+        )
         selection["execution_selection_version"] = 2
         self.assertIn(
             "lacks a Steward result brief",
-            cli_impl._execution_brief_coverage_error(state, selection) or "",
+            cli_impl._execution_brief_coverage_error(paths, state, selection) or "",
         )
         selection.pop("execution_selection_version")
         selection["steward_snapshot"] = {}
         self.assertIn(
             "v2-only fields without a selection version",
-            cli_impl._execution_brief_coverage_error(state, selection) or "",
+            cli_impl._execution_brief_coverage_error(paths, state, selection) or "",
         )
 
     def test_task_global_execution_epoch_includes_standalone_jobs(self) -> None:
@@ -10335,27 +10345,10 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("active execution topology", unbound_packet.stderr)
-        self.cli(
-            "create-packet",
-            "--task",
+        self.create_selected_packet(
             "topology-governance",
-            "--packet-id",
             "topology-bound-investigation",
-            "--agent-role",
-            "explorer",
-            "--model-tier",
-            "standard",
-            "--objective",
-            "Inspect the exact RTL side of the bounded rounding mismatch",
-            "--scope",
-            "Read-only investigation under the selected hybrid topology",
-            "--deliverable",
-            "Bounded evidence and one conclusion",
-            "--validation",
-            "Packet dispatch remains bound to the selected lane snapshot",
-            "--lane-id",
             "rtl",
-            "--execution-selection-id",
             "rtl-num-hybrid-current",
         )
         self.dispatch_packet(
@@ -12638,7 +12631,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertEqual(version.stdout.strip(), "AOI 0.2.1")
+            self.assertEqual(version.stdout.strip(), "AOI 0.2.2")
             help_result = subprocess.run(
                 [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
                 cwd=directory,

@@ -491,6 +491,19 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
     ) -> None:
         paths = h.get_paths(self.root)
         canonical_root = self.root.resolve()
+        self.cli(
+            "init-task",
+            "--task-id",
+            "custom-short-held",
+            "--title",
+            "Existing custom short lock authority",
+            "--objective",
+            "Reject a persisted non-canonical Windows lock spelling",
+            "--owner",
+            "legacy-test",
+            "--completion-boundary",
+            "The existing claim is rejected without rewriting its authority",
+        )
 
         def resolve_custom_alias(path: Path, label: str) -> Path:
             candidate = Path(path)

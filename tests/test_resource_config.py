@@ -40,6 +40,126 @@ class ResourceConfigPrimitiveTests(unittest.TestCase):
             with mock.patch.object(rc.os, "read", side_effect=short_read):
                 self.assertEqual(rc._safe_read(path, "short-read fixture"), payload)
 
+    def test_apply_rollback_failure_has_a_distinct_recovery_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.toml"
+            second = root / "second.toml"
+            first.write_bytes(b"before-first\n")
+            second.write_bytes(b"before-second\n")
+            files = [
+                {
+                    "relative_path": "first.toml",
+                    "path": first,
+                    "before": b"before-first\n",
+                    "after": b"after-first\n",
+                },
+                {
+                    "relative_path": "second.toml",
+                    "path": second,
+                    "before": b"before-second\n",
+                    "after": b"after-second\n",
+                },
+            ]
+            real_write = rc.atomic_write_bytes
+            calls = 0
+
+            def fail_apply_and_rollback(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls in {2, 3}:
+                    raise OSError(f"injected write failure {calls}")
+                real_write(path, payload)
+
+            with mock.patch.object(
+                rc, "atomic_write_bytes", side_effect=fail_apply_and_rollback
+            ), self.assertRaises(rc.ResourceApplyRollbackError):
+                rc.apply_resource_files(files)
+            self.assertEqual(first.read_bytes(), b"after-first\n")
+            self.assertEqual(second.read_bytes(), b"before-second\n")
+
+    def test_post_publication_write_error_rolls_back_the_failed_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.toml"
+            second = root / "second.toml"
+            first.write_bytes(b"before-first\n")
+            second.write_bytes(b"before-second\n")
+            files = [
+                {
+                    "relative_path": "first.toml",
+                    "path": first,
+                    "before": b"before-first\n",
+                    "after": b"after-first\n",
+                },
+                {
+                    "relative_path": "second.toml",
+                    "path": second,
+                    "before": b"before-second\n",
+                    "after": b"after-second\n",
+                },
+            ]
+            real_write = rc.atomic_write_bytes
+            calls = 0
+
+            def fail_after_second_publication(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                real_write(path, payload)
+                if calls == 2:
+                    raise OSError("injected post-publication failure")
+
+            with mock.patch.object(
+                rc, "atomic_write_bytes", side_effect=fail_after_second_publication
+            ), self.assertRaisesRegex(OSError, "post-publication"):
+                rc.apply_resource_files(files)
+            self.assertEqual(first.read_bytes(), b"before-first\n")
+            self.assertEqual(second.read_bytes(), b"before-second\n")
+
+    def test_failed_explicit_rollback_reapplies_completed_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.toml"
+            second = root / "second.toml"
+            first.write_bytes(b"after-first\n")
+            second.write_bytes(b"after-second\n")
+            files = [
+                {
+                    "relative_path": "second.toml",
+                    "path": second,
+                    "before": b"before-second\n",
+                    "after": b"after-second\n",
+                },
+                {
+                    "relative_path": "first.toml",
+                    "path": first,
+                    "before": b"before-first\n",
+                    "after": b"after-first\n",
+                },
+            ]
+            real_write = rc.atomic_write_bytes
+            calls = 0
+
+            def fail_second_rollback_write(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected rollback write failure")
+                real_write(path, payload)
+
+            with mock.patch.object(
+                rc, "atomic_write_bytes", side_effect=fail_second_rollback_write
+            ), self.assertRaisesRegex(OSError, "rollback write"):
+                rc._transition_resource_files(
+                    files,
+                    source_key="after",
+                    target_key="before",
+                    action="resource rollback",
+                    recovery_error=rc.ResourceRollbackReapplyError,
+                )
+            self.assertEqual(first.read_bytes(), b"after-first\n")
+            self.assertEqual(second.read_bytes(), b"after-second\n")
+
     def test_override_settings_are_typed_and_target_scoped(self) -> None:
         parsed = rc.parse_override_settings(
             [
@@ -76,6 +196,16 @@ class ResourceConfigPrimitiveTests(unittest.TestCase):
         )
         self.assertEqual(envelope["max_active_first_level_agents"], 2)
         self.assertEqual(envelope["max_active_total_agents"], 4)
+        with self.assertRaisesRegex(HarnessError, "unselected role"):
+            cli_impl._build_execution_resource_envelope(
+                mode="centralized_parallel",
+                lanes=lanes,
+                steward=None,
+                override_id="unrelated-role",
+                override_settings={
+                    "agents.analysis_specialist.model": "gpt-5.6-sol"
+                },
+            )
         selection = {
             "selection_id": "selection",
             "mode": "centralized_parallel",
@@ -130,6 +260,21 @@ class ResourceConfigPrimitiveTests(unittest.TestCase):
                 },
                 selection,
                 enforce_active_limit=True,
+            )
+        with self.assertRaisesRegex(HarnessError, "selected lane authority"):
+            cli_impl._validate_packet_resource_envelope(
+                state,
+                {
+                    "packet_id": "wrong-role",
+                    "lane_id": "lane-a",
+                    "agent_role": "default",
+                    "model_tier": "standard",
+                    "delegation_depth": 1,
+                    "execution_selection_id": "selection",
+                    "resource_envelope_sha256": digest,
+                },
+                selection,
+                enforce_active_limit=False,
             )
 
 
@@ -231,54 +376,6 @@ class ResourceControlTests(HarnessTestCase):
         expires_at = (
             dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
         ).isoformat()
-        self.cli(
-            "override-request",
-            "--task",
-            task_id,
-            "--override-id",
-            "raise-first-level-cap",
-            "--target-kind",
-            "execution_resource",
-            "--target-id",
-            "resource-selection",
-            "--scope",
-            "Raise only this six-lane selection from the default four active specialists to five",
-            "--setting",
-            "envelope.max_active_first_level_agents=5",
-            "--user-rationale",
-            "The user values latency for this independent six-lane evidence pass",
-            "--user-evidence",
-            "Six selected lanes have disjoint scopes and no same-lane overlap",
-            "--chief-assessment",
-            "Five concurrent specialists remain below the hard twelve-thread ceiling",
-            "--alternative",
-            "Keep the default four-agent wave and dispatch the remaining lanes later",
-            "--expires-at",
-            expires_at,
-            "--session-id",
-            root_session,
-        )
-        self.cli(
-            "override-arbitrate",
-            "--task",
-            task_id,
-            "--override-id",
-            "raise-first-level-cap",
-            "--expected-version",
-            "1",
-            "--decision",
-            "approved",
-            "--rationale",
-            "Chief accepts one extra independent lane for this exact selection",
-            "--risk-boundary",
-            "No same-lane overlap and no change to depth, claims, evidence, or provider limits",
-            "--rollback-condition",
-            "Stop arming new packets if contention or stale topology appears",
-            "--compensating-control",
-            "Packet arm revalidates the exact envelope and active count",
-            "--session-id",
-            root_session,
-        )
         selection_args = [
             "execution-select",
             "--task",
@@ -316,6 +413,106 @@ class ResourceControlTests(HarnessTestCase):
                 "raise-first-level-cap",
             ]
         )
+        preview_args = list(selection_args)
+        preview_args[0] = "execution-select-plan"
+        preview_args.extend(
+            [
+                "--proposed-setting",
+                "envelope.max_active_first_level_agents=5",
+                "--proposed-setting",
+                "agents.explorer.model=gpt-5.6-sol",
+                "--proposed-setting",
+                "agents.explorer.model_reasoning_effort=high",
+                "--json",
+            ]
+        )
+        target_contract = json.loads(self.cli(*preview_args).stdout)
+        self.cli(
+            "override-request",
+            "--task",
+            task_id,
+            "--override-id",
+            "raise-first-level-cap",
+            "--target-kind",
+            "execution_resource",
+            "--target-id",
+            "resource-selection",
+            "--target-contract-sha256",
+            target_contract["target_contract_sha256"],
+            "--scope",
+            "Raise only this six-lane selection from the default four active specialists to five",
+            "--setting",
+            "envelope.max_active_first_level_agents=5",
+            "--setting",
+            "agents.explorer.model=gpt-5.6-sol",
+            "--setting",
+            "agents.explorer.model_reasoning_effort=high",
+            "--user-rationale",
+            "The user values latency for this independent six-lane evidence pass",
+            "--user-evidence",
+            "Six selected lanes have disjoint scopes and no same-lane overlap",
+            "--chief-assessment",
+            "Five concurrent specialists remain below the hard twelve-thread ceiling",
+            "--alternative",
+            "Keep the default four-agent wave and dispatch the remaining lanes later",
+            "--expires-at",
+            expires_at,
+            "--session-id",
+            root_session,
+        )
+        changed_approval = self.cli(
+            "override-arbitrate",
+            "--task",
+            task_id,
+            "--override-id",
+            "raise-first-level-cap",
+            "--expected-version",
+            "1",
+            "--decision",
+            "approved",
+            "--approved-setting",
+            "envelope.max_active_first_level_agents=4",
+            "--rationale",
+            "Chief would prefer a different resource setting",
+            "--risk-boundary",
+            "The original semantic target contract must not be silently reused",
+            "--rollback-condition",
+            "Create a new proposal if the setting changes",
+            "--compensating-control",
+            "Reject contract-changing arbitration",
+            "--session-id",
+            root_session,
+            ok=False,
+        )
+        self.assertIn("requires a new target contract", changed_approval.stderr)
+        self.cli(
+            "override-arbitrate",
+            "--task",
+            task_id,
+            "--override-id",
+            "raise-first-level-cap",
+            "--expected-version",
+            "1",
+            "--decision",
+            "approved",
+            "--rationale",
+            "Chief accepts one extra independent lane for this exact selection",
+            "--risk-boundary",
+            "No same-lane overlap and no change to depth, claims, evidence, or provider limits",
+            "--rollback-condition",
+            "Stop arming new packets if contention or stale topology appears",
+            "--compensating-control",
+            "Packet arm revalidates the exact envelope and active count",
+            "--session-id",
+            root_session,
+        )
+        semantic_reuse = list(selection_args)
+        scope_index = semantic_reuse.index("--scope") + 1
+        semantic_reuse[scope_index] = (
+            "A materially different selection hidden behind the same identifier"
+        )
+        rejected_reuse = self.cli(*semantic_reuse, ok=False)
+        self.assertIn("different canonical contract", rejected_reuse.stderr)
         self.cli(*selection_args)
         state = self._state(task_id)
         override = state["override_requests"][0]
@@ -326,11 +523,39 @@ class ResourceControlTests(HarnessTestCase):
             selection["resource_envelope"]["max_active_first_level_agents"], 5
         )
         self.assertEqual(
+            selection["resource_envelope"]["role_config_overrides"],
+            {
+                "agents.explorer.model": "gpt-5.6-sol",
+                "agents.explorer.model_reasoning_effort": "high",
+            },
+        )
+        self.assertEqual(
             override["consumption"]["resource_envelope_sha256"],
             selection["resource_envelope_sha256"],
         )
         self.assertEqual(cli_impl.override_integrity_errors(state), [])
         self.assertEqual(cli_impl.resource_envelope_integrity_errors(state), [])
+        forged = json.loads(json.dumps(state))
+        forged_envelope = forged["execution_selections"][0]["resource_envelope"]
+        forged_envelope["max_active_first_level_agents"] = 6
+        forged_envelope["max_active_total_agents"] = 12
+        forged_digest = cli_impl.canonical_record_sha256(forged_envelope)
+        forged["execution_selections"][0][
+            "resource_envelope_sha256"
+        ] = forged_digest
+        forged["override_requests"][0]["consumption"][
+            "resource_envelope_sha256"
+        ] = forged_digest
+        forged_errors = cli_impl.resource_envelope_integrity_errors(forged)
+        self.assertTrue(forged_errors)
+        self.assertTrue(
+            any(
+                "override consumption binding is invalid" in error
+                or "differs from its topology/Chief authority" in error
+                or "target contract lost integrity" in error
+                for error in forged_errors
+            )
+        )
         for index, (lane_id, role, tier) in enumerate(roles, start=1):
             self._packet(task_id, f"packet-{index}", lane_id, role, tier)
         packet_state = self._state(task_id)
@@ -385,12 +610,14 @@ class ResourceControlTests(HarnessTestCase):
         )
         state = {
             "task_id": "resource-files",
+            "plan_sha256": "b" * 64,
             "lanes": [{"status": "active", "role": "explorer"}],
             "packets": [],
             "execution_selections": [],
         }
         with mock.patch.object(rc, "_safe_read", wraps=rc._safe_read) as reads:
             plan, files = rc.build_codex_resource_plan(
+                event_id="resource-files-event",
                 root=self.root,
                 config=load_config(self.root),
                 state=state,
@@ -405,6 +632,26 @@ class ResourceControlTests(HarnessTestCase):
         self.assertEqual(plan["resolved"]["max_threads"], 12)
         self.assertEqual(plan["resolved"]["max_depth"], 2)
         self.assertTrue(plan["restart_required"])
+        alternate_plan, _alternate_files = rc.build_codex_resource_plan(
+            event_id="different-resource-event",
+            root=self.root,
+            config=load_config(self.root),
+            state=state,
+            codex_home=codex_home,
+            managed_roles=["explorer"],
+        )
+        self.assertNotEqual(plan["plan_sha256"], alternate_plan["plan_sha256"])
+        with mock.patch.object(rc, "RESOURCE_FILE_MAX_COUNT", 1), self.assertRaisesRegex(
+            HarnessError, "1-file limit"
+        ):
+            rc.build_codex_resource_plan(
+                event_id="resource-files-event",
+                root=self.root,
+                config=load_config(self.root),
+                state=state,
+                codex_home=codex_home,
+                managed_roles=["explorer"],
+            )
         selected_state = {
             **state,
             "execution_selections": [
@@ -416,7 +663,10 @@ class ResourceControlTests(HarnessTestCase):
                         "max_active_total_agents": 4,
                         "max_delegation_depth": 2,
                         "role_model_tiers": {"explorer": "standard"},
-                        "role_config_overrides": {},
+                        "role_config_overrides": {
+                            "agents.explorer.model": "gpt-5.6-sol",
+                            "agents.explorer.model_reasoning_effort": "high",
+                        },
                     },
                     "resource_envelope_sha256": "a" * 64,
                 }
@@ -424,6 +674,7 @@ class ResourceControlTests(HarnessTestCase):
         }
         with self.assertRaisesRegex(HarnessError, "below the selected AOI"):
             rc.build_codex_resource_plan(
+                event_id="resource-files-event",
                 root=self.root,
                 config=load_config(self.root),
                 state=selected_state,
@@ -431,6 +682,23 @@ class ResourceControlTests(HarnessTestCase):
                 managed_roles=["explorer"],
                 platform_max_threads=3,
             )
+        selected_plan, _selected_files = rc.build_codex_resource_plan(
+            event_id="resource-files-event",
+            root=self.root,
+            config=load_config(self.root),
+            state=selected_state,
+            codex_home=codex_home,
+            managed_roles=["explorer"],
+        )
+        self.assertEqual(
+            selected_plan["resolved"]["agents"]["explorer"]["model"],
+            "gpt-5.6-sol",
+        )
+        self.assertEqual(
+            selected_plan["resolved"]["agents"]["explorer"]
+            ["model_reasoning_effort"],
+            "high",
+        )
         rc.apply_resource_files(files)
         project_config = self.root / ".codex" / "config.toml"
         project_agent = self.root / ".codex" / "agents" / "explorer.toml"
@@ -446,6 +714,16 @@ class ResourceControlTests(HarnessTestCase):
             applied_at="2026-07-15T00:00:00+00:00",
             root_session_id="resource-root",
         )
+        tampered_receipt = json.loads(json.dumps(receipt))
+        tampered_receipt["files"][0]["source_kind"] = "forged"
+        with self.assertRaisesRegex(HarnessError, "source identity is invalid"):
+            rc.validate_resource_receipt(tampered_receipt)
+        applied_agent = project_agent.read_bytes()
+        project_config.write_bytes(project_config.read_bytes() + b"# drift\n")
+        with self.assertRaisesRegex(HarnessError, "target drifted"):
+            rc.rollback_files_from_receipt(root=self.root, receipt=receipt)
+        self.assertEqual(project_agent.read_bytes(), applied_agent)
+        project_config.write_bytes(files[0]["after"])
         rc.rollback_files_from_receipt(root=self.root, receipt=receipt)
         self.assertFalse(project_config.exists())
         self.assertFalse(project_agent.exists())
@@ -493,6 +771,24 @@ class ResourceControlTests(HarnessTestCase):
             "--expires-at",
             expires_at,
         )
+        draft_plan = json.loads(
+            self.cli(
+                "codex-config-plan",
+                "--task",
+                task_id,
+                "--event-id",
+                event_id,
+                "--override-id",
+                "resource-config-model",
+                "--role",
+                "explorer",
+                "--proposed-setting",
+                "agents.explorer.model=gpt-5.6-sol",
+                "--proposed-setting",
+                "agents.explorer.model_reasoning_effort=high",
+                "--json",
+            ).stdout
+        )
         self.cli(
             "override-request",
             "--task",
@@ -503,6 +799,8 @@ class ResourceControlTests(HarnessTestCase):
             "resource_config",
             "--target-id",
             event_id,
+            "--target-contract-sha256",
+            draft_plan["plan_sha256"],
             "--scope",
             "Change only the explorer project profile for the named config event",
             "--setting",
@@ -522,6 +820,31 @@ class ResourceControlTests(HarnessTestCase):
             "--session-id",
             root_session,
         )
+        changed_approval = self.cli(
+            "override-arbitrate",
+            "--task",
+            task_id,
+            "--override-id",
+            "resource-config-model",
+            "--expected-version",
+            "1",
+            "--decision",
+            "approved",
+            "--approved-setting",
+            "agents.explorer.model=gpt-5.6-terra",
+            "--rationale",
+            "Chief would prefer a different model request",
+            "--risk-boundary",
+            "The reviewed config contract must not change in arbitration",
+            "--rollback-condition",
+            "Create a new config proposal if the model changes",
+            "--compensating-control",
+            "Reject contract-changing arbitration",
+            "--session-id",
+            root_session,
+            ok=False,
+        )
+        self.assertIn("requires a new target contract", changed_approval.stderr)
         self.cli(
             "override-arbitrate",
             "--task",
@@ -543,6 +866,28 @@ class ResourceControlTests(HarnessTestCase):
             "--session-id",
             root_session,
         )
+        profile_path = agents / "explorer.toml"
+        reviewed_profile = profile_path.read_bytes()
+        profile_path.write_bytes(
+            reviewed_profile.replace(
+                b"Read-only repository exploration",
+                b"Changed after Chief review",
+            )
+        )
+        drifted_plan = self.cli(
+            "codex-config-plan",
+            "--task",
+            task_id,
+            "--event-id",
+            event_id,
+            "--override-id",
+            "resource-config-model",
+            "--role",
+            "explorer",
+            ok=False,
+        )
+        self.assertIn("different canonical contract", drifted_plan.stderr)
+        profile_path.write_bytes(reviewed_profile)
         plan = json.loads(
             self.cli(
                 "codex-config-plan",
@@ -560,6 +905,7 @@ class ResourceControlTests(HarnessTestCase):
         self.assertEqual(
             plan["resolved"]["agents"]["explorer"]["model"], "gpt-5.6-sol"
         )
+        self.assertEqual(plan["plan_sha256"], draft_plan["plan_sha256"])
         self.cli(
             "codex-config-apply",
             "--task",
@@ -616,6 +962,42 @@ class ResourceControlTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("event already exists", replay.stderr)
+        invalid_reason = self.cli(
+            "codex-config-rollback",
+            "--task",
+            task_id,
+            "--event-id",
+            event_id,
+            "--reason",
+            " ",
+            "--session-id",
+            root_session,
+            ok=False,
+        )
+        self.assertIn("rollback reason", invalid_reason.stderr)
+        self.assertTrue(project_agent.exists())
+        with mock.patch.object(
+            cli_impl,
+            "write_task",
+            side_effect=HarnessError("injected rollback state write failure"),
+        ):
+            failed_publish = self.cli_in_process(
+                "codex-config-rollback",
+                "--task",
+                task_id,
+                "--event-id",
+                event_id,
+                "--reason",
+                "Exercise exact file re-apply after state publication failure",
+                "--session-id",
+                root_session,
+                ok=False,
+            )
+        self.assertIn("exact applied bytes were restored", failed_publish.stderr)
+        self.assertEqual(self._state(task_id)["resource_config_events"][0]["status"], "applied")
+        self.assertIn(
+            'model = "gpt-5.6-sol"', project_agent.read_text(encoding="utf-8")
+        )
         self.cli(
             "codex-config-rollback",
             "--task",
