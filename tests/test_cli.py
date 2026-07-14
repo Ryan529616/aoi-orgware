@@ -2933,6 +2933,7 @@ class LifecycleTests(HarnessTestCase):
             / "state.json"
         )
         state = json.loads(state_path.read_text(encoding="utf-8"))
+        task_worktree = str(h.validated_state_worktree(paths, state))
         terminal_claims = []
         terminal_count = h.COMPACT_CLAIM_HISTORY_THRESHOLD + 4
         terminal_statuses = ("done", "released", "stale")
@@ -2954,7 +2955,7 @@ class LifecycleTests(HarnessTestCase):
                 "created_at": "2026-07-12T00:00:00+00:00",
                 "updated_at": f"2026-07-12T00:00:{index:02d}+00:00",
                 "expires_at": "2099-01-01T00:00:00+00:00",
-                "worktree": str(self.root),
+                "worktree": task_worktree,
                 "baselines": {},
             }
             h.atomic_write_json(paths.claims_archive / f"{token}.json", claim)
@@ -2976,7 +2977,7 @@ class LifecycleTests(HarnessTestCase):
             "created_at": "2026-07-12T00:01:00+00:00",
             "updated_at": "2026-07-12T00:01:00+00:00",
             "expires_at": "2099-01-01T00:00:00+00:00",
-            "worktree": str(self.root),
+            "worktree": task_worktree,
             "baselines": {},
         }
         h.atomic_write_json(paths.claims_active / "active-claim.json", active_claim)
@@ -3972,6 +3973,9 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         h.ensure_layout(paths)
+        task_worktree = str(
+            h.validated_state_worktree(paths, h.load_task(paths, "orphan-task"))
+        )
         h.atomic_write_json(
             paths.claims_active / "orphan-claim.json",
             {
@@ -3989,7 +3993,7 @@ class LifecycleTests(HarnessTestCase):
                 "created_at": "2026-01-01T00:00:00+00:00",
                 "updated_at": "2026-01-01T00:00:00+00:00",
                 "expires_at": "2099-01-01T00:00:00+00:00",
-                "worktree": str(self.root),
+                "worktree": task_worktree,
                 "baselines": {},
             },
         )

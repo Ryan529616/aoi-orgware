@@ -624,9 +624,12 @@ class ResourceControlTests(HarnessTestCase):
                 codex_home=codex_home,
                 managed_roles=["explorer"],
             )
-        user_profile = agents / "explorer.toml"
+        user_profile = (agents / "explorer.toml").resolve()
         self.assertEqual(
-            sum(Path(call.args[0]) == user_profile for call in reads.call_args_list),
+            sum(
+                Path(call.args[0]).resolve() == user_profile
+                for call in reads.call_args_list
+            ),
             1,
         )
         self.assertEqual(plan["resolved"]["max_threads"], 12)
