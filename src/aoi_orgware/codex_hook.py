@@ -225,9 +225,10 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
         )
     elif status == "corrupt":
         context = (
-            "AOI could not validate the parent task mapping for this start. Stop without "
-            "material work and report the corrupt mapping to the parent. This hook observes "
-            "starts but cannot terminate an already-created sub-agent."
+            "AOI could not validate the parent task mapping or packet authority for this "
+            f"start; reason={outcome.get('reason_code')}. Stop without material work and "
+            "report the corrupt authority to the parent. This hook observes starts but "
+            "cannot terminate an already-created sub-agent."
         )
     else:
         context = (

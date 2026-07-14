@@ -126,10 +126,16 @@ from changing a file.
 Each state tree is tagged with one runtime lock domain. POSIX/WSL and native
 Windows locks are intentionally incompatible, so a domain mismatch fails
 closed before mutation. Native Windows support excludes UNC/network shares and
-case-sensitive NTFS in the v0.2 line. Benign NTFS 8.3 spellings are
-canonicalized after component-level reparse inspection; real symlink or
-junction traversal remains rejected. In the native-Windows domain, project
-paths and Git merge branch locks are case-folded before conflict comparison.
+case-sensitive NTFS in the v0.2 line. Benign NTFS aliases in project roots and
+artifact paths are canonicalized after component-level reparse inspection;
+real symlink or junction traversal remains rejected. Structured `repo:` and
+`host:` lock URIs must use canonical long spelling; alternate short spellings
+and unresolved 8.3-style components fail closed rather than becoming a second
+lock identity. In the native-Windows domain, project paths and Git merge branch
+locks are case-folded before conflict comparison. A WSL repository below the
+configured Windows drive mount likewise uses case-folded `repo:` lock
+and `git:merge:` identities; case-sensitive Windows-backed mounts are
+unsupported in v0.2.
 
 ## Delegation
 
@@ -346,7 +352,41 @@ intervention, and cost data. Missing telemetry remains missing.
 
 It may recommend a model-agnostic capability tier for a named depth-two
 lane/task-class/role combination. The Chief approves or rejects; the Steward
-records and distributes. v0.2 never auto-tunes routes or pins model brands.
+records and distributes. Capacity Planning does not infer a provider route,
+token usage, price, or cheapest sufficient model.
+
+## Codex resource control and Chief-approved override
+
+Every new execution selection carries a SHA-sealed dynamic resource envelope.
+`single` permits one active first-level agent. Parallel/hybrid work defaults to
+at most four active first-level agents and may never exceed the selected lane
+count or the twelve-thread hard ceiling. The default total-agent cap across both
+depths is twice the first-level wave and never above twelve. Delegation remains
+hard-capped at depth two, and existing topology, parent/child, role,
+capacity-decision, claim, and dispatch gates still apply. Every selected packet
+binds the exact envelope; creation validates role/depth authority and
+arm/dispatch revalidates both first-level and total active-agent counts. Older
+selections do not receive retroactive authority.
+
+A User may propose a typed resource exception, but the proposal has no
+execution authority. It must name one exact future selection or project config
+event, carry direct-User rationale/evidence, a Chief preliminary assessment,
+alternatives, and an expiry. The Chief alone approves or rejects exact settings
+with rationale, risk boundary, rollback condition, and compensating controls.
+Approval uses version CAS and is consumed once by the matching selection or
+config apply. Target mismatch, replay, expiry, or changed version fails closed.
+Chief lease, task-bound session, approved plan, claim coverage,
+dispatch-before-work, packet/result integrity, evidence strength, project
+trust/sandbox/provider limits, twelve threads, and depth two are not
+overridable.
+
+AOI may plan and apply project-scoped `.codex/config.toml` concurrency/depth
+ceilings and `.codex/agents/*.toml` model/reasoning defaults under exact claims,
+reviewed plan SHA-256, and a before/after byte receipt. It never edits user-level
+Codex configuration. Apply requires a fresh trusted Codex session and is not
+evidence of actual routing. Rollback restores exact prior bytes and refuses
+drift. Provider model, token, cost, and availability telemetry remain
+unavailable unless independently observed.
 
 ## Improvement Pipeline
 

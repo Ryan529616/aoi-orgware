@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -54,6 +55,17 @@ from .pilot import (
     initialize_kit,
     load_record,
     write_summary,
+)
+from .resource_config import (
+    AOI_MAX_DELEGATION_DEPTH,
+    ARISE_MAX_THREADS_CEILING,
+    RESOURCE_RECEIPT_SCHEMA_VERSION,
+    apply_resource_files,
+    build_codex_resource_plan,
+    make_resource_receipt,
+    parse_override_settings,
+    resource_plan_sha256,
+    rollback_files_from_receipt,
 )
 
 from .harnesslib import (
@@ -129,6 +141,10 @@ from .harnesslib import (
     takeover_chief_authority,
     validate_id,
     validate_existing_regular_file,
+    validate_claim_lock_identities,
+    validate_lock_identity,
+    validate_packet_lock_identities,
+    validated_state_worktree,
     write_index,
     write_task,
 )
@@ -353,6 +369,17 @@ NEEDS_USER_CATEGORIES = {
     "user_preference",
 }
 NEEDS_USER_STATUSES = {"needs_user", "resolved", "cancelled"}
+OVERRIDE_TARGET_KINDS = {"execution_resource", "resource_config"}
+OVERRIDE_STATUSES = {
+    "awaiting_chief",
+    "approved",
+    "rejected",
+    "consumed",
+    "revoked",
+}
+RESOURCE_CONFIG_EVENT_STATUSES = {"applied", "rolled_back"}
+RESOURCE_ENVELOPE_SCHEMA_VERSION = 1
+RESOURCE_DEFAULT_PARALLEL_AGENTS = 4
 COOPERATIVE_AUTHORITY_BOUNDARY = (
     "task-bound session assertion only; AOI does not authenticate the caller identity"
 )
@@ -366,6 +393,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "chief-status",
     "check-locks",
     "codebase-memory-benchmark-validate",
+    "codex-config-plan",
     "inspect-legacy",
     "reconcile",
     "resume",
@@ -387,6 +415,8 @@ CHIEF_STANDALONE_COMMANDS = (
 KNOWN_MANAGED_POLICY_SHA256 = {
     # AOI v0.1.3 packaged policy; safe one-way replacement during authenticated init.
     "76f116580d535ec33ca19da1e53ec3c3d35c107b05768a55d5ee654f477a3c85",
+    # AOI v0.2.1 policy before canonical long-spelling lock enforcement.
+    "eb03c009470e9bd27b521de6116b6206bfc0abf9785d0b1a1fe31416054a083f",
 }
 
 
@@ -1268,6 +1298,288 @@ def _lane_authority_snapshot(lane: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_execution_resource_envelope(
+    *,
+    mode: str,
+    lanes: list[dict[str, Any]],
+    steward: dict[str, Any] | None,
+    override_id: str,
+    override_settings: dict[str, str | int],
+) -> tuple[dict[str, Any], str]:
+    lane_count = len(lanes)
+    max_first_level = (
+        1
+        if mode == "single"
+        else min(RESOURCE_DEFAULT_PARALLEL_AGENTS, lane_count)
+    )
+    max_total_override: int | None = None
+    max_depth = AOI_MAX_DELEGATION_DEPTH
+    role_model_tiers: dict[str, str] = {}
+    for lane in lanes + ([steward] if steward is not None else []):
+        role = str(lane.get("role", ""))
+        tier = ROLE_TIER_MAP.get(role)
+        if not role or tier is None:
+            raise HarnessError(
+                f"execution resource envelope cannot resolve lane role {role!r}"
+            )
+        role_model_tiers[role] = tier
+    depth_two_role_model_tiers = {
+        role: ROLE_TIER_MAP[role]
+        for role in sorted(DEPTH_TWO_ROLES)
+        if role in ROLE_TIER_MAP
+    }
+    configurable_roles = set(ROLE_TIER_MAP)
+    role_settings: dict[str, str | int] = {}
+    for key, value in override_settings.items():
+        if key == "envelope.max_active_first_level_agents":
+            max_first_level = int(value)
+        elif key == "envelope.max_active_total_agents":
+            max_total_override = int(value)
+        elif key == "envelope.max_delegation_depth":
+            max_depth = int(value)
+        elif key.startswith("agents."):
+            role = key.split(".", 2)[1]
+            if role not in configurable_roles:
+                raise HarnessError(
+                    f"execution resource override references unselected role {role}"
+                )
+            role_settings[key] = value
+        else:
+            raise HarnessError(f"invalid execution resource setting: {key}")
+    hard_first_level = min(ARISE_MAX_THREADS_CEILING, max(1, lane_count))
+    if not 1 <= max_first_level <= hard_first_level:
+        raise HarnessError(
+            "execution max_active_first_level_agents must be within the selected "
+            f"lane count and hard ceiling (1-{hard_first_level})"
+        )
+    if mode == "single" and max_first_level != 1:
+        raise HarnessError("single execution mode has exactly one first-level agent")
+    max_total = (
+        max_total_override
+        if max_total_override is not None
+        else min(ARISE_MAX_THREADS_CEILING, max_first_level * 2)
+    )
+    if not max_first_level <= max_total <= ARISE_MAX_THREADS_CEILING:
+        raise HarnessError(
+            "execution max_active_total_agents must be at least the first-level "
+            f"limit and at most {ARISE_MAX_THREADS_CEILING}"
+        )
+    if not 1 <= max_depth <= AOI_MAX_DELEGATION_DEPTH:
+        raise HarnessError(
+            f"execution max delegation depth must be 1-{AOI_MAX_DELEGATION_DEPTH}"
+        )
+    envelope = {
+        "schema_version": RESOURCE_ENVELOPE_SCHEMA_VERSION,
+        "max_active_first_level_agents": max_first_level,
+        "max_active_total_agents": max_total,
+        "max_delegation_depth": max_depth,
+        "selected_lane_count": lane_count,
+        "role_model_tiers": dict(sorted(role_model_tiers.items())),
+        "depth_two_role_model_tiers": depth_two_role_model_tiers,
+        "role_config_overrides": dict(sorted(role_settings.items())),
+        "override_id": override_id,
+        "decision_source": (
+            "chief_approved_user_override" if override_id else "topology_policy_default"
+        ),
+        "depth_two_boundary": (
+            "Depth two remains separately gated by one exact acknowledged capacity "
+            "decision and the batch/explorer/worker leaf-role allowlist."
+        ),
+        "routing_evidence_boundary": (
+            "Role model tier and project configuration are requested authority only; "
+            "actual provider routing, token usage, and price remain unverified."
+        ),
+    }
+    return envelope, canonical_record_sha256(envelope)
+
+
+def _validate_selection_resource_envelope(
+    state: dict[str, Any], selection: dict[str, Any]
+) -> dict[str, Any] | None:
+    envelope = selection.get("resource_envelope")
+    digest = str(selection.get("resource_envelope_sha256", ""))
+    if envelope is None:
+        if digest:
+            raise HarnessError("execution selection has a digest without an envelope")
+        return None
+    if not isinstance(envelope, dict):
+        raise HarnessError("execution selection resource envelope is not an object")
+    if envelope.get("schema_version") != RESOURCE_ENVELOPE_SCHEMA_VERSION:
+        raise HarnessError("execution selection resource envelope schema is unsupported")
+    if digest != canonical_record_sha256(envelope):
+        raise HarnessError("execution selection resource envelope lost integrity")
+    mode = str(selection.get("mode", ""))
+    lane_count = len(selection.get("lane_snapshots", []))
+    max_first_level = envelope.get("max_active_first_level_agents")
+    max_total = envelope.get("max_active_total_agents")
+    max_depth = envelope.get("max_delegation_depth")
+    if (
+        not isinstance(max_first_level, int)
+        or isinstance(max_first_level, bool)
+        or not 1
+        <= max_first_level
+        <= min(ARISE_MAX_THREADS_CEILING, max(1, lane_count))
+    ):
+        raise HarnessError("execution resource first-level agent limit is invalid")
+    if mode == "single" and max_first_level != 1:
+        raise HarnessError("single execution resource envelope must limit first level to one")
+    if (
+        not isinstance(max_total, int)
+        or isinstance(max_total, bool)
+        or not max_first_level <= max_total <= ARISE_MAX_THREADS_CEILING
+    ):
+        raise HarnessError("execution resource total active-agent limit is invalid")
+    if (
+        not isinstance(max_depth, int)
+        or isinstance(max_depth, bool)
+        or not 1 <= max_depth <= AOI_MAX_DELEGATION_DEPTH
+    ):
+        raise HarnessError("execution resource delegation-depth limit is invalid")
+    expected_roles: dict[str, str] = {}
+    for snapshot in selection.get("lane_snapshots", []):
+        lane = lane_by_id(state, str(snapshot.get("lane_id", "")))
+        expected_roles[str(lane.get("role", ""))] = ROLE_TIER_MAP.get(
+            str(lane.get("role", "")), ""
+        )
+    steward_snapshot = selection.get("steward_snapshot", {})
+    if isinstance(steward_snapshot, dict) and steward_snapshot.get("lane_id"):
+        steward = lane_by_id(state, str(steward_snapshot.get("lane_id", "")))
+        expected_roles[str(steward.get("role", ""))] = ROLE_TIER_MAP.get(
+            str(steward.get("role", "")), ""
+        )
+    if envelope.get("role_model_tiers") != dict(sorted(expected_roles.items())):
+        raise HarnessError("execution resource role/model-tier mapping is stale")
+    expected_depth_two_roles = {
+        role: ROLE_TIER_MAP[role]
+        for role in sorted(DEPTH_TWO_ROLES)
+        if role in ROLE_TIER_MAP
+    }
+    if envelope.get("depth_two_role_model_tiers") != expected_depth_two_roles:
+        raise HarnessError("execution resource depth-two role mapping is stale")
+    settings = envelope.get("role_config_overrides", {})
+    if not isinstance(settings, dict):
+        raise HarnessError("execution resource role configuration override is invalid")
+    if settings:
+        canonical = parse_override_settings(
+            [f"{key}={value}" for key, value in settings.items()],
+            roles=ROLE_TIER_MAP,
+            target_kind="execution_resource",
+        )
+        if canonical != settings:
+            raise HarnessError("execution resource role overrides are not canonical")
+    override_id = str(envelope.get("override_id", ""))
+    if override_id:
+        matches = [
+            item
+            for item in state.get("override_requests", [])
+            if item.get("override_id") == override_id
+        ]
+        if len(matches) != 1 or matches[0].get("status") != "consumed":
+            raise HarnessError("execution resource envelope lacks consumed override authority")
+        consumption = matches[0].get("consumption") or {}
+        if (
+            matches[0].get("target_kind") != "execution_resource"
+            or matches[0].get("target_id") != selection.get("selection_id")
+            or consumption.get("consumer_command") != "execution-select"
+            or consumption.get("selection_id") != selection.get("selection_id")
+            or consumption.get("resource_envelope_sha256") != digest
+        ):
+            raise HarnessError("execution resource override consumption binding is invalid")
+    return envelope
+
+
+def _validate_packet_resource_envelope(
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    selection: dict[str, Any] | None,
+    *,
+    enforce_active_limit: bool,
+) -> None:
+    packet_digest = str(packet.get("resource_envelope_sha256", ""))
+    if selection is None:
+        if packet_digest:
+            raise HarnessError("packet has resource authority without an execution selection")
+        return
+    envelope = _validate_selection_resource_envelope(state, selection)
+    if envelope is None:
+        if packet_digest:
+            raise HarnessError("legacy execution selection does not own packet resource authority")
+        return
+    selection_digest = str(selection.get("resource_envelope_sha256", ""))
+    if packet_digest != selection_digest:
+        raise HarnessError("packet resource envelope binding is missing or stale")
+    depth = int(packet.get("delegation_depth", 1))
+    if depth > int(envelope["max_delegation_depth"]):
+        raise HarnessError("packet exceeds the selected resource delegation-depth limit")
+    role = str(packet.get("agent_role", ""))
+    tier = str(packet.get("model_tier", ""))
+    if depth == 1 and ROLE_TIER_MAP.get(role) != tier:
+        raise HarnessError("packet role/model tier is outside the selected resource envelope")
+    if depth == 2 and role not in envelope["depth_two_role_model_tiers"]:
+        raise HarnessError("packet leaf role is outside the selected resource envelope")
+    if enforce_active_limit:
+        selection_id = str(selection.get("selection_id", ""))
+        active_total_peers = sum(
+            other.get("packet_id") != packet.get("packet_id")
+            and other.get("status") in EXECUTING_PACKET_STATUSES
+            and other.get("execution_selection_id") == selection_id
+            for other in state.get("packets", [])
+        )
+        if active_total_peers + 1 > int(envelope["max_active_total_agents"]):
+            raise HarnessError(
+                "execution resource envelope has no remaining total agent slot"
+            )
+    if enforce_active_limit and depth == 1:
+        selection_id = str(selection.get("selection_id", ""))
+        active_peers = sum(
+            other.get("packet_id") != packet.get("packet_id")
+            and other.get("status") in EXECUTING_PACKET_STATUSES
+            and int(other.get("delegation_depth", 1)) == 1
+            and other.get("execution_selection_id") == selection_id
+            for other in state.get("packets", [])
+        )
+        if active_peers + 1 > int(envelope["max_active_first_level_agents"]):
+            raise HarnessError(
+                "execution resource envelope has no remaining first-level agent slot"
+            )
+
+
+def resource_envelope_integrity_errors(state: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for selection in state.get("execution_selections", []):
+        try:
+            envelope = _validate_selection_resource_envelope(state, selection)
+            if envelope is not None:
+                active_first_level = sum(
+                    packet.get("status") in EXECUTING_PACKET_STATUSES
+                    and int(packet.get("delegation_depth", 1)) == 1
+                    and packet.get("execution_selection_id")
+                    == selection.get("selection_id")
+                    for packet in state.get("packets", [])
+                )
+                if active_first_level > int(
+                    envelope["max_active_first_level_agents"]
+                ):
+                    raise HarnessError(
+                        "active first-level packets exceed the resource envelope"
+                    )
+                active_total = sum(
+                    packet.get("status") in EXECUTING_PACKET_STATUSES
+                    and packet.get("execution_selection_id")
+                    == selection.get("selection_id")
+                    for packet in state.get("packets", [])
+                )
+                if active_total > int(envelope["max_active_total_agents"]):
+                    raise HarnessError(
+                        "active packets exceed the total-agent resource envelope"
+                    )
+        except (HarnessError, TypeError, ValueError) as exc:
+            errors.append(
+                f"execution selection {selection.get('selection_id')} resource envelope: {exc}"
+            )
+    return errors
+
+
 def _is_steward_synthesis_packet(packet: dict[str, Any]) -> bool:
     return packet.get("packet_purpose") == "steward_synthesis"
 
@@ -1400,6 +1712,12 @@ def _validate_packet_activation_topology(
     """Fence active packet chains; ready packets remain pre-buildable."""
 
     selection = _validate_dispatch_selection(state, packet)
+    _validate_packet_resource_envelope(
+        state,
+        packet,
+        selection,
+        enforce_active_limit=False,
+    )
     packet_id = str(packet.get("packet_id", ""))
     depth = int(packet.get("delegation_depth", 1))
     executing = [
@@ -1781,6 +2099,303 @@ def needs_user_by_id(state: dict[str, Any], escalation_id: str) -> dict[str, Any
             f"expected exactly one needs-user escalation named {escalation_id}, found {len(matches)}"
         )
     return matches[0]
+
+
+def override_by_id(state: dict[str, Any], override_id: str) -> dict[str, Any]:
+    override_id = validate_id(override_id, "override id")
+    matches = [
+        item
+        for item in state.get("override_requests", [])
+        if item.get("override_id") == override_id
+    ]
+    if len(matches) != 1:
+        raise HarnessError(
+            f"expected exactly one override named {override_id}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def approved_override_settings(
+    state: dict[str, Any],
+    override_id: str,
+    *,
+    target_kind: str,
+    target_id: str,
+) -> dict[str, str | int]:
+    if not override_id:
+        return {}
+    item = override_by_id(state, override_id)
+    if (
+        item.get("target_kind") != target_kind
+        or item.get("target_id") != target_id
+        or item.get("target_task_id") != state.get("task_id")
+    ):
+        raise HarnessError("override is outside the exact requested target")
+    if item.get("status") != "approved" or is_expired(item.get("expires_at")):
+        raise HarnessError("override is not approved, is already consumed, or has expired")
+    decision = item.get("chief_decision") or {}
+    settings = decision.get("approved_settings")
+    if decision.get("decision") != "approved" or not isinstance(settings, dict):
+        raise HarnessError("override lacks an exact Chief-approved setting set")
+    return dict(settings)
+
+
+def override_integrity_errors(state: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+    for item in state.get("override_requests", []):
+        override_id = str(item.get("override_id", ""))
+        try:
+            validate_id(override_id, "override id")
+        except HarnessError as exc:
+            errors.append(str(exc))
+            continue
+        if override_id in seen:
+            errors.append(f"duplicate override id {override_id}")
+        seen.add(override_id)
+        if item.get("integrity_version") != 1:
+            errors.append(f"override {override_id} lacks integrity_version=1")
+        target_kind = str(item.get("target_kind", ""))
+        if target_kind not in OVERRIDE_TARGET_KINDS:
+            errors.append(f"override {override_id} has an invalid target kind")
+        try:
+            validate_id(str(item.get("target_id", "")), "override target id")
+        except HarnessError as exc:
+            errors.append(f"override {override_id}: {exc}")
+        if item.get("status") not in OVERRIDE_STATUSES:
+            errors.append(f"override {override_id} has an invalid status")
+        version = item.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            errors.append(f"override {override_id} has an invalid version")
+        if item.get("root_session_id") not in state.get("session_ids", []):
+            errors.append(f"override {override_id} lacks a task-bound user/Chief session")
+        if item.get("target_task_id") != state.get("task_id"):
+            errors.append(f"override {override_id} targets a different task")
+        if parse_time(str(item.get("expires_at", ""))) is None:
+            errors.append(f"override {override_id} has an invalid expiry")
+        try:
+            requested = parse_override_settings(
+                [f"{key}={value}" for key, value in item.get("requested_settings", {}).items()],
+                roles=None,
+                target_kind=target_kind,
+            )
+        except (HarnessError, AttributeError) as exc:
+            errors.append(f"override {override_id} requested settings are invalid: {exc}")
+            requested = {}
+        if requested != item.get("requested_settings"):
+            errors.append(f"override {override_id} requested settings are not canonical")
+        decision = item.get("chief_decision")
+        if item.get("status") == "awaiting_chief":
+            if decision is not None:
+                errors.append(f"pending override {override_id} unexpectedly has a decision")
+        else:
+            if not isinstance(decision, dict) or decision.get("decision") not in {
+                "approved",
+                "rejected",
+            }:
+                errors.append(f"terminal override {override_id} lacks a Chief decision")
+            elif decision.get("decision") == "approved":
+                try:
+                    approved = parse_override_settings(
+                        [
+                            f"{key}={value}"
+                            for key, value in decision.get("approved_settings", {}).items()
+                        ],
+                        roles=None,
+                        target_kind=target_kind,
+                    )
+                except (HarnessError, AttributeError) as exc:
+                    errors.append(
+                        f"override {override_id} approved settings are invalid: {exc}"
+                    )
+                else:
+                    if approved != decision.get("approved_settings"):
+                        errors.append(
+                            f"override {override_id} approved settings are not canonical"
+                        )
+        if item.get("status") == "consumed" and not item.get("consumption"):
+            errors.append(f"consumed override {override_id} lacks consumption evidence")
+        if item.get("status") == "revoked" and not item.get("revocation"):
+            errors.append(f"revoked override {override_id} lacks revocation evidence")
+        consumption = item.get("consumption")
+        revocation = item.get("revocation")
+        if item.get("status") == "consumed" and isinstance(consumption, dict):
+            if consumption.get("root_session_id") not in state.get("session_ids", []):
+                errors.append(
+                    f"consumed override {override_id} lacks a task-bound consumer session"
+                )
+            consumer = consumption.get("consumer_command")
+            if consumer == "execution-select":
+                selections = [
+                    selection
+                    for selection in state.get("execution_selections", [])
+                    if selection.get("selection_id") == item.get("target_id")
+                    and (selection.get("resource_envelope") or {}).get("override_id")
+                    == override_id
+                    and selection.get("resource_envelope_sha256")
+                    == consumption.get("resource_envelope_sha256")
+                ]
+                if item.get("target_kind") != "execution_resource" or len(selections) != 1:
+                    errors.append(
+                        f"consumed override {override_id} lacks its exact execution selection"
+                    )
+            elif consumer == "codex-config-apply":
+                events = [
+                    event
+                    for event in state.get("resource_config_events", [])
+                    if event.get("event_id") == item.get("target_id")
+                    and event.get("override_id") == override_id
+                    and event.get("plan_sha256") == consumption.get("plan_sha256")
+                ]
+                if item.get("target_kind") != "resource_config" or len(events) != 1:
+                    errors.append(
+                        f"consumed override {override_id} lacks its exact resource config event"
+                    )
+            else:
+                errors.append(f"consumed override {override_id} has an unknown consumer")
+        if item.get("status") != "consumed" and consumption is not None:
+            errors.append(f"unconsumed override {override_id} carries consumption evidence")
+        if item.get("status") == "revoked" and isinstance(revocation, dict):
+            if revocation.get("root_session_id") not in state.get("session_ids", []):
+                errors.append(
+                    f"revoked override {override_id} lacks a task-bound revocation session"
+                )
+        if item.get("status") != "revoked" and revocation is not None:
+            errors.append(f"non-revoked override {override_id} carries revocation evidence")
+        if item.get("status") in {"approved", "consumed", "revoked"} and (
+            not isinstance(decision, dict) or decision.get("decision") != "approved"
+        ):
+            errors.append(f"override {override_id} lacks an approved Chief decision")
+        if item.get("status") == "rejected" and (
+            not isinstance(decision, dict) or decision.get("decision") != "rejected"
+        ):
+            errors.append(f"override {override_id} lacks a rejected Chief decision")
+        expected_version = {
+            "awaiting_chief": 1,
+            "approved": 2,
+            "rejected": 2,
+            "consumed": 3,
+            "revoked": 3,
+        }.get(str(item.get("status", "")))
+        if expected_version is not None and version != expected_version:
+            errors.append(
+                f"override {override_id} status/version binding is invalid"
+            )
+        if isinstance(decision, dict) and decision.get("root_session_id") not in state.get(
+            "session_ids", []
+        ):
+            errors.append(f"override {override_id} Chief decision lacks a task-bound session")
+    return errors
+
+
+def resource_config_integrity_errors(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    errors: list[str] = []
+    seen: set[str] = set()
+    for event in state.get("resource_config_events", []):
+        event_id = str(event.get("event_id", ""))
+        try:
+            validate_id(event_id, "resource config event id")
+        except HarnessError as exc:
+            errors.append(str(exc))
+            continue
+        if event_id in seen:
+            errors.append(f"duplicate resource config event id {event_id}")
+        seen.add(event_id)
+        if event.get("integrity_version") != 1:
+            errors.append(f"resource config event {event_id} lacks integrity_version=1")
+        if event.get("status") not in RESOURCE_CONFIG_EVENT_STATUSES:
+            errors.append(f"resource config event {event_id} has invalid status")
+        if event.get("root_session_id") not in state.get("session_ids", []):
+            errors.append(
+                f"resource config event {event_id} lacks a task-bound root session"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", str(event.get("plan_sha256", ""))):
+            errors.append(f"resource config event {event_id} plan SHA-256 is invalid")
+        receipt_path = Path(str(event.get("receipt_path", "")))
+        expected_receipt_path = (
+            task_dir(paths, state["task_id"])
+            / "results"
+            / f"resource-config-{event_id}.json"
+        )
+        receipt_sha = str(event.get("receipt_sha256", ""))
+        if (
+            receipt_path != expected_receipt_path
+            or not receipt_path.is_file()
+            or receipt_path.is_symlink()
+            or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha)
+            or sha256_file(receipt_path) != receipt_sha
+        ):
+            errors.append(f"resource config event {event_id} receipt identity is invalid")
+        else:
+            try:
+                receipt = load_json(receipt_path)
+            except HarnessError as exc:
+                errors.append(
+                    f"resource config event {event_id} receipt is invalid: {exc}"
+                )
+            else:
+                receipt_plan = receipt.get("plan")
+                if (
+                    receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION
+                    or receipt.get("event_id") != event_id
+                    or receipt.get("task_id") != state.get("task_id")
+                    or receipt.get("plan_sha256") != event.get("plan_sha256")
+                    or receipt.get("override_id", "") != event.get("override_id", "")
+                    or receipt.get("root_session_id") != event.get("root_session_id")
+                    or receipt.get("applied_at") != event.get("applied_at")
+                    or receipt.get("restart_required")
+                    != event.get("restart_required")
+                    or not isinstance(receipt_plan, dict)
+                    or receipt_plan.get("plan_sha256") != event.get("plan_sha256")
+                    or resource_plan_sha256(receipt_plan)
+                    != event.get("plan_sha256")
+                    or receipt_plan.get("resolved") != event.get("resolved")
+                    or receipt_plan.get("dynamic_envelope")
+                    != event.get("dynamic_envelope")
+                    or receipt_plan.get("required_locks")
+                    != event.get("required_locks")
+                ):
+                    errors.append(
+                        f"resource config event {event_id} receipt binding is invalid"
+                    )
+        if event.get("override_id"):
+            matches = [
+                item
+                for item in state.get("override_requests", [])
+                if item.get("override_id") == event.get("override_id")
+            ]
+            consumption = (matches[0].get("consumption") or {}) if len(matches) == 1 else {}
+            if (
+                len(matches) != 1
+                or matches[0].get("status") != "consumed"
+                or matches[0].get("target_kind") != "resource_config"
+                or matches[0].get("target_id") != event_id
+                or consumption.get("consumer_command") != "codex-config-apply"
+                or consumption.get("event_id") != event_id
+                or consumption.get("plan_sha256") != event.get("plan_sha256")
+            ):
+                errors.append(
+                    f"resource config event {event_id} lacks consumed override authority"
+                )
+        rollback = event.get("rollback")
+        if event.get("status") == "rolled_back":
+            if not isinstance(rollback, dict):
+                errors.append(f"resource config event {event_id} lacks rollback evidence")
+            elif (
+                rollback.get("root_session_id") not in state.get("session_ids", [])
+                or not str(rollback.get("reason", "")).strip()
+                or parse_time(str(rollback.get("recorded_at", ""))) is None
+            ):
+                errors.append(
+                    f"resource config event {event_id} rollback evidence is invalid"
+                )
+        elif rollback is not None:
+            errors.append(
+                f"applied resource config event {event_id} carries rollback evidence"
+            )
+    return errors
 
 
 def require_root_session(
@@ -2578,7 +3193,7 @@ def validate_mini_locks(raw_locks: Iterable[str]) -> list[str]:
 
 
 def state_worktree(paths: HarnessPaths, state: dict[str, Any]) -> Path:
-    return Path(state.get("worktree") or paths.root).resolve()
+    return validated_state_worktree(paths, state)
 
 
 def worktree_integrity_errors(
@@ -2654,6 +3269,27 @@ def packet_contract_integrity_error(
     if hashlib.sha256(data).hexdigest() != expected_sha:
         return f"packet {packet_id} contract SHA-256 mismatch"
     contract_lines = data.decode("utf-8").splitlines()
+    resource_digest = str(packet.get("resource_envelope_sha256", ""))
+    resource_digest_lines = [
+        line
+        for line in contract_lines
+        if line.startswith("- Resource envelope SHA-256:")
+    ]
+    if resource_digest:
+        expected_resource_digest_line = (
+            f"- Resource envelope SHA-256: `{resource_digest}`"
+        )
+        expected_selection_line = (
+            "- Execution selection: "
+            f"`{packet.get('execution_selection_id', '')}`"
+        )
+        if (
+            resource_digest_lines != [expected_resource_digest_line]
+            or expected_selection_line not in contract_lines
+        ):
+            return f"packet {packet_id} contract lost its exact resource authority"
+    elif resource_digest_lines or "## AOI resource authority" in contract_lines:
+        return f"packet {packet_id} contract resource authority was removed from state"
     has_native_v5_marker = NATIVE_V5_PACKET_CONTRACT_MARKER in contract_lines
     dispatch_origin = packet.get("dispatch_schema_origin")
     if schema_version < 5 and (
@@ -2688,16 +3324,61 @@ def packet_input_integrity_errors(
     return errors
 
 
+def packet_lock_integrity_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+) -> list[str]:
+    """Validate lock authority already persisted in a delegation packet."""
+
+    try:
+        validate_packet_lock_identities(paths, state, packet)
+    except HarnessError as exc:
+        return [str(exc)]
+    return []
+
+
+def packet_resource_envelope_integrity_errors(
+    state: dict[str, Any], packet: dict[str, Any]
+) -> list[str]:
+    selection_id = str(packet.get("execution_selection_id", ""))
+    if not selection_id:
+        return (
+            ["packet has a resource envelope digest without an execution selection"]
+            if packet.get("resource_envelope_sha256")
+            else []
+        )
+    try:
+        selection = execution_selection_by_id(state, selection_id)
+        _validate_packet_resource_envelope(
+            state,
+            packet,
+            selection,
+            enforce_active_limit=False,
+        )
+    except (HarnessError, TypeError, ValueError) as exc:
+        return [str(exc)]
+    return []
+
+
 def packet_authority_integrity_errors(
     paths: HarnessPaths,
     state: dict[str, Any],
     packet: dict[str, Any],
     *,
     require_origin: bool,
+    _visited: set[str] | None = None,
 ) -> list[str]:
     """Validate every packet authority surface used by a transition/consumer."""
 
+    packet_id = str(packet.get("packet_id", ""))
+    visited = set(_visited or ())
+    if packet_id in visited:
+        return [f"packet {packet_id} authority dependency cycle"]
+    visited.add(packet_id)
     errors: list[str] = []
+    errors.extend(packet_lock_integrity_errors(paths, state, packet))
+    errors.extend(packet_resource_envelope_integrity_errors(state, packet))
     contract_error = packet_contract_integrity_error(paths, state, packet)
     if contract_error:
         errors.append(contract_error)
@@ -2709,6 +3390,88 @@ def packet_authority_integrity_errors(
     command_error = packet_command_integrity_error(packet)
     if command_error:
         errors.append(command_error)
+    try:
+        delegation_depth = int(packet.get("delegation_depth", 1))
+    except (TypeError, ValueError):
+        delegation_depth = 0
+        errors.append(f"packet {packet_id} delegation depth is invalid")
+    if delegation_depth == 2:
+        parent_id = str(packet.get("parent_packet_id", ""))
+        try:
+            parent = _packet_by_id(state, parent_id)
+        except HarnessError as exc:
+            errors.append(f"packet {packet_id} parent authority: {exc}")
+        else:
+            errors.extend(
+                f"packet {packet_id} parent authority: {item}"
+                for item in packet_authority_integrity_errors(
+                    paths,
+                    state,
+                    parent,
+                    require_origin=False,
+                    _visited=visited,
+                )
+            )
+    if _is_steward_synthesis_packet(packet):
+        selection_id = str(packet.get("execution_selection_id", ""))
+        for specialist in state.get("packets", []):
+            if (
+                specialist.get("execution_selection_id") != selection_id
+                or _is_steward_synthesis_packet(specialist)
+                or specialist.get("status") != "done"
+            ):
+                continue
+            specialist_id = str(specialist.get("packet_id", ""))
+            errors.extend(
+                f"packet {packet_id} specialist {specialist_id} authority: {item}"
+                for item in packet_authority_integrity_errors(
+                    paths,
+                    state,
+                    specialist,
+                    require_origin=False,
+                    _visited=visited,
+                )
+            )
+            errors.extend(
+                f"packet {packet_id} specialist {specialist_id} result: {item}"
+                for item in packet_result_integrity_errors(
+                    paths,
+                    state,
+                    specialist,
+                )
+            )
+    return errors
+
+
+def selection_done_packet_authority_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    selection_id: str,
+) -> list[str]:
+    """Validate done specialist evidence before a Steward packet can bind it."""
+
+    errors: list[str] = []
+    for packet in state.get("packets", []):
+        if (
+            packet.get("execution_selection_id") != selection_id
+            or _is_steward_synthesis_packet(packet)
+            or packet.get("status") != "done"
+        ):
+            continue
+        packet_id = str(packet.get("packet_id", ""))
+        errors.extend(
+            f"specialist packet {packet_id}: {item}"
+            for item in packet_authority_integrity_errors(
+                paths,
+                state,
+                packet,
+                require_origin=False,
+            )
+        )
+        errors.extend(
+            f"specialist packet {packet_id}: {item}"
+            for item in packet_result_integrity_errors(paths, state, packet)
+        )
     return errors
 
 
@@ -2760,7 +3523,45 @@ def packet_integrity_warnings(state: dict[str, Any]) -> list[str]:
     return warnings
 
 
-def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
+def packet_result_integrity_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+) -> list[str]:
+    """Validate one terminal packet result before it is consumed as evidence."""
+
+    packet_id = str(packet.get("packet_id", ""))
+    status = packet.get("status")
+    if status not in TERMINAL_PACKET_STATUSES:
+        return [f"packet {packet_id} result is not terminal"]
+    expected_path = task_dir(paths, state["task_id"]) / "results" / f"{packet_id}.md"
+    recorded_path = Path(str(packet.get("result_path", "")))
+    if recorded_path != expected_path:
+        return [f"packet {packet_id} result path is not canonical"]
+    if packet.get("integrity_version") != 1:
+        return [f"packet {packet_id} result lacks explicit integrity attestation"]
+    if not expected_path.is_file():
+        return [f"packet {packet_id} result file is missing"]
+    errors: list[str] = []
+    expected_sha = str(packet.get("result_sha256", ""))
+    actual_sha = sha256_file(expected_path)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        errors.append(f"packet {packet_id} result SHA-256 is invalid")
+    elif actual_sha != expected_sha:
+        errors.append(f"packet {packet_id} result SHA-256 mismatch")
+    if not packet.get("summary"):
+        errors.append(f"packet {packet_id} terminal summary is empty")
+    if status in {"done", "failed"} and not packet.get("evidence"):
+        errors.append(f"packet {packet_id} terminal evidence is empty")
+    return errors
+
+
+def packet_integrity_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    allow_done_lock_recovery: bool = False,
+) -> list[str]:
     errors: list[str] = []
     for packet in state.get("packets", []):
         packet_id = str(packet.get("packet_id", ""))
@@ -2768,6 +3569,13 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
         mode = packet.get("packet_mode", "legacy")
         locks = packet.get("locks", [])
         packet_purpose = packet.get("packet_purpose", "work")
+        lock_authority_is_recoverable = status in {"failed", "cancelled"} or (
+            status == "done"
+            and (allow_done_lock_recovery or state.get("status") == "cancelled")
+        )
+        if not lock_authority_is_recoverable:
+            errors.extend(packet_lock_integrity_errors(paths, state, packet))
+        errors.extend(packet_resource_envelope_integrity_errors(state, packet))
         if packet_purpose not in {"work", "steward_synthesis"}:
             errors.append(f"packet {packet_id} has an invalid packet purpose")
         if packet_purpose == "steward_synthesis":
@@ -3054,27 +3862,7 @@ def packet_integrity_errors(paths: HarnessPaths, state: dict[str, Any]) -> list[
                     f"packet {packet_id} dispatch provenance lacks an agent id"
                 )
         if status in TERMINAL_PACKET_STATUSES:
-            expected_path = task_dir(paths, state["task_id"]) / "results" / f"{packet_id}.md"
-            recorded_path = Path(str(packet.get("result_path", "")))
-            if recorded_path != expected_path:
-                errors.append(f"packet {packet_id} result path is not canonical")
-                continue
-            if packet.get("integrity_version") != 1:
-                errors.append(f"packet {packet_id} result lacks explicit integrity attestation")
-                continue
-            if not expected_path.is_file():
-                errors.append(f"packet {packet_id} result file is missing")
-                continue
-            expected_sha = str(packet.get("result_sha256", ""))
-            actual_sha = sha256_file(expected_path)
-            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-                errors.append(f"packet {packet_id} result SHA-256 is invalid")
-            elif actual_sha != expected_sha:
-                errors.append(f"packet {packet_id} result SHA-256 mismatch")
-            if not packet.get("summary"):
-                errors.append(f"packet {packet_id} terminal summary is empty")
-            if status in {"done", "failed"} and not packet.get("evidence"):
-                errors.append(f"packet {packet_id} terminal evidence is empty")
+            errors.extend(packet_result_integrity_errors(paths, state, packet))
     return errors
 
 
@@ -4891,6 +5679,8 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_briefs": [],
             "context_provider_receipts": [],
             "context_provider_benchmarks": [],
+            "override_requests": [],
+            "resource_config_events": [],
             "facts": [],
             "decisions": [],
             "rejected_paths": [],
@@ -4950,6 +5740,14 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
     intent = require_text(args.intent, "intent")
     validation = require_text(args.validation, "validation")
     metadata = git_metadata(Path(args.worktree) if args.worktree else paths.root)
+    mini_worktree = Path(metadata["worktree"])
+    locks = list(
+        dict.fromkeys(
+            validate_lock_identity(paths, lock, repo_root=mini_worktree)
+            for lock in locks
+        )
+    )
+    locks = validate_mini_locks(locks)
     lock_lines = "\n".join(f"- `{lock}`" for lock in locks)
     plan = (
         f"# Mini Plan — {task_id}\n\n"
@@ -4979,7 +5777,7 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "unresolved ambiguous legacy scope(s) block mini ownership:\n"
                 + json.dumps(ambiguous, indent=2, ensure_ascii=False)
             )
-        conflicts = find_conflicts(paths, locks)
+        conflicts = find_conflicts(paths, locks, repo_root=mini_worktree)
         if conflicts:
             raise HarnessError(
                 "mini claim conflict(s):\n" + json.dumps(conflicts, indent=2, ensure_ascii=False)
@@ -5017,6 +5815,8 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_briefs": [],
             "context_provider_receipts": [],
             "context_provider_benchmarks": [],
+            "override_requests": [],
+            "resource_config_events": [],
             "facts": ["Mini lifecycle atomically initialized, approved, bound, and claimed."],
             "decisions": [],
             "rejected_paths": [],
@@ -5051,24 +5851,47 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "baselines": baselines,
         }
         directory = task_dir(paths, task_id)
-        (directory / "packets").mkdir(parents=True, exist_ok=False)
-        (directory / "results").mkdir(parents=True, exist_ok=False)
-        atomic_write_text(directory / "plan.md", plan)
-        checkpoint, checkpoint_text, _ = prepare_checkpoint(paths, state)
-        atomic_write_text(checkpoint, checkpoint_text)
-        write_task(paths, state)
-        atomic_write_json(claim_path(paths, token, active=True), claim)
-        atomic_write_json(
-            session_path(paths, session_id),
-            {
-                "schema_version": SCHEMA_VERSION,
-                "session_id": session_id,
-                "task_id": task_id,
-                "checkpoint_path": str(checkpoint),
-                "updated_at": timestamp,
-            },
-        )
-        write_index(paths)
+        claim_destination = claim_path(paths, token, active=True)
+        session_destination = session_path(paths, session_id)
+        if directory.exists():
+            raise HarnessError(f"task directory already exists without state: {task_id}")
+        try:
+            (directory / "packets").mkdir(parents=True, exist_ok=False)
+            (directory / "results").mkdir(parents=True, exist_ok=False)
+            atomic_write_text(directory / "plan.md", plan)
+            # The claim must be visible while the semantic checkpoint validates
+            # task/claim backlinks. Any ordinary exception rolls every newly
+            # published mini artifact back while the global state lock is held.
+            atomic_write_json(claim_destination, claim)
+            write_task(paths, state)
+            checkpoint, checkpoint_text, _ = prepare_checkpoint(paths, state)
+            atomic_write_text(checkpoint, checkpoint_text)
+            atomic_write_json(
+                session_destination,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "checkpoint_path": str(checkpoint),
+                    "updated_at": timestamp,
+                },
+            )
+            write_index(paths)
+        except Exception:
+            for published in (session_destination, claim_destination):
+                try:
+                    published.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                shutil.rmtree(directory)
+            except FileNotFoundError:
+                pass
+            try:
+                write_index(paths)
+            except Exception:
+                pass
+            raise
     emit(
         {
             "task_id": task_id,
@@ -5142,8 +5965,18 @@ def cmd_import_legacy(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
 
 def cmd_check_locks(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    locks = list(dict.fromkeys(normalize_lock(item) for item in args.lock))
-    conflicts = find_conflicts(paths, locks, ignore_token=args.ignore_token)
+    locks = list(
+        dict.fromkeys(
+            validate_lock_identity(paths, item, repo_root=paths.root)
+            for item in args.lock
+        )
+    )
+    conflicts = find_conflicts(
+        paths,
+        locks,
+        ignore_token=args.ignore_token,
+        repo_root=paths.root,
+    )
     ambiguous = legacy_ambiguities(paths, ignore_token=args.ignore_token)
     payload = {
         "ok": not conflicts and not ambiguous,
@@ -5178,6 +6011,13 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if state.get("profile") == "mini":
             raise HarnessError("mini task may not acquire additional claims")
         require_plan_ready(paths, state, "acquire claim")
+        claim_worktree = state_worktree(paths, state)
+        locks = list(
+            dict.fromkeys(
+                validate_lock_identity(paths, lock, repo_root=claim_worktree)
+                for lock in locks
+            )
+        )
         active_path = claim_path(paths, token, active=True)
         archived_path = claim_path(paths, token, active=False)
         if active_path.exists() or archived_path.exists():
@@ -5230,7 +6070,10 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 + json.dumps(ambiguous, indent=2, ensure_ascii=False)
             )
         conflicts = find_conflicts(
-            paths, locks, ignore_token=token if args.adopt_legacy else None
+            paths,
+            locks,
+            ignore_token=token if args.adopt_legacy else None,
+            repo_root=claim_worktree,
         )
         if conflicts:
             raise HarnessError(
@@ -5254,7 +6097,7 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "expires_at": args.expires_at,
             "worktree": state.get("worktree"),
             "baselines": baselines_for_locks(
-                paths, locks, repo_root=state_worktree(paths, state)
+                paths, locks, repo_root=claim_worktree
             ),
         }
         atomic_write_json(active_path, claim)
@@ -5282,6 +6125,7 @@ def cmd_set_claim_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
     with state_lock(paths):
         source = claim_path(paths, args.token, active=True)
         claim = load_claim_file(source)
+        validate_claim_lock_identities(paths, claim)
         state = load_task(paths, claim["task_id"])
         claim["status"] = args.status
         claim["status_reason"] = require_text(args.reason, "reason")
@@ -5300,13 +6144,15 @@ def uncovered_dependencies_after_release(
     state: dict[str, Any],
     token: str,
 ) -> list[str]:
-    remaining_locks = [
-        lock
-        for claim in claims_owned_by_task(paths, state["task_id"])
-        if claim.get("token") != token
-        and claim.get("status") in RESERVING_CLAIM_STATUSES
-        for lock in claim.get("locks", [])
-    ]
+    remaining_locks: list[str] = []
+    for claim in claims_for_task(paths, state, validate_reserving=False):
+        if (
+            claim.get("token") == token
+            or claim.get("status") not in RESERVING_CLAIM_STATUSES
+        ):
+            continue
+        validate_claim_lock_identities(paths, claim)
+        remaining_locks.extend(str(lock) for lock in claim.get("locks", []))
     dependencies: list[tuple[str, str]] = []
     for packet in state.get("packets", []):
         if packet.get("status") in ACTIVE_PACKET_STATUSES:
@@ -5357,14 +6203,29 @@ def cmd_release_claim(args: argparse.Namespace, paths: HarnessPaths) -> int:
         claim["status"] = args.status
         claim["close_reason"] = require_text(args.reason, "reason")
         claim["updated_at"] = now_iso()
-        claim["final_baselines"] = baselines_for_locks(
-            paths,
-            claim.get("locks", []),
-            repo_root=state_worktree(paths, state),
-        )
+        stale_lock_authority_error = ""
+        try:
+            claim["final_baselines"] = baselines_for_locks(
+                paths,
+                claim.get("locks", []),
+                repo_root=state_worktree(paths, state),
+            )
+        except HarnessError as exc:
+            if args.status != "stale":
+                raise HarnessError(
+                    "claim lock authority cannot be revalidated; audit active "
+                    "dependencies and release explicitly with --status stale: "
+                    f"{exc}"
+                ) from exc
+            claim["final_baselines"] = {}
+            stale_lock_authority_error = str(exc)
+            claim["stale_lock_authority_error"] = stale_lock_authority_error
         changed: dict[str, bool] = {}
         for lock, baseline in claim.get("baselines", {}).items():
             changed[lock] = baseline != claim["final_baselines"].get(lock)
+        if stale_lock_authority_error:
+            for lock in claim.get("locks", []):
+                changed[str(lock)] = True
         claim["baseline_changed"] = changed
         destination = claim_path(paths, args.token, active=False)
         # Fail-safe ordering: make the task stale before copying/unlinking the
@@ -5464,7 +6325,11 @@ def cmd_adopt_current_branch(args: argparse.Namespace, paths: HarnessPaths) -> i
                 f"recorded starting HEAD {start_head!r} is not an ancestor of "
                 f"current HEAD {current['head_sha']}"
             )
-        required_lock = normalize_lock(f"git:merge:{current['branch']}")
+        required_lock = validate_lock_identity(
+            paths,
+            f"git:merge:{current['branch']}",
+            repo_root=worktree,
+        )
         reserving = [
             claim
             for claim in claims_owned_by_task(paths, state["task_id"])
@@ -6985,7 +7850,9 @@ def _steward_packet_binding(
 
 
 def _execution_brief_coverage_error(
-    state: dict[str, Any], selection: dict[str, Any]
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    selection: dict[str, Any],
 ) -> str | None:
     # A v2 Steward brief cannot be retroactively asserted for a legacy selection.
     # Preserve those results as legacy evidence and allow an exact supersession or
@@ -7041,6 +7908,31 @@ def _execution_brief_coverage_error(
             return f"execution selection {selection_id} Steward packet binding is invalid: {exc}"
         if stored_binding != current_binding:
             return f"execution selection {selection_id} Steward packet binding is stale"
+        steward_packet = _packet_by_id(
+            state,
+            str(stored_binding.get("packet_id", "")),
+        )
+        authority_errors = packet_authority_integrity_errors(
+            paths,
+            state,
+            steward_packet,
+            require_origin=False,
+        )
+        result_errors = packet_result_integrity_errors(
+            paths,
+            state,
+            steward_packet,
+        )
+        specialist_errors = selection_done_packet_authority_errors(
+            paths,
+            state,
+            selection_id,
+        )
+        if authority_errors or result_errors or specialist_errors:
+            return (
+                f"execution selection {selection_id} Steward evidence authority is invalid: "
+                + "; ".join(authority_errors + result_errors + specialist_errors)
+            )
     stored_sha = str(brief.get("brief_sha256", ""))
     preimage = copy.deepcopy(brief)
     preimage.pop("brief_sha256", None)
@@ -7091,6 +7983,12 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         require_plan_ready(paths, state, "select execution topology")
         _adopt_execution_policy_v2_for_new_work(state)
         session_id = require_root_session(paths, state, args.session_id)
+        resource_override_settings = approved_override_settings(
+            state,
+            args.override_id,
+            target_kind="execution_resource",
+            target_id=selection_id,
+        )
         if any(
             item.get("selection_id") == selection_id
             for item in state.get("execution_selections", [])
@@ -7146,7 +8044,11 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"cancel, complete, or arbitrate first: {detail}"
                 )
             if prior_selection.get("mode") in {"centralized_parallel", "hybrid"}:
-                brief_error = _execution_brief_coverage_error(state, prior_selection)
+                brief_error = _execution_brief_coverage_error(
+                    paths,
+                    state,
+                    prior_selection,
+                )
                 if brief_error:
                     raise HarnessError(brief_error)
             prior_selection["status"] = "superseded"
@@ -7158,6 +8060,7 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if any(lane.get("status") in {"done", "parked"} for lane in lanes):
             raise HarnessError("execution selection may not use done or parked lanes")
         steward_snapshot: dict[str, Any] = {}
+        steward: dict[str, Any] | None = None
         if args.mode in {"centralized_parallel", "hybrid"}:
             steward = _engaged_steward_lane(state)
             if steward.get("lane_id") != args.steward_lane_id:
@@ -7167,6 +8070,15 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
             if any(lane.get("lane_id") == steward.get("lane_id") for lane in lanes):
                 raise HarnessError("parallel specialist lanes may not include the Steward lane")
             steward_snapshot = _lane_authority_snapshot(steward)
+        resource_envelope, resource_envelope_sha256 = (
+            _build_execution_resource_envelope(
+                mode=args.mode,
+                lanes=lanes,
+                steward=steward,
+                override_id=args.override_id,
+                override_settings=resource_override_settings,
+            )
+        )
         recorded = now_iso()
         selection = {
             "integrity_version": 1,
@@ -7180,6 +8092,8 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 for lane in sorted(lanes, key=lambda item: item["lane_id"])
             ],
             "steward_snapshot": steward_snapshot,
+            "resource_envelope": resource_envelope,
+            "resource_envelope_sha256": resource_envelope_sha256,
             "task_characteristics": {
                 "sequential_dependency": args.sequential_dependency,
                 "tool_density": args.tool_density,
@@ -7201,6 +8115,20 @@ def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
         }
         state["execution_model_version"] = 1
         state.setdefault("execution_selections", []).append(selection)
+        if args.override_id:
+            resource_override = override_by_id(state, args.override_id)
+            if resource_override.get("status") != "approved":
+                raise HarnessError("execution resource override changed before consumption")
+            resource_override["version"] = int(resource_override["version"]) + 1
+            resource_override["status"] = "consumed"
+            resource_override["consumption"] = {
+                "consumer_command": "execution-select",
+                "selection_id": selection_id,
+                "resource_envelope_sha256": resource_envelope_sha256,
+                "root_session_id": session_id,
+                "recorded_at": recorded,
+            }
+            resource_override["updated_at"] = recorded
         state.setdefault("cross_lane_sessions", [])
         state.setdefault("needs_user_escalations", [])
         bump_task(state)
@@ -7257,10 +8185,22 @@ def cmd_execution_brief_record(
             authority_errors = packet_authority_integrity_errors(
                 paths, state, synthesis_packet, require_origin=False
             )
-            if authority_errors:
+            result_errors = packet_result_integrity_errors(
+                paths,
+                state,
+                synthesis_packet,
+            )
+            specialist_errors = selection_done_packet_authority_errors(
+                paths,
+                state,
+                args.execution_selection_id,
+            )
+            if authority_errors or result_errors or specialist_errors:
                 raise HarnessError(
-                    "Steward synthesis packet authority is missing or tampered: "
-                    + "; ".join(authority_errors)
+                    "Steward synthesis evidence is missing or tampered: "
+                    + "; ".join(
+                        authority_errors + result_errors + specialist_errors
+                    )
                 )
             brief_version = 3
         elif args.steward_packet_id:
@@ -7657,6 +8597,456 @@ def cmd_needs_user_resolve(args: argparse.Namespace, paths: HarnessPaths) -> int
         write_task(paths, state)
         write_index(paths)
     emit(escalation, args.json)
+    return 0
+
+
+def cmd_override_request(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    override_id = validate_id(args.override_id, "override id")
+    target_id = validate_id(args.target_id, "override target id")
+    settings = parse_override_settings(
+        args.setting,
+        roles=None,
+        target_kind=args.target_kind,
+    )
+    expires_at = parse_time(args.expires_at)
+    if expires_at is None or expires_at <= dt.datetime.now(dt.timezone.utc):
+        raise HarnessError("override expiry must be in the future")
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "request Chief override for")
+        require_plan_ready(paths, state, "request Chief override")
+        session_id = require_root_session(paths, state, args.session_id)
+        if any(
+            item.get("override_id") == override_id
+            for item in state.get("override_requests", [])
+        ):
+            raise HarnessError(f"override already exists: {override_id}")
+        recorded = now_iso()
+        item = {
+            "integrity_version": 1,
+            "version": 1,
+            "override_id": override_id,
+            "status": "awaiting_chief",
+            "target_kind": args.target_kind,
+            "target_id": target_id,
+            "target_task_id": state["task_id"],
+            "scope": require_evidence_detail(args.scope, "override scope"),
+            "requested_settings": settings,
+            "user_position": {
+                "rationale": require_evidence_detail(
+                    args.user_rationale, "user override rationale"
+                ),
+                "evidence": require_evidence_detail(
+                    args.user_evidence, "user override evidence"
+                ),
+                "authority_boundary": (
+                    "root attestation of direct user discussion; AOI does not "
+                    "authenticate the human speaker"
+                ),
+            },
+            "deliberation": {
+                "chief_preliminary_assessment": require_evidence_detail(
+                    args.chief_assessment, "Chief preliminary assessment"
+                ),
+                "alternatives": [
+                    require_evidence_detail(value, "override alternative")
+                    for value in args.alternative
+                ],
+            },
+            "root_session_id": session_id,
+            "root_owner": state.get("owner"),
+            "chief_decision": None,
+            "consumption": None,
+            "revocation": None,
+            "expires_at": expires_at.isoformat(timespec="microseconds"),
+            "created_at": recorded,
+            "updated_at": recorded,
+        }
+        state.setdefault("override_requests", []).append(item)
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(item, args.json)
+    return 0
+
+
+def cmd_override_arbitrate(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "arbitrate Chief override for")
+        item = override_by_id(state, args.override_id)
+        if item.get("version") != args.expected_version:
+            raise HarnessError("override arbitration CAS failed")
+        if item.get("status") != "awaiting_chief" or is_expired(
+            item.get("expires_at")
+        ):
+            raise HarnessError("override is not awaiting a current Chief decision")
+        session_id = require_root_session(paths, state, args.session_id)
+        if args.decision == "approved":
+            approved = parse_override_settings(
+                args.approved_setting or [
+                    f"{key}={value}"
+                    for key, value in item["requested_settings"].items()
+                ],
+                roles=None,
+                target_kind=str(item.get("target_kind", "")),
+            )
+            item["status"] = "approved"
+        else:
+            if args.approved_setting:
+                raise HarnessError("rejected override may not carry approved settings")
+            approved = {}
+            item["status"] = "rejected"
+        recorded = now_iso()
+        item["version"] = int(item["version"]) + 1
+        item["chief_decision"] = {
+            "decision": args.decision,
+            "approved_settings": approved,
+            "rationale": require_evidence_detail(
+                args.rationale, "Chief override rationale"
+            ),
+            "risk_boundary": require_evidence_detail(
+                args.risk_boundary, "Chief override risk boundary"
+            ),
+            "rollback_condition": require_evidence_detail(
+                args.rollback_condition, "Chief override rollback condition"
+            ),
+            "compensating_controls": [
+                require_evidence_detail(value, "override compensating control")
+                for value in args.compensating_control
+            ],
+            "non_overridable_guardrails": [
+                "Chief lease and task-bound session authority",
+                "current approved plan and exact claim coverage",
+                "dispatch-before-work and packet/result integrity",
+                "evidence-strength and technical PASS boundaries",
+                "ARISE 12-thread and AOI depth-two hard ceilings",
+                "Codex project trust, sandbox, and provider availability",
+            ],
+            "root_session_id": session_id,
+            "recorded_at": recorded,
+        }
+        item["updated_at"] = recorded
+        state.setdefault("decisions", []).append(
+            f"Chief {args.decision} override {item['override_id']}: "
+            f"{item['chief_decision']['rationale']}"
+        )
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(item, args.json)
+    return 0
+
+
+def cmd_override_revoke(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "revoke Chief override for")
+        item = override_by_id(state, args.override_id)
+        if item.get("version") != args.expected_version:
+            raise HarnessError("override revocation CAS failed")
+        if item.get("status") != "approved":
+            raise HarnessError("only an approved, unconsumed override may be revoked")
+        session_id = require_root_session(paths, state, args.session_id)
+        recorded = now_iso()
+        item["version"] = int(item["version"]) + 1
+        item["status"] = "revoked"
+        item["revocation"] = {
+            "reason": require_evidence_detail(args.reason, "override revocation reason"),
+            "root_session_id": session_id,
+            "recorded_at": recorded,
+        }
+        item["updated_at"] = recorded
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(item, args.json)
+    return 0
+
+
+def _codex_home(args: argparse.Namespace) -> Path:
+    if args.codex_home:
+        return Path(args.codex_home)
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured) if configured else Path.home() / ".codex"
+
+
+def _task_resource_worktree(paths: HarnessPaths, state: dict[str, Any]) -> Path:
+    worktree = validated_state_worktree(paths, state)
+    if worktree != Path(state.get("worktree", "")).resolve():
+        raise HarnessError("task resource worktree identity changed")
+    return worktree
+
+
+def _require_task_lock_coverage(
+    paths: HarnessPaths, state: dict[str, Any], locks: Iterable[str]
+) -> list[str]:
+    worktree = _task_resource_worktree(paths, state)
+    normalized = [
+        validate_lock_identity(paths, lock, repo_root=worktree) for lock in locks
+    ]
+    held = [
+        str(lock)
+        for claim in claims_owned_by_task(paths, state["task_id"])
+        if claim.get("status") in RESERVING_CLAIM_STATUSES
+        for lock in claim.get("locks", [])
+    ]
+    missing = [
+        lock for lock in normalized if not any(lock_covers(owner, lock) for owner in held)
+    ]
+    if missing:
+        raise HarnessError(
+            "Codex resource targets lack reserving claim coverage: "
+            + ", ".join(missing)
+        )
+    return normalized
+
+
+def _resource_plan(
+    args: argparse.Namespace, paths: HarnessPaths, state: dict[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    active_selections = [
+        item
+        for item in state.get("execution_selections", [])
+        if item.get("status") == "active"
+        and (
+            not args.execution_selection_id
+            or item.get("selection_id") == args.execution_selection_id
+        )
+    ]
+    if args.execution_selection_id and len(active_selections) != 1:
+        raise HarnessError("Codex resource plan selection is missing or inactive")
+    if not args.execution_selection_id and len(active_selections) > 1:
+        raise HarnessError(
+            "multiple active execution selections exist; pass --execution-selection-id"
+        )
+    if active_selections:
+        _validate_selection_resource_envelope(state, active_selections[0])
+    override_settings = approved_override_settings(
+        state,
+        args.override_id,
+        target_kind="resource_config",
+        target_id=args.event_id,
+    )
+    return build_codex_resource_plan(
+        root=_task_resource_worktree(paths, state),
+        config=paths.project,
+        state=state,
+        codex_home=_codex_home(args),
+        managed_roles=args.role,
+        platform_max_threads=args.max_threads,
+        platform_max_depth=args.max_depth,
+        execution_selection_id=args.execution_selection_id,
+        override_id=args.override_id,
+        override_settings=override_settings,
+    )
+
+
+def cmd_codex_config_plan(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    validate_id(args.event_id, "resource config event id")
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "plan Codex resource configuration for")
+        require_plan_ready(paths, state, "plan Codex resource configuration")
+        plan, _files = _resource_plan(args, paths, state)
+    emit(plan, args.json)
+    return 0
+
+
+def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    event_id = validate_id(args.event_id, "resource config event id")
+    expected_plan = args.expected_plan_sha256.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_plan):
+        raise HarnessError("--expected-plan-sha256 must be full lowercase SHA-256")
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "apply Codex resource configuration for")
+        require_plan_ready(paths, state, "apply Codex resource configuration")
+        session_id = require_root_session(paths, state, args.session_id)
+        if any(
+            event.get("event_id") == event_id
+            for event in state.get("resource_config_events", [])
+        ):
+            raise HarnessError(f"resource config event already exists: {event_id}")
+        plan, files = _resource_plan(args, paths, state)
+        if plan["plan_sha256"] != expected_plan:
+            raise HarnessError("Codex resource plan changed after Chief review")
+        _require_task_lock_coverage(paths, state, plan["required_locks"])
+        recorded = now_iso()
+        receipt = make_resource_receipt(
+            event_id=event_id,
+            plan=plan,
+            files=files,
+            applied_at=recorded,
+            root_session_id=session_id,
+        )
+        receipt_path = task_dir(paths, state["task_id"]) / "results" / (
+            f"resource-config-{event_id}.json"
+        )
+        receipt_payload = (
+            json.dumps(receipt, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        receipt_sha = hashlib.sha256(receipt_payload).hexdigest()
+        atomic_create_bytes(receipt_path, receipt_payload)
+        applied = False
+        state_published = False
+        try:
+            apply_resource_files(files)
+            applied = True
+            event = {
+                "integrity_version": 1,
+                "event_id": event_id,
+                "status": "applied",
+                "plan_sha256": plan["plan_sha256"],
+                "override_id": args.override_id,
+                "receipt_path": str(receipt_path),
+                "receipt_sha256": receipt_sha,
+                "resolved": plan["resolved"],
+                "dynamic_envelope": plan["dynamic_envelope"],
+                "execution_selection_id": plan["dynamic_envelope"].get(
+                    "execution_selection_id", ""
+                ),
+                "required_locks": plan["required_locks"],
+                "restart_required": True,
+                "root_session_id": session_id,
+                "applied_at": recorded,
+                "rollback": None,
+            }
+            state.setdefault("resource_config_events", []).append(event)
+            if args.override_id:
+                override = override_by_id(state, args.override_id)
+                if override.get("status") != "approved":
+                    raise HarnessError("override authority changed before consumption")
+                override["version"] = int(override["version"]) + 1
+                override["status"] = "consumed"
+                override["consumption"] = {
+                    "consumer_command": "codex-config-apply",
+                    "event_id": event_id,
+                    "plan_sha256": plan["plan_sha256"],
+                    "root_session_id": session_id,
+                    "recorded_at": recorded,
+                }
+                override["updated_at"] = recorded
+            _extend_unique(
+                state,
+                "changed_files",
+                [item["relative_path"] for item in plan["files"]],
+            )
+            state.setdefault("facts", []).append(
+                f"Applied Codex resource event {event_id}; a fresh trusted session "
+                "is still required before claiming activation."
+            )
+            bump_task(state)
+            write_task(paths, state)
+            state_published = True
+        except BaseException as exc:
+            if applied and not state_published:
+                try:
+                    published_state = load_task(paths, args.task)
+                except (HarnessError, OSError, ValueError):
+                    published_state = {}
+                published_events = [
+                    item
+                    for item in published_state.get("resource_config_events", [])
+                    if item.get("event_id") == event_id
+                    and item.get("plan_sha256") == plan["plan_sha256"]
+                    and item.get("receipt_sha256") == receipt_sha
+                    and item.get("status") == "applied"
+                ]
+                state_published = len(published_events) == 1
+            if applied and not state_published:
+                rollback_files_from_receipt(
+                    root=_task_resource_worktree(paths, state), receipt=receipt
+                )
+            if not state_published:
+                try:
+                    receipt_path.unlink()
+                except FileNotFoundError:
+                    pass
+            if state_published:
+                raise HarnessError(
+                    "Codex resource state and files were published, but the final "
+                    "durability step reported an error; event retained for doctor/reconcile"
+                ) from exc
+            raise
+        write_index(paths)
+    emit(
+        {
+            "event_id": event_id,
+            "status": "applied",
+            "plan_sha256": plan["plan_sha256"],
+            "receipt_path": str(receipt_path),
+            "receipt_sha256": receipt_sha,
+            "restart_required": True,
+            "routing_verified": False,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_codex_config_rollback(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "roll back Codex resource configuration for")
+        session_id = require_root_session(paths, state, args.session_id)
+        matches = [
+            event
+            for event in state.get("resource_config_events", [])
+            if event.get("event_id") == args.event_id
+        ]
+        if len(matches) != 1 or matches[0].get("status") != "applied":
+            raise HarnessError("resource config event is not uniquely applied")
+        event = matches[0]
+        receipt_path = Path(str(event.get("receipt_path", "")))
+        expected_receipt_path = (
+            task_dir(paths, state["task_id"])
+            / "results"
+            / f"resource-config-{args.event_id}.json"
+        )
+        if (
+            receipt_path != expected_receipt_path
+            or not receipt_path.is_file()
+            or receipt_path.is_symlink()
+            or sha256_file(receipt_path) != event.get("receipt_sha256")
+        ):
+            raise HarnessError("resource config rollback receipt is missing or changed")
+        receipt = load_json(receipt_path)
+        receipt_plan = receipt.get("plan")
+        if (
+            receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION
+            or receipt.get("event_id") != event.get("event_id")
+            or receipt.get("plan_sha256") != event.get("plan_sha256")
+            or receipt.get("task_id") != state.get("task_id")
+            or receipt.get("root_session_id") != event.get("root_session_id")
+            or receipt.get("applied_at") != event.get("applied_at")
+            or receipt.get("restart_required") != event.get("restart_required")
+            or not isinstance(receipt_plan, dict)
+            or receipt_plan.get("plan_sha256") != event.get("plan_sha256")
+            or resource_plan_sha256(receipt_plan) != event.get("plan_sha256")
+            or receipt_plan.get("resolved") != event.get("resolved")
+            or receipt_plan.get("dynamic_envelope")
+            != event.get("dynamic_envelope")
+            or receipt_plan.get("required_locks") != event.get("required_locks")
+        ):
+            raise HarnessError("resource config receipt binding is invalid")
+        _require_task_lock_coverage(paths, state, event.get("required_locks", []))
+        rollback_files_from_receipt(
+            root=_task_resource_worktree(paths, state), receipt=receipt
+        )
+        recorded = now_iso()
+        event["status"] = "rolled_back"
+        event["rollback"] = {
+            "reason": require_evidence_detail(
+                args.reason, "resource config rollback reason"
+            ),
+            "root_session_id": session_id,
+            "recorded_at": recorded,
+        }
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(event, args.json)
     return 0
 
 
@@ -10127,6 +11517,12 @@ def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 + "; ".join(authority_errors)
             )
         selection = _validate_packet_activation_topology(state, packet)
+        _validate_packet_resource_envelope(
+            state,
+            packet,
+            selection,
+            enforce_active_limit=True,
+        )
         _validate_skill_canary_work_unit_binding(
             state,
             str(packet.get("skill_release_id", "")),
@@ -10302,6 +11698,12 @@ def _validate_current_dispatch_arm(
     if authority_errors:
         raise HarnessError("packet authority is invalid: " + "; ".join(authority_errors))
     selection = _validate_packet_activation_topology(state, packet)
+    _validate_packet_resource_envelope(
+        state,
+        packet,
+        selection,
+        enforce_active_limit=True,
+    )
     if attempt.get("lane_snapshot") != _packet_execution_lane_snapshot(
         selection, packet
     ) or attempt.get("steward_snapshot") != (
@@ -10398,6 +11800,21 @@ def observe_subagent_start(
             for attempt in packet.get("dispatch_attempts", []):
                 observation = attempt.get("observation")
                 if isinstance(observation, dict) and observation.get("event_id") == event_id:
+                    authority_errors = packet_authority_integrity_errors(
+                        paths,
+                        state,
+                        packet,
+                        require_origin=False,
+                    )
+                    if authority_errors:
+                        return {
+                            "status": "corrupt",
+                            "reason_code": "packet_authority_invalid",
+                            "task_id": state["task_id"],
+                            "packet_id": packet.get("packet_id"),
+                            "event_id": event_id,
+                            "idempotent": True,
+                        }
                     return {
                         "status": "authorized",
                         "task_id": state["task_id"],
@@ -10658,6 +12075,13 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if state.get("profile") == "mini":
             raise HarnessError("mini task may not create delegation packets")
         require_plan_ready(paths, state, "create packet")
+        packet_worktree = state_worktree(paths, state)
+        packet_locks = list(
+            dict.fromkeys(
+                validate_lock_identity(paths, lock, repo_root=packet_worktree)
+                for lock in packet_locks
+            )
+        )
         _adopt_execution_policy_v2_for_new_work(state)
         packet_purpose = "work"
         steward_input_bindings: list[dict[str, Any]] = []
@@ -10707,6 +12131,16 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 raise HarnessError(
                     "Steward synthesis requires terminal specialist work: "
                     + ", ".join(unfinished + active_jobs)
+                )
+            specialist_authority_errors = selection_done_packet_authority_errors(
+                paths,
+                state,
+                synthesis_selection_id,
+            )
+            if specialist_authority_errors:
+                raise HarnessError(
+                    "Steward synthesis specialist authority is missing or tampered: "
+                    + "; ".join(specialist_authority_errors)
                 )
             steward_input_bindings = _selection_terminal_packet_bindings(
                 state, synthesis_selection_id
@@ -10761,6 +12195,24 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                         "begins: "
                         + ", ".join(frozen_by)
                     )
+        resource_envelope_sha256 = ""
+        if selection is not None and selection.get("resource_envelope") is not None:
+            resource_envelope_sha256 = str(
+                selection.get("resource_envelope_sha256", "")
+            )
+            _validate_packet_resource_envelope(
+                state,
+                {
+                    "packet_id": packet_id,
+                    "agent_role": args.agent_role,
+                    "model_tier": args.model_tier,
+                    "delegation_depth": args.delegation_depth,
+                    "execution_selection_id": selection.get("selection_id", ""),
+                    "resource_envelope_sha256": resource_envelope_sha256,
+                },
+                selection,
+                enforce_active_limit=False,
+            )
         skill_binding = _validate_skill_canary_work_unit_binding(
             state,
             args.skill_release_id or "",
@@ -10807,6 +12259,17 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             ):
                 raise HarnessError(
                     "depth-two parent must be a dispatched depth-one packet in the same lane"
+                )
+            parent_authority_errors = packet_authority_integrity_errors(
+                paths,
+                state,
+                parent,
+                require_origin=False,
+            )
+            if parent_authority_errors:
+                raise HarnessError(
+                    "depth-two parent authority is missing or tampered: "
+                    + "; ".join(parent_authority_errors)
                 )
             decision_matches = [
                 review
@@ -10872,7 +12335,11 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             for claim in claims_owned_by_task(paths, state["task_id"])
             if claim.get("status") in RESERVING_CLAIM_STATUSES
         ]
-        held_locks = [lock for claim in reserving for lock in claim.get("locks", [])]
+        held_locks = [
+            str(lock)
+            for claim in reserving
+            for lock in claim.get("locks", [])
+        ]
         unowned = [
             lock
             for lock in packet_locks
@@ -10932,6 +12399,13 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             },
         )
         text += f"\n## AOI dispatch authority\n\n{NATIVE_V5_PACKET_CONTRACT_MARKER}\n"
+        if resource_envelope_sha256:
+            text += (
+                "\n## AOI resource authority\n\n"
+                f"- Execution selection: `{selection.get('selection_id', '')}`\n"
+                f"- Resource envelope SHA-256: `{resource_envelope_sha256}`\n"
+                "- Requested model routing remains unverified until observed.\n"
+            )
         if command_record:
             text += (
                 "\n## Exact command authority\n\n"
@@ -10976,6 +12450,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "execution_selection_id": selection.get("selection_id", "")
                 if selection
                 else "",
+                "resource_envelope_sha256": resource_envelope_sha256,
                 "packet_purpose": packet_purpose,
                 **(
                     {
@@ -11064,7 +12539,13 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     "packet authority is missing or tampered: "
                     + "; ".join(authority_errors)
                 )
-            _validate_packet_activation_topology(state, packet)
+            selection = _validate_packet_activation_topology(state, packet)
+            _validate_packet_resource_envelope(
+                state,
+                packet,
+                selection,
+                enforce_active_limit=True,
+            )
             _validate_skill_canary_work_unit_binding(
                 state,
                 str(packet.get("skill_release_id", "")),
@@ -11254,6 +12735,18 @@ def cmd_packet_attest_result(args: argparse.Namespace, paths: HarnessPaths) -> i
         packet = matches[0]
         if packet.get("status") not in TERMINAL_PACKET_STATUSES:
             raise HarnessError("only a terminal packet result can be attested")
+        if packet.get("status") == "done":
+            authority_errors = packet_authority_integrity_errors(
+                paths,
+                state,
+                packet,
+                require_origin=False,
+            )
+            if authority_errors:
+                raise HarnessError(
+                    "done packet authority is missing or tampered: "
+                    + "; ".join(authority_errors)
+                )
         expected = task_dir(paths, args.task) / "results" / f"{args.packet_id}.md"
         if Path(str(packet.get("result_path", ""))) != expected or not expected.is_file():
             raise HarnessError("packet result path is missing or non-canonical")
@@ -11857,10 +13350,13 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     failures.extend(provider_errors)
     failures.extend(context_benchmark_integrity_errors(paths, state))
     failures.extend(portfolio_integrity_errors(state, paths))
+    failures.extend(override_integrity_errors(state))
+    failures.extend(resource_config_integrity_errors(paths, state))
+    failures.extend(resource_envelope_integrity_errors(state))
     for selection in state.get("execution_selections", []):
         if selection.get("mode") not in {"centralized_parallel", "hybrid"}:
             continue
-        brief_error = _execution_brief_coverage_error(state, selection)
+        brief_error = _execution_brief_coverage_error(paths, state, selection)
         if brief_error:
             failures.append(brief_error)
     unresolved_coordination = [
@@ -11908,6 +13404,15 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     if open_user_escalations:
         failures.append(
             "unresolved needs-user escalations: " + ", ".join(open_user_escalations)
+        )
+    open_overrides = [
+        str(item.get("override_id"))
+        for item in state.get("override_requests", [])
+        if item.get("status") in {"awaiting_chief", "approved"}
+    ]
+    if open_overrides:
+        failures.append(
+            "unresolved or unconsumed Chief overrides: " + ", ".join(open_overrides)
         )
     open_spawn_incidents = [
         str(item.get("incident_id"))
@@ -12033,6 +13538,16 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "unresolved needs-user escalations: "
                 + ", ".join(open_user_escalations)
             )
+        open_overrides = [
+            str(item.get("override_id"))
+            for item in state.get("override_requests", [])
+            if item.get("status") in {"awaiting_chief", "approved"}
+        ]
+        if open_overrides:
+            failures.append(
+                "unresolved or unconsumed Chief overrides: "
+                + ", ".join(open_overrides)
+            )
         open_spawn_incidents = [
             str(item.get("incident_id"))
             for item in state.get("subagent_incidents", [])
@@ -12045,10 +13560,19 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             )
         if state.get("delivery", {}).get("mode") == "pending":
             failures.append("delivery disposition is pending")
-        failures.extend(packet_integrity_errors(paths, state))
+        failures.extend(
+            packet_integrity_errors(
+                paths,
+                state,
+                allow_done_lock_recovery=True,
+            )
+        )
         failures.extend(subagent_incident_integrity_errors(state))
         failures.extend(packet_recovery_integrity_errors(paths, state))
         failures.extend(job_integrity_errors(paths, state))
+        failures.extend(override_integrity_errors(state))
+        failures.extend(resource_config_integrity_errors(paths, state))
+        failures.extend(resource_envelope_integrity_errors(state))
         worktree_errors, _ = worktree_integrity_errors(paths, state)
         failures.extend(worktree_errors)
         if failures:
@@ -12698,11 +14222,29 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         try:
             task = load_task(paths, args.task)
             tasks = [task]
-            claims = referenced_claims(paths, task)
         except HarnessError as exc:
             tasks = []
             claims = []
             errors.append(str(exc))
+        else:
+            try:
+                all_claims = load_all_claims(paths)
+            except HarnessError as exc:
+                claims = []
+                errors.append(str(exc))
+            else:
+                referenced_tokens = {
+                    str(token) for token in task.get("claims", [])
+                }
+                claims = [
+                    claim
+                    for claim in all_claims
+                    if str(claim.get("token", "")) in referenced_tokens
+                    or (
+                        not claim.get("legacy")
+                        and str(claim.get("task_id", "")) == task["task_id"]
+                    )
+                ]
     else:
         try:
             tasks = load_all_tasks(paths)
@@ -12728,6 +14270,14 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             warnings.append(f"expired but still reserving: {token}")
         if claim.get("legacy") and claim.get("scope_parse_warnings"):
             warnings.append(f"legacy scope needs audit: {token}")
+        try:
+            validate_claim_lock_identities(paths, claim)
+        except HarnessError as exc:
+            message = f"claim {token} lock authority: {exc}"
+            if claim.get("status") in RESERVING_CLAIM_STATUSES:
+                errors.append(message)
+            else:
+                warnings.append(message)
         if not claim.get("legacy"):
             task_id = str(claim.get("task_id", ""))
             structured_by_task.setdefault(task_id, set()).add(token)
@@ -12778,6 +14328,14 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             errors.append(str(exc))
 
         worktree = state_worktree(paths, task)
+        for packet in task.get("packets", []):
+            if packet.get("status") not in {"failed", "cancelled"} and not (
+                task.get("status") == "cancelled"
+                and packet.get("status") == "done"
+            ):
+                continue
+            lock_errors = packet_lock_integrity_errors(paths, task, packet)
+            warnings.extend(f"task {task_id}: {item}" for item in lock_errors)
         if task.get("status") in {"active", "blocked"}:
             task_worktree_errors, _ = worktree_integrity_errors(paths, task)
             errors.extend(f"task {task_id}: {item}" for item in task_worktree_errors)
@@ -12786,6 +14344,17 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
         errors.extend(
             f"task {task_id}: {item}" for item in portfolio_integrity_errors(task, paths)
+        )
+        errors.extend(
+            f"task {task_id}: {item}" for item in override_integrity_errors(task)
+        )
+        errors.extend(
+            f"task {task_id}: {item}"
+            for item in resource_config_integrity_errors(paths, task)
+        )
+        errors.extend(
+            f"task {task_id}: {item}"
+            for item in resource_envelope_integrity_errors(task)
         )
         errors.extend(
             f"task {task_id}: {item}"
@@ -13589,6 +15158,7 @@ def build_parser(
     p.add_argument("--falsification-condition", required=True)
     p.add_argument("--escalation-condition", required=True)
     p.add_argument("--session-id", required=True)
+    p.add_argument("--override-id", default="")
     add_json_argument(p)
     p.set_defaults(handler=cmd_execution_select)
 
@@ -13664,6 +15234,79 @@ def build_parser(
     p.add_argument("--user-evidence", required=True)
     add_json_argument(p)
     p.set_defaults(handler=cmd_needs_user_resolve)
+
+    p = sub.add_parser("override-request")
+    p.add_argument("--task", required=True)
+    p.add_argument("--override-id", required=True)
+    p.add_argument("--target-kind", choices=sorted(OVERRIDE_TARGET_KINDS), required=True)
+    p.add_argument("--target-id", required=True)
+    p.add_argument("--scope", required=True)
+    p.add_argument("--setting", action="append", default=[], required=True)
+    p.add_argument("--user-rationale", required=True)
+    p.add_argument("--user-evidence", required=True)
+    p.add_argument("--chief-assessment", required=True)
+    p.add_argument("--alternative", action="append", default=[], required=True)
+    p.add_argument("--expires-at", required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_override_request)
+
+    p = sub.add_parser("override-arbitrate")
+    p.add_argument("--task", required=True)
+    p.add_argument("--override-id", required=True)
+    p.add_argument("--expected-version", type=int, required=True)
+    p.add_argument("--decision", choices=["approved", "rejected"], required=True)
+    p.add_argument("--approved-setting", action="append", default=[])
+    p.add_argument("--rationale", required=True)
+    p.add_argument("--risk-boundary", required=True)
+    p.add_argument("--rollback-condition", required=True)
+    p.add_argument("--compensating-control", action="append", default=[], required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_override_arbitrate)
+
+    p = sub.add_parser("override-revoke")
+    p.add_argument("--task", required=True)
+    p.add_argument("--override-id", required=True)
+    p.add_argument("--expected-version", type=int, required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_override_revoke)
+
+    def add_codex_resource_plan_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--task", required=True)
+        parser.add_argument("--event-id", required=True)
+        parser.add_argument("--override-id", default="")
+        parser.add_argument("--execution-selection-id", default="")
+        parser.add_argument("--codex-home")
+        parser.add_argument("--role", action="append", default=[])
+        parser.add_argument(
+            "--max-threads", type=int, default=12, help="static project ceiling"
+        )
+        parser.add_argument(
+            "--max-depth", type=int, default=2, help="static project ceiling"
+        )
+
+    p = sub.add_parser("codex-config-plan")
+    add_codex_resource_plan_arguments(p)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_codex_config_plan)
+
+    p = sub.add_parser("codex-config-apply")
+    add_codex_resource_plan_arguments(p)
+    p.add_argument("--expected-plan-sha256", required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_codex_config_apply)
+
+    p = sub.add_parser("codex-config-rollback")
+    p.add_argument("--task", required=True)
+    p.add_argument("--event-id", required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--session-id", required=True)
+    add_json_argument(p)
+    p.set_defaults(handler=cmd_codex_config_rollback)
 
     p = sub.add_parser("lane-set-status")
     p.add_argument("--task", required=True)

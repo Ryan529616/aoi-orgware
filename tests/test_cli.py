@@ -421,6 +421,14 @@ class HarnessTestCase(unittest.TestCase):
         )
         return receipt, hashlib.sha256(receipt.read_bytes()).hexdigest()
 
+    def write_terminal_log(
+        self, name: str, payload: bytes = b"PASS exit=0\n"
+    ) -> tuple[Path, str]:
+        terminal_log = self.root / "terminal-log-fixtures" / name
+        terminal_log.parent.mkdir(parents=True, exist_ok=True)
+        terminal_log.write_bytes(payload)
+        return terminal_log, hashlib.sha256(payload).hexdigest()
+
     def hook(self, payload: dict, bom: bool = False) -> dict:
         raw = json.dumps(payload).encode("utf-8")
         if bom:
@@ -1122,7 +1130,7 @@ class ChiefAuthorityTests(HarnessTestCase):
                 epoch=int(authority["epoch"]),
                 credential_file=credentials[0],
             )
-            self.assertEqual(loaded_path, credentials[0])
+            self.assertEqual(loaded_path, credentials[0].resolve())
             h.require_chief_authority(
                 paths,
                 session_id="published-fault-chief",
@@ -1165,7 +1173,9 @@ class ChiefAuthorityTests(HarnessTestCase):
         if os.name != "nt":
             existing.chmod(0o700)
         with mock.patch.object(h, "_chmod_private") as chmod_private:
-            self.assertEqual(h._ensure_private_credential_directory(existing), existing)
+            self.assertEqual(
+                h._ensure_private_credential_directory(existing), existing.resolve()
+            )
         chmod_private.assert_not_called()
 
         unavailable = Path(self.backup_temp.name) / "unavailable-credential-directory"
@@ -1315,6 +1325,12 @@ class ChiefAuthorityTests(HarnessTestCase):
         self.assertEqual(
             paths.harness.joinpath("POLICY.md").read_bytes(),
             (SRC / "aoi_orgware" / "resources" / "policy.md").read_bytes(),
+        )
+
+    def test_v021_policy_digest_remains_an_exact_managed_upgrade_source(self) -> None:
+        self.assertIn(
+            "eb03c009470e9bd27b521de6116b6206bfc0abf9785d0b1a1fe31416054a083f",
+            cli_impl.KNOWN_MANAGED_POLICY_SHA256,
         )
 
     def test_chief_acquire_bootstraps_only_a_complete_missing_lock(self) -> None:
@@ -1868,7 +1884,10 @@ class ChiefAuthorityTests(HarnessTestCase):
         projects = cli_impl._pilot_output_projects(
             nested / "pilot-summary.json", kit_destinations=False
         )
-        self.assertEqual({item.root for item in projects}, {self.root, nested})
+        self.assertEqual(
+            {item.root for item in projects},
+            {self.root.resolve(), nested.resolve()},
+        )
         rejected = self.cli(
             "pilot-summary",
             "--record",
@@ -2409,7 +2428,7 @@ class LockTests(HarnessTestCase):
         host_file.parent.mkdir(parents=True)
         host_file.write_text("v1\n", encoding="utf-8")
         lock = (
-            h.normalize_lock(f"host:file:{host_file.as_posix()}")
+            h.normalize_lock(f"host:file:{host_file.resolve().as_posix()}")
             if os.name == "nt"
             else "host:file:D:/workspace/project/hook.json"
         )
@@ -2483,6 +2502,248 @@ class LockTests(HarnessTestCase):
                 ok=False,
             )
             self.assertIn("symlink", rejected.stderr)
+
+    def test_ntfs_short_name_lock_spelling_fails_closed(self) -> None:
+        paths = h.get_paths(self.root)
+        for lock in (
+            "host:tree:C:/PROGRA~1",
+            "host:file:C:/Users/RUNNER~1/file.txt",
+            "host:file:C:/TEMP/LONGFI~1.TXT",
+            "host:tree:C:/TEMP/ÉCLAI~1",
+            "host:file:C:/TEMP/RÉSUMÉ~2.DAT",
+            "host:file:C:/TEMP/FOO~BA~1.TXT",
+            "host:tree:C:/TEMP/~LONGF~1",
+        ):
+            with self.subTest(lock=lock):
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "canonical long spelling|NTFS 8.3-style",
+                ):
+                    h.validate_lock_identity(paths, lock, repo_root=self.root)
+
+        external_lock = (
+            f"{h.EXTERNAL_LOCK_NAMESPACE}:tree:/tmp/RUNNER~1"
+        )
+        self.assertEqual(h.normalize_lock(external_lock), external_lock)
+        if os.name == "nt":
+            with self.assertRaisesRegex(
+                h.HarnessError,
+                "canonical long spelling|NTFS 8.3-style",
+            ):
+                h.validate_lock_identity(
+                    paths,
+                    "repo:tree:RUNNER~1",
+                    repo_root=self.root,
+                )
+        else:
+            self.assertEqual(
+                h.validate_lock_identity(
+                    paths,
+                    "repo:tree:RUNNER~1",
+                    repo_root=self.root,
+                ),
+                "repo:tree:RUNNER~1",
+            )
+            self.assertEqual(
+                h.validate_lock_identity(
+                    paths,
+                    "repo:tree:MixedCase",
+                    repo_root=self.root,
+                ),
+                "repo:tree:MixedCase",
+            )
+            self.assertEqual(
+                h.validate_lock_identity(
+                    paths,
+                    "git:merge:MixedCase",
+                    repo_root=self.root,
+                ),
+                "git:merge:MixedCase",
+            )
+            host_mount = self.root / "host-mount"
+            mounted_repo = host_mount / "c" / "workspace"
+            mounted_repo.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {"AOI_HOST_MOUNT_ROOT": str(host_mount)},
+            ):
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "repo lock URI contains an unresolved NTFS 8.3-style",
+                ):
+                    h.validate_lock_identity(
+                        paths,
+                        "repo:tree:RUNNER~1",
+                        repo_root=mounted_repo,
+                    )
+                self.assertEqual(
+                    h.validate_lock_identity(
+                        paths,
+                        "repo:tree:Program Files",
+                        repo_root=mounted_repo,
+                    ),
+                    "repo:tree:program files",
+                )
+                self.assertEqual(
+                    h.validate_lock_identity(
+                        paths,
+                        "git:merge:Feature/CaseAlias",
+                        repo_root=mounted_repo,
+                    ),
+                    "git:merge:feature/casealias",
+                )
+                mounted_high_risk = h.validate_lock_identity(
+                    paths,
+                    "repo:file:.AOI/claims/forged.json",
+                    repo_root=mounted_repo,
+                )
+                self.assertEqual(
+                    mounted_high_risk,
+                    "repo:file:.aoi/claims/forged.json",
+                )
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "mini task may not own high-risk path",
+                ):
+                    cli_impl.validate_mini_locks([mounted_high_risk])
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "persisted lock URI must use.*canonical Windows-mount identity",
+                ):
+                    h.validate_persisted_lock_identity(
+                        paths,
+                        "git:merge:Feature/CaseAlias",
+                        repo_root=mounted_repo,
+                    )
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "persisted lock URI must use.*canonical Windows-mount identity",
+                ):
+                    h.validate_persisted_lock_identity(
+                        paths,
+                        "repo:tree:Program Files",
+                        repo_root=mounted_repo,
+                    )
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "claim mounted-case-alias has non-canonical lock authority",
+                ):
+                    h.validate_claim_lock_identities(
+                        paths,
+                        {
+                            "token": "mounted-case-alias",
+                            "worktree": str(mounted_repo),
+                            "locks": ["repo:tree:Program Files"],
+                        },
+                    )
+                packet_state = {
+                    "task_id": "mounted-packet",
+                    "worktree": str(mounted_repo),
+                }
+                packet = {
+                    "packet_id": "mounted-case-packet",
+                    "status": "ready",
+                    "locks": ["repo:tree:Program Files"],
+                }
+                self.assertRegex(
+                    "\n".join(
+                        cli_impl.packet_lock_integrity_errors(
+                            paths,
+                            packet_state,
+                            packet,
+                        )
+                    ),
+                    "persisted lock URI must use.*canonical Windows-mount identity",
+                )
+                packet["locks"] = ["repo:tree:program files"]
+                self.assertEqual(
+                    cli_impl.packet_lock_integrity_errors(
+                        paths,
+                        packet_state,
+                        packet,
+                    ),
+                    [],
+                )
+        for canonical_tilde_name in ("A B~1", "A~1.X.Y", "A~1.💥"):
+            lock = f"host:tree:C:/TEMP/{canonical_tilde_name}"
+            self.assertEqual(
+                h.validate_lock_identity(paths, lock, repo_root=self.root),
+                h.normalize_lock(lock),
+            )
+
+        parent = {
+            "packet_id": "parent-authority",
+            "delegation_depth": 1,
+            "locks": ["host:tree:C:/PROGRA~1"],
+        }
+        child = {
+            "packet_id": "child-authority",
+            "delegation_depth": 2,
+            "parent_packet_id": "parent-authority",
+            "locks": [],
+        }
+        specialist = {
+            "packet_id": "specialist-authority",
+            "status": "done",
+            "execution_selection_id": "selection-authority",
+            "locks": ["host:tree:C:/PROGRA~1"],
+        }
+        synthesis = {
+            "packet_id": "steward-authority",
+            "packet_purpose": "steward_synthesis",
+            "execution_selection_id": "selection-authority",
+            "locks": [],
+        }
+        packet_state = {
+            "task_id": "packet-authority-chain",
+            "worktree": str(self.root.resolve()),
+            "packets": [parent, child, specialist, synthesis],
+        }
+        with (
+            mock.patch.object(
+                cli_impl,
+                "packet_contract_integrity_error",
+                return_value=None,
+            ),
+            mock.patch.object(
+                cli_impl,
+                "packet_input_integrity_errors",
+                return_value=[],
+            ),
+            mock.patch.object(
+                cli_impl,
+                "packet_command_integrity_error",
+                return_value=None,
+            ),
+        ):
+            child_errors = cli_impl.packet_authority_integrity_errors(
+                paths,
+                packet_state,
+                child,
+                require_origin=False,
+            )
+            self.assertTrue(
+                any(
+                    "parent authority" in item
+                    and "non-canonical lock authority" in item
+                    for item in child_errors
+                ),
+                child_errors,
+            )
+            synthesis_errors = cli_impl.packet_authority_integrity_errors(
+                paths,
+                packet_state,
+                synthesis,
+                require_origin=False,
+            )
+            self.assertTrue(
+                any(
+                    "specialist specialist-authority authority" in item
+                    and "non-canonical lock authority" in item
+                    for item in synthesis_errors
+                ),
+                synthesis_errors,
+            )
 
 
 class LifecycleTests(HarnessTestCase):
@@ -2785,6 +3046,26 @@ class LifecycleTests(HarnessTestCase):
         )
         self.assertNotIn("Terminal claim history:", below_rendered)
         self.assertIn("terminal-claim-00 [done]", below_rendered)
+
+    def test_compact_packet_result_keeps_relative_path_visible(self) -> None:
+        self.init_task("relative-packet-result")
+        paths = h.get_paths(self.root)
+        raw_result = (
+            ".aoi/tasks/relative-packet-result/results/relative-reader.md"
+        )
+        digest = "a" * 64
+        packet = {
+            "packet_id": "relative-reader",
+            "result_path": raw_result,
+            "result_sha256": digest,
+        }
+        with mock.patch.object(Path, "cwd", return_value=self.root):
+            reference = h._compact_packet_result_reference(
+                paths,
+                {"task_id": "relative-packet-result"},
+                packet,
+            )
+        self.assertEqual(reference, f"{raw_result}@{digest[:12]}")
 
     def test_terminal_history_uses_bounded_deterministic_projection(self) -> None:
         self.init_task("compact-checkpoint")
@@ -3707,6 +3988,39 @@ class LifecycleTests(HarnessTestCase):
                 "baselines": {},
             },
         )
+        state_path = paths.tasks / "orphan-task" / "state.json"
+        checkpoint_path = paths.tasks / "orphan-task" / "checkpoint.md"
+        before_state = state_path.read_bytes()
+        before_checkpoint = checkpoint_path.read_bytes()
+        rejected_checkpoint = self.cli(
+            "checkpoint",
+            "--task",
+            "orphan-task",
+            "--next-action",
+            "Do not omit the crash-orphaned authority",
+            ok=False,
+        )
+        self.assertIn("orphan claim orphan-claim", rejected_checkpoint.stderr)
+        self.assertEqual(state_path.read_bytes(), before_state)
+        self.assertEqual(checkpoint_path.read_bytes(), before_checkpoint)
+        scoped_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                "orphan-task",
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(scoped_doctor.returncode, 1, scoped_doctor.stderr)
+        self.assertIn("active/archive orphan claim orphan-claim", scoped_doctor.stdout)
         failed = self.cli(
             "close-task",
             "--task",
@@ -3957,9 +4271,9 @@ class LifecycleTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("unresolved queued/running/unknown jobs", unresolved.stderr)
-        terminal_log = Path("/tmp/aoi-example-run/driver.log")
-        terminal_log.parent.mkdir(parents=True, exist_ok=True)
-        terminal_log.write_text("PASS exit=0\n", encoding="utf-8")
+        terminal_log, terminal_log_sha = self.write_terminal_log(
+            "aoi-example-run-driver.log"
+        )
         self.cli(
             "job-update",
             "--task",
@@ -3972,6 +4286,10 @@ class LifecycleTests(HarnessTestCase):
             "/tmp/aoi-example-run/driver.log exit=0 PASS",
             "--exit-code",
             "0",
+            "--terminal-log-artifact",
+            str(terminal_log),
+            "--terminal-log-sha256",
+            terminal_log_sha,
         )
         self.cli(
             "release-claim",
@@ -4498,9 +4816,9 @@ class HardeningTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("requires exit code 0", nonzero_pass.stderr)
-        terminal_log = Path("/tmp/receipt-run/driver.log")
-        terminal_log.parent.mkdir(parents=True, exist_ok=True)
-        terminal_log.write_text("PASS exit=0\n", encoding="utf-8")
+        terminal_log, terminal_log_sha = self.write_terminal_log(
+            "receipt-run-driver.log"
+        )
         self.cli(
             "job-update",
             "--task",
@@ -4513,6 +4831,22 @@ class HardeningTests(HarnessTestCase):
             "driver.log records PASS and process exit 0",
             "--exit-code",
             "0",
+            "--terminal-log-artifact",
+            str(terminal_log),
+            "--terminal-log-sha256",
+            terminal_log_sha,
+        )
+        job = h.load_json(
+            self.root / ".aoi" / "tasks" / "receipt-task" / "state.json"
+        )["jobs"][0]
+        self.assertEqual(job["terminal_artifact_status"], "preserved")
+        terminal_manifest = h.load_json(Path(job["terminal_manifest_path"]))
+        self.assertEqual(
+            Path(terminal_manifest["artifact"]["capture_source"]),
+            terminal_log.resolve(),
+        )
+        self.assertEqual(
+            terminal_manifest["artifact"]["sha256"], terminal_log_sha
         )
 
     def test_packet_result_tamper_blocks_close_and_doctor(self) -> None:
@@ -6153,35 +6487,54 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("frozen after Steward synthesis begins", late_specialist.stderr)
+        brief_args = [
+            "execution-brief-record",
+            "--task",
+            task_id,
+            "--brief-id",
+            "parallel-review-brief",
+            "--execution-selection-id",
+            "parallel-reviews",
+            "--steward-lane-id",
+            "steward",
+            "--steward-packet-id",
+            "parallel-review-steward-synthesis",
+            "--packet-id",
+            "rtl-one",
+            "--packet-id",
+            "rtl-two",
+            "--packet-id",
+            "numeric-one",
+            "--summary",
+            "Steward consolidated the independent RTL and numeric terminal results",
+            "--dissent",
+            "No unresolved specialist dissent was reported",
+            "--blocker",
+            "No remaining blocker was reported for this review phase",
+            "--recommendation",
+            "Chief should continue only the bounded sequential RTL follow-up",
+            "--session-id",
+            "chief-centralized",
+        ]
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        synthesis_state = json.loads(state_path.read_text(encoding="utf-8"))
+        synthesis_packet = next(
+            packet
+            for packet in synthesis_state["packets"]
+            if packet["packet_id"] == "parallel-review-steward-synthesis"
+        )
+        synthesis_result = Path(synthesis_packet["result_path"])
+        original_result = synthesis_result.read_bytes()
+        before_state = state_path.read_bytes()
+        synthesis_result.write_bytes(original_result + b"\nTAMPERED\n")
+        rejected_brief = self.cli(*brief_args, ok=False)
+        self.assertIn("Steward synthesis evidence is missing or tampered", rejected_brief.stderr)
+        self.assertIn("result SHA-256 mismatch", rejected_brief.stderr)
+        self.assertEqual(state_path.read_bytes(), before_state)
+        synthesis_result.write_bytes(original_result)
         brief = json.loads(
             self.cli(
-                "execution-brief-record",
-                "--task",
-                task_id,
-                "--brief-id",
-                "parallel-review-brief",
-                "--execution-selection-id",
-                "parallel-reviews",
-                "--steward-lane-id",
-                "steward",
-                "--steward-packet-id",
-                "parallel-review-steward-synthesis",
-                "--packet-id",
-                "rtl-one",
-                "--packet-id",
-                "rtl-two",
-                "--packet-id",
-                "numeric-one",
-                "--summary",
-                "Steward consolidated the independent RTL and numeric terminal results",
-                "--dissent",
-                "No unresolved specialist dissent was reported",
-                "--blocker",
-                "No remaining blocker was reported for this review phase",
-                "--recommendation",
-                "Chief should continue only the bounded sequential RTL follow-up",
-                "--session-id",
-                "chief-centralized",
+                *brief_args,
                 "--json",
             ).stdout
         )
@@ -7542,7 +7895,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         def make_terminal(task_id: str, terminal_status: str) -> tuple[Path, Path]:
             self.init_task(task_id)
             source = self.root.parent / f"{self.root.name}-{task_id}.txt"
-            source.write_text("legacy input\n", encoding="utf-8")
+            source.write_bytes(b"legacy input\n")
             digest = hashlib.sha256(source.read_bytes()).hexdigest()
             self.cli(
                 "create-packet",
@@ -7598,7 +7951,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 }
             ]
             state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-            source.write_text("legitimate later source\n", encoding="utf-8")
+            source.write_bytes(b"legitimate later source\n")
             return state_path, source
 
         failed_state_path, failed_source = make_terminal(
@@ -7628,12 +7981,12 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             / failed_digest[:2]
             / failed_digest
         )
-        snapshot.write_text("tampered canonical snapshot\n", encoding="utf-8")
+        snapshot.write_bytes(b"tampered canonical snapshot\n")
         failed_packet["input_artifact_refs"] = [
             {
                 "snapshot_version": 1,
                 "source_path": str(failed_source.resolve()),
-                "path": str(snapshot),
+                "path": str(snapshot.resolve()),
                 "sha256": failed_digest,
                 "size_bytes": len(b"legacy input\n"),
             }
@@ -10690,9 +11043,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--pid",
             "4242",
         )
-        terminal_log = Path("/tmp/topology-transition-run/driver.log")
-        terminal_log.parent.mkdir(parents=True, exist_ok=True)
-        terminal_log.write_text("PASS exit=0\n", encoding="utf-8")
+        terminal_log, terminal_log_sha = self.write_terminal_log(
+            "topology-transition-run-driver.log"
+        )
         self.cli(
             "job-update",
             "--task",
@@ -10705,6 +11058,10 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "Synthetic terminal fixture records PASS and exit 0",
             "--exit-code",
             "0",
+            "--terminal-log-artifact",
+            str(terminal_log),
+            "--terminal-log-sha256",
+            terminal_log_sha,
         )
 
     def test_unknown_job_cannot_pass_without_validated_launch(self) -> None:
@@ -10810,9 +11167,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--evidence",
             "No launch identity was ever recorded",
         )
-        terminal_log = Path("/tmp/unknown-launch-run/driver.log")
-        terminal_log.parent.mkdir(parents=True, exist_ok=True)
-        terminal_log.write_text("PASS exit=0\n", encoding="utf-8")
+        terminal_log, terminal_log_sha = self.write_terminal_log(
+            "unknown-launch-run-driver.log"
+        )
         bypass = self.cli(
             "job-update",
             "--task",
@@ -10825,6 +11182,10 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "A terminal marker cannot substitute for launch authority",
             "--exit-code",
             "0",
+            "--terminal-log-artifact",
+            str(terminal_log),
+            "--terminal-log-sha256",
+            terminal_log_sha,
             ok=False,
         )
         self.assertIn("prior topology/skill-validated running", bypass.stderr)
@@ -12604,6 +12965,40 @@ class HookTests(HarnessTestCase):
         replay = self.hook(event)
         self.assertIn(packet_id, replay["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.task_state(task_id)["revision"], revision)
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        checkpoint_path = self.root / ".aoi" / "tasks" / task_id / "checkpoint.md"
+        invalid_authority = copy.deepcopy(state)
+        invalid_authority["packets"][0]["locks"] = [
+            "host:tree:C:/PROGRA~1"
+        ]
+        h.atomic_write_json(state_path, invalid_authority)
+        before_state = state_path.read_bytes()
+        before_checkpoint = checkpoint_path.read_bytes()
+        rejected_checkpoint = self.cli(
+            "checkpoint",
+            "--task",
+            task_id,
+            "--next-action",
+            "Reject the ambiguous packet authority before handoff",
+            ok=False,
+        )
+        self.assertIn("non-canonical lock authority", rejected_checkpoint.stderr)
+        self.assertEqual(state_path.read_bytes(), before_state)
+        self.assertEqual(checkpoint_path.read_bytes(), before_checkpoint)
+        corrupt_replay = cli_impl.observe_subagent_start(
+            h.get_paths(self.root),
+            event,
+        )
+        self.assertEqual(corrupt_replay["status"], "corrupt")
+        self.assertEqual(
+            corrupt_replay["reason_code"],
+            "packet_authority_invalid",
+        )
+        corrupt_hook = self.hook(event)
+        corrupt_context = corrupt_hook["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("packet authority", corrupt_context)
+        self.assertIn("packet_authority_invalid", corrupt_context)
+        h.atomic_write_json(state_path, state)
         self.cli(
             "packet-update",
             "--task",
@@ -12631,6 +13026,38 @@ class HookTests(HarnessTestCase):
         self.assertEqual(capacity_record["dispatch_recorded_at"], observed_at)
         self.assertEqual(capacity_record["subagent_start_observed_at"], observed_at)
         self.assertEqual(capacity_record["orchestration_started_at"], "")
+        invalid_done = copy.deepcopy(terminal_state)
+        invalid_done["packets"][0]["locks"] = ["host:tree:C:/PROGRA~1"]
+        h.atomic_write_json(state_path, invalid_done)
+        rejected_attestation = self.cli(
+            "packet-attest-result",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--evidence",
+            "A result SHA cannot repair ambiguous historical packet authority",
+            ok=False,
+        )
+        self.assertIn("done packet authority", rejected_attestation.stderr)
+        active_errors = cli_impl.packet_integrity_errors(
+            h.get_paths(self.root),
+            invalid_done,
+        )
+        self.assertTrue(
+            any("non-canonical lock authority" in item for item in active_errors),
+            active_errors,
+        )
+        cancelled_view = {**invalid_done, "status": "cancelled"}
+        cancelled_errors = cli_impl.packet_integrity_errors(
+            h.get_paths(self.root),
+            cancelled_view,
+        )
+        self.assertFalse(
+            any("non-canonical lock authority" in item for item in cancelled_errors),
+            cancelled_errors,
+        )
+        h.atomic_write_json(state_path, terminal_state)
         second_start = dict(event)
         second_start["turn_id"] = "turn-observed-2"
         second_start["agent_id"] = "/root/unarmed-second-explorer"
@@ -12642,6 +13069,92 @@ class HookTests(HarnessTestCase):
         self.assertEqual(
             self.task_state(task_id)["subagent_incidents"][0]["reason_code"],
             "no_matching_arm",
+        )
+
+    def test_invalid_done_packet_authority_blocks_close_but_allows_task_cancel(
+        self,
+    ) -> None:
+        task_id = "invalid-done-cancel-recovery"
+        packet_id = "observed-result"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm_packet(
+            task_id,
+            packet_id,
+            expected_agent_type="explorer",
+            parent_session_id="harness-test-chief",
+        )
+        event = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "harness-test-chief",
+            "turn_id": "invalid-done-cancel-turn",
+            "agent_id": "/root/invalid-done-cancel-worker",
+            "agent_type": "explorer",
+            "permission_mode": "default",
+        }
+        self.assertIn(
+            "valid pre-armed dispatch",
+            self.hook(event)["hookSpecificOutput"]["additionalContext"],
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "done",
+            "--summary",
+            "The bounded inspection completed before legacy authority was audited",
+            "--evidence",
+            "The result file and observed dispatch are intact",
+        )
+        self.add_passing_verification(task_id)
+        self.cli(
+            "set-delivery",
+            "--task",
+            task_id,
+            "--mode",
+            "none",
+            "--detail",
+            "Cancellation recovery publishes no code delivery",
+        )
+        paths = h.get_paths(self.root)
+        state_path = paths.tasks / task_id / "state.json"
+        tampered = h.load_task(paths, task_id)
+        tampered["packets"][0]["packet_mode"] = "bounded_mutation"
+        tampered["packets"][0]["locks"] = ["host:tree:C:/PROGRA~1"]
+        h.atomic_write_json(state_path, tampered)
+        self.cli(
+            "checkpoint",
+            "--task",
+            task_id,
+            "--next-action",
+            "Cancel rather than accept ambiguous done authority",
+        )
+        rejected_close = self.cli(
+            "close-task",
+            "--task",
+            task_id,
+            "--summary",
+            "Ambiguous packet authority cannot support achieved closure",
+            ok=False,
+        )
+        self.assertIn("non-canonical lock authority", rejected_close.stderr)
+        self.cli(
+            "cancel-task",
+            "--task",
+            task_id,
+            "--reason",
+            "Archive the invalid historical result without accepting it",
+        )
+        doctor = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertEqual(doctor["errors"], [])
+        self.assertTrue(
+            any("non-canonical lock authority" in item for item in doctor["warnings"]),
+            doctor,
         )
 
     def test_legacy_task_packet_creation_and_manual_upgrade_set_dispatch_version(self) -> None:

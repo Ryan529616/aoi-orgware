@@ -8,3 +8,4 @@ build/
 dist/
 .state.lock
 # Managed projects receive their configured AOI state entry during `aoi init`.
+/.aoi/

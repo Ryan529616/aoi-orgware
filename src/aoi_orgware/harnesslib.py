@@ -115,7 +115,9 @@ TASK_OBJECT_LIST_FIELDS = {
     "lane_dependencies",
     "lanes",
     "needs_user_escalations",
+    "override_requests",
     "packets",
+    "resource_config_events",
     "skill_adoption_events",
     "skill_releases",
     "subagent_incidents",
@@ -2681,6 +2683,26 @@ def _validate_windows_path_components(
             )
 
 
+def _looks_like_ntfs_short_name(component: str) -> bool:
+    stem, separator, extension = component.partition(".")
+    return bool(
+        len(stem) <= 8
+        and re.fullmatch(
+            r"[A-Za-z0-9!#$%&'()@^_`{}~\-\u0080-\uffff]{1,6}~[0-9]+",
+            stem,
+            re.IGNORECASE,
+        )
+        and (
+            not separator
+            or re.fullmatch(
+                r"[A-Za-z0-9!#$%&'()@^_`{}~\-\u0080-\uffff]{1,3}",
+                extension,
+                re.IGNORECASE,
+            )
+        )
+    )
+
+
 def _normalize_host_path(raw: str) -> str:
     if not raw or "\x00" in raw or "\\" in raw:
         raise HarnessError(f"host lock must use a Windows drive path with '/' separators: {raw!r}")
@@ -2725,6 +2747,20 @@ def _host_trusted_root(raw: str) -> Path:
         return Path(PureWindowsPath(canonical).anchor)
     mount_root = Path(os.environ.get("AOI_HOST_MOUNT_ROOT", "/mnt"))
     return mount_root / canonical[0].lower()
+
+
+def _path_uses_windows_host_mount(path: Path) -> bool:
+    """Return whether a POSIX path is below the configured drive mount root."""
+
+    mount_root = Path(os.environ.get("AOI_HOST_MOUNT_ROOT", "/mnt")).resolve(
+        strict=False
+    )
+    candidate = path.resolve(strict=False)
+    try:
+        relative = candidate.relative_to(mount_root)
+    except ValueError:
+        return False
+    return bool(relative.parts and re.fullmatch(r"[A-Za-z]", relative.parts[0]))
 
 
 def _reject_link_traversal(
@@ -2861,6 +2897,168 @@ def parse_lock(lock: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
+def validate_lock_identity(
+    paths: HarnessPaths,
+    lock: str,
+    repo_root: Path | None = None,
+) -> str:
+    """Require one stable long-path lock identity for Windows-backed paths.
+
+    Pure lock normalization remains filesystem-independent.  Authority entry
+    points call this validator before persisting or comparing a lock so an
+    existing NTFS short-name spelling cannot become a second identity.
+    """
+
+    canonical = normalize_lock(lock)
+    namespace, kind, raw_path = parse_lock(canonical)
+    if namespace == "git":
+        if os.name != "nt" and _path_uses_windows_host_mount(
+            Path(repo_root or paths.root)
+        ):
+            return f"git:merge:{raw_path.casefold()}"
+        return canonical
+    if namespace == "repo":
+        raw_components = list(PurePosixPath(raw_path).parts)
+    elif namespace == "host":
+        raw_components = [part for part in raw_path[3:].split("/") if part]
+    else:
+        return canonical
+    short_name_components = [
+        part for part in raw_components if _looks_like_ntfs_short_name(part)
+    ]
+    if os.name != "nt":
+        repo_uses_host_mount = namespace == "repo" and _path_uses_windows_host_mount(
+            Path(repo_root or paths.root)
+        )
+        if short_name_components and (namespace == "host" or repo_uses_host_mount):
+            raise HarnessError(
+                f"{namespace} lock URI contains an unresolved NTFS 8.3-style component; "
+                "use canonical long spelling: "
+                f"{raw_path!r}"
+            )
+        if repo_uses_host_mount:
+            _validate_windows_path_components(
+                raw_components,
+                "repo lock on a Windows drive mount",
+                raw_path,
+            )
+            return f"repo:{kind}:{raw_path.casefold()}"
+        return canonical
+    if namespace == "repo":
+        trusted_root = canonicalize_no_link_traversal(
+            repo_root or paths.root, "repo lock root"
+        )
+        candidate = trusted_root / raw_path
+        resolved = canonicalize_no_link_traversal(candidate, "repo lock path")
+        try:
+            relative = resolved.relative_to(trusted_root).as_posix()
+        except ValueError as exc:
+            raise HarnessError(f"repo lock escapes its trusted root: {raw_path}") from exc
+        expected = f"repo:{kind}:{_normalize_repo_path(relative)}"
+    elif namespace == "host":
+        trusted_root = canonicalize_no_link_traversal(
+            _host_trusted_root(raw_path), "host lock root"
+        )
+        resolved = canonicalize_no_link_traversal(
+            host_path_to_runtime(raw_path), "host lock path"
+        )
+        try:
+            resolved.relative_to(trusted_root)
+        except ValueError as exc:
+            raise HarnessError(f"host lock escapes its trusted root: {raw_path}") from exc
+        expected = f"host:{kind}:{_normalize_host_path(resolved.as_posix())}"
+    else:
+        return canonical
+    if expected != canonical:
+        raise HarnessError(
+            f"{namespace} lock URI must use canonical long spelling; "
+            f"use {expected!r} instead of {canonical!r}"
+        )
+    if short_name_components:
+        probe = trusted_root
+        for component in raw_components:
+            probe /= component
+            if _looks_like_ntfs_short_name(component) and not probe.exists():
+                raise HarnessError(
+                    f"{namespace} lock URI contains an unresolved NTFS 8.3-style "
+                    f"component {component!r}; use canonical long spelling"
+                )
+    return canonical
+
+
+def validate_persisted_lock_identity(
+    paths: HarnessPaths,
+    lock: str,
+    repo_root: Path | None = None,
+) -> str:
+    """Reject persisted authority that predates path-aware canonicalization."""
+
+    normalized = normalize_lock(lock)
+    canonical = validate_lock_identity(paths, normalized, repo_root=repo_root)
+    if canonical != normalized:
+        raise HarnessError(
+            "persisted lock URI must use its canonical Windows-mount identity; "
+            f"use {canonical!r} instead of {normalized!r}"
+        )
+    return canonical
+
+
+def validated_state_worktree(paths: HarnessPaths, state: dict[str, Any]) -> Path:
+    """Return one canonical absolute worktree or reject malformed state."""
+
+    task_id = str(state.get("task_id") or "unknown")
+    raw_worktree = state.get("worktree")
+    recorded = raw_worktree is not None and raw_worktree != ""
+    if recorded:
+        if not isinstance(raw_worktree, str) or not raw_worktree.strip():
+            raise HarnessError(f"task {task_id} worktree must be a path string")
+        candidate = Path(raw_worktree)
+        if not candidate.is_absolute():
+            raise HarnessError(f"task {task_id} worktree must be an absolute path")
+    else:
+        candidate = paths.root
+    try:
+        canonical = canonicalize_no_link_traversal(
+            candidate,
+            f"task {task_id} worktree",
+        )
+    except HarnessError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise HarnessError(f"task {task_id} worktree is invalid: {exc}") from exc
+    if recorded and canonical != candidate:
+        raise HarnessError(
+            f"task {task_id} worktree must use canonical spelling: "
+            f"{canonical} instead of {candidate}"
+        )
+    return canonical
+
+
+def validate_packet_lock_identities(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+) -> None:
+    """Validate lock authority already persisted in one delegation packet."""
+
+    packet_id = str(packet.get("packet_id") or "unknown")
+    locks = packet.get("locks", [])
+    if not isinstance(locks, list):
+        raise HarnessError(f"packet {packet_id} locks must be a list")
+    repo_root = validated_state_worktree(paths, state)
+    try:
+        for lock in locks:
+            validate_persisted_lock_identity(
+                paths,
+                str(lock),
+                repo_root=repo_root,
+            )
+    except HarnessError as exc:
+        raise HarnessError(
+            f"packet {packet_id} has non-canonical lock authority: {exc}"
+        ) from exc
+
+
 def _is_descendant_or_same(child: str, parent: str) -> bool:
     if parent in {".", "/"}:
         return True
@@ -2945,6 +3143,9 @@ def baselines_for_locks(
     result: dict[str, Any] = {}
     baseline_root = (repo_root or paths.root).resolve()
     for lock in locks:
+        lock = validate_persisted_lock_identity(
+            paths, lock, repo_root=baseline_root
+        )
         namespace, kind, raw_path = parse_lock(lock)
         if namespace not in {"repo", "host"}:
             continue
@@ -3013,29 +3214,84 @@ def load_claim_file(path: Path) -> dict[str, Any]:
     return claim
 
 
+def validate_claim_lock_identities(
+    paths: HarnessPaths, claim: dict[str, Any]
+) -> None:
+    token = str(claim.get("token") or "unknown")
+    raw_worktree = claim.get("worktree")
+    if claim.get("legacy"):
+        if raw_worktree is None or raw_worktree == "":
+            repo_root = paths.root
+        elif isinstance(raw_worktree, str) and raw_worktree.strip():
+            repo_root = Path(raw_worktree)
+            if not repo_root.is_absolute():
+                raise HarnessError(f"claim {token} worktree must be an absolute path")
+        else:
+            raise HarnessError(f"claim {token} worktree must be a path string")
+    else:
+        if not isinstance(raw_worktree, str) or not raw_worktree.strip():
+            raise HarnessError(
+                f"structured claim {token} worktree must be a path string"
+            )
+        recorded_root = Path(raw_worktree)
+        if not recorded_root.is_absolute():
+            raise HarnessError(f"claim {token} worktree must be an absolute path")
+        task_id = validate_id(str(claim.get("task_id", "")), "claim task id")
+        task = load_task(paths, task_id)
+        task_root = validated_state_worktree(paths, task)
+        claim_root = canonicalize_no_link_traversal(
+            recorded_root,
+            f"claim {token} worktree",
+        )
+        if claim_root != recorded_root or claim_root != task_root:
+            raise HarnessError(
+                f"structured claim {token} worktree must exactly match owning task "
+                f"worktree {task_root}"
+            )
+        repo_root = task_root
+    try:
+        for lock in claim.get("locks", []):
+            validate_persisted_lock_identity(
+                paths, str(lock), repo_root=repo_root
+            )
+    except HarnessError as exc:
+        raise HarnessError(
+            f"claim {token} has non-canonical lock authority: {exc}"
+        ) from exc
+
+
 def reserving_claims(paths: HarnessPaths) -> Iterator[dict[str, Any]]:
     for path in _claim_files(paths.claims_active):
         claim = load_claim_file(path)
         if claim.get("status") in RESERVING_CLAIM_STATUSES:
+            validate_claim_lock_identities(paths, claim)
             claim["_path"] = str(path)
             yield claim
     for path in _claim_files(paths.legacy_pending):
         claim = load_claim_file(path)
         if claim.get("status") in RESERVING_CLAIM_STATUSES:
+            validate_claim_lock_identities(paths, claim)
             claim["_path"] = str(path)
             yield claim
 
 
 def find_conflicts(
-    paths: HarnessPaths, locks: Iterable[str], ignore_token: str | None = None
+    paths: HarnessPaths,
+    locks: Iterable[str],
+    ignore_token: str | None = None,
+    repo_root: Path | None = None,
 ) -> list[dict[str, str]]:
-    requested = [normalize_lock(item) for item in locks]
+    requested = [
+        validate_lock_identity(paths, item, repo_root=repo_root)
+        for item in locks
+    ]
     conflicts: list[dict[str, str]] = []
     for existing in reserving_claims(paths):
         if ignore_token and existing.get("token") == ignore_token:
             continue
+        held_locks = [str(item) for item in existing.get("locks", [])]
         for proposed in requested:
-            for held in existing.get("locks", []):
+            for held in held_locks:
                 if locks_overlap(proposed, held):
                     conflicts.append(
                         {
@@ -3079,13 +3335,24 @@ def _markdown_list(values: Iterable[str], empty: str = "- None recorded.") -> st
     return "\n".join(f"- {item}" for item in items) if items else empty
 
 
-def claims_for_task(paths: HarnessPaths, state: dict[str, Any]) -> list[dict[str, Any]]:
+def claims_for_task(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    validate_reserving: bool = True,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for token in state.get("claims", []):
         active_path = claim_path(paths, token, active=True)
         archive_path = claim_path(paths, token, active=False)
         if active_path.exists():
-            result.append(load_claim_file(active_path))
+            claim = load_claim_file(active_path)
+            if (
+                validate_reserving
+                and claim.get("status") in RESERVING_CLAIM_STATUSES
+            ):
+                validate_claim_lock_identities(paths, claim)
+            result.append(claim)
         elif archive_path.exists():
             result.append(load_claim_file(archive_path))
         else:
@@ -3099,9 +3366,46 @@ def claims_owned_by_task(paths: HarnessPaths, task_id: str) -> list[dict[str, An
         for path in _claim_files(directory):
             claim = load_claim_file(path)
             if not claim.get("legacy") and claim.get("task_id") == task_id:
+                if claim.get("status") in RESERVING_CLAIM_STATUSES:
+                    validate_claim_lock_identities(paths, claim)
                 claim["_path"] = str(path)
                 result.append(claim)
     return result
+
+
+def validate_task_claim_references(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+) -> None:
+    """Reject missing, foreign, duplicate, or orphan structured claim records."""
+
+    task_id = str(state.get("task_id", ""))
+    referenced = [str(token) for token in state.get("claims", [])]
+    errors: list[str] = []
+    if len(set(referenced)) != len(referenced):
+        errors.append("task claim references contain duplicates")
+    owned_records = [
+        claim
+        for claim in load_all_claims(paths)
+        if not claim.get("legacy") and str(claim.get("task_id", "")) == task_id
+    ]
+    owned_counts: dict[str, int] = {}
+    for claim in owned_records:
+        token = str(claim.get("token", ""))
+        owned_counts[token] = owned_counts.get(token, 0) + 1
+    for token, count in sorted(owned_counts.items()):
+        if count != 1:
+            errors.append(f"claim {token} has {count} active/archive records")
+    referenced_set = set(referenced)
+    owned_set = set(owned_counts)
+    for token in sorted(referenced_set - owned_set):
+        errors.append(f"task references missing/foreign claim {token}")
+    for token in sorted(owned_set - referenced_set):
+        errors.append(f"orphan claim {token} is absent from task state")
+    if errors:
+        raise HarnessError(
+            f"task {task_id} claim reference integrity failed: " + "; ".join(errors)
+        )
 
 
 def _checkpoint_compaction_marker(
@@ -3385,12 +3689,19 @@ def _compact_packet_result_reference(
         return "n/a"
 
     result_path = Path(raw_result)
-    try:
-        display = result_path.relative_to(
-            task_dir(paths, state["task_id"])
-        ).as_posix()
-    except ValueError:
+    if not result_path.is_absolute():
         display = raw_result
+    else:
+        try:
+            canonical_result_path = canonicalize_no_link_traversal(
+                result_path, "packet result path"
+            )
+            canonical_task_dir = canonicalize_no_link_traversal(
+                task_dir(paths, state["task_id"]), "packet task directory"
+            )
+            display = canonical_result_path.relative_to(canonical_task_dir).as_posix()
+        except (HarnessError, ValueError):
+            display = raw_result
 
     digest = str(packet.get("result_sha256") or "")
     valid_digest = bool(re.fullmatch(r"[0-9a-f]{64}", digest))
@@ -3451,6 +3762,10 @@ def render_checkpoint(
     *,
     compact_terminal_detail: bool = False,
 ) -> str:
+    validate_task_claim_references(paths, state)
+    for packet in state.get("packets", []):
+        if packet.get("status") in ACTIVE_PACKET_STATUSES:
+            validate_packet_lock_identities(paths, state, packet)
     claims = claims_for_task(paths, state)
     compact_claim_history = (
         _compact_terminal_claim_history(paths, state, claims)
@@ -3671,10 +3986,16 @@ def render_checkpoint(
         item.get("status") == "needs_user"
         for item in state.get("needs_user_escalations", [])
     )
+    open_overrides = sum(
+        item.get("status") in {"awaiting_chief", "approved"}
+        for item in state.get("override_requests", [])
+    )
     control_plane_lines = [
         f"Steward inbox: coordination={active_coordination}, capacity={active_capacity}, "
         f"improvement={active_improvements}, cross_lane={active_cross_sessions}; "
-        f"needs_user={needs_user}; execution_briefs={len(state.get('execution_briefs', []))}; "
+        f"needs_user={needs_user}, overrides={open_overrides}; "
+        f"resource_events={len(state.get('resource_config_events', []))}; "
+        f"execution_briefs={len(state.get('execution_briefs', []))}; "
         "complete records are in state.json"
     ]
 
@@ -4289,6 +4610,13 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
             "needs_user_count": sum(
                 item.get("status") == "needs_user"
                 for item in state.get("needs_user_escalations", [])
+            ),
+            "override_inbox_count": sum(
+                item.get("status") in {"awaiting_chief", "approved"}
+                for item in state.get("override_requests", [])
+            ),
+            "resource_config_event_count": len(
+                state.get("resource_config_events", [])
             ),
             "open_subagent_incident_count": sum(
                 item.get("status") == "open"

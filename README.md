@@ -59,6 +59,15 @@ every request through every lane.
 - lanes, dependencies, coordination requests, Chief decisions, directives, and
   independent verification before resolution
 - `needs_user` escalation for goal, risk, budget, and preference decisions
+- topology-derived execution resource envelopes that cap active first-level
+  agents, total agents across both depths, and delegation depth; envelopes are
+  SHA-bound into every new selected packet and revalidated at packet
+  arm/dispatch
+- typed, versioned User-to-Chief override proposals with exact target,
+  expiration, Chief rationale/risk/rollback controls, and one-time consumption
+- receipt-backed project `.codex/config.toml` and `.codex/agents/*.toml`
+  planning, apply, and exact-byte rollback for Codex concurrency, model, and
+  reasoning defaults
 - task-aware Capacity Planning recommendations for depth-two agents
 - a bottom-up Improvement Pipeline with qualification, canary, rollback, and
   deprecation records for reusable skills
@@ -71,11 +80,13 @@ every request through every lane.
   ceiling; the separate critical-status view remains capped at 12 KiB
 - optional Codex lifecycle hooks that consume one-time packet arms or record
   incidents; they remain post-start procedural guardrails, not a security boundary
-- strict, model-agnostic project configuration in `aoi.toml`
+- strict project organization configuration in `aoi.toml`
 
-AOI deliberately does **not** launch an LLM provider, choose a model brand,
-install hooks silently, prevent non-cooperating processes from editing files, or
-turn an acknowledgement or code graph into proof of implementation.
+AOI deliberately does **not** launch an LLM provider, infer the cheapest usable
+model from live token/price telemetry, install hooks silently, prevent
+non-cooperating processes from editing files, or turn an acknowledgement or
+code graph into proof of implementation. Project Codex model/reasoning files
+are requested configuration, not proof of the provider route actually used.
 
 ## Requirements
 
@@ -89,9 +100,15 @@ uses `fcntl`, while native Windows uses `msvcrt` byte-range locking. Do not
 alternate or concurrently write the same state tree from WSL and native
 Windows; their locks do not interoperate. Native Windows support is limited to
 ordinary local filesystems. UNC/network shares and case-sensitive NTFS are not
-supported in the v0.2 line. Benign NTFS 8.3 aliases are canonicalized after
-component-level reparse inspection; actual symlink/junction traversal is
-rejected.
+supported in the v0.2 line. Benign NTFS aliases in project roots and artifact
+paths are canonicalized after component-level reparse inspection; actual
+symlink/junction traversal is rejected. Structured `repo:` and `host:` lock
+URIs must already use canonical long spelling; alternate short spellings and
+unresolved 8.3-style components fail closed instead of becoming a second lock
+identity. A WSL repository below the configured Windows drive mount uses the
+same case-folded `repo:` lock domain; case-sensitive Windows-backed mounts are
+outside the v0.2 support boundary. `git:merge:` identities use that same
+case-folded domain when their repository is Windows-backed.
 
 On WSL, metadata-less DrvFs mounts such as a default `/mnt/c` or `/mnt/d` may
 report every file as broadly accessible. AOI intentionally fails closed instead
@@ -232,6 +249,22 @@ aoi close-task --task docs-fix --summary "Setup guide is reproducible"
 ```
 
 ## Dispatch a bounded Codex sub-agent
+
+For ARISE-first resource control, first select execution topology. New
+selections automatically receive a dynamic envelope: `single` permits one
+active first-level agent; parallel/hybrid permits up to the selected lane count
+with a default soft cap of four; delegation remains hard-capped at depth two
+and the default total-agent cap is twice the first-level wave but never above
+twelve. Every depth-two leaf still needs its existing Capacity Planning decision.
+The exact envelope digest is copied into each packet and rechecked when it is
+armed or dispatched.
+
+When the default envelope or project Codex profile is inappropriate, the User
+may propose a typed exception, but it has no authority until the Chief records
+an exact approval. The approval expires, is bound to one future selection or
+config event, and is consumed once. See
+[`docs/resource_control.md`](docs/resource_control.md) for the deliberation,
+configuration, rollback, and fresh-session commands.
 
 Create the packet first. Immediately before the corresponding Codex spawn,
 issue a permit that expires within 15 minutes:

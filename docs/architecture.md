@@ -41,6 +41,14 @@ an Agents SDK application, a custom supervisor, or a human-operated workflow.
   synthesis packet/result, dissent, blockers, and recommendation for a
   parallel/hybrid selection; a live/successful synthesis freezes new specialist
   packets and jobs in that selection so its immutable input set cannot drift
+- `Execution resource envelope`: topology-derived active-agent/depth limits,
+  role/tier policy, optional approved role configuration, and a digest copied
+  into every packet under the selection
+- `Override request`: typed User proposal, exact target and expiry, versioned
+  Chief decision, and one-time consumption or revocation evidence
+- `Resource config event`: reviewed plan digest, exact selection/envelope,
+  project file set, immutable before/after receipt, requested routing boundary,
+  and rollback disposition
 - `Capacity review`: observed demand and single-use routing recommendation
 - `Improvement request`: observed pain through qualified skill adoption or reject
 - `Needs-user escalation`: explicit boundary that AI authority cannot cross
@@ -77,6 +85,38 @@ identity so existing transactional handlers can nest safely. A five-second
 wall-clock jitter allowance is clamped to the previous renewal timestamp;
 larger rollback fails rather than producing a backward audit chain.
 
+## Resource-control binding
+
+Resource control deliberately splits static Codex configuration from dynamic
+AOI execution authority. Project `.codex/config.toml` holds platform ceilings;
+project `.codex/agents/*.toml` holds requested role model/reasoning defaults.
+The execution selection holds the smaller active-agent/depth envelope. Packet
+creation binds its digest, while arm, hook consumption, manual dispatch,
+doctor, and closure revalidate it against current state.
+
+The normal envelope is derived from topology without provider telemetry:
+single is one first-level agent; parallel/hybrid is the selected specialist
+lane count capped at four by default and twelve absolutely. The total active
+count across first- and second-level agents defaults to twice that wave and is
+also hard-capped at twelve. Depth two is only a ceiling here; the independent
+Capacity Planning decision and parent/leaf gates remain mandatory.
+
+User/Chief override authority is a separate state machine. The User proposal
+is a task-bound attestation, not authenticated human identity and not direct
+execution authority. Chief arbitration uses expected-version CAS and records
+exact approved settings. Only `execution-select` or `codex-config-apply` can
+consume the matching target once. The resulting envelope/event points back to
+the consumed authority, so removing either side is an integrity error.
+
+Config apply requires claim coverage and the exact reviewed plan SHA. It writes
+a task-local receipt before changing project files, applies each file with
+drift checks and best-effort transactional rollback, then publishes the event.
+A post-publication durability error retains the consistent event/files for
+doctor/reconcile instead of rolling back behind an already-published state.
+Explicit rollback requires unchanged applied bytes and restores the receipt's
+exact prior bytes. No operation edits user-level Codex configuration or
+hot-reloads the current session.
+
 ## Bootstrap boundary
 
 The optional `aoi-bootstrap` skill is an inference and onboarding layer, not a
@@ -102,7 +142,11 @@ decisions.
 - Explicit roots do not walk upward into a parent project.
 - filesystem root, the user's home directory, explicit roots crossing real
   symlink/reparse components, path traversal, and malformed lock URIs fail
-  closed; benign Windows 8.3 aliases are canonicalized after component checks.
+  closed; benign Windows aliases in roots/artifact paths are canonicalized
+  after component checks, while structured lock URIs must use canonical long
+  spelling and reject alternate short spellings or unresolved 8.3-style
+  components; WSL repositories below the configured Windows drive mount use a
+  case-folded `repo:` and `git:merge:` authority domain.
 - configured state paths are validated under both POSIX and Windows path
   semantics and must resolve inside the project root;
 - state writes use same-directory replacement after flushing the new file;
@@ -187,6 +231,9 @@ Steward-brief, and close-gate error. See
   authority, lifecycle payload, managed resource, or unknown entry. It then
   acquires the first Chief; rerun the identical profile with that credential.
 - Capability tiers are policy labels, not calibrated cross-provider scores.
+- Project Codex model/reasoning settings and packet model tiers are requested
+  routes, not observations. AOI has no authoritative per-spawn token/price
+  telemetry and cannot select or prove the cheapest sufficient provider model.
 - Hook-observed dispatch authenticates a permit/epoch/state transition, not the
   human identity behind a session id or the provider's actual model routing.
 - Legacy execution-selection v1 records are not silently reinterpreted and

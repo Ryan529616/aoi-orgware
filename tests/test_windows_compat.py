@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -276,7 +277,7 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
     def test_native_host_baseline_uses_real_drive_path(self) -> None:
         target = self.root / "host-baseline.txt"
         target.write_bytes(b"native baseline\n")
-        lock = f"host:file:{target.as_posix()}"
+        lock = f"host:file:{target.resolve().as_posix()}"
         paths = h.get_paths(self.root)
         baseline = h.baselines_for_locks(paths, [lock])
         canonical = h.normalize_lock(lock)
@@ -285,6 +286,282 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
             baseline[canonical]["sha256"],
             hashlib.sha256(b"native baseline\n").hexdigest(),
         )
+
+    def test_ntfs_short_name_claim_aliases_fail_closed(self) -> None:
+        program_files = Path(
+            os.environ.get("ProgramFiles", "C:/Program Files")
+        ).resolve()
+        short_program_files = Path(program_files.anchor) / "PROGRA~1"
+        if (
+            not short_program_files.is_dir()
+            or short_program_files.resolve() != program_files
+        ):
+            self.skipTest("this Windows volume does not expose the PROGRA~1 alias")
+
+        paths = h.get_paths(self.root)
+        long_host_lock = f"host:tree:{program_files.as_posix()}"
+        short_host_lock = h.normalize_lock(
+            f"host:tree:{short_program_files.as_posix()}"
+        )
+        accepted_host = self.cli("check-locks", "--lock", long_host_lock, "--json")
+        self.assertTrue(json.loads(accepted_host.stdout)["ok"])
+
+        rejected_host = self.cli(
+            "check-locks",
+            "--lock",
+            f"host:tree:{short_program_files.as_posix()}",
+            "--json",
+            ok=False,
+        )
+        self.assertEqual(rejected_host.returncode, 2, rejected_host.stderr)
+        self.assertRegex(
+            rejected_host.stderr,
+            "canonical long spelling|NTFS 8.3-style",
+        )
+
+        long_repo_directory = self.root / "Long Directory"
+        long_repo_directory.mkdir()
+        accepted_repo = self.cli(
+            "check-locks", "--lock", "repo:tree:Long Directory", "--json"
+        )
+        self.assertTrue(json.loads(accepted_repo.stdout)["ok"])
+        canonical_tilde_directory = self.root / "CANON~1"
+        canonical_tilde_directory.mkdir()
+        accepted_canonical_tilde = self.cli(
+            "check-locks", "--lock", "repo:tree:CANON~1", "--json"
+        )
+        self.assertTrue(json.loads(accepted_canonical_tilde.stdout)["ok"])
+        rejected_repo = self.cli(
+            "check-locks",
+            "--lock",
+            "repo:tree:LONGDI~1",
+            "--json",
+            ok=False,
+        )
+        self.assertEqual(rejected_repo.returncode, 2, rejected_repo.stderr)
+        self.assertRegex(
+            rejected_repo.stderr,
+            "canonical long spelling|NTFS 8.3-style",
+        )
+
+        self.cli(
+            "init-task",
+            "--task-id",
+            "short-alias-claim",
+            "--title",
+            "Short alias claim rejection",
+            "--objective",
+            "Prove claim authority rejects a second NTFS spelling",
+            "--owner",
+            "native-windows-test",
+            "--completion-boundary",
+            "No claim artifact may be published",
+        )
+        self.cli(
+            "approve-plan",
+            "--task",
+            "short-alias-claim",
+            "--note",
+            "The canonical long-spelling boundary is explicit",
+        )
+        rejected_claim = self.cli(
+            "claim",
+            "--task",
+            "short-alias-claim",
+            "--token",
+            "short-alias-claim-token",
+            "--owner",
+            "native-windows-test",
+            "--kind",
+            "HOST",
+            "--lock",
+            f"host:tree:{short_program_files.as_posix()}",
+            "--intent",
+            "Attempt a duplicate physical lock identity",
+            "--validation",
+            "The short spelling must fail before publication",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertEqual(rejected_claim.returncode, 2, rejected_claim.stderr)
+        self.assertRegex(
+            rejected_claim.stderr,
+            "canonical long spelling|NTFS 8.3-style",
+        )
+        self.assertFalse(
+            (paths.claims_active / "short-alias-claim-token.json").exists()
+        )
+
+        h.atomic_write_json(
+            paths.claims_active / "legacy-short-lock.json",
+            {
+                "schema_version": h.SCHEMA_VERSION,
+                "legacy": False,
+                "source": "structured",
+                "token": "legacy-short-lock",
+                "task_id": "short-alias-claim",
+                "owner": "legacy-test",
+                "kind": "HOST",
+                "locks": [short_host_lock],
+                "status": "active",
+                "worktree": str(self.root.resolve()),
+            },
+        )
+        blocked_by_legacy_alias = self.cli(
+            "check-locks", "--lock", long_host_lock, "--json", ok=False
+        )
+        self.assertEqual(
+            blocked_by_legacy_alias.returncode, 2, blocked_by_legacy_alias.stderr
+        )
+        self.assertRegex(
+            blocked_by_legacy_alias.stderr,
+            "canonical long spelling|NTFS 8.3-style",
+        )
+
+        state = h.load_task(paths, "short-alias-claim")
+        state["claims"].append("legacy-short-lock")
+        h.bump_task(state)
+        h.write_task(paths, state)
+        state_path = paths.tasks / "short-alias-claim" / "state.json"
+        checkpoint_path = paths.tasks / "short-alias-claim" / "checkpoint.md"
+        before_checkpoint_state = state_path.read_bytes()
+        before_checkpoint = checkpoint_path.read_bytes()
+        rejected_checkpoint = self.cli(
+            "checkpoint",
+            "--task",
+            "short-alias-claim",
+            "--next-action",
+            "Audit and stale the historical short-name claim",
+            ok=False,
+        )
+        self.assertEqual(
+            rejected_checkpoint.returncode, 2, rejected_checkpoint.stderr
+        )
+        self.assertIn("non-canonical lock authority", rejected_checkpoint.stderr)
+        self.assertEqual(state_path.read_bytes(), before_checkpoint_state)
+        self.assertEqual(checkpoint_path.read_bytes(), before_checkpoint)
+        unhealthy = self.cli("doctor", "--json", ok=False)
+        self.assertEqual(unhealthy.returncode, 1, unhealthy.stderr)
+        unhealthy_payload = json.loads(unhealthy.stdout)
+        self.assertTrue(
+            any(
+                "claim legacy-short-lock lock authority" in error
+                for error in unhealthy_payload["errors"]
+            ),
+            unhealthy_payload,
+        )
+
+        refused_done = self.cli(
+            "release-claim",
+            "--token",
+            "legacy-short-lock",
+            "--status",
+            "done",
+            "--reason",
+            "The historical alias cannot be revalidated as canonical",
+            ok=False,
+        )
+        self.assertEqual(refused_done.returncode, 2, refused_done.stderr)
+        self.assertIn("--status stale", refused_done.stderr)
+        self.cli(
+            "release-claim",
+            "--token",
+            "legacy-short-lock",
+            "--status",
+            "stale",
+            "--reason",
+            "Explicitly archive the historical short-name authority after audit",
+        )
+        archived = h.load_json(paths.claims_archive / "legacy-short-lock.json")
+        self.assertIn("canonical long spelling", archived["stale_lock_authority_error"])
+        self.assertTrue(archived["baseline_changed"][short_host_lock])
+        recovered = json.loads(self.cli("doctor", "--json").stdout)
+        self.assertFalse(recovered["errors"], recovered)
+        self.assertTrue(
+            any(
+                "claim legacy-short-lock lock authority" in warning
+                for warning in recovered["warnings"]
+            ),
+            recovered,
+        )
+
+    def test_existing_custom_short_lock_spelling_is_rejected_not_rewritten(
+        self,
+    ) -> None:
+        paths = h.get_paths(self.root)
+        canonical_root = self.root.resolve()
+
+        def resolve_custom_alias(path: Path, label: str) -> Path:
+            candidate = Path(path)
+            if candidate.name.casefold() == "custom":
+                return candidate.parent / "Long Directory"
+            return candidate.resolve(strict=False)
+
+        with mock.patch.object(
+            h,
+            "canonicalize_no_link_traversal",
+            side_effect=resolve_custom_alias,
+        ):
+            with self.assertRaisesRegex(
+                h.HarnessError,
+                "must use canonical long spelling.*repo:tree:long directory",
+            ):
+                h.validate_lock_identity(
+                    paths,
+                    "repo:tree:CUSTOM",
+                    repo_root=canonical_root,
+                )
+
+            h.atomic_write_json(
+                paths.claims_active / "custom-short-held.json",
+                {
+                    "schema_version": h.SCHEMA_VERSION,
+                    "legacy": False,
+                    "source": "structured",
+                    "token": "custom-short-held",
+                    "task_id": "custom-short-held",
+                    "owner": "legacy-test",
+                    "kind": "REPO",
+                    "locks": ["repo:tree:CUSTOM"],
+                    "status": "active",
+                    "worktree": str(canonical_root),
+                },
+            )
+            with self.assertRaisesRegex(
+                h.HarnessError,
+                "claim custom-short-held has non-canonical lock authority",
+            ):
+                h.find_conflicts(
+                    paths,
+                    ["repo:tree:Long Directory"],
+                    repo_root=canonical_root,
+                )
+
+        h.atomic_write_json(
+            paths.claims_active / "invalid-worktree-claim.json",
+            {
+                "schema_version": h.SCHEMA_VERSION,
+                "legacy": False,
+                "source": "structured",
+                "token": "invalid-worktree-claim",
+                "task_id": "invalid-worktree-claim",
+                "owner": "tamper-test",
+                "kind": "REPO",
+                "locks": ["repo:file:tracked.txt"],
+                "status": "active",
+                "worktree": [],
+            },
+        )
+        with self.assertRaisesRegex(
+            h.HarnessError,
+            "claim invalid-worktree-claim worktree must be a path string",
+        ):
+            h.find_conflicts(
+                paths,
+                ["repo:file:tracked.txt"],
+                repo_root=canonical_root,
+            )
 
     def test_repo_lock_case_alias_cannot_issue_a_second_claim(self) -> None:
         target = self.root / "CaseTarget.txt"
@@ -499,11 +776,11 @@ class NativeWindowsCompatibilityTests(unittest.TestCase):
             )
             if created.returncode != 0:
                 self.skipTest(f"junction creation unavailable: {created.stderr}")
-            with self.assertRaisesRegex(h.HarnessError, "symlink or junction"):
+            with self.assertRaisesRegex(h.HarnessError, "symlinks? or junctions?"):
                 h.baselines_for_locks(
                     h.get_paths(self.root), ["repo:file:repo-link/secret.txt"]
                 )
-            with self.assertRaisesRegex(h.HarnessError, "symlink or junction"):
+            with self.assertRaisesRegex(h.HarnessError, "symlinks? or junctions?"):
                 h.baselines_for_locks(
                     h.get_paths(self.root), ["repo:tree:repo-link"]
                 )
