@@ -12727,6 +12727,59 @@ class HookTests(HarnessTestCase):
             "no_matching_arm",
         )
 
+    def test_packet_role_is_distinct_from_codex_transport_agent_type(self) -> None:
+        task_id = "hook-role-transport-separation"
+        packet_id = "independent-review"
+        arm_help = " ".join(self.cli("packet-arm", "--help").stdout.split())
+        self.assertIn("Codex transport agent_type", arm_help)
+        self.assertIn("independent of the packet's AOI technical role", arm_help)
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--agent-role",
+            "reviewer",
+            "--model-tier",
+            "expert",
+            "--objective",
+            "Review one bounded change without mutation authority",
+            "--scope",
+            "Read-only source and test review",
+            "--deliverable",
+            "Independent findings with exact evidence",
+            "--validation",
+            "Chief checks every finding against the frozen diff",
+        )
+        self.arm_packet(
+            task_id,
+            packet_id,
+            expected_agent_type="default",
+            parent_session_id="harness-test-chief",
+        )
+        event = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "harness-test-chief",
+            "turn_id": "reviewer-over-default-transport",
+            "agent_id": "/root/independent-review",
+            "agent_type": "default",
+        }
+
+        output = self.hook(event)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        state = self.task_state(task_id)
+        packet = state["packets"][0]
+        attempt = packet["dispatch_attempts"][0]
+
+        self.assertIn("valid pre-armed dispatch", context)
+        self.assertIn("Codex transport agent_type=default", context)
+        self.assertIn("technical role is defined by the packet contract", context)
+        self.assertEqual(packet["agent_role"], "reviewer")
+        self.assertEqual(attempt["expected_agent_type"], "default")
+        self.assertEqual(attempt["observation"]["agent_type"], "default")
+
     def test_invalid_done_packet_authority_blocks_close_but_allows_task_cancel(
         self,
     ) -> None:

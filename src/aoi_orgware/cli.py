@@ -28,6 +28,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from . import __version__
+from . import dispatch_protocol as dispatch_protocol_impl
 from . import resource_governance as resource_governance_impl
 from .commands.resource import register_resource_commands
 from .codebase_memory import (
@@ -1322,6 +1323,17 @@ def _resource_governance_policy(
         resource_config_event_statuses=RESOURCE_CONFIG_EVENT_STATUSES,
         envelope_schema_version=RESOURCE_ENVELOPE_SCHEMA_VERSION,
         default_parallel_agents=RESOURCE_DEFAULT_PARALLEL_AGENTS,
+    )
+
+
+def _dispatch_protocol_policy(
+) -> dispatch_protocol_impl.DispatchProtocolPolicy:
+    return dispatch_protocol_impl.DispatchProtocolPolicy(
+        hook_protocol_version=int(HOOK_PROTOCOL_VERSION),
+        hook_id_re=HOOK_ID_RE,
+        executing_packet_statuses=frozenset(EXECUTING_PACKET_STATUSES),
+        root_session_mapping_kind=ROOT_SESSION_MAPPING_KIND,
+        subagent_parent_mapping_kind=SUBAGENT_PARENT_MAPPING_KIND,
     )
 
 
@@ -11155,17 +11167,7 @@ def _dispatch_attempt_authority_sha256(attempt: dict[str, Any]) -> str:
 
 
 def _active_dispatch_attempt(packet: dict[str, Any]) -> dict[str, Any]:
-    attempts = packet.get("dispatch_attempts", [])
-    matches = [
-        attempt
-        for attempt in attempts
-        if isinstance(attempt, dict) and attempt.get("status") == "armed"
-    ]
-    if len(matches) != 1:
-        raise HarnessError(
-            f"armed packet {packet.get('packet_id')} must have exactly one active arm"
-        )
-    return matches[0]
+    return dispatch_protocol_impl.active_dispatch_attempt(packet)
 
 
 def _selection_lane_snapshot(
@@ -11195,49 +11197,26 @@ def _packet_execution_lane_snapshot(
 
 
 def _validate_hook_identity(value: Any, label: str) -> str:
-    text = str(value or "")
-    if not HOOK_ID_RE.fullmatch(text) or "\x00" in text or "\n" in text or "\r" in text:
-        raise HarnessError(f"{label} is missing or unsafe")
-    return text
+    return dispatch_protocol_impl.validate_hook_identity(
+        value, label, policy=_dispatch_protocol_policy()
+    )
 
 
 def _safe_hook_observation_text(value: Any) -> str:
-    text = str(value or "")
-    if len(text) > 512 or any(character in text for character in ("\x00", "\n", "\r")):
-        return ""
-    return text
+    return dispatch_protocol_impl.safe_hook_observation_text(
+        value, policy=_dispatch_protocol_policy()
+    )
 
 
 def _expire_dispatch_arms(
     state: dict[str, Any], *, current: dt.datetime
 ) -> list[dict[str, str]]:
-    expired: list[dict[str, str]] = []
-    closed_at = current.isoformat(timespec="microseconds")
-    for packet in state.get("packets", []):
-        if packet.get("status") != "armed":
-            continue
-        attempt = _active_dispatch_attempt(packet)
-        expires_at = parse_time(str(attempt.get("expires_at", "")))
-        if expires_at is None or expires_at > current:
-            continue
-        attempt["status"] = "expired"
-        attempt["closed_at"] = closed_at
-        attempt["reason"] = "Arm expired before an observed SubagentStart event."
-        packet["status"] = "ready"
-        packet["updated_at"] = closed_at
-        expired.append(
-            {
-                "packet_id": str(packet.get("packet_id", "")),
-                "parent_session_id": str(attempt.get("parent_session_id", "")),
-                "expected_agent_type": str(attempt.get("expected_agent_type", "")),
-            }
-        )
-    return expired
+    return dispatch_protocol_impl.expire_dispatch_arms(state, current=current)
 
 
 def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
     expected_agent_type = _validate_hook_identity(
-        args.expected_agent_type, "expected Codex agent type"
+        args.expected_agent_type, "expected Codex transport agent type"
     )
     expires_at = parse_time(args.expires_at)
     current = dt.datetime.now().astimezone()
@@ -11396,51 +11375,9 @@ def cmd_packet_disarm(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
 
 def _subagent_event_id(payload: dict[str, Any]) -> str:
-    identity = {
-        "session_id": _safe_hook_observation_text(payload.get("session_id", "")),
-        "turn_id": _safe_hook_observation_text(payload.get("turn_id", "")),
-        "agent_id": _safe_hook_observation_text(payload.get("agent_id", "")),
-        "agent_type": _safe_hook_observation_text(payload.get("agent_type", "")),
-        "hook_protocol_version": int(HOOK_PROTOCOL_VERSION),
-    }
-    return "spawn-" + canonical_record_sha256(identity)[:32]
-
-
-def _record_subagent_incident(
-    state: dict[str, Any],
-    payload: dict[str, Any],
-    *,
-    reason_code: str,
-    candidate_packet_ids: list[str],
-    observed_at: str,
-) -> dict[str, Any]:
-    incident_id = _subagent_event_id(payload)
-    existing = [
-        item
-        for item in state.get("subagent_incidents", [])
-        if item.get("incident_id") == incident_id
-    ]
-    if existing:
-        return existing[0]
-    incident = {
-        "incident_id": incident_id,
-        "kind": "unmanaged_subagent_start",
-        "status": "open",
-        "parent_session_id": _safe_hook_observation_text(
-            payload.get("session_id", "")
-        ),
-        "turn_id": _safe_hook_observation_text(payload.get("turn_id", "")),
-        "agent_id": _safe_hook_observation_text(payload.get("agent_id", "")),
-        "agent_type": _safe_hook_observation_text(payload.get("agent_type", "")),
-        "observed_at": observed_at,
-        "reason_code": reason_code,
-        "candidate_packet_ids": sorted(set(candidate_packet_ids)),
-        "hook_protocol_version": int(HOOK_PROTOCOL_VERSION),
-        "resolution": None,
-    }
-    state["dispatch_model_version"] = 1
-    state.setdefault("subagent_incidents", []).append(incident)
-    return incident
+    return dispatch_protocol_impl.subagent_event_id(
+        payload, policy=_dispatch_protocol_policy()
+    )
 
 
 def _validate_current_dispatch_arm(
@@ -11512,12 +11449,12 @@ def _validate_observed_arm(
     attempt: dict[str, Any],
     *,
     parent_session_id: str,
-    agent_type: str,
+    transport_agent_type: str,
     current: dt.datetime,
 ) -> None:
     if (
         attempt.get("parent_session_id") != parent_session_id
-        or attempt.get("expected_agent_type") != agent_type
+        or attempt.get("expected_agent_type") != transport_agent_type
     ):
         raise HarnessError("packet arm no longer matches the observed parent/type")
     _validate_current_dispatch_arm(
@@ -11538,220 +11475,26 @@ def _refresh_index_after_hook_commit(paths: HarnessPaths) -> bool:
     return True
 
 
+def _dispatch_protocol_services(
+) -> dispatch_protocol_impl.DispatchProtocolServices:
+    return dispatch_protocol_impl.DispatchProtocolServices(
+        packet_by_id=_packet_by_id,
+        packet_authority_integrity_errors=packet_authority_integrity_errors,
+        validate_observed_arm=_validate_observed_arm,
+        ensure_subagent_parent_mapping=ensure_subagent_parent_mapping_unlocked,
+        refresh_index_after_commit=_refresh_index_after_hook_commit,
+    )
+
+
 def observe_subagent_start(
     paths: HarnessPaths, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    """Consume one exact arm or durably record an unmanaged start incident."""
-
-    parent_session_id = str(payload.get("session_id", ""))
-    if not HOOK_ID_RE.fullmatch(parent_session_id):
-        return {"status": "unbound", "reason_code": "invalid_parent_session"}
-    mapping_path = session_path(paths, parent_session_id)
-    if not mapping_path.exists():
-        return {"status": "unbound", "reason_code": "no_task_mapping"}
-    with state_lock(paths, create_layout=False):
-        try:
-            mapping = load_json(mapping_path)
-            if mapping.get("session_id") != parent_session_id:
-                raise HarnessError("session mapping identity mismatch")
-            state = load_task(paths, str(mapping.get("task_id", "")))
-            mapping_kind = mapping.get(
-                "mapping_kind", ROOT_SESSION_MAPPING_KIND
-            )
-            if mapping_kind == ROOT_SESSION_MAPPING_KIND:
-                if parent_session_id not in state.get("session_ids", []):
-                    raise HarnessError("root session mapping lacks task backlink")
-            elif mapping_kind == SUBAGENT_PARENT_MAPPING_KIND:
-                if parent_session_id not in state.get(
-                    "subagent_parent_session_ids", []
-                ):
-                    raise HarnessError(
-                        "subagent parent mapping lacks task backlink"
-                    )
-                parent_packet = _packet_by_id(
-                    state, str(mapping.get("packet_id", ""))
-                )
-                if (
-                    int(parent_packet.get("delegation_depth", 1)) != 1
-                    or parent_packet.get("agent_id") != parent_session_id
-                ):
-                    raise HarnessError(
-                        "subagent parent mapping lost packet identity"
-                    )
-            else:
-                raise HarnessError("session mapping kind is invalid")
-        except HarnessError:
-            return {"status": "corrupt", "reason_code": "corrupt_task_mapping"}
-        event_id = _subagent_event_id(payload)
-        for packet in state.get("packets", []):
-            for attempt in packet.get("dispatch_attempts", []):
-                observation = attempt.get("observation")
-                if isinstance(observation, dict) and observation.get("event_id") == event_id:
-                    authority_errors = packet_authority_integrity_errors(
-                        paths,
-                        state,
-                        packet,
-                        require_origin=False,
-                    )
-                    if authority_errors:
-                        return {
-                            "status": "corrupt",
-                            "reason_code": "packet_authority_invalid",
-                            "task_id": state["task_id"],
-                            "packet_id": packet.get("packet_id"),
-                            "event_id": event_id,
-                            "idempotent": True,
-                        }
-                    return {
-                        "status": "authorized",
-                        "task_id": state["task_id"],
-                        "packet_id": packet.get("packet_id"),
-                        "packet_path": packet.get("path"),
-                        "event_id": event_id,
-                        "idempotent": True,
-                    }
-        existing_incident = next(
-            (
-                item
-                for item in state.get("subagent_incidents", [])
-                if item.get("incident_id") == event_id
-            ),
-            None,
-        )
-        if existing_incident is not None:
-            return {
-                "status": "incident",
-                "task_id": state["task_id"],
-                "incident_id": event_id,
-                "reason_code": existing_incident.get("reason_code"),
-                "idempotent": True,
-            }
-        observed_at = now_iso()
-        current = dt.datetime.now().astimezone()
-        agent_type = str(payload.get("agent_type", ""))
-        agent_id = str(payload.get("agent_id", ""))
-        expired_arms = _expire_dispatch_arms(state, current=current)
-        valid_event = bool(
-            HOOK_ID_RE.fullmatch(agent_type) and HOOK_ID_RE.fullmatch(agent_id)
-        )
-        candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        if valid_event:
-            for packet in state.get("packets", []):
-                if packet.get("status") != "armed":
-                    continue
-                attempt = _active_dispatch_attempt(packet)
-                if (
-                    attempt.get("parent_session_id") == parent_session_id
-                    and attempt.get("expected_agent_type") == agent_type
-                ):
-                    candidates.append((packet, attempt))
-        matched_expired_packet_ids = [
-            item["packet_id"]
-            for item in expired_arms
-            if item["parent_session_id"] == parent_session_id
-            and item["expected_agent_type"] == agent_type
-        ]
-        reason_code = ""
-        if not valid_event:
-            reason_code = "invalid_event"
-        elif any(
-            packet.get("agent_id") == agent_id
-            for packet in state.get("packets", [])
-            if packet.get("status") in EXECUTING_PACKET_STATUSES
-        ):
-            reason_code = "duplicate_agent"
-        elif len(candidates) > 1:
-            reason_code = "ambiguous_arm"
-        elif not candidates:
-            reason_code = (
-                "expired_arm" if matched_expired_packet_ids else "no_matching_arm"
-            )
-        if not reason_code:
-            packet, attempt = candidates[0]
-            try:
-                _validate_observed_arm(
-                    paths,
-                    state,
-                    packet,
-                    attempt,
-                    parent_session_id=parent_session_id,
-                    agent_type=agent_type,
-                    current=current,
-                )
-            except HarnessError as exc:
-                reason_code = (
-                    "topology_rejected"
-                    if any(
-                        marker in str(exc).lower()
-                        for marker in ("topology", "selection", "depth-one", "depth-two", "lane")
-                    )
-                    else "authority_invalid"
-                )
-        if reason_code:
-            incident = _record_subagent_incident(
-                state,
-                payload,
-                reason_code=reason_code,
-                candidate_packet_ids=[
-                    str(packet.get("packet_id", "")) for packet, _ in candidates
-                ]
-                or matched_expired_packet_ids,
-                observed_at=observed_at,
-            )
-            bump_task(state)
-            write_task(paths, state)
-            index_refreshed = _refresh_index_after_hook_commit(paths)
-            return {
-                "status": "incident",
-                "task_id": state["task_id"],
-                "incident_id": incident["incident_id"],
-                "reason_code": reason_code,
-                "idempotent": False,
-                "index_refresh_deferred": not index_refreshed,
-            }
-        packet, attempt = candidates[0]
-        observation = {
-            "event_id": event_id,
-            "hook_protocol_version": int(HOOK_PROTOCOL_VERSION),
-            "parent_session_id": parent_session_id,
-            "turn_id": _safe_hook_observation_text(payload.get("turn_id", "")),
-            "agent_id": agent_id,
-            "agent_type": agent_type,
-            "permission_mode": _safe_hook_observation_text(
-                payload.get("permission_mode", "")
-            ),
-            "observed_at": observed_at,
-        }
-        attempt["status"] = "consumed"
-        attempt["observation"] = observation
-        attempt["closed_at"] = observed_at
-        packet["status"] = "dispatched"
-        packet["dispatch_provenance"] = "codex_subagent_start_observed"
-        packet["dispatch_recorded_at"] = observed_at
-        packet["agent_id"] = agent_id
-        packet["updated_at"] = observed_at
-        state["dispatch_model_version"] = 1
-        parent_mapping_deferred = False
-        if int(packet.get("delegation_depth", 1)) == 1:
-            try:
-                ensure_subagent_parent_mapping_unlocked(paths, state, packet)
-            except HarnessError:
-                # The observed dispatch remains valid. Nested delegation stays
-                # fail-closed until the Chief can repair the parent-only mapping.
-                parent_mapping_deferred = True
-        bump_task(state)
-        write_task(paths, state)
-        index_refreshed = _refresh_index_after_hook_commit(paths)
-        return {
-            "status": "authorized",
-            "task_id": state["task_id"],
-            "packet_id": packet["packet_id"],
-            "packet_path": packet["path"],
-            "event_id": event_id,
-            "idempotent": False,
-            "index_refresh_deferred": not index_refreshed,
-            "parent_mapping_deferred": parent_mapping_deferred,
-        }
+    return dispatch_protocol_impl.observe_subagent_start(
+        paths,
+        payload,
+        policy=_dispatch_protocol_policy(),
+        services=_dispatch_protocol_services(),
+    )
 
 
 def cmd_subagent_incident_account(
@@ -15343,7 +15086,14 @@ def build_parser(
     p = sub.add_parser("packet-arm")
     p.add_argument("--task", required=True)
     p.add_argument("--packet-id", required=True)
-    p.add_argument("--expected-agent-type", required=True)
+    p.add_argument(
+        "--expected-agent-type",
+        required=True,
+        help=(
+            "Codex transport agent_type expected from SubagentStart; independent "
+            "of the packet's AOI technical role"
+        ),
+    )
     p.add_argument("--expires-at", required=True)
     p.add_argument("--parent-session-id")
     add_json_argument(p)

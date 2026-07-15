@@ -209,8 +209,10 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
         context = (
             f"AOI observed a valid pre-armed dispatch for {paths.project.name!r}: "
             f"task={outcome.get('task_id')}, packet={outcome.get('packet_id')}, "
-            f"contract={outcome.get('packet_path')}. Role={agent_type}. Read that exact "
-            "packet before work and stay inside its scope. The root owns AOI state, "
+            f"contract={outcome.get('packet_path')}. Codex transport "
+            f"agent_type={agent_type}; the AOI technical role is defined by the packet "
+            "contract. Read that exact packet before work and stay inside its scope. "
+            "The root owns AOI state, "
             f"claims, plan, checkpoint, and final completion; do not edit {paths.harness}. "
             "Return a bounded conclusion with exact evidence/artifact paths, files inspected "
             "or changed, verification, unresolved risks, and one next action; never paste raw logs."
