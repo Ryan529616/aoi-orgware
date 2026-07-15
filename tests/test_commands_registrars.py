@@ -24,7 +24,11 @@ REPO = HERE.parent
 SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
+from aoi_orgware.commands.backup import register_backup_commands  # noqa: E402
 from aoi_orgware.commands.capacity import register_capacity_commands  # noqa: E402
+from aoi_orgware.commands.context_memory import (  # noqa: E402
+    register_context_memory_commands,
+)
 from aoi_orgware.commands.coordination import (  # noqa: E402
     register_coordination_commands,
     register_cross_lane_commands,
@@ -38,6 +42,16 @@ from aoi_orgware.commands.improvement import (  # noqa: E402
 from aoi_orgware.commands.jobs import register_job_commands  # noqa: E402
 from aoi_orgware.commands.lanes import register_lane_commands  # noqa: E402
 from aoi_orgware.commands.packets import register_packet_commands  # noqa: E402
+from aoi_orgware.commands.status import register_status_commands  # noqa: E402
+from aoi_orgware.commands.task_lifecycle import (  # noqa: E402
+    register_bootstrap_commands,
+    register_chief_commands,
+    register_pilot_commands,
+    register_task_lifecycle_commands,
+)
+from aoi_orgware.commands.verification import (  # noqa: E402
+    register_verification_commands,
+)
 
 
 # Extracted registrar modules that must never import the monolithic CLI.
@@ -50,6 +64,11 @@ REGISTRAR_MODULES = [
     SRC / "aoi_orgware" / "commands" / "capacity.py",
     SRC / "aoi_orgware" / "commands" / "improvement.py",
     SRC / "aoi_orgware" / "commands" / "execution_selection.py",
+    SRC / "aoi_orgware" / "commands" / "task_lifecycle.py",
+    SRC / "aoi_orgware" / "commands" / "verification.py",
+    SRC / "aoi_orgware" / "commands" / "status.py",
+    SRC / "aoi_orgware" / "commands" / "backup.py",
+    SRC / "aoi_orgware" / "commands" / "context_memory.py",
 ]
 
 
@@ -102,6 +121,9 @@ def _make_vocab() -> SimpleNamespace:
         role_tier_values=frozenset({"frontier", "expert", "advanced", "standard"}),
         skill_adoption_actions=("canary", "adopt", "pause", "rollback", "deprecate"),
         tool_densities=("low", "medium", "high"),
+        verification_categories=frozenset(
+            {"static_check", "unit_test", "integration_test", "compile_acceptance"}
+        ),
     )
 
 
@@ -1091,6 +1113,555 @@ class ExecutionSelectionCommandRegistryTests(unittest.TestCase):
                 handlers={"unexpected": object()},  # type: ignore[dict-item]
                 add_json_argument=lambda _parser: None,
                 vocab=_make_vocab(),
+            )
+
+
+def _add_json(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--json", action="store_true")
+
+
+class BootstrapCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {"init", "config_check"}
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_bootstrap_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_init_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["init", "--project-name", "demo", "--json"])
+        self.assertIs(args.handler, handlers["init"])
+        self.assertTrue(args.json)
+
+    def test_registry_accepts_config_check_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["config-check", "--file", "aoi.toml"])
+        self.assertIs(args.handler, handlers["config_check"])
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_bootstrap_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+            )
+
+
+class ChiefCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "chief_acquire",
+        "chief_renew",
+        "chief_release",
+        "chief_takeover",
+        "chief_status",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_chief_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_chief_acquire_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["chief-acquire", "--session-id", "S1"])
+        self.assertIs(args.handler, handlers["chief_acquire"])
+        # default TTL from the moved block survives extraction
+        self.assertEqual(args.ttl_seconds, 60 * 60)
+
+    def test_registry_accepts_chief_takeover_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "chief-takeover",
+                "--session-id",
+                "S1",
+                "--expected-epoch",
+                "2",
+                "--reason",
+                "expired",
+                "--force-live",
+            ]
+        )
+        self.assertIs(args.handler, handlers["chief_takeover"])
+        self.assertTrue(args.force_live)
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_chief_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+            )
+
+
+class PilotCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {"pilot_init", "pilot_validate", "pilot_summary"}
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_pilot_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_pilot_init_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["pilot-init", "--output", "out/", "--force"])
+        self.assertIs(args.handler, handlers["pilot_init"])
+        self.assertTrue(args.force)
+
+    def test_registry_accepts_pilot_summary_format_choice(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "pilot-summary",
+                "--record",
+                "r1.json",
+                "--output",
+                "out.csv",
+                "--format",
+                "csv",
+            ]
+        )
+        self.assertIs(args.handler, handlers["pilot_summary"])
+        self.assertEqual(args.format, "csv")
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_pilot_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+            )
+
+
+class TaskLifecycleCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "init_task",
+        "start_mini",
+        "approve_plan",
+        "bind_session",
+        "unbind_session",
+        "import_legacy",
+        "check_locks",
+        "inspect_legacy",
+        "claim",
+        "set_claim_status",
+        "release_claim",
+        "audit_legacy",
+        "set_phase",
+        "adopt_current_branch",
+        "checkpoint",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_task_lifecycle_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_init_task_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "init-task",
+                "--task-id",
+                "T1",
+                "--title",
+                "title",
+                "--objective",
+                "obj",
+                "--owner",
+                "alice",
+                "--completion-boundary",
+                "cb",
+            ]
+        )
+        self.assertIs(args.handler, handlers["init_task"])
+
+    def test_registry_uses_injected_vocab_for_claim_status_choices(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "set-claim-status",
+                "--token",
+                "TOK1",
+                "--status",
+                "active",
+                "--reason",
+                "r",
+            ]
+        )
+        self.assertIs(args.handler, handlers["set_claim_status"])
+        self.assertEqual(args.status, "active")
+
+    def test_registry_rejects_out_of_vocab_release_claim_status(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "release-claim",
+                    "--token",
+                    "TOK1",
+                    "--status",
+                    "active",
+                    "--reason",
+                    "r",
+                ]
+            )
+
+    def test_registry_rejects_out_of_vocab_phase(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "set-phase",
+                    "--task",
+                    "T1",
+                    "--phase",
+                    "not_a_phase",
+                ]
+            )
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_task_lifecycle_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+            )
+
+
+class VerificationCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "reconcile",
+        "add_verification",
+        "materialize_artifacts",
+        "packet_input_recover_from_tar",
+        "verification_supersede",
+        "verification_supersession_seal",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_verification_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+            vocab=_make_vocab(),
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_add_verification_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "add-verification",
+                "--task",
+                "T1",
+                "--category",
+                "unit_test",
+                "--status",
+                "pass",
+                "--evidence",
+                "e",
+                "--command",
+                "cmd",
+                "--boundary",
+                "b",
+            ]
+        )
+        self.assertIs(args.handler, handlers["add_verification"])
+        self.assertEqual(args.category, "unit_test")
+
+    def test_registry_rejects_out_of_vocab_category(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "add-verification",
+                    "--task",
+                    "T1",
+                    "--category",
+                    "not_a_category",
+                    "--status",
+                    "pass",
+                    "--evidence",
+                    "e",
+                    "--command",
+                    "cmd",
+                    "--boundary",
+                    "b",
+                ]
+            )
+
+    def test_registry_rejects_out_of_vocab_status(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "add-verification",
+                    "--task",
+                    "T1",
+                    "--category",
+                    "unit_test",
+                    "--status",
+                    "not_a_status",
+                    "--evidence",
+                    "e",
+                    "--command",
+                    "cmd",
+                    "--boundary",
+                    "b",
+                ]
+            )
+
+    def test_registry_accepts_verification_supersession_seal_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "verification-supersession-seal",
+                "--task",
+                "T1",
+                "--verification-index",
+                "1",
+                "--expected-current-record-sha256",
+                "deadbeef",
+                "--expected-source-record-sha256",
+                "deadbeef",
+                "--replacement-index",
+                "2",
+                "--expected-replacement-before-materialize-sha256",
+                "deadbeef",
+                "--expected-replacement-current-sha256",
+                "deadbeef",
+            ]
+        )
+        self.assertIs(args.handler, handlers["verification_supersession_seal"])
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_verification_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+                vocab=_make_vocab(),
+            )
+
+
+class StatusCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {"resume", "status", "render_index"}
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_status_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_resume_task(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["resume", "--task", "T1"])
+        self.assertIs(args.handler, handlers["resume"])
+
+    def test_registry_resume_requires_mutually_exclusive_group(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["resume"])
+
+    def test_registry_rejects_resume_with_both_task_and_session(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["resume", "--task", "T1", "--session-id", "S1"]
+            )
+
+    def test_registry_accepts_status_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["status", "--critical"])
+        self.assertIs(args.handler, handlers["status"])
+        self.assertTrue(args.critical)
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_status_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+            )
+
+
+class BackupCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {"backup_state", "verify_backup"}
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_backup_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_backup_state_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(["backup-state", "--destination", "/tmp/b"])
+        self.assertIs(args.handler, handlers["backup_state"])
+
+    def test_registry_verify_backup_requires_manifest(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["verify-backup"])
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_backup_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
+            )
+
+
+class ContextMemoryCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "context_receipt_record",
+        "codebase_memory_benchmark_validate",
+        "codebase_memory_benchmark_record",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+        register_context_memory_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=_add_json,
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_context_receipt_record_args(
+        self,
+    ) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "context-receipt-record",
+                "--task",
+                "T1",
+                "--provider",
+                "codebase-memory",
+                "--receipt-id",
+                "R1",
+                "--receipt",
+                "payload",
+                "--receipt-sha256",
+                "deadbeef",
+                "--session-id",
+                "S1",
+            ]
+        )
+        self.assertIs(args.handler, handlers["context_receipt_record"])
+        # defaults from the moved block survive extraction
+        self.assertEqual(args.requirement, "optional")
+        self.assertEqual(args.freshness_profile, "receipt-only")
+
+    def test_registry_rejects_out_of_vocab_freshness_profile(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "context-receipt-record",
+                    "--task",
+                    "T1",
+                    "--provider",
+                    "codebase-memory",
+                    "--receipt-id",
+                    "R1",
+                    "--receipt",
+                    "payload",
+                    "--receipt-sha256",
+                    "deadbeef",
+                    "--session-id",
+                    "S1",
+                    "--freshness-profile",
+                    "not_a_profile",
+                ]
+            )
+
+    def test_registry_accepts_codebase_memory_benchmark_record_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "codebase-memory-benchmark-record",
+                "--task",
+                "T1",
+                "--benchmark-id",
+                "B1",
+                "--receipt-id",
+                "R1",
+                "--record",
+                "rec1.json",
+                "--record-sha256",
+                "deadbeef",
+                "--session-id",
+                "S1",
+            ]
+        )
+        self.assertIs(args.handler, handlers["codebase_memory_benchmark_record"])
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_context_memory_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=_add_json,
             )
 
 

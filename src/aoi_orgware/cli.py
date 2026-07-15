@@ -31,7 +31,9 @@ from typing import Any, Iterable
 from . import __version__
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import resource_governance as resource_governance_impl
+from .commands.backup import register_backup_commands
 from .commands.capacity import register_capacity_commands
+from .commands.context_memory import register_context_memory_commands
 from .commands.coordination import (
     register_coordination_commands,
     register_cross_lane_commands,
@@ -42,8 +44,15 @@ from .commands.jobs import register_job_commands
 from .commands.lanes import register_lane_commands
 from .commands.packets import register_packet_commands
 from .commands.resource import register_resource_commands
+from .commands.status import register_status_commands
+from .commands.task_lifecycle import (
+    register_bootstrap_commands,
+    register_chief_commands,
+    register_pilot_commands,
+    register_task_lifecycle_commands,
+)
+from .commands.verification import register_verification_commands
 from .codebase_memory import (
-    FRESHNESS_PROFILES as CODEBASE_MEMORY_FRESHNESS_PROFILES,
     QUERY_EVIDENCE_CATEGORY as CODEBASE_MEMORY_QUERY_EVIDENCE_CATEGORY,
     RECEIPT_MAX_BYTES as CODEBASE_MEMORY_RECEIPT_MAX_BYTES,
     active_receipt_records as active_context_receipt_records,
@@ -96,7 +105,6 @@ from .harnesslib import (
     PACKET_STATUSES,
     RESERVING_CLAIM_STATUSES,
     SCHEMA_VERSION,
-    TASK_PHASES,
     TASK_STATUSES,
     TERMINAL_CLAIM_STATUSES,
     VERIFICATION_STATUSES,
@@ -14259,6 +14267,7 @@ class ParserVocabulary:
     role_tier_values: frozenset[str]
     skill_adoption_actions: tuple[str, ...]
     tool_densities: tuple[str, ...]
+    verification_categories: frozenset[str]
 
 
 def _parser_vocabulary() -> ParserVocabulary:
@@ -14281,6 +14290,7 @@ def _parser_vocabulary() -> ParserVocabulary:
         role_tier_values=frozenset(ROLE_TIER_MAP.values()),
         skill_adoption_actions=tuple(SKILL_ADOPTION_ACTIONS),
         tool_densities=tuple(TOOL_DENSITIES),
+        verification_categories=frozenset(VERIFICATION_CATEGORIES),
     )
 
 
@@ -14329,284 +14339,68 @@ def build_parser(
     sub = parser.add_subparsers(dest="_aoi_command", required=True)
     vocab = _parser_vocabulary()
 
-    p = sub.add_parser("init", help="initialize AOI in the current Git repository")
-    source = p.add_mutually_exclusive_group()
-    source.add_argument("--project-name")
-    source.add_argument(
-        "--config",
-        help="initialize from one strictly validated candidate aoi.toml",
+    register_bootstrap_commands(
+        sub,
+        handlers={
+            "init": cmd_init,
+            "config_check": cmd_config_check,
+        },
+        add_json_argument=add_json_argument,
     )
-    p.add_argument(
-        "--expected-config-sha256",
-        help=(
-            "required with --config; fail unless it still matches this "
-            "approved full SHA-256"
-        ),
+
+    register_context_memory_commands(
+        sub,
+        handlers={
+            "context_receipt_record": cmd_context_receipt_record,
+            "codebase_memory_benchmark_validate": cmd_codebase_memory_benchmark_validate,
+            "codebase_memory_benchmark_record": cmd_codebase_memory_benchmark_record,
+        },
+        add_json_argument=add_json_argument,
     )
-    p.add_argument(
-        "--replace-policy-sha256",
-        help=(
-            "replace a reviewed non-packaged managed policy only if its current "
-            "full SHA-256 still matches"
-        ),
+
+    register_chief_commands(
+        sub,
+        handlers={
+            "chief_acquire": cmd_chief_acquire,
+            "chief_renew": cmd_chief_renew,
+            "chief_release": cmd_chief_release,
+            "chief_takeover": cmd_chief_takeover,
+            "chief_status": cmd_chief_status,
+        },
+        add_json_argument=add_json_argument,
     )
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_init)
 
-    p = sub.add_parser(
-        "config-check",
-        help="validate and summarize a candidate aoi.toml without applying it",
+    register_pilot_commands(
+        sub,
+        handlers={
+            "pilot_init": cmd_pilot_init,
+            "pilot_validate": cmd_pilot_validate,
+            "pilot_summary": cmd_pilot_summary,
+        },
+        add_json_argument=add_json_argument,
     )
-    p.add_argument("--file", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_config_check)
 
-    p = sub.add_parser(
-        "context-receipt-record",
-        help="record an immutable optional context-provider receipt",
+    register_task_lifecycle_commands(
+        sub,
+        handlers={
+            "init_task": cmd_init_task,
+            "start_mini": cmd_start_mini,
+            "approve_plan": cmd_approve_plan,
+            "bind_session": cmd_bind_session,
+            "unbind_session": cmd_unbind_session,
+            "import_legacy": cmd_import_legacy,
+            "check_locks": cmd_check_locks,
+            "inspect_legacy": cmd_inspect_legacy,
+            "claim": cmd_claim,
+            "set_claim_status": cmd_set_claim_status,
+            "release_claim": cmd_release_claim,
+            "audit_legacy": cmd_audit_legacy,
+            "set_phase": cmd_set_phase,
+            "adopt_current_branch": cmd_adopt_current_branch,
+            "checkpoint": cmd_checkpoint,
+        },
+        add_json_argument=add_json_argument,
     )
-    p.add_argument("--task", required=True)
-    p.add_argument("--provider", choices=["codebase-memory"], required=True)
-    p.add_argument("--receipt-id", required=True)
-    p.add_argument("--receipt", required=True)
-    p.add_argument("--receipt-sha256", required=True)
-    p.add_argument(
-        "--requirement", choices=["optional", "required"], default="optional"
-    )
-    p.add_argument(
-        "--freshness-profile",
-        choices=sorted(CODEBASE_MEMORY_FRESHNESS_PROFILES),
-        default="receipt-only",
-    )
-    p.add_argument("--supersedes-receipt-id")
-    p.add_argument("--session-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_context_receipt_record)
-
-    p = sub.add_parser(
-        "codebase-memory-benchmark-validate",
-        help="validate one navigation-only codebase-memory A/B record",
-    )
-    p.add_argument("--record", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_codebase_memory_benchmark_validate)
-
-    p = sub.add_parser(
-        "codebase-memory-benchmark-record",
-        help="snapshot and summarize paired navigation-only A/B records",
-    )
-    p.add_argument("--task", required=True)
-    p.add_argument("--benchmark-id", required=True)
-    p.add_argument("--receipt-id", required=True)
-    p.add_argument("--record", action="append", default=[], required=True)
-    p.add_argument("--record-sha256", action="append", default=[], required=True)
-    p.add_argument("--session-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_codebase_memory_benchmark_record)
-
-    p = sub.add_parser("chief-acquire", help="acquire the project Chief lease")
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--ttl-seconds", type=int, default=CHIEF_DEFAULT_TTL_SECONDS)
-    p.add_argument(
-        "--credential-home",
-        help="optional absolute repo-external credential store root",
-    )
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_chief_acquire)
-
-    p = sub.add_parser("chief-renew", help="renew the current Chief lease")
-    p.add_argument("--ttl-seconds", type=int, default=CHIEF_DEFAULT_TTL_SECONDS)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_chief_renew)
-
-    p = sub.add_parser("chief-release", help="release the current Chief lease")
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_chief_release)
-
-    p = sub.add_parser(
-        "chief-takeover",
-        help="replace an expired lease or explicitly force replacement of a live lease",
-    )
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--expected-epoch", type=int, required=True)
-    p.add_argument("--reason", required=True)
-    p.add_argument("--force-live", action="store_true")
-    p.add_argument("--ttl-seconds", type=int, default=CHIEF_DEFAULT_TTL_SECONDS)
-    p.add_argument(
-        "--credential-home",
-        help="optional absolute repo-external credential store root",
-    )
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_chief_takeover)
-
-    p = sub.add_parser("chief-status", help="show non-secret Chief lease status")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_chief_status)
-
-    p = sub.add_parser(
-        "pilot-init",
-        help="create a self-contained closed-alpha tester kit",
-        description="create a self-contained closed-alpha tester kit",
-    )
-    p.add_argument("--output", required=True)
-    p.add_argument("--force", action="store_true")
-    p.add_argument(
-        "--allow-unverified-windows-acl",
-        action="store_true",
-        help="acknowledge that AOI cannot verify private file ACLs on native Windows",
-    )
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_pilot_init)
-
-    p = sub.add_parser(
-        "pilot-validate",
-        help="strictly validate one sanitized closed-alpha run record",
-        description="strictly validate one sanitized closed-alpha run record",
-    )
-    p.add_argument("--record", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_pilot_validate)
-
-    p = sub.add_parser(
-        "pilot-summary",
-        help="produce a deterministic, de-identified descriptive summary",
-        description="produce a deterministic, de-identified descriptive summary",
-    )
-    p.add_argument("--record", action="append", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--format", choices=("json", "csv"), default="json")
-    p.add_argument("--force", action="store_true")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_pilot_summary)
-
-    p = sub.add_parser("init-task")
-    p.add_argument("--task-id", required=True)
-    p.add_argument("--title", required=True)
-    p.add_argument("--objective", required=True)
-    p.add_argument("--owner", required=True)
-    p.add_argument("--completion-boundary", required=True)
-    p.add_argument("--next-action")
-    p.add_argument("--session-id")
-    p.add_argument("--worktree")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_init_task)
-
-    p = sub.add_parser("start-mini")
-    p.add_argument("--task-id", required=True)
-    p.add_argument("--title", required=True)
-    p.add_argument("--objective", required=True)
-    p.add_argument("--owner", required=True)
-    p.add_argument("--completion-boundary", required=True)
-    p.add_argument("--next-action")
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--worktree")
-    p.add_argument("--token", required=True)
-    p.add_argument("--lock", action="append", required=True)
-    p.add_argument("--intent", required=True)
-    p.add_argument("--validation", required=True)
-    p.add_argument("--expires-at", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_start_mini)
-
-    p = sub.add_parser("approve-plan")
-    p.add_argument("--task", required=True)
-    p.add_argument("--note", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_approve_plan)
-
-    p = sub.add_parser("bind-session")
-    p.add_argument("--task", required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--force", action="store_true")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_bind_session)
-
-    p = sub.add_parser("unbind-session")
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--task")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_unbind_session)
-
-    p = sub.add_parser("import-legacy")
-    p.add_argument("--source")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_import_legacy)
-
-    p = sub.add_parser("check-locks")
-    p.add_argument("--lock", action="append", required=True)
-    p.add_argument("--ignore-token")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_check_locks)
-
-    p = sub.add_parser("inspect-legacy")
-    p.add_argument("--token", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_inspect_legacy)
-
-    p = sub.add_parser("claim")
-    p.add_argument("--task", required=True)
-    p.add_argument("--token", required=True)
-    p.add_argument("--owner", required=True)
-    p.add_argument("--kind", required=True)
-    p.add_argument("--lock", action="append", default=[], required=True)
-    p.add_argument("--intent", required=True)
-    p.add_argument("--validation", required=True)
-    p.add_argument("--expires-at", required=True)
-    p.add_argument("--adopt-legacy", action="store_true")
-    p.add_argument("--adoption-evidence")
-    p.add_argument("--ack-legacy-ambiguity", action="store_true")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_claim)
-
-    p = sub.add_parser("set-claim-status")
-    p.add_argument("--token", required=True)
-    p.add_argument("--status", choices=sorted(RESERVING_CLAIM_STATUSES), required=True)
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_set_claim_status)
-
-    p = sub.add_parser("release-claim")
-    p.add_argument("--token", required=True)
-    p.add_argument("--status", choices=sorted(TERMINAL_CLAIM_STATUSES), required=True)
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_release_claim)
-
-    p = sub.add_parser("audit-legacy")
-    p.add_argument("--token", required=True)
-    p.add_argument("--decision", choices=["still-active", "released", "stale"], required=True)
-    p.add_argument("--detail", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_audit_legacy)
-
-    p = sub.add_parser("set-phase")
-    p.add_argument("--task", required=True)
-    p.add_argument("--phase", choices=sorted(TASK_PHASES), required=True)
-    p.add_argument("--task-status", choices=sorted({"active", "blocked"}))
-    p.add_argument("--summary")
-    p.add_argument("--next-action")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_set_phase)
-
-    p = sub.add_parser("adopt-current-branch")
-    p.add_argument("--task", required=True)
-    p.add_argument("--reason", required=True)
-    p.add_argument("--next-action")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_adopt_current_branch)
-
-    p = sub.add_parser("checkpoint")
-    p.add_argument("--task", required=True)
-    p.add_argument("--fact", action="append", default=[])
-    p.add_argument("--decision", action="append", default=[])
-    p.add_argument("--rejected", action="append", default=[])
-    p.add_argument("--changed-file", action="append", default=[])
-    p.add_argument("--blocker", action="append", default=[])
-    p.add_argument("--risk", action="append", default=[])
-    p.add_argument("--next-action")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_checkpoint)
 
     register_capacity_commands(
         sub,
@@ -14701,80 +14495,19 @@ def build_parser(
         vocab=vocab,
     )
 
-    p = sub.add_parser("reconcile")
-    p.add_argument("--task", required=True)
-    p.add_argument("--observations")
-    p.add_argument("--observations-sha")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_reconcile)
-
-    p = sub.add_parser("add-verification")
-    p.add_argument("--task", required=True)
-    p.add_argument("--category", choices=sorted(VERIFICATION_CATEGORIES), required=True)
-    p.add_argument("--status", choices=sorted(VERIFICATION_STATUSES), required=True)
-    p.add_argument("--evidence", required=True)
-    p.add_argument("--command", required=True)
-    p.add_argument("--boundary", required=True)
-    p.add_argument("--run-id")
-    p.add_argument("--lane-id")
-    p.add_argument("--artifact-ref", action="append", default=[])
-    p.add_argument("--review-packet-id")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_add_verification)
-
-    p = sub.add_parser(
-        "materialize-artifacts",
-        help="snapshot still-valid legacy packet and verification artifacts",
+    register_verification_commands(
+        sub,
+        handlers={
+            "reconcile": cmd_reconcile,
+            "add_verification": cmd_add_verification,
+            "materialize_artifacts": cmd_materialize_artifacts,
+            "packet_input_recover_from_tar": cmd_packet_input_recover_from_tar,
+            "verification_supersede": cmd_verification_supersede,
+            "verification_supersession_seal": cmd_verification_supersession_seal,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
     )
-    p.add_argument("--task", required=True)
-    p.add_argument("--verification-index", type=int, action="append", default=[])
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_materialize_artifacts)
-
-    p = sub.add_parser(
-        "packet-input-recover-from-tar",
-        help="recover one drifted legacy done-packet input from a bound tar member",
-    )
-    p.add_argument("--task", required=True)
-    p.add_argument("--packet-id", required=True)
-    p.add_argument("--input-index", type=int, required=True)
-    p.add_argument("--expected-input-sha256", required=True)
-    p.add_argument("--carrier-input-index", type=int, required=True)
-    p.add_argument("--carrier-sha256", required=True)
-    p.add_argument("--archive-member", required=True)
-    p.add_argument("--expected-result-sha256", required=True)
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_packet_input_recover_from_tar)
-
-    p = sub.add_parser(
-        "verification-supersede",
-        help="retire one exact legacy verification in favor of a later valid pass",
-    )
-    p.add_argument("--task", required=True)
-    p.add_argument("--verification-index", type=int, required=True)
-    p.add_argument("--expected-record-sha256", required=True)
-    p.add_argument("--replacement-index", type=int, required=True)
-    p.add_argument("--replacement-record-sha256", required=True)
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_verification_supersede)
-
-    p = sub.add_parser(
-        "verification-supersession-seal",
-        help="seal a legacy supersession against its exact canonical replacement",
-    )
-    p.add_argument("--task", required=True)
-    p.add_argument("--verification-index", type=int, required=True)
-    p.add_argument("--expected-current-record-sha256", required=True)
-    p.add_argument("--expected-source-record-sha256", required=True)
-    p.add_argument("--replacement-index", type=int, required=True)
-    p.add_argument(
-        "--expected-replacement-before-materialize-sha256", required=True
-    )
-    p.add_argument("--expected-replacement-current-sha256", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_verification_supersession_seal)
 
     register_packet_commands(
         sub,
@@ -14830,33 +14563,24 @@ def build_parser(
     add_json_argument(p)
     p.set_defaults(handler=cmd_cancel_task)
 
-    p = sub.add_parser("resume")
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--task")
-    group.add_argument("--session-id")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_resume)
+    register_status_commands(
+        sub,
+        handlers={
+            "resume": cmd_resume,
+            "status": cmd_status,
+            "render_index": cmd_render_index,
+        },
+        add_json_argument=add_json_argument,
+    )
 
-    p = sub.add_parser("status")
-    p.add_argument("--legacy", action="store_true")
-    p.add_argument("--task")
-    p.add_argument("--critical", action="store_true")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_status)
-
-    p = sub.add_parser("render-index")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_render_index)
-
-    p = sub.add_parser("backup-state")
-    p.add_argument("--destination")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_backup_state)
-
-    p = sub.add_parser("verify-backup")
-    p.add_argument("--manifest", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_verify_backup)
+    register_backup_commands(
+        sub,
+        handlers={
+            "backup_state": cmd_backup_state,
+            "verify_backup": cmd_verify_backup,
+        },
+        add_json_argument=add_json_argument,
+    )
 
     p = sub.add_parser("doctor")
     p.add_argument("--task")
