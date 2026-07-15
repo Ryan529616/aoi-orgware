@@ -31,10 +31,13 @@ from typing import Any, Iterable
 from . import __version__
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import resource_governance as resource_governance_impl
+from .commands.capacity import register_capacity_commands
 from .commands.coordination import (
     register_coordination_commands,
     register_cross_lane_commands,
 )
+from .commands.execution_selection import register_execution_selection_commands
+from .commands.improvement import register_improvement_commands
 from .commands.jobs import register_job_commands
 from .commands.lanes import register_lane_commands
 from .commands.packets import register_packet_commands
@@ -14244,11 +14247,18 @@ class ParserVocabulary:
     change_classes: frozenset[str]
     close_qualifying_categories: frozenset[str]
     dependency_kinds: tuple[str, ...]
+    dependency_levels: tuple[str, ...]
+    depth_two_roles: tuple[str, ...]
+    execution_modes: tuple[str, ...]
+    improvement_option_ids: tuple[str, ...]
+    improvement_trigger_classes: tuple[str, ...]
     lane_kinds: tuple[str, ...]
     lane_statuses: tuple[str, ...]
     needs_user_categories: tuple[str, ...]
     role_tier_map: tuple[str, ...]
     role_tier_values: frozenset[str]
+    skill_adoption_actions: tuple[str, ...]
+    tool_densities: tuple[str, ...]
 
 
 def _parser_vocabulary() -> ParserVocabulary:
@@ -14259,11 +14269,18 @@ def _parser_vocabulary() -> ParserVocabulary:
         change_classes=frozenset(CHANGE_CLASSES),
         close_qualifying_categories=frozenset(CLOSE_QUALIFYING_CATEGORIES),
         dependency_kinds=tuple(DEPENDENCY_KINDS),
+        dependency_levels=tuple(DEPENDENCY_LEVELS),
+        depth_two_roles=tuple(DEPTH_TWO_ROLES),
+        execution_modes=tuple(EXECUTION_MODES),
+        improvement_option_ids=tuple(IMPROVEMENT_OPTION_IDS),
+        improvement_trigger_classes=tuple(IMPROVEMENT_TRIGGER_CLASSES),
         lane_kinds=tuple(LANE_KINDS),
         lane_statuses=tuple(LANE_STATUSES),
         needs_user_categories=tuple(NEEDS_USER_CATEGORIES),
         role_tier_map=tuple(ROLE_TIER_MAP),
         role_tier_values=frozenset(ROLE_TIER_MAP.values()),
+        skill_adoption_actions=tuple(SKILL_ADOPTION_ACTIONS),
+        tool_densities=tuple(TOOL_DENSITIES),
     )
 
 
@@ -14591,189 +14608,43 @@ def build_parser(
     add_json_argument(p)
     p.set_defaults(handler=cmd_checkpoint)
 
-    p = sub.add_parser("capacity-snapshot")
-    p.add_argument("--task", required=True)
-    p.add_argument("--review-id", required=True)
-    p.add_argument("--capacity-lane-id", required=True)
-    p.add_argument("--target-lane-id", required=True)
-    p.add_argument("--task-type", required=True)
-    p.add_argument("--leaf-role", choices=sorted(DEPTH_TWO_ROLES), required=True)
-    p.add_argument("--expected-lane-revision", type=int, required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_capacity_snapshot)
-
-    p = sub.add_parser("capacity-recommend")
-    p.add_argument("--task", required=True)
-    p.add_argument("--review-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--source-packet-id", required=True)
-    p.add_argument("--capability-tier", choices=sorted(CAPABILITY_TIER_MAP), required=True)
-    p.add_argument("--rationale", required=True)
-    p.add_argument("--risk", required=True)
-    p.add_argument("--confidence-boundary", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_capacity_recommend)
-
-    p = sub.add_parser("capacity-arbitrate")
-    p.add_argument("--task", required=True)
-    p.add_argument("--review-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--decision", choices=["approved", "rejected"], required=True)
-    p.add_argument("--rationale", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_capacity_arbitrate)
-
-    p = sub.add_parser("capacity-distribute")
-    p.add_argument("--task", required=True)
-    p.add_argument("--review-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--steward-lane-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_capacity_distribute)
-
-    p = sub.add_parser("capacity-ack")
-    p.add_argument("--task", required=True)
-    p.add_argument("--review-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--actor-lane", required=True)
-    p.add_argument("--evidence", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_capacity_ack)
-
-    p = sub.add_parser("improvement-create")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--source-lane", required=True)
-    p.add_argument("--task-type", required=True)
-    p.add_argument(
-        "--trigger-class", choices=sorted(IMPROVEMENT_TRIGGER_CLASSES), required=True
+    register_capacity_commands(
+        sub,
+        handlers={
+            "capacity_snapshot": cmd_capacity_snapshot,
+            "capacity_recommend": cmd_capacity_recommend,
+            "capacity_arbitrate": cmd_capacity_arbitrate,
+            "capacity_distribute": cmd_capacity_distribute,
+            "capacity_ack": cmd_capacity_ack,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
     )
-    p.add_argument("--pain-statement", required=True)
-    p.add_argument("--desired-outcome", required=True)
-    p.add_argument("--occurrence", action="append", default=[], required=True)
-    p.add_argument("--release-blocking", action="store_true")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_improvement_create)
 
-    p = sub.add_parser("improvement-brief")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--steward-lane-id", required=True)
-    p.add_argument("--option", action="append", default=[], required=True)
-    p.add_argument("--capacity-review-id")
-    p.add_argument("--recommendation", required=True)
-    p.add_argument("--evidence-boundary", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_improvement_brief)
+    register_improvement_commands(
+        sub,
+        handlers={
+            "improvement_create": cmd_improvement_create,
+            "improvement_brief": cmd_improvement_brief,
+            "improvement_arbitrate": cmd_improvement_arbitrate,
+            "improvement_link_project": cmd_improvement_link_project,
+            "skill_release_record": cmd_skill_release_record,
+            "skill_adoption_record": cmd_skill_adoption_record,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
+    )
 
-    p = sub.add_parser("improvement-arbitrate")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--decision", choices=["approved", "rejected"], required=True)
-    p.add_argument("--selected-option", choices=sorted(IMPROVEMENT_OPTION_IDS))
-    p.add_argument("--rationale", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_improvement_arbitrate)
-
-    p = sub.add_parser("improvement-link-project")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--project-task-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_improvement_link_project)
-
-    p = sub.add_parser("skill-release-record")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--release-id", required=True)
-    p.add_argument("--skill-id", required=True)
-    p.add_argument("--skill-version", required=True)
-    p.add_argument("--maintenance-owner", required=True)
-    p.add_argument("--rollback-plan", required=True)
-    p.add_argument("--bundle", required=True)
-    p.add_argument("--bundle-sha256", required=True)
-    p.add_argument("--manifest", required=True)
-    p.add_argument("--manifest-sha256", required=True)
-    p.add_argument("--validation-receipt", required=True)
-    p.add_argument("--validation-receipt-sha256", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_skill_release_record)
-
-    p = sub.add_parser("skill-adoption-record")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--release-id", required=True)
-    p.add_argument("--action", choices=sorted(SKILL_ADOPTION_ACTIONS), required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--evidence-artifact", required=True)
-    p.add_argument("--evidence-sha256", required=True)
-    p.add_argument("--rationale", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_skill_adoption_record)
-
-    def add_execution_selection_arguments(
-        parser: argparse.ArgumentParser, *, override_required: bool
-    ) -> None:
-        parser.add_argument("--task", required=True)
-        parser.add_argument("--selection-id", required=True)
-        parser.add_argument("--work-unit-id", required=True)
-        parser.add_argument("--supersedes-selection-id")
-        parser.add_argument("--mode", choices=sorted(EXECUTION_MODES), required=True)
-        parser.add_argument("--lane", action="append", default=[], required=True)
-        parser.add_argument("--steward-lane-id")
-        parser.add_argument("--scope", required=True)
-        parser.add_argument(
-            "--sequential-dependency",
-            choices=sorted(DEPENDENCY_LEVELS),
-            required=True,
-        )
-        parser.add_argument(
-            "--tool-density", choices=sorted(TOOL_DENSITIES), required=True
-        )
-        parser.add_argument(
-            "--shared-context", choices=sorted(DEPENDENCY_LEVELS), required=True
-        )
-        parser.add_argument("--rationale", required=True)
-        parser.add_argument("--falsification-condition", required=True)
-        parser.add_argument("--escalation-condition", required=True)
-        parser.add_argument("--session-id", required=True)
-        parser.add_argument(
-            "--override-id", required=override_required, default=""
-        )
-
-    p = sub.add_parser("execution-select-plan")
-    add_execution_selection_arguments(p, override_required=True)
-    p.add_argument("--proposed-setting", action="append", default=[], required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_execution_select_plan)
-
-    p = sub.add_parser("execution-select")
-    add_execution_selection_arguments(p, override_required=False)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_execution_select)
-
-    p = sub.add_parser("execution-brief-record")
-    p.add_argument("--task", required=True)
-    p.add_argument("--brief-id", required=True)
-    p.add_argument("--execution-selection-id", required=True)
-    p.add_argument("--steward-lane-id", required=True)
-    p.add_argument("--steward-packet-id")
-    p.add_argument("--packet-id", action="append", default=[], required=True)
-    p.add_argument("--cross-lane-session-id", action="append", default=[])
-    p.add_argument("--summary", required=True)
-    p.add_argument("--dissent", required=True)
-    p.add_argument("--blocker", required=True)
-    p.add_argument("--recommendation", required=True)
-    p.add_argument("--session-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_execution_brief_record)
+    register_execution_selection_commands(
+        sub,
+        handlers={
+            "execution_select_plan": cmd_execution_select_plan,
+            "execution_select": cmd_execution_select,
+            "execution_brief_record": cmd_execution_brief_record,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
+    )
 
     register_cross_lane_commands(
         sub,

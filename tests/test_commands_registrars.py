@@ -24,9 +24,16 @@ REPO = HERE.parent
 SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
+from aoi_orgware.commands.capacity import register_capacity_commands  # noqa: E402
 from aoi_orgware.commands.coordination import (  # noqa: E402
     register_coordination_commands,
     register_cross_lane_commands,
+)
+from aoi_orgware.commands.execution_selection import (  # noqa: E402
+    register_execution_selection_commands,
+)
+from aoi_orgware.commands.improvement import (  # noqa: E402
+    register_improvement_commands,
 )
 from aoi_orgware.commands.jobs import register_job_commands  # noqa: E402
 from aoi_orgware.commands.lanes import register_lane_commands  # noqa: E402
@@ -40,6 +47,9 @@ REGISTRAR_MODULES = [
     SRC / "aoi_orgware" / "commands" / "coordination.py",
     SRC / "aoi_orgware" / "commands" / "packets.py",
     SRC / "aoi_orgware" / "commands" / "jobs.py",
+    SRC / "aoi_orgware" / "commands" / "capacity.py",
+    SRC / "aoi_orgware" / "commands" / "improvement.py",
+    SRC / "aoi_orgware" / "commands" / "execution_selection.py",
 ]
 
 
@@ -80,11 +90,18 @@ def _make_vocab() -> SimpleNamespace:
             {"unit_test", "integration_test", "static_check"}
         ),
         dependency_kinds=("hard_gate", "soft_dependency", "informational"),
+        dependency_levels=("low", "medium", "high"),
+        depth_two_roles=("batch", "explorer", "worker"),
+        execution_modes=("single", "centralized_parallel", "hybrid"),
+        improvement_option_ids=("maintain-current", "capacity", "skill-automation"),
+        improvement_trigger_classes=("repeated_pain", "critical_single_incident"),
         lane_kinds=("architecture", "implementation", "verification"),
         lane_statuses=("active", "waiting", "blocked", "done"),
         needs_user_categories=("goal_change", "accuracy_budget", "cost_budget"),
         role_tier_map=("architect", "reviewer", "worker"),
         role_tier_values=frozenset({"frontier", "expert", "advanced", "standard"}),
+        skill_adoption_actions=("canary", "adopt", "pause", "rollback", "deprecate"),
+        tool_densities=("low", "medium", "high"),
     )
 
 
@@ -664,6 +681,416 @@ class JobCommandRegistryTests(unittest.TestCase):
                 subparsers,
                 handlers={"unexpected": object()},  # type: ignore[dict-item]
                 add_json_argument=lambda _parser: None,
+            )
+
+
+class CapacityCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "capacity_snapshot",
+        "capacity_recommend",
+        "capacity_arbitrate",
+        "capacity_distribute",
+        "capacity_ack",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+
+        def add_json_argument(command: argparse.ArgumentParser) -> None:
+            command.add_argument("--json", action="store_true")
+
+        register_capacity_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=add_json_argument,
+            vocab=_make_vocab(),
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_capacity_snapshot_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "capacity-snapshot",
+                "--task",
+                "T1",
+                "--review-id",
+                "R1",
+                "--capacity-lane-id",
+                "L1",
+                "--target-lane-id",
+                "L2",
+                "--task-type",
+                "batch_job",
+                "--leaf-role",
+                "worker",
+                "--expected-lane-revision",
+                "2",
+                "--json",
+            ]
+        )
+        self.assertIs(args.handler, handlers["capacity_snapshot"])
+        self.assertTrue(args.json)
+
+    def test_registry_uses_injected_vocab_for_capability_tier_choices(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "capacity-recommend",
+                "--task",
+                "T1",
+                "--review-id",
+                "R1",
+                "--expected-version",
+                "1",
+                "--source-packet-id",
+                "P1",
+                "--capability-tier",
+                "c2_routine",
+                "--rationale",
+                "r",
+                "--risk",
+                "low",
+                "--confidence-boundary",
+                "b",
+            ]
+        )
+        self.assertIs(args.handler, handlers["capacity_recommend"])
+        self.assertEqual(args.capability_tier, "c2_routine")
+
+    def test_registry_rejects_out_of_vocab_leaf_role(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "capacity-snapshot",
+                    "--task",
+                    "T1",
+                    "--review-id",
+                    "R1",
+                    "--capacity-lane-id",
+                    "L1",
+                    "--target-lane-id",
+                    "L2",
+                    "--task-type",
+                    "batch_job",
+                    "--leaf-role",
+                    "not_a_role",
+                    "--expected-lane-revision",
+                    "2",
+                ]
+            )
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_capacity_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=lambda _parser: None,
+                vocab=_make_vocab(),
+            )
+
+
+class ImprovementCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "improvement_create",
+        "improvement_brief",
+        "improvement_arbitrate",
+        "improvement_link_project",
+        "skill_release_record",
+        "skill_adoption_record",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+
+        def add_json_argument(command: argparse.ArgumentParser) -> None:
+            command.add_argument("--json", action="store_true")
+
+        register_improvement_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=add_json_argument,
+            vocab=_make_vocab(),
+        )
+        return parser, handlers
+
+    def test_registry_injects_handler_and_accepts_improvement_create_args(
+        self,
+    ) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "improvement-create",
+                "--task",
+                "T1",
+                "--request-id",
+                "N1",
+                "--source-lane",
+                "L1",
+                "--task-type",
+                "batch_job",
+                "--trigger-class",
+                "repeated_pain",
+                "--pain-statement",
+                "p",
+                "--desired-outcome",
+                "o",
+                "--occurrence",
+                "e1",
+                "--json",
+            ]
+        )
+        self.assertIs(args.handler, handlers["improvement_create"])
+        self.assertFalse(args.release_blocking)
+        self.assertTrue(args.json)
+
+    def test_registry_uses_injected_vocab_for_skill_adoption_action_choices(
+        self,
+    ) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "skill-adoption-record",
+                "--task",
+                "T1",
+                "--request-id",
+                "N1",
+                "--expected-version",
+                "1",
+                "--release-id",
+                "REL1",
+                "--action",
+                "canary",
+                "--session-id",
+                "S1",
+                "--evidence-artifact",
+                "a",
+                "--evidence-sha256",
+                "deadbeef",
+                "--rationale",
+                "r",
+            ]
+        )
+        self.assertIs(args.handler, handlers["skill_adoption_record"])
+        self.assertEqual(args.action, "canary")
+
+    def test_registry_rejects_out_of_vocab_trigger_class(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "improvement-create",
+                    "--task",
+                    "T1",
+                    "--request-id",
+                    "N1",
+                    "--source-lane",
+                    "L1",
+                    "--task-type",
+                    "batch_job",
+                    "--trigger-class",
+                    "not_a_trigger",
+                    "--pain-statement",
+                    "p",
+                    "--desired-outcome",
+                    "o",
+                    "--occurrence",
+                    "e1",
+                ]
+            )
+
+    def test_registry_accepts_skill_release_record_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "skill-release-record",
+                "--task",
+                "T1",
+                "--request-id",
+                "N1",
+                "--expected-version",
+                "1",
+                "--release-id",
+                "REL1",
+                "--skill-id",
+                "SK1",
+                "--skill-version",
+                "1.0",
+                "--maintenance-owner",
+                "alice",
+                "--rollback-plan",
+                "plan",
+                "--bundle",
+                "b.tar",
+                "--bundle-sha256",
+                "deadbeef",
+                "--manifest",
+                "m.json",
+                "--manifest-sha256",
+                "deadbeef",
+                "--validation-receipt",
+                "v.json",
+                "--validation-receipt-sha256",
+                "deadbeef",
+            ]
+        )
+        self.assertIs(args.handler, handlers["skill_release_record"])
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_improvement_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=lambda _parser: None,
+                vocab=_make_vocab(),
+            )
+
+
+class ExecutionSelectionCommandRegistryTests(unittest.TestCase):
+    HANDLER_NAMES = {
+        "execution_select_plan",
+        "execution_select",
+        "execution_brief_record",
+    }
+
+    def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        handlers = {name: object() for name in self.HANDLER_NAMES}
+
+        def add_json_argument(command: argparse.ArgumentParser) -> None:
+            command.add_argument("--json", action="store_true")
+
+        register_execution_selection_commands(
+            subparsers,
+            handlers=handlers,  # type: ignore[arg-type]
+            add_json_argument=add_json_argument,
+            vocab=_make_vocab(),
+        )
+        return parser, handlers
+
+    def _base_execution_select_args(self) -> list[str]:
+        return [
+            "--task",
+            "T1",
+            "--selection-id",
+            "E1",
+            "--work-unit-id",
+            "W1",
+            "--mode",
+            "single",
+            "--lane",
+            "L1",
+            "--scope",
+            "s",
+            "--sequential-dependency",
+            "low",
+            "--tool-density",
+            "medium",
+            "--shared-context",
+            "low",
+            "--rationale",
+            "r",
+            "--falsification-condition",
+            "f",
+            "--escalation-condition",
+            "e",
+            "--session-id",
+            "S1",
+        ]
+
+    def test_registry_injects_handler_and_accepts_execution_select_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            ["execution-select", *self._base_execution_select_args(), "--json"]
+        )
+        self.assertIs(args.handler, handlers["execution_select"])
+        self.assertEqual(args.override_id, "")
+        self.assertTrue(args.json)
+
+    def test_registry_requires_override_id_for_execution_select_plan(self) -> None:
+        parser, _ = self.parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "execution-select-plan",
+                    *self._base_execution_select_args(),
+                    "--proposed-setting",
+                    "x=1",
+                ]
+            )
+
+    def test_registry_accepts_execution_select_plan_with_override_id(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "execution-select-plan",
+                *self._base_execution_select_args(),
+                "--override-id",
+                "OV1",
+                "--proposed-setting",
+                "x=1",
+            ]
+        )
+        self.assertIs(args.handler, handlers["execution_select_plan"])
+        self.assertEqual(args.override_id, "OV1")
+        self.assertEqual(args.proposed_setting, ["x=1"])
+
+    def test_registry_rejects_out_of_vocab_mode(self) -> None:
+        parser, _ = self.parser()
+        args = self._base_execution_select_args()
+        mode_index = args.index("--mode") + 1
+        args[mode_index] = "not_a_mode"
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["execution-select", *args])
+
+    def test_registry_accepts_execution_brief_record_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "execution-brief-record",
+                "--task",
+                "T1",
+                "--brief-id",
+                "B1",
+                "--execution-selection-id",
+                "E1",
+                "--steward-lane-id",
+                "L1",
+                "--packet-id",
+                "P1",
+                "--summary",
+                "s",
+                "--dissent",
+                "d",
+                "--blocker",
+                "b",
+                "--recommendation",
+                "r",
+                "--session-id",
+                "S1",
+            ]
+        )
+        self.assertIs(args.handler, handlers["execution_brief_record"])
+
+    def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers()
+        with self.assertRaisesRegex(ValueError, "handler map mismatch"):
+            register_execution_selection_commands(
+                subparsers,
+                handlers={"unexpected": object()},  # type: ignore[dict-item]
+                add_json_argument=lambda _parser: None,
+                vocab=_make_vocab(),
             )
 
 
