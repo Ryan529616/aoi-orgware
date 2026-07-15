@@ -17,13 +17,14 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 SRC = REPO / "src"
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware import resource_config as rc  # noqa: E402
 from aoi_orgware.config import load_config  # noqa: E402
 from aoi_orgware.harnesslib import HarnessError, get_paths  # noqa: E402
-from test_cli import HarnessTestCase  # noqa: E402
+from tests.harness_case import HarnessTestCase  # noqa: E402
 
 
 class ResourceConfigPrimitiveTests(unittest.TestCase):
