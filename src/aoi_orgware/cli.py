@@ -24,12 +24,14 @@ import subprocess
 import tarfile
 import tomllib
 import zlib
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from . import __version__
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import resource_governance as resource_governance_impl
+from .commands.lanes import register_lane_commands
 from .commands.resource import register_resource_commands
 from .codebase_memory import (
     FRESHNESS_PROFILES as CODEBASE_MEMORY_FRESHNESS_PROFILES,
@@ -14221,6 +14223,36 @@ def add_json_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
+@dataclass(frozen=True)
+class ParserVocabulary:
+    """Immutable snapshot of parser-facing choice vocabularies.
+
+    Built once inside :func:`build_parser` from the live module globals and
+    injected into extracted command registrars (see ``commands/``) so they can
+    declare ``choices=`` without importing this monolithic module or
+    re-declaring its mutable constants.  Fields stay alphabetized; later
+    extraction steps append more as their command blocks need them.
+    """
+
+    change_classes: frozenset[str]
+    dependency_kinds: tuple[str, ...]
+    lane_kinds: tuple[str, ...]
+    lane_statuses: tuple[str, ...]
+    role_tier_map: tuple[str, ...]
+
+
+def _parser_vocabulary() -> ParserVocabulary:
+    """Snapshot the live parser vocabulary globals for registrar injection."""
+
+    return ParserVocabulary(
+        change_classes=frozenset(CHANGE_CLASSES),
+        dependency_kinds=tuple(DEPENDENCY_KINDS),
+        lane_kinds=tuple(LANE_KINDS),
+        lane_statuses=tuple(LANE_STATUSES),
+        role_tier_map=tuple(ROLE_TIER_MAP),
+    )
+
+
 def build_parser(
     chief_defaults: dict[str, str | None] | None = None,
 ) -> argparse.ArgumentParser:
@@ -14264,6 +14296,7 @@ def build_parser(
         ),
     )
     sub = parser.add_subparsers(dest="_aoi_command", required=True)
+    vocab = _parser_vocabulary()
 
     p = sub.add_parser("init", help="initialize AOI in the current Git repository")
     source = p.add_mutually_exclusive_group()
@@ -14798,70 +14831,18 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
-    p = sub.add_parser("lane-set-status")
-    p.add_argument("--task", required=True)
-    p.add_argument("--lane-id", required=True)
-    p.add_argument("--expected-revision", type=int, required=True)
-    p.add_argument("--expected-status", choices=sorted(LANE_STATUSES), required=True)
-    p.add_argument("--status", choices=sorted(LANE_STATUSES), required=True)
-    p.add_argument("--next-action", required=True)
-    p.add_argument("--reason", required=True)
-    p.add_argument("--session-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_lane_set_status)
-
-    p = sub.add_parser("lane-create")
-    p.add_argument("--task", required=True)
-    p.add_argument("--lane-id", required=True)
-    p.add_argument("--kind", choices=sorted(LANE_KINDS), required=True)
-    p.add_argument("--status", choices=sorted(LANE_STATUSES), default="active")
-    p.add_argument("--owner", required=True)
-    p.add_argument("--role", choices=sorted(ROLE_TIER_MAP), required=True)
-    p.add_argument("--authority-commit", required=True)
-    p.add_argument("--contract-version", required=True)
-    p.add_argument("--generator-version", default="not_applicable")
-    p.add_argument("--adapter-version", default="not_applicable")
-    p.add_argument("--next-action", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_lane_create)
-
-    p = sub.add_parser("lane-revise")
-    p.add_argument("--task", required=True)
-    p.add_argument("--lane-id", required=True)
-    p.add_argument("--expected-revision", type=int, required=True)
-    p.add_argument("--authority-commit", required=True)
-    p.add_argument(
-        "--change-class", choices=sorted(CHANGE_CLASSES - {"genesis"}), required=True
+    register_lane_commands(
+        sub,
+        handlers={
+            "lane_set_status": cmd_lane_set_status,
+            "lane_create": cmd_lane_create,
+            "lane_revise": cmd_lane_revise,
+            "lane_dependency_add": cmd_lane_dependency_add,
+            "lane_dependency_update": cmd_lane_dependency_update,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
     )
-    p.add_argument("--contract-version", required=True)
-    p.add_argument("--generator-version", required=True)
-    p.add_argument("--adapter-version", required=True)
-    p.add_argument("--next-action", required=True)
-    p.add_argument("--decision", required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--coord", action="append", default=[])
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_lane_revise)
-
-    p = sub.add_parser("lane-dependency-add")
-    p.add_argument("--task", required=True)
-    p.add_argument("--dependency-id", required=True)
-    p.add_argument("--source-lane", required=True)
-    p.add_argument("--target-lane", required=True)
-    p.add_argument("--kind", choices=sorted(DEPENDENCY_KINDS), required=True)
-    p.add_argument("--reason", required=True)
-    p.add_argument("--needed-by-gate")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_lane_dependency_add)
-
-    p = sub.add_parser("lane-dependency-update")
-    p.add_argument("--task", required=True)
-    p.add_argument("--dependency-id", required=True)
-    p.add_argument("--status", choices=["satisfied", "waived", "superseded"], required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--evidence", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_lane_dependency_update)
 
     p = sub.add_parser("coordination-create")
     p.add_argument("--task", required=True)
