@@ -31,7 +31,13 @@ from typing import Any, Iterable
 from . import __version__
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import resource_governance as resource_governance_impl
+from .commands.coordination import (
+    register_coordination_commands,
+    register_cross_lane_commands,
+)
+from .commands.jobs import register_job_commands
 from .commands.lanes import register_lane_commands
+from .commands.packets import register_packet_commands
 from .commands.resource import register_resource_commands
 from .codebase_memory import (
     FRESHNESS_PROFILES as CODEBASE_MEMORY_FRESHNESS_PROFILES,
@@ -14234,22 +14240,30 @@ class ParserVocabulary:
     extraction steps append more as their command blocks need them.
     """
 
+    capability_tier_map: tuple[str, ...]
     change_classes: frozenset[str]
+    close_qualifying_categories: frozenset[str]
     dependency_kinds: tuple[str, ...]
     lane_kinds: tuple[str, ...]
     lane_statuses: tuple[str, ...]
+    needs_user_categories: tuple[str, ...]
     role_tier_map: tuple[str, ...]
+    role_tier_values: frozenset[str]
 
 
 def _parser_vocabulary() -> ParserVocabulary:
     """Snapshot the live parser vocabulary globals for registrar injection."""
 
     return ParserVocabulary(
+        capability_tier_map=tuple(CAPABILITY_TIER_MAP),
         change_classes=frozenset(CHANGE_CLASSES),
+        close_qualifying_categories=frozenset(CLOSE_QUALIFYING_CATEGORIES),
         dependency_kinds=tuple(DEPENDENCY_KINDS),
         lane_kinds=tuple(LANE_KINDS),
         lane_statuses=tuple(LANE_STATUSES),
+        needs_user_categories=tuple(NEEDS_USER_CATEGORIES),
         role_tier_map=tuple(ROLE_TIER_MAP),
+        role_tier_values=frozenset(ROLE_TIER_MAP.values()),
     )
 
 
@@ -14761,62 +14775,18 @@ def build_parser(
     add_json_argument(p)
     p.set_defaults(handler=cmd_execution_brief_record)
 
-    p = sub.add_parser("cross-lane-open")
-    p.add_argument("--task", required=True)
-    p.add_argument("--cross-lane-session-id", required=True)
-    p.add_argument("--execution-selection-id", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--steward-lane-id", required=True)
-    p.add_argument("--participant-lane", action="append", default=[], required=True)
-    p.add_argument("--topic", required=True)
-    p.add_argument("--evidence-boundary", required=True)
-    p.add_argument("--expires-at", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_cross_lane_open)
-
-    p = sub.add_parser("cross-lane-close")
-    p.add_argument("--task", required=True)
-    p.add_argument("--cross-lane-session-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--steward-lane-id", required=True)
-    p.add_argument("--conclusion", required=True)
-    p.add_argument("--dissent", required=True)
-    p.add_argument("--blocker", required=True)
-    p.add_argument("--evidence", action="append", default=[], required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_cross_lane_close)
-
-    p = sub.add_parser("cross-lane-cancel")
-    p.add_argument("--task", required=True)
-    p.add_argument("--cross-lane-session-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--steward-lane-id", required=True)
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_cross_lane_cancel)
-
-    p = sub.add_parser("needs-user-create")
-    p.add_argument("--task", required=True)
-    p.add_argument("--escalation-id", required=True)
-    p.add_argument("--category", choices=sorted(NEEDS_USER_CATEGORIES), required=True)
-    p.add_argument("--source-lane", required=True)
-    p.add_argument("--request-id")
-    p.add_argument("--problem", required=True)
-    p.add_argument("--option", action="append", default=[], required=True)
-    p.add_argument("--evidence", action="append", default=[], required=True)
-    p.add_argument("--chief-recommendation", required=True)
-    p.add_argument("--session-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_needs_user_create)
-
-    p = sub.add_parser("needs-user-resolve")
-    p.add_argument("--task", required=True)
-    p.add_argument("--escalation-id", required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--user-decision", required=True)
-    p.add_argument("--user-evidence", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_needs_user_resolve)
+    register_cross_lane_commands(
+        sub,
+        handlers={
+            "cross_lane_open": cmd_cross_lane_open,
+            "cross_lane_close": cmd_cross_lane_close,
+            "cross_lane_cancel": cmd_cross_lane_cancel,
+            "needs_user_create": cmd_needs_user_create,
+            "needs_user_resolve": cmd_needs_user_resolve,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
+    )
 
     register_resource_commands(
         sub,
@@ -14844,116 +14814,21 @@ def build_parser(
         vocab=vocab,
     )
 
-    p = sub.add_parser("coordination-create")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--source-lane", required=True)
-    p.add_argument("--target-lane", required=True)
-    p.add_argument("--severity", choices=sorted(DEPENDENCY_KINDS), required=True)
-    p.add_argument("--request", required=True)
-    p.add_argument("--outcome", required=True)
-    p.add_argument("--evidence", action="append", default=[], required=True)
-    p.add_argument("--option", action="append", default=[])
-    p.add_argument("--needed-by-gate")
-    p.add_argument(
-        "--change-class",
-        choices=sorted(CHANGE_CLASSES - {"genesis"}),
-        default="same_contract_implementation",
+    register_coordination_commands(
+        sub,
+        handlers={
+            "coordination_create": cmd_coordination_create,
+            "coordination_update": cmd_coordination_update,
+            "coordination_arbitrate": cmd_coordination_arbitrate,
+            "coordination_directive_ack": cmd_coordination_directive_ack,
+            "coordination_resolve": cmd_coordination_resolve,
+            "coordination_implementation_submit": cmd_coordination_implementation_submit,
+            "coordination_verify": cmd_coordination_verify,
+            "baseline_freeze": cmd_baseline_freeze,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
     )
-    p.add_argument(
-        "--closure-category",
-        choices=sorted(CLOSE_QUALIFYING_CATEGORIES),
-        default="integration_test",
-    )
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_create)
-
-    p = sub.add_parser("coordination-update")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--actor-lane", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--status", choices=["acknowledged", "countered"], required=True)
-    p.add_argument("--response", required=True)
-    p.add_argument("--evidence", action="append", default=[])
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_update)
-
-    p = sub.add_parser("coordination-arbitrate")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--decision", choices=["approved", "rejected"], required=True)
-    p.add_argument("--rationale", required=True)
-    p.add_argument("--selected-option")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_arbitrate)
-
-    p = sub.add_parser("coordination-directive-ack")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--directive-id", required=True)
-    p.add_argument("--actor-lane", required=True)
-    p.add_argument("--evidence", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_directive_ack)
-
-    p = sub.add_parser("coordination-resolve")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--evidence", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_resolve)
-
-    p = sub.add_parser("coordination-implementation-submit")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--actor-lane", required=True)
-    p.add_argument("--claim-token", required=True)
-    p.add_argument("--baseline-id", required=True)
-    p.add_argument(
-        "--evidence-category",
-        choices=sorted(CLOSE_QUALIFYING_CATEGORIES),
-        required=True,
-    )
-    p.add_argument("--command", required=True)
-    p.add_argument("--boundary", required=True)
-    p.add_argument("--evidence-artifact", required=True)
-    p.add_argument("--evidence-sha256", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_implementation_submit)
-
-    p = sub.add_parser("coordination-verify")
-    p.add_argument("--task", required=True)
-    p.add_argument("--request-id", required=True)
-    p.add_argument("--expected-version", type=int, required=True)
-    p.add_argument("--verifier-lane", required=True)
-    p.add_argument(
-        "--category", choices=sorted(CLOSE_QUALIFYING_CATEGORIES), required=True
-    )
-    p.add_argument("--status", choices=["pass", "fail"], required=True)
-    p.add_argument("--test-oracle", required=True)
-    p.add_argument("--command", required=True)
-    p.add_argument("--boundary", required=True)
-    p.add_argument("--evidence-artifact", required=True)
-    p.add_argument("--evidence-sha256", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_coordination_verify)
-
-    p = sub.add_parser("baseline-freeze")
-    p.add_argument("--task", required=True)
-    p.add_argument("--baseline-id", required=True)
-    p.add_argument("--contract-version", required=True)
-    p.add_argument("--session-id", required=True)
-    p.add_argument("--decision", required=True)
-    p.add_argument("--lane", action="append", default=[])
-    p.add_argument("--coord", action="append", default=[])
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_baseline_freeze)
 
     p = sub.add_parser("reconcile")
     p.add_argument("--task", required=True)
@@ -15030,139 +14905,28 @@ def build_parser(
     add_json_argument(p)
     p.set_defaults(handler=cmd_verification_supersession_seal)
 
-    p = sub.add_parser("create-packet")
-    p.add_argument("--task", required=True)
-    p.add_argument("--packet-id", required=True)
-    p.add_argument("--agent-role", required=True)
-    p.add_argument("--model-tier", required=True)
-    p.add_argument("--objective", required=True)
-    p.add_argument("--scope", required=True)
-    p.add_argument("--lock", action="append", default=[])
-    p.add_argument("--deliverable", required=True)
-    p.add_argument("--validation", required=True)
-    p.add_argument("--read-first", action="append", default=[])
-    p.add_argument("--lane-id")
-    p.add_argument("--execution-selection-id")
-    p.add_argument("--steward-synthesis-for-selection-id")
-    p.add_argument("--skill-release-id")
-    p.add_argument("--skill-canary-event-id")
-    p.add_argument("--task-type", default="general")
-    p.add_argument("--delegation-depth", type=int, choices=[1, 2], default=1)
-    p.add_argument("--parent-packet-id")
-    p.add_argument("--capability-tier", choices=sorted(CAPABILITY_TIER_MAP))
-    p.add_argument("--capacity-decision-id")
-    p.add_argument("--retry-of-packet-id")
-    p.add_argument("--capacity-review-source-id")
-    p.add_argument("--input-artifact", action="append", default=[])
-    p.add_argument(
-        "--packet-mode",
-        choices=["read_only", "bounded_mutation", "exact_command"],
-        default="read_only",
+    register_packet_commands(
+        sub,
+        handlers={
+            "create_packet": cmd_create_packet,
+            "packet_arm": cmd_packet_arm,
+            "packet_disarm": cmd_packet_disarm,
+            "packet_update": cmd_packet_update,
+            "packet_attest_result": cmd_packet_attest_result,
+            "subagent_incident_account": cmd_subagent_incident_account,
+        },
+        add_json_argument=add_json_argument,
+        vocab=vocab,
     )
-    p.add_argument("--command-artifact")
-    p.add_argument("--command-sha256")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_create_packet)
 
-    p = sub.add_parser("packet-arm")
-    p.add_argument("--task", required=True)
-    p.add_argument("--packet-id", required=True)
-    p.add_argument(
-        "--expected-agent-type",
-        required=True,
-        help=(
-            "Codex transport agent_type expected from SubagentStart; independent "
-            "of the packet's AOI technical role"
-        ),
+    register_job_commands(
+        sub,
+        handlers={
+            "job_start": cmd_job_start,
+            "job_update": cmd_job_update,
+        },
+        add_json_argument=add_json_argument,
     )
-    p.add_argument("--expires-at", required=True)
-    p.add_argument("--parent-session-id")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_packet_arm)
-
-    p = sub.add_parser("packet-disarm")
-    p.add_argument("--task", required=True)
-    p.add_argument("--packet-id", required=True)
-    p.add_argument("--reason", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_packet_disarm)
-
-    p = sub.add_parser("packet-update")
-    p.add_argument("--task", required=True)
-    p.add_argument("--packet-id", required=True)
-    p.add_argument(
-        "--status",
-        choices=sorted(PACKET_STATUSES - {"ready", "armed"}),
-        required=True,
-    )
-    p.add_argument("--agent-id")
-    p.add_argument("--actual-role", choices=sorted(ROLE_TIER_MAP))
-    p.add_argument("--actual-model-tier", choices=sorted(set(ROLE_TIER_MAP.values())))
-    p.add_argument("--routing-evidence")
-    p.add_argument("--manual-unverified-reason")
-    p.add_argument("--summary")
-    p.add_argument("--evidence", action="append", default=[])
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_packet_update)
-
-    p = sub.add_parser("packet-attest-result")
-    p.add_argument("--task", required=True)
-    p.add_argument("--packet-id", required=True)
-    p.add_argument("--evidence", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_packet_attest_result)
-
-    p = sub.add_parser("subagent-incident-account")
-    p.add_argument("--task", required=True)
-    p.add_argument("--incident-id", required=True)
-    p.add_argument(
-        "--disposition",
-        choices=["no_material_work", "work_discarded", "manual_unverified"],
-        required=True,
-    )
-    p.add_argument("--reason", required=True)
-    p.add_argument("--evidence", required=True)
-    p.add_argument("--session-id", required=True)
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_subagent_incident_account)
-
-    p = sub.add_parser("job-start")
-    p.add_argument("--task", required=True)
-    p.add_argument("--run-id", required=True)
-    p.add_argument("--host", required=True)
-    p.add_argument("--tool", required=True)
-    p.add_argument("--work-root", required=True)
-    p.add_argument("--status", choices=["queued"], default="queued")
-    p.add_argument("--log", required=True)
-    p.add_argument("--pid")
-    p.add_argument("--tmux")
-    p.add_argument("--stop-condition", required=True)
-    p.add_argument("--source-sha", required=True)
-    p.add_argument("--source-manifest", required=True)
-    p.add_argument("--tool-path", required=True)
-    p.add_argument("--tool-version", required=True)
-    p.add_argument("--command", required=True)
-    p.add_argument("--success-exit-code", type=int, default=0)
-    p.add_argument("--lane-id")
-    p.add_argument("--execution-selection-id")
-    p.add_argument("--owner-packet-id")
-    p.add_argument("--skill-release-id")
-    p.add_argument("--skill-canary-event-id")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_job_start)
-
-    p = sub.add_parser("job-update")
-    p.add_argument("--task", required=True)
-    p.add_argument("--run-id", required=True)
-    p.add_argument("--status", choices=sorted(JOB_STATUSES), required=True)
-    p.add_argument("--evidence", required=True)
-    p.add_argument("--exit-code", type=int)
-    p.add_argument("--pid")
-    p.add_argument("--tmux")
-    p.add_argument("--terminal-log-artifact")
-    p.add_argument("--terminal-log-sha256")
-    add_json_argument(p)
-    p.set_defaults(handler=cmd_job_update)
 
     p = sub.add_parser("set-delivery")
     p.add_argument("--task", required=True)
