@@ -53,7 +53,9 @@ an Agents SDK application, a custom supervisor, or a human-operated workflow.
 - `Improvement request`: observed pain through qualified skill adoption or reject
 - `Needs-user escalation`: explicit boundary that AI authority cannot cross
 
-AOI stores project configuration in tracked `aoi.toml`. Operational state lives
+AOI stores project configuration in `aoi.toml`. Downstream managed projects
+track their own `aoi.toml` in their repositories; this repository's root
+`aoi.toml` is a local dogfood config and is intentionally untracked. Operational state lives
 under the configured private state directory (default `.aoi/`) and is ignored by
 Git. Backups are deterministic, hash-verified snapshots of configuration and
 state, not substitutes for source control.

@@ -26,6 +26,11 @@ dependencies = []
 aoi = "aoi_orgware.cli:main"
 aoi-codex-hook = "aoi_orgware.codex_hook:main"
 
+[tool.pytest.ini_options]
+# Scope collection to the real suite; the pilot sample project under
+# src/aoi_orgware/resources/ ships an intentionally-failing test fixture.
+testpaths = ["tests"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/aoi_orgware"]
 

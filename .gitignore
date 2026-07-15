@@ -9,3 +9,7 @@ dist/
 .state.lock
 # Managed projects receive their configured AOI state entry during `aoi init`.
 /.aoi/
+# The repo's own dogfood config is local-only (removed from tracking in 8ea3080);
+# downstream managed projects track their own aoi.toml.
+/aoi.toml
+.ruff_cache/
