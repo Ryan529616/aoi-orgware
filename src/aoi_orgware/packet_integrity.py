@@ -456,8 +456,14 @@ def packet_evidence_self_reference_error(
     normalized (absolute/relative, host case) before comparison.
     """
 
+    def path_key(value: str) -> str:
+        # realpath collapses NTFS 8.3 short-name spellings (RUNNER~1) and
+        # symlinks for the existing prefix, so an alias spelling of the own
+        # result file cannot slip past the comparison.
+        return os.path.normcase(os.path.normpath(os.path.realpath(value)))
+
     result_path = task_dir_path / "results" / f"{packet_id}.md"
-    own_key = os.path.normcase(os.path.normpath(str(result_path)))
+    own_key = path_key(str(result_path))
     references = [str(item).strip() for item in evidence if str(item).strip()]
     if not references:
         return (
@@ -465,11 +471,9 @@ def packet_evidence_self_reference_error(
             "reference; result-as-own-evidence is unverifiable"
         )
     for reference in references:
-        keys = {os.path.normcase(os.path.normpath(reference))}
+        keys = {path_key(reference)}
         if not os.path.isabs(reference):
-            keys.add(
-                os.path.normcase(os.path.normpath(str(task_dir_path / reference)))
-            )
+            keys.add(path_key(str(task_dir_path / reference)))
         if own_key not in keys:
             return None
     return (

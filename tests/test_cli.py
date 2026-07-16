@@ -2515,6 +2515,14 @@ class LockTests(HarnessTestCase):
         # lock, and one such record previously aborted status/doctor entirely.
         self.init_task("legacy-colon")
         typo_lock = "repo:file:rtl/adfp/tests:test_dense_weight_cache.py"
+        # Use the task's own recorded worktree spelling: on CI runners the
+        # temp root has an NTFS 8.3 alias, and claim/task worktrees must
+        # match exactly.
+        task_state = json.loads(
+            (self.root / ".aoi" / "tasks" / "legacy-colon" / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
         claim = {
             "schema_version": 1,
             "legacy": False,
@@ -2530,7 +2538,7 @@ class LockTests(HarnessTestCase):
             "created_at": "2026-07-15T07:16:46+08:00",
             "updated_at": "2026-07-16T13:54:28+08:00",
             "expires_at": "2099-01-01T00:00:00+00:00",
-            "worktree": str(self.root),
+            "worktree": task_state["worktree"],
             "baselines": [{"lock": typo_lock, "exists": False, "sha256": None}],
         }
         archive = self.root / ".aoi" / "claims" / "archive"
