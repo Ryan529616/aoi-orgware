@@ -84,6 +84,7 @@ from ..harnesslib import (
     HarnessError,
     HarnessPaths,
     acquire_chief_authority,
+    admit_new_claim_locks,
     atomic_create_bytes,
     atomic_create_text,
     atomic_write_bytes,
@@ -888,6 +889,13 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths, *, services: T
             raise HarnessError(
                 "mini claim conflict(s):\n" + json.dumps(conflicts, indent=2, ensure_ascii=False)
             )
+        admit_new_claim_locks(
+            paths,
+            locks,
+            repo_root=mini_worktree,
+            allow_nonexistent=False,
+            mini=True,
+        )
         baselines = baselines_for_locks(paths, locks, repo_root=Path(metadata["worktree"]))
         state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
@@ -1185,6 +1193,16 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLi
             raise HarnessError(
                 "claim conflict(s):\n" + json.dumps(conflicts, indent=2, ensure_ascii=False)
             )
+        planned = admit_new_claim_locks(
+            paths,
+            locks,
+            repo_root=claim_worktree,
+            allow_nonexistent=args.allow_nonexistent,
+        )
+        baselines = baselines_for_locks(paths, locks, repo_root=claim_worktree)
+        for planned_lock in planned:
+            if planned_lock in baselines:
+                baselines[planned_lock]["planned"] = True
         timestamp = now_iso()
         claim = {
             "schema_version": SCHEMA_VERSION,
@@ -1202,9 +1220,7 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLi
             "updated_at": timestamp,
             "expires_at": args.expires_at,
             "worktree": state.get("worktree"),
-            "baselines": baselines_for_locks(
-                paths, locks, repo_root=claim_worktree
-            ),
+            "baselines": baselines,
         }
         atomic_write_json(active_path, claim)
         if token not in state["claims"]:
@@ -1708,6 +1724,7 @@ def register_task_lifecycle_commands(
     parser.add_argument("--adopt-legacy", action="store_true")
     parser.add_argument("--adoption-evidence")
     parser.add_argument("--ack-legacy-ambiguity", action="store_true")
+    parser.add_argument("--allow-nonexistent", action="store_true")
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["claim"])
 
