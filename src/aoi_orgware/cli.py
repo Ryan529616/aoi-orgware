@@ -184,6 +184,8 @@ from .commands.task_lifecycle import (
     cmd_pilot_summary,
     cmd_pilot_validate,
     cmd_release_claim,
+    cmd_retarget_task,
+    cmd_retire_risk,
     cmd_set_claim_status,
     cmd_set_phase,
     cmd_start_mini,
@@ -2690,6 +2692,13 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "artifact_refs": artifact_refs,
             "recorded_at": now_iso(),
         }
+        if getattr(args, "asserts_completion_boundary", False):
+            if args.status != "pass":
+                raise HarnessError(
+                    "--asserts-completion-boundary is valid only on a passing "
+                    "verification"
+                )
+            item["asserts_completion_boundary"] = True
         if review_packet is not None:
             item["review_packet_id"] = review_packet["packet_id"]
             item["review_result_sha256"] = review_packet["result_sha256"]
@@ -5091,7 +5100,12 @@ def cmd_set_delivery(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
-def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
+def close_gate(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    intended_outcome: str = "achieved",
+) -> list[str]:
     failures: list[str] = []
     if not state.get("completion_boundary"):
         failures.append("completion boundary is empty")
@@ -5221,17 +5235,35 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     worktree_errors, _ = worktree_integrity_errors(paths, state)
     failures.extend(worktree_errors)
     verification = state.get("verification", [])
-    if not verification:
-        failures.append("no verification/evidence record")
-    if verification and not any(
-        item.get("integrity_version") == 1
-        and item.get("status") == "pass"
-        and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
-        for item in verification
-    ):
-        failures.append(
-            "achieved outcome requires at least one passing, close-qualifying verification"
-        )
+    if intended_outcome == "achieved":
+        if not verification:
+            failures.append("no verification/evidence record")
+        if verification and not any(
+            item.get("integrity_version") == 1
+            and item.get("status") == "pass"
+            and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
+            for item in verification
+        ):
+            failures.append(
+                "achieved outcome requires at least one passing, close-qualifying verification"
+            )
+        if verification and not any(
+            item.get("integrity_version") == 1
+            and item.get("status") == "pass"
+            and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
+            and item.get("asserts_completion_boundary") is True
+            for item in verification
+        ):
+            # An achieved close must bind at least one passing verification to
+            # the registered completion boundary. Observed on ARISE: a task
+            # closed outcome=achieved while all 23 verification boundaries
+            # explicitly excluded the completion boundary's own claim, and the
+            # gate was satisfied by an unrelated bootstrap delivery_check.
+            failures.append(
+                "achieved outcome requires a passing, close-qualifying "
+                "verification recorded with --asserts-completion-boundary "
+                "covering the registered completion boundary"
+            )
     unaccounted = [
         str(item.get("category"))
         for item in verification
@@ -5244,15 +5276,34 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
 
 
 def cmd_close_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    outcome = args.outcome
+    if outcome != "achieved" and not (args.boundary_disposition or "").strip():
+        # A non-achieved close must say where the registered boundary went.
+        raise HarnessError(
+            f"closing with outcome {outcome!r} requires --boundary-disposition "
+            "stating why the registered completion boundary was not met and "
+            "where that scope now lives"
+        )
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "close")
-        failures = close_gate(paths, state)
+        if outcome == "achieved" and state.get("blockers"):
+            if not (args.blockers_disposition or "").strip():
+                raise HarnessError(
+                    "closing achieved with recorded blockers requires "
+                    "--blockers-disposition accounting for: "
+                    + "; ".join(str(item) for item in state.get("blockers", []))
+                )
+        failures = close_gate(paths, state, intended_outcome=outcome)
         if failures:
             raise HarnessError("close gate failed:\n- " + "\n- ".join(failures))
         state["status"] = "done"
         state["phase"] = "closing"
-        state["outcome"] = "achieved"
+        state["outcome"] = outcome
+        if (args.boundary_disposition or "").strip():
+            state["boundary_disposition"] = args.boundary_disposition.strip()
+        if (args.blockers_disposition or "").strip():
+            state["blockers_disposition"] = args.blockers_disposition.strip()
         state.setdefault("facts", []).append(require_text(args.summary, "summary"))
         state["next_action"] = args.next_action or "No further action; task closed."
         bump_task(state, checkpoint_required=False)
@@ -5369,8 +5420,21 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
         failures.extend(resource_envelope_integrity_errors(state))
         worktree_errors, _ = worktree_integrity_errors(paths, state)
         failures.extend(worktree_errors)
+        if state.get("changed_files") and not (
+            args.changed_files_disposition or ""
+        ).strip():
+            # Cancelling a task that recorded real mutations must account for
+            # them. Observed on ARISE: a cancelled task's delivery detail said
+            # "no mutation" while the same state carried three committed
+            # changed files in another repository.
+            failures.append(
+                "recorded changed files require --changed-files-disposition: "
+                + ", ".join(str(item) for item in state.get("changed_files", []))
+            )
         if failures:
             raise HarnessError("cancel gate failed:\n- " + "\n- ".join(failures))
+        if (args.changed_files_disposition or "").strip():
+            state["changed_files_disposition"] = args.changed_files_disposition.strip()
         _extend_unique(state, "blockers", [f"CANCELLED: {reason}"])
         state["status"] = "cancelled"
         state["phase"] = "closing"
@@ -6251,6 +6315,8 @@ def build_parser(
             "checkpoint": functools.partial(
                 cmd_checkpoint, services=task_lifecycle_services
             ),
+            "retarget_task": cmd_retarget_task,
+            "retire_risk": cmd_retire_risk,
         },
         add_json_argument=add_json_argument,
     )
@@ -6468,6 +6534,23 @@ def build_parser(
     p = sub.add_parser("close-task")
     p.add_argument("--task", required=True)
     p.add_argument("--summary", required=True)
+    p.add_argument(
+        "--outcome",
+        choices=("achieved", "scope_changed", "partial", "superseded"),
+        required=True,
+        help="honest close disposition against the registered completion boundary",
+    )
+    p.add_argument(
+        "--boundary-disposition",
+        help=(
+            "required for non-achieved outcomes: why the registered boundary "
+            "was not met and where that scope now lives"
+        ),
+    )
+    p.add_argument(
+        "--blockers-disposition",
+        help="required when closing achieved with recorded blockers",
+    )
     p.add_argument("--next-action")
     add_json_argument(p)
     p.set_defaults(handler=cmd_close_task)
@@ -6482,6 +6565,10 @@ def build_parser(
     p = sub.add_parser("cancel-task")
     p.add_argument("--task", required=True)
     p.add_argument("--reason", required=True)
+    p.add_argument(
+        "--changed-files-disposition",
+        help="required when the task recorded changed files: what happens to them",
+    )
     p.add_argument("--next-action")
     add_json_argument(p)
     p.set_defaults(handler=cmd_cancel_task)

@@ -96,10 +96,14 @@ TASK_STRING_LIST_FIELDS = {
     "decisions",
     "facts",
     "rejected_paths",
-    "risks",
     "session_ids",
     "subagent_parent_session_ids",
 }
+# Fields that accept legacy plain-string entries alongside typed objects.
+# Legacy states keep loading byte-identical; new writers append typed entries.
+TASK_MIXED_LIST_FIELDS = {"risks"}
+RISK_STATUSES = {"open", "retired", "materialized"}
+RISK_ID_RE = re.compile(r"r[1-9][0-9]{0,5}")
 TASK_OBJECT_LIST_FIELDS = {
     "branch_adoptions",
     "capacity_reviews",
@@ -2591,12 +2595,32 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
         raise HarnessError(f"invalid checkpoint revision{where}")
     if checkpoint_revision > revision:
         raise HarnessError(f"checkpoint revision exceeds task revision{where}")
-    for field in sorted(TASK_STRING_LIST_FIELDS | TASK_OBJECT_LIST_FIELDS):
+    for field in sorted(
+        TASK_STRING_LIST_FIELDS | TASK_OBJECT_LIST_FIELDS | TASK_MIXED_LIST_FIELDS
+    ):
         if field not in state:
             continue
         value = state[field]
         if not isinstance(value, list):
             raise HarnessError(f"task field {field!r} must be a list{where}")
+        if field in TASK_MIXED_LIST_FIELDS:
+            for item in value:
+                if isinstance(item, str):
+                    continue
+                if not isinstance(item, dict):
+                    raise HarnessError(
+                        f"task field {field!r} entries must be strings or objects{where}"
+                    )
+                if (
+                    not RISK_ID_RE.fullmatch(str(item.get("id", "")))
+                    or not str(item.get("text", "")).strip()
+                    or item.get("status") not in RISK_STATUSES
+                ):
+                    raise HarnessError(
+                        f"task field {field!r} typed entry requires id, text, and "
+                        f"a status in {sorted(RISK_STATUSES)}{where}"
+                    )
+            continue
         expected_type = dict if field in TASK_OBJECT_LIST_FIELDS else str
         if any(not isinstance(item, expected_type) for item in value):
             kind = "objects" if expected_type is dict else "strings"
@@ -3999,9 +4023,29 @@ def render_checkpoint(
         "complete records are in state.json"
     ]
 
+    open_risk_lines: list[str] = []
+    retired_risks: list[str] = []
+    materialized_risks: list[str] = []
+    for item in state.get("risks", []):
+        if isinstance(item, str):
+            open_risk_lines.append(f"RISK: {item}")
+        elif item.get("status") == "retired":
+            retired_risks.append(str(item.get("id", "")))
+        elif item.get("status") == "materialized":
+            materialized_risks.append(str(item.get("id", "")))
+        else:
+            open_risk_lines.append(f"RISK[{item.get('id', '')}]: {item.get('text', '')}")
+    if retired_risks or materialized_risks:
+        open_risk_lines.append(
+            "RISKS ACCOUNTED: "
+            f"retired={len(retired_risks)} ({', '.join(retired_risks) or 'none'}), "
+            f"materialized={len(materialized_risks)} "
+            f"({', '.join(materialized_risks) or 'none'}); "
+            "full text in state.json"
+        )
     blockers_and_risks = [
         *(f"BLOCKER: {item}" for item in state.get("blockers", [])),
-        *(f"RISK: {item}" for item in state.get("risks", [])),
+        *open_risk_lines,
     ]
     facts = list(state.get("facts", []))
     compact_fact_history = (

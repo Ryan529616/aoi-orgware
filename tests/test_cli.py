@@ -2430,6 +2430,8 @@ class LifecycleTests(HarnessTestCase):
         before_checkpoint = checkpoint_path.read_bytes()
         self.cli_in_process(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "rollback-task",
             "--summary",
@@ -3320,6 +3322,8 @@ class LifecycleTests(HarnessTestCase):
         )
         failed = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "close-task",
             "--summary",
@@ -3338,6 +3342,8 @@ class LifecycleTests(HarnessTestCase):
         )
         stale = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "close-task",
             "--summary",
@@ -3354,6 +3360,8 @@ class LifecycleTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "close-task",
             "--summary",
@@ -3392,6 +3400,8 @@ class LifecycleTests(HarnessTestCase):
         )
         empty = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "close-empty-verification",
             "--summary",
@@ -3438,6 +3448,8 @@ class LifecycleTests(HarnessTestCase):
         )
         pending = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "close-pending-verification",
             "--summary",
@@ -3617,6 +3629,8 @@ class LifecycleTests(HarnessTestCase):
         self.assertIn("active/archive orphan claim orphan-claim", scoped_doctor.stdout)
         failed = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "orphan-task",
             "--summary",
@@ -3677,6 +3691,8 @@ class LifecycleTests(HarnessTestCase):
         )
         unfinished = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "packet-task",
             "--summary",
@@ -3732,6 +3748,8 @@ class LifecycleTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "packet-task",
             "--summary",
@@ -3858,6 +3876,8 @@ class LifecycleTests(HarnessTestCase):
         )
         unresolved = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "eda-task",
             "--summary",
@@ -3903,6 +3923,8 @@ class LifecycleTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "eda-task",
             "--summary",
@@ -4506,6 +4528,8 @@ class HardeningTests(HarnessTestCase):
         result_path.write_text("tampered\n", encoding="utf-8")
         close = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "packet-tamper",
             "--summary",
@@ -4579,6 +4603,8 @@ class HardeningTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "post-close-tamper",
             "--summary",
@@ -4781,6 +4807,8 @@ class HardeningTests(HarnessTestCase):
         )
         active_drift = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             task_id,
             "--summary",
@@ -4813,6 +4841,8 @@ class HardeningTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             task_id,
             "--summary",
@@ -5003,6 +5033,8 @@ class HardeningTests(HarnessTestCase):
         )
         inference_only = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "verification-task",
             "--summary",
@@ -5020,6 +5052,8 @@ class HardeningTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "verification-task",
             "--summary",
@@ -6264,6 +6298,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             task_id,
             "--summary",
@@ -8458,6 +8494,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             task_id,
             "--summary",
@@ -8943,6 +8981,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         premature_close = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             "steward-control-plane",
             "--summary",
@@ -12036,6 +12076,8 @@ class V5FeatureTests(HarnessTestCase):
         )
         self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             task_id,
             "--summary",
@@ -12936,6 +12978,8 @@ class HookTests(HarnessTestCase):
         )
         rejected_close = self.cli(
             "close-task",
+            "--outcome",
+            "achieved",
             "--task",
             task_id,
             "--summary",

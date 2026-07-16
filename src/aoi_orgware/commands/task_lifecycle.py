@@ -171,6 +171,8 @@ _HANDLER_NAMES = frozenset(
         "set_phase",
         "adopt_current_branch",
         "checkpoint",
+        "retarget_task",
+        "retire_risk",
     }
 )
 
@@ -798,6 +800,8 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
             "delivery": {"mode": "pending", "detail": "", "commit": ""},
             "plan_ready": False,
             "plan_sha256": "",
+            "plan_approvals": [],
+            "scope_revisions": [],
             **metadata,
         }
         directory = task_dir(paths, task_id)
@@ -936,6 +940,15 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths, *, services: T
             "plan_sha256": hashlib.sha256(plan.encode("utf-8")).hexdigest(),
             "plan_approved_at": timestamp,
             "plan_approval_note": "Atomic constrained mini lifecycle",
+            "plan_approvals": [
+                {
+                    "plan_sha256": hashlib.sha256(plan.encode("utf-8")).hexdigest(),
+                    "approved_at": timestamp,
+                    "note": "Atomic constrained mini lifecycle",
+                    "revision": 1,
+                }
+            ],
+            "scope_revisions": [],
             **metadata,
         }
         claim = {
@@ -1032,10 +1045,33 @@ def cmd_approve_plan(args: argparse.Namespace, paths: HarnessPaths, *, services:
         if not state.get("worktree"):
             state.update(git_metadata(paths.root))
         digest = sha256_file(source)
+        previous_digest = str(state.get("plan_sha256", ""))
+        has_dispatched_work = bool(state.get("packets") or state.get("jobs"))
+        coverage_note = ""
+        if previous_digest and previous_digest != digest and has_dispatched_work:
+            # Packets/jobs already ran under the earlier approved plan. Without a
+            # coverage note the close gate would validate against a plan that
+            # never governed that work (observed on ARISE: 39 packets and 40
+            # jobs closed against a later audit plan that replaced the original).
+            coverage_note = require_text(
+                args.coverage_note or "",
+                "plan re-approval coverage note (--coverage-note): state which "
+                "packets/jobs the superseded plan governed",
+            )
+        approved_at = now_iso()
         state["plan_ready"] = True
         state["plan_sha256"] = digest
-        state["plan_approved_at"] = now_iso()
+        state["plan_approved_at"] = approved_at
         state["plan_approval_note"] = require_text(args.note, "approval note")
+        approval = {
+            "plan_sha256": digest,
+            "approved_at": approved_at,
+            "note": state["plan_approval_note"],
+            "revision": int(state.get("revision", 0)) + 1,
+        }
+        if coverage_note:
+            approval["coverage_note"] = coverage_note
+        state.setdefault("plan_approvals", []).append(approval)
         bump_task(state)
         write_task(paths, state)
         write_index(paths)
@@ -1431,16 +1467,84 @@ def cmd_adopt_current_branch(args: argparse.Namespace, paths: HarnessPaths, *, s
     return 0
 
 
+def _next_risk_id(state: dict[str, Any]) -> str:
+    highest = 0
+    for item in state.get("risks", []):
+        if isinstance(item, dict):
+            match = re.fullmatch(r"r([1-9][0-9]{0,5})", str(item.get("id", "")))
+            if match:
+                highest = max(highest, int(match.group(1)))
+    return f"r{highest + 1}"
+
+
+def _append_risks(state: dict[str, Any], values: Iterable[str]) -> None:
+    """Append typed open risks, skipping texts already present in any shape."""
+
+    existing = {
+        item if isinstance(item, str) else str(item.get("text", ""))
+        for item in state.get("risks", [])
+    }
+    for value in values:
+        if value in existing:
+            continue
+        existing.add(value)
+        state.setdefault("risks", []).append(
+            {
+                "id": _next_risk_id(state),
+                "text": value,
+                "status": "open",
+                "recorded_at": now_iso(),
+            }
+        )
+
+
+def _require_changed_files_in_worktree(
+    state: dict[str, Any], values: Iterable[str], *, allow_outside: bool
+) -> None:
+    """Reject absolute changed-file records outside the bound worktree.
+
+    Observed on ARISE (fec-worth-hunt): a task bound to one repository recorded
+    committed mutations in a different repository, leaving them unclaimed and
+    unverified. Relative paths are implicitly worktree-scoped and stay allowed.
+    """
+
+    worktree = str(state.get("worktree", "") or "")
+    for value in values:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            continue
+        if allow_outside:
+            continue
+        if not worktree:
+            raise HarnessError(
+                f"changed file {value!r} is absolute but the task has no bound "
+                "worktree; use a repo-relative path or --allow-outside-worktree"
+            )
+        try:
+            candidate.resolve().relative_to(Path(worktree).resolve())
+        except (ValueError, OSError) as exc:
+            raise HarnessError(
+                f"changed file {value!r} is outside the task worktree "
+                f"{worktree!r}; acknowledge cross-repository mutation with "
+                "--allow-outside-worktree"
+            ) from exc
+
+
 def cmd_checkpoint(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices) -> int:
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "checkpoint")
+        _require_changed_files_in_worktree(
+            state,
+            args.changed_file,
+            allow_outside=bool(getattr(args, "allow_outside_worktree", False)),
+        )
         _extend_unique(state, "facts", args.fact)
         _extend_unique(state, "decisions", args.decision)
         _extend_unique(state, "rejected_paths", args.rejected)
         _extend_unique(state, "changed_files", args.changed_file)
         _extend_unique(state, "blockers", args.blocker)
-        _extend_unique(state, "risks", args.risk)
+        _append_risks(state, args.risk)
         if args.next_action:
             state["next_action"] = args.next_action
         if state["status"] in {"active", "blocked"} and not state.get("next_action"):
@@ -1455,6 +1559,138 @@ def cmd_checkpoint(args: argparse.Namespace, paths: HarnessPaths, *, services: T
             "task_id": state["task_id"],
             "revision": state["revision"],
             "checkpoint": str(checkpoint),
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_retarget_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """Re-anchor an open task's registered scope with a durable revision trail.
+
+    Observed on ARISE: title/objective/completion_boundary are written only at
+    task creation, so a legitimately re-scoped task could only close against
+    its stale registered scope (outcome said "achieved" beside an unmet
+    boundary). Retargeting records old/new/reason and forces plan re-approval.
+    """
+
+    changes = {
+        "title": args.title,
+        "objective": args.objective,
+        "completion_boundary": args.completion_boundary,
+    }
+    changes = {key: value for key, value in changes.items() if value is not None}
+    if not changes:
+        raise HarnessError(
+            "retarget requires at least one of --title, --objective, "
+            "--completion-boundary"
+        )
+    for key, value in changes.items():
+        changes[key] = require_text(value, key.replace("_", " "))
+    reason = require_text(args.reason, "retarget reason")
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "retarget")
+        old = {key: str(state.get(key, "")) for key in changes}
+        if all(old[key] == value for key, value in changes.items()):
+            raise HarnessError("retarget changes nothing; scope is already exact")
+        revision_entry = {
+            "at": now_iso(),
+            "reason": reason,
+            "old": old,
+            "new": dict(changes),
+            "plan_sha256_at_retarget": str(state.get("plan_sha256", "")),
+        }
+        for key, value in changes.items():
+            state[key] = value
+        # The approved plan described the old scope; force explicit re-approval.
+        state["plan_ready"] = False
+        state.setdefault("scope_revisions", []).append(revision_entry)
+        state.setdefault("facts", []).append(
+            "Task scope retargeted (" + ", ".join(sorted(changes)) + f"): {reason}"
+        )
+        bump_task(state)
+        revision_entry["revision"] = state["revision"]
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "retargeted": sorted(changes),
+            "revision": revision_entry["revision"],
+            "plan_ready": False,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_retire_risk(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """Retire or mark-materialized one recorded risk with a reason.
+
+    Observed on ARISE: risks[] was append-only prose with no removal path, so
+    a closed task's checkpoint still carried 39 risks including seven
+    already-superseded restatements the same state's facts had resolved.
+    """
+
+    if bool(args.id) == bool(args.text_exact):
+        raise HarnessError("provide exactly one of --id or --text-exact")
+    reason = require_text(args.reason, "retire reason")
+    status = "materialized" if args.materialized else "retired"
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "retire risk for")
+        risks = state.setdefault("risks", [])
+        target: dict[str, Any] | None = None
+        if args.id:
+            for item in risks:
+                if isinstance(item, dict) and item.get("id") == args.id:
+                    target = item
+                    break
+            if target is None:
+                raise HarnessError(f"no typed risk with id {args.id!r}")
+        else:
+            matches = [
+                (index, item)
+                for index, item in enumerate(risks)
+                if (item if isinstance(item, str) else str(item.get("text", "")))
+                == args.text_exact
+            ]
+            if len(matches) != 1:
+                raise HarnessError(
+                    f"--text-exact must match exactly one risk; found {len(matches)}"
+                )
+            index, item = matches[0]
+            if isinstance(item, str):
+                # Upgrade the legacy string in place so the retirement is typed.
+                target = {
+                    "id": _next_risk_id(state),
+                    "text": item,
+                    "status": "open",
+                    "recorded_at": "",
+                }
+                risks[index] = target
+            else:
+                target = item
+        if target.get("status") != "open":
+            raise HarnessError(
+                f"risk {target.get('id')!r} is already {target.get('status')}"
+            )
+        target["status"] = status
+        target["retired_at"] = now_iso()
+        target["retire_reason"] = reason
+        if args.superseded_by:
+            target["superseded_by"] = require_text(
+                args.superseded_by, "superseded-by reference"
+            )
+        bump_task(state)
+        write_task(paths, state)
+        write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "risk_id": target["id"],
+            "status": status,
         },
         args.json,
     )
@@ -1664,8 +1900,40 @@ def register_task_lifecycle_commands(
     parser = subparsers.add_parser("approve-plan")
     parser.add_argument("--task", required=True)
     parser.add_argument("--note", required=True)
+    parser.add_argument(
+        "--coverage-note",
+        help=(
+            "required when re-approving a changed plan after packets/jobs "
+            "already ran: state which work the superseded plan governed"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["approve_plan"])
+
+    parser = subparsers.add_parser(
+        "retarget-task",
+        help="re-anchor an open task's title/objective/completion boundary",
+    )
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--title")
+    parser.add_argument("--objective")
+    parser.add_argument("--completion-boundary")
+    parser.add_argument("--reason", required=True)
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["retarget_task"])
+
+    parser = subparsers.add_parser(
+        "retire-risk",
+        help="retire or mark-materialized one recorded task risk",
+    )
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--id")
+    parser.add_argument("--text-exact")
+    parser.add_argument("--reason", required=True)
+    parser.add_argument("--materialized", action="store_true")
+    parser.add_argument("--superseded-by")
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["retire_risk"])
 
     parser = subparsers.add_parser("bind-session")
     parser.add_argument("--task", required=True)
@@ -1762,6 +2030,11 @@ def register_task_lifecycle_commands(
     parser.add_argument("--changed-file", action="append", default=[])
     parser.add_argument("--blocker", action="append", default=[])
     parser.add_argument("--risk", action="append", default=[])
+    parser.add_argument(
+        "--allow-outside-worktree",
+        action="store_true",
+        help="acknowledge recording a changed file outside the bound worktree",
+    )
     parser.add_argument("--next-action")
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["checkpoint"])
@@ -1801,6 +2074,8 @@ __all__ = [
     "cmd_set_phase",
     "cmd_adopt_current_branch",
     "cmd_checkpoint",
+    "cmd_retarget_task",
+    "cmd_retire_risk",
     "register_bootstrap_commands",
     "register_chief_commands",
     "register_pilot_commands",

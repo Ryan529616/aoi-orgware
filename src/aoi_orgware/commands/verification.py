@@ -71,6 +71,15 @@ def register_verification_commands(
     parser.add_argument("--lane-id")
     parser.add_argument("--artifact-ref", action="append", default=[])
     parser.add_argument("--review-packet-id")
+    parser.add_argument(
+        "--asserts-completion-boundary",
+        action="store_true",
+        help=(
+            "declare that this passing verification covers the task's "
+            "registered completion boundary itself (required once for an "
+            "achieved close)"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["add_verification"])
 

@@ -250,6 +250,7 @@ class HarnessTestCase(unittest.TestCase):
         boundary: str = "Only the named isolated harness behavior",
         artifact_refs: tuple[str, ...] = (),
         review_packet_id: str | None = None,
+        asserts_completion_boundary: bool = True,
     ) -> None:
         args = [
             "add-verification",
@@ -266,6 +267,8 @@ class HarnessTestCase(unittest.TestCase):
             "--boundary",
             boundary,
         ]
+        if asserts_completion_boundary:
+            args.append("--asserts-completion-boundary")
         for artifact_ref in artifact_refs:
             args.extend(["--artifact-ref", artifact_ref])
         if review_packet_id:
