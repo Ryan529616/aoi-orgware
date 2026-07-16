@@ -77,9 +77,29 @@ Task status (`active`, `blocked`, `done`, `cancelled`) is separate from phase
 (`planning`, `gathering`, `diagnosing`, `implementing`, `waiting_external`,
 `verifying`, `reviewing`, `closing`).
 
+Closing is an honesty boundary, not a formality. Every close declares an
+explicit outcome: `achieved`, `scope_changed`, `partial`, or `superseded`.
+An `achieved` close requires at least one passing, close-qualifying
+verification that explicitly asserts coverage of the registered completion
+boundary; a non-achieved close records a boundary disposition stating why the
+registered boundary was not met and where that scope now lives. Closing
+`achieved` over recorded blockers requires an explicit blockers disposition.
+
+The registered scope (title, objective, completion boundary) is mutable only
+through an explicit retarget, which appends an immutable `scope_revisions`
+entry (old, new, reason) and invalidates plan approval until the plan is
+re-approved against the new scope. Plan approvals accumulate as history;
+replacing an approved plan after packets or jobs already ran requires a
+coverage note stating which work the superseded plan governed.
+
+Risks are typed records (`open`, `retired`, `materialized`), never
+append-only prose: a risk leaves the active picture only through an explicit
+retirement with a reason, and checkpoints render open risks only.
+
 Cancellation is not an escape hatch from user authority. A task with an open
 `needs_user` escalation cannot be cancelled until the bound user disposition is
-recorded.
+recorded. Cancelling a task that recorded changed files requires an explicit
+disposition for those mutations.
 
 ## Checkpoint bounds
 

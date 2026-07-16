@@ -8485,6 +8485,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--detail",
             "Synthetic supersession migration has no tracked delivery",
         )
+        self.add_passing_verification(task_id)
         self.cli(
             "checkpoint",
             "--task",
