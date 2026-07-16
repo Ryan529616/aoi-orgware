@@ -212,6 +212,76 @@ class RetargetTests(HarnessTestCase):
         )
         self.assertTrue(self._state("retarget-a")["plan_ready"])
 
+    def test_retarget_invalidates_stale_boundary_assertions(self) -> None:
+        # Review finding: an assertion recorded against boundary B1 must not
+        # satisfy an achieved close after the task retargets to boundary B2.
+        self.init_task("retarget-d")
+        self.add_passing_verification("retarget-d")
+        self.cli(
+            "set-delivery",
+            "--task",
+            "retarget-d",
+            "--mode",
+            "none",
+            "--detail",
+            "test task has no tracked delivery",
+        )
+        self.cli(
+            "retarget-task",
+            "--task",
+            "retarget-d",
+            "--completion-boundary",
+            "A structurally different boundary the old assertion never covered",
+            "--reason",
+            "boundary re-anchored after measurement",
+        )
+        self.cli(
+            "approve-plan",
+            "--task",
+            "retarget-d",
+            "--note",
+            "Plan re-approved against the retargeted completion boundary",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            "retarget-d",
+            "--next-action",
+            "Close the task",
+        )
+        failed = self.cli(
+            "close-task",
+            "--task",
+            "retarget-d",
+            "--outcome",
+            "achieved",
+            "--summary",
+            "done",
+            ok=False,
+        )
+        self.assertIn("CURRENT registered completion boundary", failed.stderr)
+        self.add_passing_verification(
+            "retarget-d",
+            evidence="fresh run covering the retargeted boundary",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            "retarget-d",
+            "--next-action",
+            "Close the task",
+        )
+        self.cli(
+            "close-task",
+            "--task",
+            "retarget-d",
+            "--outcome",
+            "achieved",
+            "--summary",
+            "done",
+        )
+        self.assertEqual(self._state("retarget-d")["outcome"], "achieved")
+
     def test_retarget_rejects_noop(self) -> None:
         self.init_task("retarget-b")
         self.cli(
@@ -449,6 +519,41 @@ class TypedRiskTests(HarnessTestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["risks"][0]["status"], "retired")
         self.assertEqual(state["risks"][0]["text"], "legacy prose risk from 0.2.1")
+
+    def test_retired_risk_text_can_be_reraised(self) -> None:
+        self.init_task("risks-e")
+        self.cli(
+            "checkpoint",
+            "--task",
+            "risks-e",
+            "--risk",
+            "loader starves under back-pressure",
+            "--next-action",
+            "Investigate",
+        )
+        self.cli(
+            "retire-risk",
+            "--task",
+            "risks-e",
+            "--id",
+            "r1",
+            "--reason",
+            "fixed by refill rework",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            "risks-e",
+            "--risk",
+            "loader starves under back-pressure",
+            "--next-action",
+            "It came back",
+        )
+        state = self._state("risks-e")
+        self.assertEqual(len(state["risks"]), 2)
+        self.assertEqual(state["risks"][0]["status"], "retired")
+        self.assertEqual(state["risks"][1]["status"], "open")
+        self.assertEqual(state["risks"][1]["id"], "r2")
 
     def test_retire_materialized(self) -> None:
         self.init_task("risks-d")

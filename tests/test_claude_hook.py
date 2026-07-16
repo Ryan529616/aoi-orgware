@@ -672,6 +672,20 @@ class ClaudeHookTestCase(HarnessTestCase):
             ok=False,
         )
         self.assertNotIn("Traceback", neither.stderr)
+        # The CLI rejections above are argparse's mutually-exclusive group.
+        # The in-handler guard exists for programmatic callers that bypass
+        # argparse entirely; exercise it directly so it is not dead code.
+        with self.assertRaisesRegex(
+            cli_impl.HarnessError,
+            "exactly one of --expected-agent-type or --any-agent-type",
+        ):
+            cli_impl.cmd_packet_arm(
+                cli_impl.argparse.Namespace(
+                    any_agent_type=True,
+                    expected_agent_type="general-purpose",
+                ),
+                h.get_paths(self.root),
+            )
 
     # ------------------------------------------------------------------
     # B2 resume is not a spawn

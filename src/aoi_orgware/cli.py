@@ -2496,6 +2496,11 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     "verification"
                 )
             item["asserts_completion_boundary"] = True
+            # Bind the assertion to the exact boundary text it covered so a
+            # later retarget cannot be closed against a stale assertion.
+            item["completion_boundary_sha256"] = hashlib.sha256(
+                str(state.get("completion_boundary", "")).encode("utf-8")
+            ).hexdigest()
         if review_packet is not None:
             item["review_packet_id"] = review_packet["packet_id"]
             item["review_result_sha256"] = review_packet["result_sha256"]
@@ -5161,22 +5166,28 @@ def close_gate(
             failures.append(
                 "achieved outcome requires at least one passing, close-qualifying verification"
             )
+        current_boundary_sha256 = hashlib.sha256(
+            str(state.get("completion_boundary", "")).encode("utf-8")
+        ).hexdigest()
         if verification and not any(
             item.get("integrity_version") == 1
             and item.get("status") == "pass"
             and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
             and item.get("asserts_completion_boundary") is True
+            and item.get("completion_boundary_sha256") == current_boundary_sha256
             for item in verification
         ):
             # An achieved close must bind at least one passing verification to
-            # the registered completion boundary. Observed on ARISE: a task
-            # closed outcome=achieved while all 23 verification boundaries
+            # the exact registered completion boundary. Observed on ARISE: a
+            # task closed outcome=achieved while all 23 verification boundaries
             # explicitly excluded the completion boundary's own claim, and the
-            # gate was satisfied by an unrelated bootstrap delivery_check.
+            # gate was satisfied by an unrelated bootstrap delivery_check. The
+            # SHA binding additionally prevents an assertion recorded against a
+            # superseded boundary from surviving a retarget.
             failures.append(
                 "achieved outcome requires a passing, close-qualifying "
                 "verification recorded with --asserts-completion-boundary "
-                "covering the registered completion boundary"
+                "against the CURRENT registered completion boundary"
             )
     unaccounted = [
         str(item.get("category"))

@@ -2587,6 +2587,29 @@ class LockTests(HarnessTestCase):
             ),
             doctor["errors"],
         )
+        # Review finding: the reserving claim's true pre-tightening scope is
+        # unknowable, so every NEW acquire fails closed until it is released.
+        blocked = self.cli(
+            "claim",
+            "--task",
+            "legacy-colon",
+            "--token",
+            "unrelated-new-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "DOC",
+            "--lock",
+            "repo:file:notes/unrelated.md",
+            "--intent",
+            "unrelated doc edit",
+            "--validation",
+            "content check",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("malformed lock of unknown scope", blocked.stderr)
 
     def test_host_lock_drive_colon_allowed_but_second_colon_rejected(self) -> None:
         self.assertEqual(

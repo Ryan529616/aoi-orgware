@@ -1502,11 +1502,16 @@ def _next_risk_id(state: dict[str, Any]) -> str:
 
 
 def _append_risks(state: dict[str, Any], values: Iterable[str]) -> None:
-    """Append typed open risks, skipping texts already present in any shape."""
+    """Append typed open risks, skipping texts that are already open.
+
+    Retired/materialized texts do not suppress a re-raise: a risk that came
+    back is a new open entry with a new id, not a silent no-op.
+    """
 
     existing = {
         item if isinstance(item, str) else str(item.get("text", ""))
         for item in state.get("risks", [])
+        if isinstance(item, str) or item.get("status") == "open"
     }
     for value in values:
         if value in existing:

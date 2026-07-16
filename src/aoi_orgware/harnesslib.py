@@ -3850,8 +3850,10 @@ def load_claim_file(path: Path) -> dict[str, Any]:
     # Lock admission rules may tighten between releases (e.g. the ':' typo
     # class). A persisted claim that predates a tightened rule must still
     # LOAD, or one malformed archive entry bricks status/doctor for the whole
-    # project. The malformed lock never matched any other lock (that is the
-    # defect), so it is excluded from overlap math and kept for audit.
+    # project. The malformed lock is removed from overlap math and kept for
+    # audit; find_conflicts fails closed on any RESERVING claim that carries
+    # one (its true pre-tightening scope is unknowable), and doctor reports
+    # every occurrence.
     normalized: list[str] = []
     malformed: list[dict[str, str]] = []
     for item in locks:
@@ -3940,6 +3942,25 @@ def find_conflicts(
     for existing in reserving_claims(paths):
         if ignore_token and existing.get("token") == ignore_token:
             continue
+        for malformed in existing.get("malformed_locks", []):
+            # A reserving claim with an uncanonicalizable lock has an unknown
+            # true scope (the pre-tightening spelling may have overlapped tree
+            # ancestors). Fail closed on every new acquire until the Chief
+            # releases the claim or re-acquires it with corrected locks.
+            for proposed in requested:
+                conflicts.append(
+                    {
+                        "requested": proposed,
+                        "held": str(malformed.get("lock", "")),
+                        "token": str(existing.get("token", "unknown")),
+                        "owner": str(existing.get("owner", "unknown")),
+                        "source": str(existing.get("source", "structured")),
+                        "status": str(existing.get("status", "unknown")),
+                        "expires_at": str(existing.get("expires_at", "")),
+                        "reason": "reserving claim carries a malformed lock of "
+                        "unknown scope; release or re-acquire it first",
+                    }
+                )
         held_locks = [str(item) for item in existing.get("locks", [])]
         for proposed in requested:
             for held in held_locks:
