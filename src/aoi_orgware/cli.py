@@ -85,7 +85,15 @@ from .commands.backup import (
     register_backup_commands,
     verify_backup,
 )
-from .commands.capacity import register_capacity_commands
+from .commands.capacity import (
+    CapacityCmdServices,
+    cmd_capacity_ack,
+    cmd_capacity_arbitrate,
+    cmd_capacity_distribute,
+    cmd_capacity_recommend,
+    cmd_capacity_snapshot,
+    register_capacity_commands,
+)
 from .commands.context_memory import (
     ContextMemoryCmdServices,
     cmd_codebase_memory_benchmark_record,
@@ -2725,258 +2733,6 @@ def _records_fingerprint(records: list[dict[str, Any]]) -> str:
     ).hexdigest()
 
 
-def cmd_capacity_snapshot(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    review_id = validate_id(args.review_id, "capacity review id")
-    task_type = validate_id(args.task_type, "capacity task type")
-    if args.leaf_role not in DEPTH_TWO_ROLES:
-        raise HarnessError("capacity review leaf role must be batch, explorer, or worker")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "snapshot capacity data for")
-        require_plan_ready(paths, state, "snapshot capacity data")
-        if any(review.get("review_id") == review_id for review in state.get("capacity_reviews", [])):
-            raise HarnessError(f"capacity review already exists: {review_id}")
-        capacity_lane = _engaged_capacity_lane(state, args.capacity_lane_id)
-        steward = _engaged_steward_lane(state)
-        target = lane_by_id(state, args.target_lane_id)
-        if target.get("revision") != args.expected_lane_revision:
-            raise HarnessError("capacity target lane revision CAS failed")
-        records = _capacity_records(state, target["lane_id"], task_type)
-        dataset_payload = {
-            "dataset_version": 1,
-            "task_id": state["task_id"],
-            "review_id": review_id,
-            "steward_lane_id": steward["lane_id"],
-            "steward_lane_revision": steward["revision"],
-            "capacity_lane_id": capacity_lane["lane_id"],
-            "capacity_lane_revision": capacity_lane["revision"],
-            "target_lane_id": target["lane_id"],
-            "target_lane_revision": target["revision"],
-            "task_type": task_type,
-            "leaf_role": args.leaf_role,
-            "records": records,
-            "token_usage": "unavailable",
-            "cost": "unavailable",
-        }
-        dataset_path = (
-            task_dir(paths, args.task) / "results" / f"capacity-dataset-{review_id}.json"
-        )
-        atomic_write_json(dataset_path, dataset_payload)
-        dataset_sha = sha256_file(dataset_path)
-        recorded = now_iso()
-        review = {
-            "integrity_version": 1,
-            "review_id": review_id,
-            "version": 1,
-            "status": "data_ready",
-            "scope": {
-                "target_lane_id": target["lane_id"],
-                "target_lane_revision": target["revision"],
-                "authority_commit": target["authority_commit"],
-                "contract_version": target["contract_version"],
-                "task_type": task_type,
-                "leaf_role": args.leaf_role,
-                "target_depth": 2,
-            },
-            "capacity_lane_id": capacity_lane["lane_id"],
-            "capacity_lane_revision": capacity_lane["revision"],
-            "steward_lane_id": steward["lane_id"],
-            "steward_lane_revision": steward["revision"],
-            "catalog_version": CAPABILITY_CATALOG_VERSION,
-            "plan_sha256": state.get("plan_sha256"),
-            "dataset": {
-                "path": str(dataset_path),
-                "sha256": dataset_sha,
-                "record_count": len(records),
-                "fingerprint": _records_fingerprint(records),
-                "cutoff_at": recorded,
-            },
-            "recommendation": None,
-            "chief_decision": None,
-            "distribution": None,
-            "acknowledgement": None,
-            "consumption": None,
-            "created_at": recorded,
-            "updated_at": recorded,
-        }
-        state["capacity_planning_version"] = 1
-        state.setdefault("capacity_reviews", []).append(review)
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(review, args.json)
-    return 0
-
-
-def cmd_capacity_recommend(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    if args.capability_tier not in CAPABILITY_TIER_MAP:
-        raise HarnessError("unknown capability tier")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "record capacity recommendation for")
-        review = capacity_review_by_id(state, args.review_id)
-        if review.get("version") != args.expected_version or review.get("status") != "data_ready":
-            raise HarnessError("capacity recommendation CAS/status gate failed")
-        dataset = review.get("dataset", {})
-        dataset_path = Path(str(dataset.get("path", "")))
-        if not dataset_path.is_file() or sha256_file(dataset_path) != dataset.get("sha256"):
-            raise HarnessError("capacity dataset is missing or tampered")
-        if int(dataset.get("record_count", 0)) < 1:
-            raise HarnessError("capacity recommendation requires at least one verified task-type record")
-        matches = [
-            packet
-            for packet in state.get("packets", [])
-            if packet.get("packet_id") == args.source_packet_id
-        ]
-        if len(matches) != 1:
-            raise HarnessError("capacity source packet does not exist")
-        source_packet = matches[0]
-        if (
-            source_packet.get("status") != "done"
-            or source_packet.get("lane_id") != review.get("capacity_lane_id")
-            or not source_packet.get("result_sha256")
-            or source_packet.get("capacity_review_source_id") != review["review_id"]
-            or not any(
-                (ref.get("source_path") or ref.get("path")) == dataset.get("path")
-                and ref.get("sha256") == dataset.get("sha256")
-                for ref in source_packet.get("input_artifact_refs", [])
-            )
-        ):
-            raise HarnessError(
-                "capacity recommendation requires a done source packet bound to this review dataset"
-            )
-        authority_errors = packet_authority_integrity_errors(
-            paths, state, source_packet, require_origin=False
-        )
-        if authority_errors:
-            raise HarnessError(
-                "capacity recommendation source packet authority is missing or tampered: "
-                + "; ".join(authority_errors)
-            )
-        source_result = Path(str(source_packet.get("result_path", "")))
-        expected_source_result = (
-            task_dir(paths, args.task) / "results" / f"{source_packet['packet_id']}.md"
-        )
-        if (
-            source_result != expected_source_result
-            or not source_result.is_file()
-            or source_result.is_symlink()
-            or sha256_file(source_result) != source_packet.get("result_sha256")
-        ):
-            raise HarnessError("capacity recommendation source result is missing or tampered")
-        review["version"] = int(review["version"]) + 1
-        review["status"] = "awaiting_chief"
-        review["recommendation"] = {
-            "capability_tier": args.capability_tier,
-            "requested_model_tier": CAPABILITY_TIER_MAP[args.capability_tier],
-            "rationale": require_evidence_detail(args.rationale, "capacity rationale"),
-            "risk": require_evidence_detail(args.risk, "capacity risk"),
-            "confidence_boundary": require_evidence_detail(
-                args.confidence_boundary, "capacity confidence boundary"
-            ),
-            "source_packet_id": source_packet["packet_id"],
-            "source_result_sha256": source_packet["result_sha256"],
-        }
-        review["updated_at"] = now_iso()
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(review, args.json)
-    return 0
-
-
-def cmd_capacity_arbitrate(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "arbitrate capacity recommendation for")
-        if any(
-            item.get("status") == "needs_user"
-            for item in state.get("needs_user_escalations", [])
-        ):
-            raise HarnessError(
-                "unresolved needs-user escalation blocks capacity arbitration"
-            )
-        review = capacity_review_by_id(state, args.review_id)
-        if review.get("version") != args.expected_version or review.get("status") != "awaiting_chief":
-            raise HarnessError("capacity arbitration CAS/status gate failed")
-        session_id = require_root_session(paths, state, args.session_id)
-        recorded = now_iso()
-        decision_id = f"{review['review_id']}-chief-1"
-        review["version"] = int(review["version"]) + 1
-        review["status"] = "approved" if args.decision == "approved" else "rejected"
-        review["chief_decision"] = {
-            "decision_id": decision_id,
-            "decision": args.decision,
-            "rationale": require_evidence_detail(args.rationale, "capacity chief rationale"),
-            "root_owner": state.get("owner"),
-            "root_session_id": session_id,
-            "recorded_at": recorded,
-        }
-        review["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(review, args.json)
-    return 0
-
-
-def cmd_capacity_distribute(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "distribute capacity decision for")
-        review = capacity_review_by_id(state, args.review_id)
-        if review.get("version") != args.expected_version or review.get("status") != "approved":
-            raise HarnessError("capacity distribution CAS/status gate failed")
-        steward = _engaged_steward_lane(state)
-        if steward.get("lane_id") != args.steward_lane_id:
-            raise HarnessError("capacity decision must be distributed by the engaged steward")
-        review["version"] = int(review["version"]) + 1
-        review["status"] = "distributed"
-        review["distribution"] = {
-            "steward_lane_id": steward["lane_id"],
-            "decision_id": review["chief_decision"]["decision_id"],
-            "recorded_at": now_iso(),
-        }
-        review["updated_at"] = review["distribution"]["recorded_at"]
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(review, args.json)
-    return 0
-
-
-def cmd_capacity_ack(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "acknowledge capacity decision for")
-        review = capacity_review_by_id(state, args.review_id)
-        if review.get("version") != args.expected_version or review.get("status") != "distributed":
-            raise HarnessError("capacity acknowledgement CAS/status gate failed")
-        scope = review["scope"]
-        if args.actor_lane != scope["target_lane_id"]:
-            raise HarnessError("only the target department lane may acknowledge capacity")
-        target = lane_by_id(state, args.actor_lane)
-        if (
-            target.get("revision") != scope["target_lane_revision"]
-            or target.get("authority_commit") != scope["authority_commit"]
-            or target.get("contract_version") != scope["contract_version"]
-        ):
-            raise HarnessError("capacity recommendation is stale against target lane authority")
-        review["version"] = int(review["version"]) + 1
-        review["status"] = "acknowledged"
-        review["acknowledgement"] = {
-            "actor_lane": args.actor_lane,
-            "evidence": require_evidence_detail(args.evidence, "capacity acknowledgement"),
-            "recorded_at": now_iso(),
-        }
-        review["updated_at"] = review["acknowledgement"]["recorded_at"]
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(review, args.json)
-    return 0
-
-
 def cmd_improvement_create(args: argparse.Namespace, paths: HarnessPaths) -> int:
     request_id = validate_id(args.request_id, "improvement request id")
     task_type = validate_id(args.task_type, "improvement task type")
@@ -4484,6 +4240,19 @@ def _context_memory_cmd_services() -> ContextMemoryCmdServices:
     return ContextMemoryCmdServices(
         require_plan_ready=require_plan_ready,
         require_root_session=require_root_session,
+    )
+
+
+def _capacity_cmd_services() -> CapacityCmdServices:
+    return CapacityCmdServices(
+        require_plan_ready=require_plan_ready,
+        require_root_session=require_root_session,
+        packet_authority_integrity_errors=packet_authority_integrity_errors,
+        capacity_records=_capacity_records,
+        records_fingerprint=_records_fingerprint,
+        capability_catalog_version=CAPABILITY_CATALOG_VERSION,
+        capability_tier_map=CAPABILITY_TIER_MAP,
+        depth_two_roles=DEPTH_TWO_ROLES,
     )
 
 
@@ -9439,12 +9208,19 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    capacity_services = _capacity_cmd_services()
     register_capacity_commands(
         sub,
         handlers={
-            "capacity_snapshot": cmd_capacity_snapshot,
-            "capacity_recommend": cmd_capacity_recommend,
-            "capacity_arbitrate": cmd_capacity_arbitrate,
+            "capacity_snapshot": functools.partial(
+                cmd_capacity_snapshot, services=capacity_services
+            ),
+            "capacity_recommend": functools.partial(
+                cmd_capacity_recommend, services=capacity_services
+            ),
+            "capacity_arbitrate": functools.partial(
+                cmd_capacity_arbitrate, services=capacity_services
+            ),
             "capacity_distribute": cmd_capacity_distribute,
             "capacity_ack": cmd_capacity_ack,
         },
