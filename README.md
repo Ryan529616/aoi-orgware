@@ -221,8 +221,13 @@ four protocol-v6 lifecycle hooks into `.codex/hooks.json`, enables the stable
 Codex hook feature in `.codex/config.toml`, and installs the generic AOI skill
 once at user scope under `$HOME/.agents/skills/aoi/SKILL.md`. Existing Codex
 settings and unrelated hooks are preserved. Re-running the command is
-idempotent. Project-specific instructions belong in the repository's
-`AGENTS.md` or a genuinely project-specific repo skill.
+idempotent. All destinations are preflighted before initialization; each file
+is replaced atomically, unchanged files are not rewritten, and a later failure
+can be resumed without discarding completed destinations. If the first run has
+already published `aoi.toml`, acquire/export a Chief credential and then rerun
+the same command. Project-specific
+instructions belong in the repository's `AGENTS.md` or a genuinely
+project-specific repo skill.
 
 For an existing AOI project the command is Chief-fenced. Enabling the hook
 policy is refused while an active or blocked task still binds the prior
@@ -238,6 +243,10 @@ aoi codex-init \
   "wsl.exe -d Ubuntu --cd /path/to/project aoi-codex-hook --hook-version 6" \
   --user-skills-root /mnt/c/Users/<windows-user>/.agents/skills
 ```
+
+Only a direct `aoi-codex-hook --hook-version 6` executable (including an
+absolute path) or the structured `wsl[.exe]` form above is accepted. Shell
+commands that merely contain the entry-point name are not treated as AOI-owned.
 
 `--user-skills-root` names the user-scope skill directory on the Codex host;
 it never writes `.agents/skills/aoi` inside the project. A differing existing
@@ -263,6 +272,12 @@ runs in WSL for a Windows-hosted Claude installation, pass
 `--user-skills-root /mnt/c/Users/<windows-user>/.claude/skills`. A differing
 existing user skill requires its exact reviewed SHA-256 through
 `--replace-user-skill-sha256` before AOI will replace it.
+Claude settings and the skill destination are preflighted before AOI
+initialization; changed files are atomic and an interrupted later stage is
+resumed by rerunning the same `claude-init` command (after acquiring a Chief
+credential if that first run already initialized AOI). Its governed `PreToolUse`
+gate allows a live arm only after the full Chief, digest, topology, lane, and
+resource authority check succeeds.
 
 ## Minimal governed task
 

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import subprocess
@@ -10,12 +12,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from harness_case import HarnessTestCase  # noqa: E402
 from aoi_orgware import cli as cli_impl  # noqa: E402
+from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware.commands import claude_onboarding as co  # noqa: E402
 
 
@@ -58,6 +62,42 @@ class MergeSettingsTests(unittest.TestCase):
         self.assertTrue(co._entry_carries_aoi_hook(session_entries[1]))
         self.assertIn("SessionStart", added)
 
+    def test_merge_rejects_malformed_hooks_without_discarding_them(self) -> None:
+        with self.assertRaises(co.ClaudeOnboardingError):
+            co.merge_claude_hook_settings({"hooks": ["not-an-object"]})
+        with self.assertRaises(co.ClaudeOnboardingError):
+            co.merge_claude_hook_settings({"hooks": {"Stop": {"bad": True}}})
+        for malformed in (None, "not-an-array", {}, [None], [{"command": 7}]):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(co.ClaudeOnboardingError):
+                    co.merge_claude_hook_settings(
+                        {"hooks": {"Stop": [{"hooks": malformed}]}}
+                    )
+
+    def test_old_absolute_aoi_handler_is_upgraded_but_spoof_is_preserved(self) -> None:
+        old = '"C:\\AOI Tools\\aoi-claude-hook.exe" --hook-version 0'
+        spoof = "echo aoi-claude-hook --hook-version 1"
+        chained = "aoi-claude-hook --hook-version 0 && echo keep-me"
+        settings = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"command": spoof},
+                            {"command": chained},
+                            {"command": old},
+                        ]
+                    },
+                ]
+            }
+        }
+        merged, _ = co.merge_claude_hook_settings(settings)
+        stop = merged["hooks"]["Stop"]
+        self.assertEqual(
+            stop[0]["hooks"], [{"command": spoof}, {"command": chained}]
+        )
+        self.assertEqual(stop[1]["hooks"][0]["command"], co.HOOK_COMMAND)
+
 
 class InstallHelpersTests(unittest.TestCase):
     def test_install_hooks_round_trips_and_is_merge_safe(self) -> None:
@@ -87,6 +127,38 @@ class InstallHelpersTests(unittest.TestCase):
             with self.assertRaises(co.ClaudeOnboardingError):
                 co.install_claude_hooks(settings)
 
+    def test_install_hooks_is_atomic_and_skips_semantic_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            first = co.install_claude_hooks(settings)
+            self.assertTrue(first["changed"])
+            with mock.patch.object(co, "_atomic_write_text") as writer:
+                second = co.install_claude_hooks(settings)
+            writer.assert_not_called()
+            self.assertFalse(second["changed"])
+
+    def test_preflight_rejects_bad_shape_without_mutating_and_empty_env_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text('{"hooks": [], "keep": true}\n', encoding="utf-8")
+            before = settings.read_bytes()
+            with self.assertRaises(co.ClaudeOnboardingError):
+                co.preflight_claude_onboarding(settings)
+            self.assertEqual(settings.read_bytes(), before)
+
+            settings.write_text(
+                json.dumps(
+                    {
+                        "env": {co.GOVERNED_AGENT_TYPES_ENV: "explorer", "KEEP": "1"}
+                    }
+                ),
+                encoding="utf-8",
+            )
+            co.install_claude_hooks(settings, governed_agent_types="")
+            payload = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertNotIn(co.GOVERNED_AGENT_TYPES_ENV, payload["env"])
+            self.assertEqual(payload["env"]["KEEP"], "1")
+
     def test_install_skill_writes_named_user_skill_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             skills_root = Path(tmp) / ".claude" / "skills"
@@ -99,6 +171,7 @@ class InstallHelpersTests(unittest.TestCase):
             self.assertFalse(result["updated"])
             second = co.install_claude_user_skill(skills_root, "# skill body\n")
             self.assertFalse(second["changed"])
+            self.assertFalse(second["updated"])
 
     def test_user_skill_requires_digest_to_replace_different_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,6 +212,123 @@ class WiringTests(unittest.TestCase):
 
 
 class FreshClaudeInitCliTests(unittest.TestCase):
+    def test_post_init_failure_explains_and_completes_chief_fenced_resume(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            tempfile.TemporaryDirectory() as credential_home,
+        ):
+            root = Path(temporary)
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            skills_root = root / "user-skills"
+            args = argparse.Namespace(
+                project_name=None,
+                governed_agent_types=None,
+                user_skills_root=str(skills_root),
+                replace_user_skill_sha256=None,
+                json=True,
+            )
+            with (
+                mock.patch.object(
+                    co, "install_claude_user_skill", side_effect=OSError("disk fault")
+                ),
+                mock.patch.object(sys, "stdout", new=io.StringIO()),
+            ):
+                with self.assertRaisesRegex(h.HarnessError, "chief-acquire"):
+                    cli_impl.cmd_claude_init(args, h.get_paths(root))
+            self.assertTrue((root / "aoi.toml").is_file())
+
+            env = os.environ.copy()
+            for name in (
+                "AOI_ROOT",
+                "AOI_CHIEF_SESSION_ID",
+                "AOI_CHIEF_EPOCH",
+                "AOI_CHIEF_TOKEN",
+                "AOI_CHIEF_CREDENTIAL_FILE",
+            ):
+                env.pop(name, None)
+            env["PYTHONPATH"] = str(HERE.parent / "src")
+            env["AOI_CHIEF_CREDENTIAL_HOME"] = credential_home
+            acquired = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "aoi_orgware.cli",
+                    "chief-acquire",
+                    "--session-id",
+                    "claude-resume-chief",
+                    "--json",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            authority = json.loads(acquired.stdout)
+            env["AOI_CHIEF_SESSION_ID"] = "claude-resume-chief"
+            env["AOI_CHIEF_EPOCH"] = str(authority["authority"]["epoch"])
+            env["AOI_CHIEF_CREDENTIAL_FILE"] = authority["credential_file"]
+            resumed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "aoi_orgware.cli",
+                    "claude-init",
+                    "--user-skills-root",
+                    str(skills_root),
+                    "--json",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            self.assertTrue(json.loads(resumed.stdout)["resumable"])
+
+    def test_invalid_settings_fail_preflight_before_aoi_init(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            settings = root / ".claude" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            original = '{"hooks": ["invalid"]}\n'
+            settings.write_text(original, encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(HERE.parent / "src")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "aoi_orgware.cli",
+                    "claude-init",
+                    "--user-skills-root",
+                    str(root / "user-skills"),
+                    "--json",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse((root / "aoi.toml").exists())
+            self.assertEqual(settings.read_text(encoding="utf-8"), original)
+
     def test_fresh_repo_uses_user_skill_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -226,6 +416,29 @@ class ClaudeInitCliTests(HarnessTestCase):
         self.assertIn("Operating under AOI", skill_text)
         self.assertEqual(result["skill"]["scope"], "user")
         self.assertFalse((self.root / ".claude" / "skills" / "aoi").exists())
+
+    def test_partial_atomic_write_failure_is_reported_and_resumable(self) -> None:
+        args = argparse.Namespace(
+            project_name=None,
+            governed_agent_types=None,
+            user_skills_root=str(self.root / "user-skills"),
+            replace_user_skill_sha256=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(
+                co, "install_claude_user_skill", side_effect=OSError("disk fault")
+            ),
+            mock.patch.object(sys, "stdout", new=io.StringIO()),
+        ):
+            with self.assertRaisesRegex(h.HarnessError, "rerun the same command"):
+                cli_impl.cmd_claude_init(args, h.get_paths(self.root))
+        self.assertTrue((self.root / ".claude" / "settings.json").is_file())
+
+        resumed = json.loads(self.claude_init("--json").stdout)
+        self.assertTrue(resumed["resumable"])
+        self.assertEqual(resumed["hooks"]["events_added"], [])
+        self.assertTrue((self.root / "user-skills" / "aoi" / "SKILL.md").is_file())
 
 
 if __name__ == "__main__":

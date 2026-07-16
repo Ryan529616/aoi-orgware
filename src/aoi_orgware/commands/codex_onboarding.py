@@ -13,10 +13,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -84,31 +85,176 @@ def _aoi_hook_entry(
     return entry
 
 
-def _command_invokes_aoi(value: Any) -> bool:
+def _strip_wrapping_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _executable_names(value: str) -> set[str]:
+    return {
+        PurePosixPath(value).name.lower(),
+        PureWindowsPath(value).name.lower(),
+    }
+
+
+def _contains_shell_control(command: str) -> bool:
+    quote = ""
+    for character in command:
+        if character in {"'", '"'}:
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            continue
+        if character in "$`%!^":
+            return True
+        if not quote and character in "\r\n;&|<>()":
+            return True
+    return False
+
+
+def _wsl_hook_index(argv: list[str]) -> int | None:
+    """Return the hook argv index for a conservative documented WSL launcher."""
+
+    index = 1
+    options_with_value = {"-d", "--distribution", "-u", "--user", "--cd"}
+    options_with_equals = ("--distribution=", "--user=", "--cd=")
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--exec", "-e", "--"}:
+            index += 1
+            break
+        if token in options_with_value:
+            if index + 1 >= len(argv):
+                return None
+            value = argv[index + 1]
+            if not value or value.startswith("-"):
+                return None
+            index += 2
+            continue
+        if token.startswith(options_with_equals):
+            value = _strip_wrapping_quotes(token.split("=", 1)[1])
+            if not value or value.startswith("-"):
+                return None
+            index += 1
+            continue
+        break
+    return index if index < len(argv) else None
+
+
+def _direct_aoi_hook_argv(value: Any) -> list[str] | None:
+    """Parse a direct hook or the narrow ``wsl [--exec]`` process wrapper."""
+
     command = str(value or "").strip()
-    if not command:
+    if not command or _contains_shell_control(command):
+        return None
+    for posix in (False, True):
+        try:
+            raw = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        argv = [_strip_wrapping_quotes(item) for item in raw]
+        if not argv:
+            continue
+        names = _executable_names(argv[0])
+        if names & {HOOK_COMMAND_HEAD, f"{HOOK_COMMAND_HEAD}.exe"}:
+            return argv
+        if names & {"wsl", "wsl.exe"}:
+            hook_index = _wsl_hook_index(argv)
+            if hook_index is not None and _executable_names(argv[hook_index]) & {
+                HOOK_COMMAND_HEAD,
+                f"{HOOK_COMMAND_HEAD}.exe",
+            }:
+                return argv[hook_index:]
+    return None
+
+
+def is_aoi_codex_hook_command(value: Any, *, require_current: bool = True) -> bool:
+    """Recognize direct AOI-owned commands, optionally at any hook version."""
+
+    argv = _direct_aoi_hook_argv(value)
+    if argv is None:
         return False
-    return bool(
-        re.search(
-            rf"(?:^|[\\/\s\"']){re.escape(HOOK_COMMAND_HEAD)}"
-            r"(?:\.exe)?(?=$|[\s\"'])",
-            command,
-            flags=re.I,
-        )
+    versioned = (
+        len(argv) == 3
+        and argv[1] == "--hook-version"
+        and re.fullmatch(r"\d+", argv[2]) is not None
     )
+    if not versioned:
+        return False
+    if not require_current:
+        return True
+    return argv[2] == "6"
+
+
+def _command_invokes_aoi(value: Any) -> bool:
+    return is_aoi_codex_hook_command(value, require_current=False)
+
+
+def _validate_hook_command(value: str, label: str) -> str:
+    command = value.strip()
+    if not is_aoi_codex_hook_command(command):
+        raise CodexOnboardingError(
+            f"{label} must directly invoke aoi-codex-hook --hook-version 6 "
+            "(an absolute path or narrow 'wsl [--exec]' launcher is allowed)"
+        )
+    return command
+
+
+def _handler_is_aoi_owned(handler: Any) -> bool:
+    if not isinstance(handler, dict):
+        return False
+    commands = [
+        handler.get(key)
+        for key in ("command", "commandWindows")
+        if str(handler.get(key, "")).strip()
+    ]
+    ownership = [_command_invokes_aoi(command) for command in commands]
+    if any(ownership) and not all(ownership):
+        raise CodexOnboardingError(
+            "Codex hook handler mixes an AOI-owned command with a foreign "
+            "platform command; split or remove it before wiring AOI"
+        )
+    return bool(ownership) and all(ownership)
 
 
 def _entry_carries_aoi_hook(entry: Any) -> bool:
     if not isinstance(entry, dict):
         return False
-    for hook in entry.get("hooks", []):
-        if not isinstance(hook, dict):
-            continue
-        if _command_invokes_aoi(hook.get("command")) or _command_invokes_aoi(
-            hook.get("commandWindows")
+    handlers = entry.get("hooks", [])
+    if not isinstance(handlers, list):
+        return False
+    return any(_handler_is_aoi_owned(handler) for handler in handlers)
+
+
+def _validate_event_entries(event: str, entries: list[Any]) -> None:
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise CodexOnboardingError(
+                f".codex/hooks.json event {event!r} entry {index} "
+                "must be a JSON object"
+            )
+        handlers = entry.get("hooks")
+        if not isinstance(handlers, list):
+            raise CodexOnboardingError(
+                f".codex/hooks.json event {event!r} entry {index} "
+                "'hooks' must be a JSON array"
+            )
+        if not all(isinstance(handler, dict) for handler in handlers):
+            raise CodexOnboardingError(
+                f".codex/hooks.json event {event!r} entry {index} "
+                "hook handlers must be JSON objects"
+            )
+        if any(
+            key in handler and not isinstance(handler[key], str)
+            for handler in handlers
+            for key in ("command", "commandWindows")
         ):
-            return True
-    return False
+            raise CodexOnboardingError(
+                f".codex/hooks.json event {event!r} entry {index} "
+                "hook command values must be strings"
+            )
 
 
 def _merge_codex_hook_settings_detailed(
@@ -119,10 +265,10 @@ def _merge_codex_hook_settings_detailed(
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     """Return merged settings plus added and upgraded AOI event lists."""
 
-    command = command.strip()
-    command_windows = (command_windows or command).strip()
-    if not command or not command_windows:
-        raise CodexOnboardingError("Codex hook commands may not be empty")
+    command = _validate_hook_command(command, "Codex hook command")
+    command_windows = _validate_hook_command(
+        command_windows or command, "Codex Windows hook command"
+    )
     merged: dict[str, Any] = dict(settings)
     raw_hooks = merged.get("hooks")
     if raw_hooks is not None and not isinstance(raw_hooks, dict):
@@ -137,6 +283,7 @@ def _merge_codex_hook_settings_detailed(
                 f".codex/hooks.json event {event!r} must be a JSON array"
             )
         entries = list(existing) if isinstance(existing, list) else []
+        _validate_event_entries(event, entries)
         desired = _aoi_hook_entry(
             event,
             command=command,
@@ -163,13 +310,7 @@ def _merge_codex_hook_settings_detailed(
             unrelated = [
                 handler
                 for handler in handlers
-                if not (
-                    isinstance(handler, dict)
-                    and (
-                        _command_invokes_aoi(handler.get("command"))
-                        or _command_invokes_aoi(handler.get("commandWindows"))
-                    )
-                )
+                if not _handler_is_aoi_owned(handler)
             ]
             if unrelated:
                 retained_entry = dict(entry)
@@ -220,10 +361,12 @@ def install_codex_hooks(
     merged, added, updated = _merge_codex_hook_settings_detailed(
         payload, command=command, command_windows=command_windows
     )
-    _atomic_write_text(
-        hooks_path,
-        json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
-    )
+    changed = merged != payload or not hooks_path.exists()
+    if changed:
+        _atomic_write_text(
+            hooks_path,
+            json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+        )
     return {
         "hooks_path": str(hooks_path),
         "events_added": added,
@@ -236,6 +379,7 @@ def install_codex_hooks(
         "hook_command": command,
         "hook_command_windows": command_windows or command,
         "trust_required": True,
+        "changed": changed,
     }
 
 
@@ -485,7 +629,8 @@ def install_codex_user_skill(
     )
     if result["changed"]:
         _atomic_write_text(Path(result["skill_path"]), skill_text)
-    result["updated"] = result["existing_sha256"] is not None
+    result["updated"] = bool(result["changed"] and result["existing_sha256"] is not None)
+    result["created"] = bool(result["changed"] and result["existing_sha256"] is None)
     return result
 
 
@@ -511,7 +656,10 @@ def register_codex_onboarding_commands(
     )
     parser.add_argument(
         "--hook-command-windows",
-        help="optional Windows command override (for example a WSL launcher)",
+        help=(
+            "optional Windows AOI hook command override; direct absolute paths "
+            "and a narrow 'wsl [--exec] aoi-codex-hook ...' launcher are allowed"
+        ),
     )
     parser.add_argument(
         "--user-skills-root",
@@ -538,6 +686,7 @@ __all__ = [
     "install_codex_config",
     "install_codex_hooks",
     "install_codex_user_skill",
+    "is_aoi_codex_hook_command",
     "merge_codex_config_toml",
     "merge_codex_hook_settings",
     "preflight_codex_onboarding",

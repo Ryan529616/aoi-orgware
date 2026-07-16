@@ -27,6 +27,21 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 - Packaging metadata for a public release: `[project.urls]`, richer trove
   classifiers, and this changelog.
 
+### Changed
+- Claude's `PreToolUse` gate now validates the full live arm authority before
+  allowing a governed spawn: Chief epoch, plan and packet digests, execution
+  topology, lane snapshots, and resource authority must all still match.
+- Claude and Codex onboarding now preflight existing destinations, preserve
+  malformed/foreign settings by refusing unsafe rewrites, publish each changed
+  file atomically, skip semantic no-op writes, and are idempotently resumable
+  after a later destination fails.
+- Hook command ownership is conservative. AOI upgrades only a direct AOI-owned
+  entry point (plus the documented structured WSL launcher for Codex); embedded
+  strings, mixed-platform handlers, shell chains, and malformed inner hook
+  shapes are preserved or rejected without unsafe rewrites. A fresh partial
+  install that already initialized AOI now gives the exact Chief-acquire/rerun
+  recovery sequence.
+
 ### Notes
 - The hook adapter remains a cooperative, fail-open procedural guardrail, not a
   security sandbox. Workflow-orchestrated spawns bypass `PreToolUse`; the

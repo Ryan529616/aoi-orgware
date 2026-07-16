@@ -166,6 +166,85 @@ class ClaudeHookTestCase(HarnessTestCase):
         state = self.task_state(task_id)
         self.assertEqual(state["packets"][0]["status"], "armed")
 
+    def test_gate_denies_live_slots_with_stale_exact_authority(self) -> None:
+        task_id = "claude-gate-drift"
+        self.init_task(task_id, session_id="harness-test-chief")
+        cases = (
+            (
+                "chief",
+                lambda attempt: attempt.__setitem__(
+                    "chief_epoch", int(attempt["chief_epoch"]) + 1
+                ),
+                "authority",
+            ),
+            (
+                "plan",
+                lambda attempt: attempt.__setitem__("plan_sha256", "f" * 64),
+                "authority",
+            ),
+            (
+                "contract",
+                lambda attempt: attempt.__setitem__(
+                    "packet_contract_sha256", "e" * 64
+                ),
+                "authority",
+            ),
+            (
+                "topology",
+                lambda attempt: attempt.__setitem__(
+                    "lane_snapshot", {"lane_id": "forged"}
+                ),
+                "topology",
+            ),
+        )
+        for label, mutate, expected_reason in cases:
+            with self.subTest(label=label):
+                packet_id = f"claude-drift-{label}"
+                agent_type = f"governed-{label}"
+                self.create_hook_packet(task_id, packet_id)
+                self.arm(task_id, packet_id, agent_type=agent_type)
+                state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+                state = self.task_state(task_id)
+                pristine_state = copy.deepcopy(state)
+                before_revision = state["revision"]
+                packet = next(
+                    item for item in state["packets"] if item["packet_id"] == packet_id
+                )
+                attempt = packet["dispatch_attempts"][0]
+                mutate(attempt)
+                attempt["arm_authority_sha256"] = (
+                    cli_impl._dispatch_attempt_authority_sha256(attempt)
+                )
+                h.atomic_write_json(state_path, state)
+
+                decision = self.claude_hook(
+                    self.pretooluse_payload(subagent_type=agent_type),
+                    env_extra={"AOI_CLAUDE_GOVERNED_AGENT_TYPES": agent_type},
+                )
+                output = decision["hookSpecificOutput"]
+                self.assertEqual(output["permissionDecision"], "deny")
+                self.assertIn(
+                    expected_reason, output["permissionDecisionReason"].lower()
+                )
+                after = self.task_state(task_id)
+                self.assertEqual(after["revision"], before_revision)
+                after_packet = next(
+                    packet
+                    for packet in after["packets"]
+                    if packet["packet_id"] == packet_id
+                )
+                self.assertEqual(after_packet["status"], "armed")
+                h.atomic_write_json(state_path, pristine_state)
+                self.cli(
+                    "packet-disarm",
+                    "--task",
+                    task_id,
+                    "--packet-id",
+                    packet_id,
+                    "--reason",
+                    "test cleanup after read-only stale-arm gate",
+                )
+
     def test_gate_denies_expired_arm(self) -> None:
         task_id = "claude-gate-expired"
         packet_id = "claude-expired-packet"
@@ -211,6 +290,17 @@ class ClaudeHookTestCase(HarnessTestCase):
         output = decision["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("depth-two", output["permissionDecisionReason"])
+
+    def test_gate_allows_nested_governed_spawn_when_session_is_unbound(self) -> None:
+        decision = self.claude_hook(
+            self.pretooluse_payload(
+                session_id="never-bound-nested",
+                agent_id="ambient-parent-agent",
+            )
+        )
+        output = decision["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "allow")
+        self.assertIn("not bound", output["permissionDecisionReason"])
 
     def test_gate_announces_passthrough_and_stays_silent_for_other_tools(self) -> None:
         task_id = "claude-gate-passthrough"

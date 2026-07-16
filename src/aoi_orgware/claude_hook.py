@@ -141,9 +141,19 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
             "packet evidence.",
         )
         return
-    mapping_status, mapped = session_state(root, session_id)
-    if mapping_status == "unbound":
-        # Not an AOI-bound session: governance does not apply. Announce and allow.
+    # Import lazily so ordinary hook startup stays small.  This validator is
+    # read-only but checks the same Chief, plan/contract, topology, lane, and
+    # resource authority that SubagentStart checks before consuming the arm.
+    from .cli import validate_claude_pre_spawn_arm
+
+    outcome = validate_claude_pre_spawn_arm(
+        get_paths(root),
+        parent_session_id=session_id,
+        transport_agent_type=subagent_type,
+    )
+    status = outcome.get("status")
+    reason_code = str(outcome.get("reason_code", ""))
+    if status == "unbound":
         pretooluse_decision(
             "allow",
             f"AOI: dispatching {subagent_type!r}{task_suffix}. This session is not "
@@ -151,11 +161,12 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
             "to govern sub-agent dispatch.",
         )
         return
-    if mapping_status not in {"valid", "subagent_parent"} or mapped is None:
+    if status == "corrupt":
         pretooluse_decision(
             "deny",
-            "AOI session mapping is corrupt or inconsistent; run `aoi doctor` and "
-            "repair or rebind the session before dispatching a governed sub-agent.",
+            "AOI session mapping or armed packet state is corrupt or inconsistent; "
+            "run `aoi doctor` and repair or rebind before dispatching a governed "
+            "sub-agent.",
         )
         return
     if str(payload.get("agent_id", "")):
@@ -167,29 +178,38 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
             "path instead.",
         )
         return
-    live, expired = _live_arm_slots(
-        mapped[0], parent_session_id=session_id, agent_type=subagent_type
-    )
-    if len(live) == 1:
+    if status == "authorized":
+        packet_id = str(outcome.get("packet_id", ""))
         pretooluse_decision(
             "allow",
-            f"AOI pre-armed dispatch: packet {live[0]} is armed for this "
+            f"AOI pre-armed dispatch: packet {packet_id} has current full authority "
+            "and is armed for this "
             f"parent-session/agent-type slot ({subagent_type}){task_suffix}. The "
             "following SubagentStart observation consumes the arm.",
         )
         return
-    if live:
+    if reason_code == "ambiguous_arm":
         pretooluse_decision(
             "deny",
             "AOI found more than one live arm for this parent-session/agent-type "
             "slot; the state is inconsistent. Run `aoi doctor` before dispatching.",
         )
         return
-    if expired:
+    if reason_code == "expired_arm":
+        packet_ids = ", ".join(outcome.get("candidate_packet_ids", []))
         pretooluse_decision(
             "deny",
-            f"The AOI packet arm for this slot expired ({', '.join(expired)}). "
+            f"The AOI packet arm for this slot expired ({packet_ids}). "
             "Re-arm the packet with `aoi packet-arm` and spawn again.",
+        )
+        return
+    if reason_code in {"authority_invalid", "topology_rejected"}:
+        label = "topology" if reason_code == "topology_rejected" else "authority"
+        pretooluse_decision(
+            "deny",
+            f"The AOI packet arm for this slot failed current {label} validation. "
+            "Review the packet, plan, Chief lease, lane/selection snapshots, and "
+            "run `aoi doctor` before re-arming.",
         )
         return
     pretooluse_decision(

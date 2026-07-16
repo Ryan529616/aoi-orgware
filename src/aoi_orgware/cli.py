@@ -1565,6 +1565,20 @@ def _resource_text(name: str) -> str:
     return resource.read_text(encoding="utf-8")
 
 
+def _onboarding_resume_instruction(command: str, *, created_config: bool) -> str:
+    if created_config:
+        return (
+            f"{command} writes each destination atomically and is idempotent, but "
+            "AOI is now initialized. Acquire a Chief lease with `aoi "
+            "chief-acquire --session-id <session-id> --json`, export the returned "
+            "AOI_CHIEF_* credential fields, then rerun the same command to resume"
+        )
+    return (
+        f"{command} writes each destination atomically and is idempotent; "
+        "rerun the same command with the current Chief credential to resume"
+    )
+
+
 def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """One command: initialize AOI and wire this repo's Claude Code sessions.
 
@@ -1583,7 +1597,12 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         else Path.home() / ".claude" / "skills"
     )
     claude_skill_text = _resource_text("claude/SKILL.md")
+    settings_path = paths.root / ".claude" / "settings.json"
     try:
+        hooks_preflight = claude_onboarding_impl.preflight_claude_onboarding(
+            settings_path,
+            governed_agent_types=args.governed_agent_types,
+        )
         skill_preflight = claude_onboarding_impl.preflight_claude_user_skill(
             user_skills_root,
             claude_skill_text,
@@ -1613,26 +1632,53 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         init_result = {}
     paths = get_paths(paths.root)
     project_name = init_result.get("project", paths.project.name)
+    created_config = bool(init_result.get("created_config", False))
     # 2. Wire the Claude Code lifecycle hooks and install the AOI skill.
     try:
-        hooks_result = claude_onboarding_impl.install_claude_hooks(
-            paths.root / ".claude" / "settings.json",
-            governed_agent_types=args.governed_agent_types,
-        )
-        skill_result = claude_onboarding_impl.install_claude_user_skill(
-            user_skills_root,
-            claude_skill_text,
-            replace_sha256=args.replace_user_skill_sha256,
-        )
-    except claude_onboarding_impl.ClaudeOnboardingError as exc:
-        raise HarnessError(str(exc)) from exc
+        # Existing projects already hold the command-wide lock. Fresh init did
+        # not, so keep this reentrant acquisition across every later write and
+        # refuse if a competing Chief appeared after bootstrap.
+        with state_lock(paths):
+            paths = _reload_locked_paths(paths)
+            if created_config and load_chief_authority(
+                paths, allow_missing=True
+            ) is not None:
+                raise HarnessError(
+                    "Chief authority appeared after fresh AOI initialization; "
+                    "acquire that Chief authority and rerun claude-init"
+                )
+            hooks_result = claude_onboarding_impl.install_claude_hooks(
+                settings_path,
+                governed_agent_types=args.governed_agent_types,
+            )
+            skill_result = claude_onboarding_impl.install_claude_user_skill(
+                user_skills_root,
+                claude_skill_text,
+                replace_sha256=args.replace_user_skill_sha256,
+            )
+    except (
+        HarnessError,
+        OSError,
+        claude_onboarding_impl.ClaudeOnboardingError,
+    ) as exc:
+        raise HarnessError(
+            f"{exc}; "
+            + _onboarding_resume_instruction(
+                "claude-init",
+                created_config=created_config,
+            )
+        ) from exc
     payload = {
         "claude_init": True,
         "project": project_name,
         "root": str(paths.root),
         "aoi_initialized": init_result.get("initialized", True),
         "created_config": init_result.get("created_config", False),
-        "preflight": {"user_skill": skill_preflight},
+        "preflight": {
+            "hooks": hooks_preflight,
+            "user_skill": skill_preflight,
+        },
+        "resumable": True,
         "hooks": hooks_result,
         "skill": skill_result,
         "next_steps": [
@@ -1650,40 +1696,56 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     emit(payload, args.json)
     return 0
 
-def _enable_codex_hook_policy(paths: HarnessPaths) -> tuple[HarnessPaths, bool]:
+def _enable_codex_hook_policy(
+    paths: HarnessPaths, *, fresh_unauthenticated_init: bool
+) -> tuple[HarnessPaths, bool]:
     """Enable the explicit AOI Codex-hook policy without changing any other key."""
 
-    if paths.project.codex_hooks_enabled:
-        return paths, False
-    active_tasks = [
-        str(state.get("task_id", ""))
-        for state in load_all_tasks(paths)
-        if state.get("status") in {"active", "blocked"}
-    ]
-    if active_tasks:
-        raise HarnessError(
-            "cannot enable hooks.codex while active AOI tasks bind the current "
-            f"configuration digest: {sorted(active_tasks)}"
-        )
-    try:
-        current_text = paths.config.read_text(encoding="utf-8")
-        candidate, changed = codex_onboarding_impl.enable_aoi_codex_hooks_policy(
-            current_text
-        )
-    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
-        raise HarnessError(str(exc)) from exc
-    if not changed:
-        return paths, False
-    atomic_write_text(paths.config, candidate)
-    updated = get_paths(paths.root)
-    if updated.harness != paths.harness or updated.lock != paths.lock:
-        raise HarnessError(
-            "codex-init changed an AOI path or lock domain unexpectedly; restore aoi.toml"
-        )
-    if not updated.project.codex_hooks_enabled:
-        raise HarnessError("codex-init failed to enable hooks.codex in aoi.toml")
-    write_index(updated)
-    return updated, True
+    # Existing projects arrive under the command-wide state lock. Fresh init
+    # releases its bootstrap lock before returning, so reacquire it here and
+    # recheck that no Chief/task appeared in the gap before changing the config
+    # digest. The lock is exact-path reentrant for the existing-project path.
+    with state_lock(paths):
+        paths = _reload_locked_paths(paths)
+        if fresh_unauthenticated_init and load_chief_authority(
+            paths, allow_missing=True
+        ) is not None:
+            raise HarnessError(
+                "Chief authority appeared after fresh AOI initialization; acquire "
+                "that Chief authority and rerun codex-init"
+            )
+        if paths.project.codex_hooks_enabled:
+            return paths, False
+        active_tasks = [
+            str(state.get("task_id", ""))
+            for state in load_all_tasks(paths)
+            if state.get("status") in {"active", "blocked"}
+        ]
+        if active_tasks:
+            raise HarnessError(
+                "cannot enable hooks.codex while active AOI tasks bind the current "
+                f"configuration digest: {sorted(active_tasks)}"
+            )
+        try:
+            current_text = paths.config.read_text(encoding="utf-8")
+            candidate, changed = codex_onboarding_impl.enable_aoi_codex_hooks_policy(
+                current_text
+            )
+        except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+            raise HarnessError(str(exc)) from exc
+        if not changed:
+            return paths, False
+        atomic_write_text(paths.config, candidate)
+        updated = get_paths(paths.root)
+        if updated.harness != paths.harness or updated.lock != paths.lock:
+            raise HarnessError(
+                "codex-init changed an AOI path or lock domain unexpectedly; "
+                "restore aoi.toml"
+            )
+        if not updated.project.codex_hooks_enabled:
+            raise HarnessError("codex-init failed to enable hooks.codex in aoi.toml")
+        write_index(updated)
+        return updated, True
 
 def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """Initialize AOI, wire project hooks, and install the user AOI skill."""
@@ -1718,6 +1780,23 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             command=args.hook_command,
             command_windows=args.hook_command_windows,
         )
+        if paths.config.is_file():
+            _candidate, policy_change = (
+                codex_onboarding_impl.enable_aoi_codex_hooks_policy(
+                    paths.config.read_text(encoding="utf-8")
+                )
+            )
+            policy_preflight = {
+                "config_path": str(paths.config),
+                "changed": policy_change,
+            }
+        else:
+            policy_preflight = {
+                "config_path": str(paths.config),
+                "changed": True,
+                "source": "default_config",
+            }
+        preflight["aoi_hook_policy"] = policy_preflight
         preflight["user_skill"] = skill_preflight
     except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
         raise HarnessError(str(exc)) from exc
@@ -1741,26 +1820,41 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         init_result = {}
 
     paths = get_paths(paths.root)
-    # Existing projects arrive here under the Chief/state lock. Fresh projects
-    # have just completed init and have no task state yet. In both cases the
-    # change is limited to one reviewed boolean and refuses active task digests.
-    paths, policy_changed = _enable_codex_hook_policy(paths)
+    created_config = bool(init_result.get("created_config", False))
     try:
-        config_result = codex_onboarding_impl.install_codex_config(
-            paths.root / ".codex" / "config.toml"
-        )
-        hooks_result = codex_onboarding_impl.install_codex_hooks(
-            paths.root / ".codex" / "hooks.json",
-            command=args.hook_command,
-            command_windows=args.hook_command_windows,
-        )
-        skill_result = codex_onboarding_impl.install_codex_user_skill(
-            user_skills_root,
-            codex_skill_text,
-            replace_sha256=args.replace_user_skill_sha256,
-        )
-    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
-        raise HarnessError(str(exc)) from exc
+        # The initialized-project dispatcher already holds this lock. Fresh init
+        # did not, so take it here and retain it across the policy flip and all
+        # client writes; a competing Chief/task cannot enter between stages.
+        with state_lock(paths):
+            paths, policy_changed = _enable_codex_hook_policy(
+                paths,
+                fresh_unauthenticated_init=created_config,
+            )
+            config_result = codex_onboarding_impl.install_codex_config(
+                paths.root / ".codex" / "config.toml"
+            )
+            hooks_result = codex_onboarding_impl.install_codex_hooks(
+                paths.root / ".codex" / "hooks.json",
+                command=args.hook_command,
+                command_windows=args.hook_command_windows,
+            )
+            skill_result = codex_onboarding_impl.install_codex_user_skill(
+                user_skills_root,
+                codex_skill_text,
+                replace_sha256=args.replace_user_skill_sha256,
+            )
+    except (
+        HarnessError,
+        OSError,
+        codex_onboarding_impl.CodexOnboardingError,
+    ) as exc:
+        raise HarnessError(
+            f"{exc}; "
+            + _onboarding_resume_instruction(
+                "codex-init",
+                created_config=created_config,
+            )
+        ) from exc
 
     payload = {
         "codex_init": True,
@@ -1773,6 +1867,7 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "config_sha256": paths.project.sha256,
         "codex_config": config_result,
         "preflight": preflight,
+        "resumable": True,
         "hooks": hooks_result,
         "skill": skill_result,
         "next_steps": [
@@ -3723,6 +3818,23 @@ def observe_subagent_start(
         paths,
         payload,
         policy=_dispatch_protocol_policy(),
+        services=_dispatch_protocol_services(),
+    )
+
+
+def validate_claude_pre_spawn_arm(
+    paths: HarnessPaths,
+    *,
+    parent_session_id: str,
+    transport_agent_type: str,
+) -> dict[str, Any]:
+    """Validate Claude's pre-spawn slot against the full live arm authority."""
+
+    return dispatch_protocol_impl.validate_pre_spawn_arm(
+        paths,
+        parent_session_id=parent_session_id,
+        transport_agent_type=transport_agent_type,
+        policy=_claude_dispatch_protocol_policy(),
         services=_dispatch_protocol_services(),
     )
 
@@ -5863,7 +5975,12 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                                 str(handler.get("command", "")),
                                 str(handler.get("commandWindows", "")),
                             )
-                            if any("aoi-codex-hook" in command for command in commands):
+                            if any(
+                                codex_onboarding_impl.is_aoi_codex_hook_command(
+                                    command, require_current=False
+                                )
+                                for command in commands
+                            ):
                                 matching_handlers.append(handler)
                     if len(matching_handlers) != 1:
                         errors.append(
@@ -5880,10 +5997,11 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                         )
                     for key in ("command", "commandWindows"):
                         command = str(handler.get(key, ""))
-                        if "aoi-codex-hook" not in command:
-                            errors.append(f"{hook_path} {event} {key} does not invoke AOI")
-                        if f"--hook-version {HOOK_PROTOCOL_VERSION}" not in command:
-                            errors.append(f"{hook_path} {event} {key} has wrong hook version")
+                        if not codex_onboarding_impl.is_aoi_codex_hook_command(command):
+                            errors.append(
+                                f"{hook_path} {event} {key} must directly invoke the "
+                                "current AOI Codex hook command"
+                            )
 
     if paths.project.legacy_enabled:
         legacy_source = paths.root / "LEGACY_CONTROL.md"

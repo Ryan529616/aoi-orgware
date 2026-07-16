@@ -99,11 +99,14 @@ enabled = false
   packet first and
   then use explicit manual-unverified packet dispatch before that short-lived
   arm expires. AOI revalidates the same authority snapshot at consumption.
+  Installer command ownership requires a direct current AOI entry point or the
+  documented structured WSL launcher; substring matches are never sufficient.
 - `aoi claude-init`: merges Claude lifecycle hooks into the repository's
   `.claude/settings.json`, but installs the generic AOI skill only at Claude
   user scope (`$HOME/.claude/skills`). It never creates the generic skill under
   the project. A differing user skill is replaced only after its exact reviewed
-  SHA-256 is supplied.
+  SHA-256 is supplied. The pre-spawn gate validates the full live arm authority,
+  not only the parent-session and agent-type slot.
 - `legacy.enabled`: enables compatibility-ledger import and reporting.
 
 The full default file is available at `examples/aoi.toml`.
@@ -123,6 +126,14 @@ task binds the current digest. It does not rewrite model, reasoning, approval,
 sandbox, provider, notification, MCP, plugin, or global Codex settings.
 The separate user-scope skill write is preflighted before project mutation and
 refuses a differing existing skill without its reviewed SHA-256.
+After a fresh bootstrap, onboarding reacquires the project state lock, rechecks
+that no competing Chief or task appeared, and retains the lock across the
+remaining policy and client-file writes.
+Both client onboarding commands preflight existing client files, atomically
+replace only changed destinations, and are idempotently resumable by rerunning
+the same command if a later destination fails. When the interrupted first run
+already published `aoi.toml`, acquire/export the project Chief credential before
+rerunning. They are intentionally not one distributed filesystem transaction.
 
 Initialization is resumable and non-clobbering, but it is not a distributed
 multi-file transaction. If the first process stops after publishing `aoi.toml`

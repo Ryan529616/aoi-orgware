@@ -293,6 +293,51 @@ def matching_expired_packet_ids(
     ]
 
 
+def _load_mapped_task_unlocked(
+    paths: HarnessPaths,
+    parent_session_id: str,
+    *,
+    policy: DispatchProtocolPolicy,
+    services: DispatchProtocolServices,
+) -> dict[str, Any]:
+    """Load and validate the session-to-task backlink under the state lock."""
+
+    mapping = load_json(session_path(paths, parent_session_id))
+    if mapping.get("session_id") != parent_session_id:
+        raise HarnessError("session mapping identity mismatch")
+    state = load_task(paths, str(mapping.get("task_id", "")))
+    mapping_kind = mapping.get("mapping_kind", policy.root_session_mapping_kind)
+    if mapping_kind == policy.root_session_mapping_kind:
+        if parent_session_id not in state.get("session_ids", []):
+            raise HarnessError("root session mapping lacks task backlink")
+    elif mapping_kind == policy.subagent_parent_mapping_kind:
+        if parent_session_id not in state.get("subagent_parent_session_ids", []):
+            raise HarnessError("subagent parent mapping lacks task backlink")
+        parent_packet = services.packet_by_id(
+            state, str(mapping.get("packet_id", ""))
+        )
+        if (
+            int(parent_packet.get("delegation_depth", 1)) != 1
+            or parent_packet.get("agent_id") != parent_session_id
+        ):
+            raise HarnessError("subagent parent mapping lost packet identity")
+    else:
+        raise HarnessError("session mapping kind is invalid")
+    return state
+
+
+def _arm_validation_rejection_reason(exc: HarnessError) -> str:
+    message = str(exc).lower()
+    if "expired" in message:
+        return "expired_arm"
+    if any(
+        marker in message
+        for marker in ("topology", "selection", "depth-one", "depth-two", "lane")
+    ):
+        return "topology_rejected"
+    return "authority_invalid"
+
+
 def initial_rejection_reason(
     state: dict[str, Any],
     *,
@@ -319,6 +364,90 @@ def initial_rejection_reason(
     return ""
 
 
+def validate_pre_spawn_arm(
+    paths: HarnessPaths,
+    *,
+    parent_session_id: str,
+    transport_agent_type: str,
+    policy: DispatchProtocolPolicy,
+    services: DispatchProtocolServices,
+    current: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Read-only exact-arm validation for transports with a pre-spawn gate."""
+
+    if not policy.hook_id_re.fullmatch(parent_session_id):
+        return {"status": "corrupt", "reason_code": "invalid_parent_session"}
+    if not policy.hook_id_re.fullmatch(transport_agent_type):
+        return {"status": "denied", "reason_code": "invalid_agent_type"}
+    mapping_path = session_path(paths, parent_session_id)
+    if not mapping_path.exists():
+        return {"status": "unbound", "reason_code": "no_task_mapping"}
+    current = current or dt.datetime.now().astimezone()
+    with state_lock(paths, create_layout=False):
+        try:
+            state = _load_mapped_task_unlocked(
+                paths,
+                parent_session_id,
+                policy=policy,
+                services=services,
+            )
+            candidates = matching_armed_packets(
+                state,
+                parent_session_id=parent_session_id,
+                transport_agent_type=transport_agent_type,
+            )
+        except HarnessError:
+            return {"status": "corrupt", "reason_code": "corrupt_task_mapping"}
+        packet_ids = [str(packet.get("packet_id", "")) for packet, _ in candidates]
+        if len(candidates) > 1:
+            return {
+                "status": "denied",
+                "reason_code": "ambiguous_arm",
+                "task_id": state["task_id"],
+                "candidate_packet_ids": packet_ids,
+            }
+        if not candidates:
+            return {
+                "status": "denied",
+                "reason_code": "no_matching_arm",
+                "task_id": state["task_id"],
+                "candidate_packet_ids": [],
+            }
+        packet, attempt = candidates[0]
+        expires_at = parse_time(str(attempt.get("expires_at", "")))
+        if expires_at is None or expires_at <= current:
+            return {
+                "status": "denied",
+                "reason_code": "expired_arm",
+                "task_id": state["task_id"],
+                "candidate_packet_ids": packet_ids,
+            }
+        try:
+            services.validate_observed_arm(
+                paths,
+                state,
+                packet,
+                attempt,
+                parent_session_id=parent_session_id,
+                transport_agent_type=transport_agent_type,
+                current=current,
+            )
+        except HarnessError as exc:
+            return {
+                "status": "denied",
+                "reason_code": _arm_validation_rejection_reason(exc),
+                "task_id": state["task_id"],
+                "candidate_packet_ids": packet_ids,
+            }
+        return {
+            "status": "authorized",
+            "reason_code": "",
+            "task_id": state["task_id"],
+            "packet_id": packet.get("packet_id"),
+            "packet_path": packet.get("path"),
+        }
+
+
 def observe_subagent_start(
     paths: HarnessPaths,
     payload: dict[str, Any],
@@ -336,35 +465,12 @@ def observe_subagent_start(
         return {"status": "unbound", "reason_code": "no_task_mapping"}
     with state_lock(paths, create_layout=False):
         try:
-            mapping = load_json(mapping_path)
-            if mapping.get("session_id") != parent_session_id:
-                raise HarnessError("session mapping identity mismatch")
-            state = load_task(paths, str(mapping.get("task_id", "")))
-            mapping_kind = mapping.get(
-                "mapping_kind", policy.root_session_mapping_kind
+            state = _load_mapped_task_unlocked(
+                paths,
+                parent_session_id,
+                policy=policy,
+                services=services,
             )
-            if mapping_kind == policy.root_session_mapping_kind:
-                if parent_session_id not in state.get("session_ids", []):
-                    raise HarnessError("root session mapping lacks task backlink")
-            elif mapping_kind == policy.subagent_parent_mapping_kind:
-                if parent_session_id not in state.get(
-                    "subagent_parent_session_ids", []
-                ):
-                    raise HarnessError(
-                        "subagent parent mapping lacks task backlink"
-                    )
-                parent_packet = services.packet_by_id(
-                    state, str(mapping.get("packet_id", ""))
-                )
-                if (
-                    int(parent_packet.get("delegation_depth", 1)) != 1
-                    or parent_packet.get("agent_id") != parent_session_id
-                ):
-                    raise HarnessError(
-                        "subagent parent mapping lost packet identity"
-                    )
-            else:
-                raise HarnessError("session mapping kind is invalid")
         except HarnessError:
             return {"status": "corrupt", "reason_code": "corrupt_task_mapping"}
 
@@ -461,20 +567,7 @@ def observe_subagent_start(
                     current=current,
                 )
             except HarnessError as exc:
-                reason_code = (
-                    "topology_rejected"
-                    if any(
-                        marker in str(exc).lower()
-                        for marker in (
-                            "topology",
-                            "selection",
-                            "depth-one",
-                            "depth-two",
-                            "lane",
-                        )
-                    )
-                    else "authority_invalid"
-                )
+                reason_code = _arm_validation_rejection_reason(exc)
 
         if reason_code:
             incident = record_subagent_incident(

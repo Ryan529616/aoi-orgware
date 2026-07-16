@@ -172,9 +172,13 @@ Hook consumption records the transport-specific provenance
 actual event identity. This proves only that the permit existed before AOI
 observed the start. Codex creates the sub-agent before `SubagentStart`, and hook
 output cannot terminate that agent; the Claude Code adapter additionally denies
-an unarmed governed spawn at `PreToolUse` before the sub-agent exists, but
-non-cooperating or workflow-orchestrated spawns still reach `SubagentStart`
-unblocked. A start with no unique valid arm therefore
+a governed spawn at `PreToolUse` unless the exact arm still passes full Chief,
+digest, topology, lane, and resource-authority validation before the sub-agent
+exists, but non-cooperating or workflow-orchestrated spawns still reach
+`SubagentStart` unblocked. Like every client hook path, an unexpected adapter
+exception remains fail-open and is not a security boundary; classified mapping,
+arm, and authority failures deny normally. A start with no unique valid arm
+therefore
 creates an idempotent open `unmanaged_subagent_start` incident and instructs the
 agent to stop without material work. Open incidents are visible in checkpoints,
 are doctor errors, and block close/cancel until the Chief records one of the
