@@ -51,6 +51,8 @@ SUPPORTED_HOOK_VERSION = "1"
 GOVERNED_AGENT_TYPES_ENV = "AOI_CLAUDE_GOVERNED_AGENT_TYPES"
 DEFAULT_GOVERNED_AGENT_TYPES = ("general-purpose",)
 AGENT_TOOL_NAME = "Agent"
+# A wildcard arm matches any observed transport agent_type for its parent slot.
+WILDCARD_AGENT_TYPE = "*"
 
 
 def governed_agent_types() -> frozenset[str]:
@@ -88,9 +90,9 @@ def _live_arm_slots(
         for attempt in packet.get("dispatch_attempts", []):
             if not isinstance(attempt, dict) or attempt.get("status") != "armed":
                 continue
-            if (
-                attempt.get("parent_session_id") != parent_session_id
-                or attempt.get("expected_agent_type") != agent_type
+            expected = attempt.get("expected_agent_type")
+            if attempt.get("parent_session_id") != parent_session_id or (
+                expected != agent_type and expected != WILDCARD_AGENT_TYPE
             ):
                 continue
             packet_id = str(packet.get("packet_id", ""))
@@ -170,12 +172,33 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
         )
         return
     if str(payload.get("agent_id", "")):
+        # A depth-two spawn. Read-only helpers are allowed against a parent
+        # packet's Chief-granted helper budget; anything needing write authority
+        # still goes through the manual depth-two dispatch path.
+        from .cli import validate_claude_helper_slot
+
+        helper = validate_claude_helper_slot(
+            get_paths(root), parent_session_id=session_id
+        )
+        if helper.get("status") == "authorized":
+            parent_packet_id = str(helper.get("packet_id", ""))
+            remaining = helper.get("remaining_helper_budget")
+            budget = helper.get("helper_spawn_budget")
+            pretooluse_decision(
+                "allow",
+                f"AOI helper-budget dispatch: parent packet {parent_packet_id} has "
+                f"{remaining} of {budget} depth-two helper spawns remaining"
+                f"{task_suffix}. This is bounded read-only support under the parent "
+                "packet; its output is the parent agent's working material, not "
+                "independent packet evidence, and it must not mutate AOI state.",
+            )
+            return
         pretooluse_decision(
             "deny",
-            "A depth-one agent tried to spawn a nested governed sub-agent. The "
-            "Claude adapter v1 does not hook-verify depth-two spawns; the Chief "
-            "must arm and register depth-two packets through the manual dispatch "
-            "path instead.",
+            "A depth-one agent tried to spawn a nested governed sub-agent with no "
+            "remaining helper budget. Grant read-only helpers with "
+            "`aoi create-packet --helper-spawn-budget N`, or arm and register a "
+            "depth-two packet through the manual dispatch path for write authority.",
         )
         return
     if status == "authorized":
@@ -261,7 +284,28 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
 
     outcome = observe_claude_subagent_start(paths, protocol_payload)
     status = outcome.get("status")
-    if status == "authorized":
+    if status == "authorized" and outcome.get("resumed"):
+        context = (
+            f"AOI observed a resumed dispatch of an existing packet thread for "
+            f"{paths.project.name!r}: task={outcome.get('task_id')}, "
+            f"packet={outcome.get('packet_id')}, "
+            f"contract={outcome.get('packet_path')}. This is the same packet agent "
+            f"resuming (Claude transport agent_type={display_agent_type}), not a fresh "
+            "dispatch: stay inside the original packet contract scope, do not start "
+            f"unrelated work, and do not edit {paths.harness}."
+        )
+    elif status == "authorized" and outcome.get("helper"):
+        remaining = outcome.get("remaining_helper_budget")
+        context = (
+            f"AOI authorized a budgeted depth-two helper under parent packet "
+            f"{outcome.get('packet_id')} for {paths.project.name!r} "
+            f"(remaining helper budget={remaining}). This is bounded read-only support: "
+            "your output is the parent agent's working material, NOT independent packet "
+            f"evidence. Do not mutate AOI state under {paths.harness}, do not spawn "
+            "further sub-agents, and report a bounded conclusion with exact paths to the "
+            "parent agent."
+        )
+    elif status == "authorized":
         context = (
             f"AOI observed a valid pre-armed dispatch for {paths.project.name!r}: "
             f"task={outcome.get('task_id')}, packet={outcome.get('packet_id')}, "
