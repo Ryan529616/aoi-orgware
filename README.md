@@ -1,541 +1,274 @@
 # AOI
 
-**Agent Organization Infrastructure** — an experimental orgware layer for
-governed, long-running multi-agent engineering work.
+**Git-native governance for coding-agent teams.**
 
-AOI treats an agent team as an organization with explicit authority, durable
-state, bounded delegation, evidence gates, and configurable capability tiers.
-It is not another chat router. It sits above an agent runtime and records what
-the organization is allowed to do, what it decided, what changed, and what was
-actually verified.
+Run Codex or Claude Code normally. AOI keeps ownership, delegation, decisions,
+checkpoints, and verification accountable when the work becomes parallel,
+long-running, or evidence-sensitive.
 
-> Status: **v0.2.2 alpha**. The core lifecycle is tested, but AOI has not yet been
-> proven better than a simpler single-agent or supervisor topology. Benchmark it
-> on your own workload before relying on it.
+[![CI](https://github.com/Ryan529616/aoi-orgware/actions/workflows/test.yml/badge.svg)](https://github.com/Ryan529616/aoi-orgware/actions/workflows/test.yml)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Status: alpha](https://img.shields.io/badge/status-alpha-orange)
 
-## The operating model
-
-```mermaid
-flowchart LR
-    U["User / goal authority"] --> C["Chief / technical authority"]
-    S1["Specialist lane"] -->|evidence, blockers, dissent| ST["Steward / system of record"]
-    S2["Specialist lane"] -->|evidence, blockers, dissent| ST
-    S3["Specialist lane"] -->|evidence, blockers, dissent| ST
-    ST -->|bounded arbitration brief| C
-    C -->|decision| ST
-    ST -->|versioned directives| S1
-    ST -->|versioned directives| S2
-    ST -->|versioned directives| S3
-```
-
-- **Chief** is the only formal technical arbitrator.
-- **Steward** validates versions, preserves evidence and dissent, and maintains
-  the system of record. It does not decide technical questions.
-- **Specialist lanes** execute bounded work and produce evidence.
-- **User** retains goal, budget, preference, and irreversible-risk authority.
-
-The organization is stable; execution topology is task-contingent. AOI records
-single-lane, centralized-parallel, and controlled hybrid work instead of forcing
-every request through every lane.
-
-## What v0.2 contains
-
-- Git-bound tasks, plans, claims, checkpoints, delivery records, and close gates
-- exact file/tree/contract locks with conflict detection and SHA-bound baselines
-- bounded delegation packets and external-job ownership (`--owner-packet-id`), with task-local
-  content-addressed snapshots for packet and verification artifacts
-- optional, immutable context-provider receipts with tri-state freshness,
-  doctor/Steward health reporting, and navigation-only A/B summaries that can
-  never qualify task closure
-- packet dispatch provenance: short-lived Chief-issued arms, protocol-v6
-  `SubagentStart` observation, pre-armed manual-unverified fallback, and
-  durable unmanaged-start incidents
-- task-global execution epochs: unselected work is implicit single, explicit
-  single selections cannot run across work units, and parallel chains must share
-  one centralized/hybrid selection; standalone external jobs occupy the same
-  epoch and owned jobs remain inside their dispatched packet chain
-- sequential Steward synthesis packets whose terminal result is required by a
-  parallel/hybrid execution brief
-- lanes, dependencies, coordination requests, Chief decisions, directives, and
-  independent verification before resolution
-- `needs_user` escalation for goal, risk, budget, and preference decisions
-- topology-derived execution resource envelopes that cap active first-level
-  agents, total agents across both depths, and delegation depth; envelopes are
-  SHA-bound into every new selected packet and revalidated at packet
-  arm/dispatch
-- typed, versioned User-to-Chief override proposals with a SHA-bound semantic
-  target contract, expiration, Chief rationale/risk/rollback controls, and
-  one-time consumption
-- receipt-backed project `.codex/config.toml` and `.codex/agents/*.toml`
-  planning, apply, and exact-byte rollback for Codex concurrency, model, and
-  reasoning defaults
-- task-aware Capacity Planning recommendations for depth-two agents
-- a bottom-up Improvement Pipeline with qualification, canary, rollback, and
-  deprecation records for reusable skills
-- deterministic state backup and integrity checks
-- one durable Chief lease per project with monotonic epochs, explicit takeover,
-  and default fencing of lifecycle mutations
-- repo-external Chief credentials: owner-only POSIX files or CurrentUser DPAPI
-  on native Windows; plaintext tokens never enter shared AOI state or stdout
-- deterministic checkpoint compaction at 16 KiB with a fail-closed 32 KiB hard
-  ceiling; the separate critical-status view remains capped at 12 KiB
-- optional Codex lifecycle hooks that consume one-time packet arms or record
-  incidents; they remain post-start procedural guardrails, not a security boundary
-- strict project organization configuration in `aoi.toml`
-
-AOI deliberately does **not** launch an LLM provider, infer the cheapest usable
-model from live token/price telemetry, install hooks silently, prevent
-non-cooperating processes from editing files, or turn an acknowledgement or
-code graph into proof of implementation. Project Codex model/reasoning files
-are requested configuration, not proof of the provider route actually used.
-
-## Requirements
-
-- Python 3.11+
-- Git
-- Linux, WSL on its native filesystem (or a mount with reliable POSIX metadata),
-  or native Windows on an ordinary local filesystem
-
-AOI binds each `.aoi/` state tree to one lock domain on first use: POSIX/WSL
-uses `fcntl`, while native Windows uses `msvcrt` byte-range locking. Do not
-alternate or concurrently write the same state tree from WSL and native
-Windows; their locks do not interoperate. Native Windows support is limited to
-ordinary local filesystems. UNC/network shares and case-sensitive NTFS are not
-supported in the v0.2 line. Benign NTFS aliases in project roots and artifact
-paths are canonicalized after component-level reparse inspection; actual
-symlink/junction traversal is rejected. Structured `repo:` and `host:` lock
-URIs must already use canonical long spelling; alternate short spellings and
-unresolved 8.3-style components fail closed instead of becoming a second lock
-identity. A WSL repository below the configured Windows drive mount uses the
-same case-folded `repo:` lock domain; case-sensitive Windows-backed mounts are
-outside the v0.2 support boundary. `git:merge:` identities use that same
-case-folded domain when their repository is Windows-backed.
-
-On WSL, metadata-less DrvFs mounts such as a default `/mnt/c` or `/mnt/d` may
-report every file as broadly accessible. AOI intentionally fails closed instead
-of claiming `0600` privacy there. Prefer the distribution's native filesystem
-(for example `/home/<user>/project`) or enable DrvFs `metadata`, remount, and
-verify the effective modes before initializing or migrating AOI state.
-
-## Install from source
-
-```bash
-git clone <your-fork-or-local-path>/aoi-orgware.git
-cd aoi-orgware
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install .
-aoi --version
-```
-
-On PowerShell, activate the virtual environment with
-`.\.venv\Scripts\Activate.ps1`. On POSIX shells, use `. .venv/bin/activate`.
-
-AOI is not published to PyPI yet. A wheel and source distribution can be built
-with `python -m build`.
-
-## Initialize a project
-
-Run this in an existing Git repository:
-
-```bash
-cd /path/to/project
-aoi init --project-name "My Project"
-aoi chief-acquire --session-id my-chief-session --json
-aoi status
-aoi doctor
-```
-
-Initialization creates and tracks `aoi.toml`, adds `/.aoi/` to `.gitignore`,
-and creates private runtime state under `.aoi/`. It does not install hooks.
-
-The first `aoi init` is the only unauthenticated lifecycle write. Copy the
-`authority.epoch` and `credential_file` returned by `chief-acquire` into the
-controlling session environment before running mutating commands:
-
-```bash
-export AOI_CHIEF_SESSION_ID=my-chief-session
-export AOI_CHIEF_EPOCH=<epoch-from-acquire>
-export AOI_CHIEF_CREDENTIAL_FILE=<absolute-path-from-acquire>
-```
-
-Use `aoi chief-renew` before a long turn and `aoi chief-release --reason
-"handoff complete"` when ownership ends. An expired lease requires
-`chief-takeover --expected-epoch ... --reason ...`; replacing a live lease also
-requires `--force-live`. AOI never auto-steals a lease. A bounded five-second
-clock-skew allowance is clamped to the last renewal; larger rollback fails.
-
-### Bootstrap from project requirements
-
-The repository includes the first-party [`aoi-bootstrap`](skills/aoi-bootstrap/)
-Codex skill. It inspects an existing Git repository, combines that evidence with
-the user's project requirements, and drafts a conservative organization profile.
-Its fixed gate is:
+AOI is not another agent runtime. It sits between a coding-agent client and the
+repository:
 
 ```text
-inspect -> draft -> validate -> preview -> explicit approval -> apply -> doctor
+you set the goal
+       |
+Codex / Claude Code          reasoning, tools, implementation
+       |
+AOI skill + hooks            lifecycle context and runtime observations
+       |
+AOI core                     authority, ownership, evidence, recovery
+       |
+Git + tests + build / EDA    source of truth
 ```
 
-The skill does not initialize AOI, enable hooks, or overwrite an existing
-profile before approval of the exact candidate SHA-256. Install or point Codex
-at `skills/aoi-bootstrap`, then ask it to bootstrap AOI in the target repository.
-The `aoi` CLI must already be installed in that environment.
+It targets a recurring failure mode: delegation succeeds, several agents become
+busy, and nobody can later prove who owned a file, which result used the current
+baseline, or whether “tests passed” meant that a test actually ran.
 
-Without the skill, the same validation/apply boundary is available directly:
+> **Alpha status:** AOI's lifecycle and integrity rules are tested, but AOI has
+> not established general superiority over a strong single agent or a simpler
+> supervisor. It is a cooperative procedural guardrail, not a security sandbox.
+> Test it on your own workload before making it the default.
+
+## Install it with your coding agent
+
+From the repository you want to govern, paste this into Codex or Claude Code:
+
+> Inspect https://github.com/Ryan529616/aoi-orgware and my current repository
+> without modifying my project. Resolve AOI `main` to an exact commit and show
+> me the proposed AOI revision, project files, user-scope files, hooks, and trust
+> boundary. Wait for my approval. Then install that exact commit in an isolated
+> tool environment, use AOI's bootstrap flow when a project-specific profile is
+> justified, bind this repository to the current coding-agent client, preserve
+> unrelated settings, run AOI doctor and the integration smoke checks, and use
+> AOI for future material work. Do not claim that hooks are trusted or that a
+> model route was observed unless the runtime provides evidence for it.
+
+That is the intended onboarding experience. The coding agent operates AOI's
+deterministic CLI internally; the user should not have to memorize lifecycle
+commands. The approval is deliberate because installing code from a URL and
+adding persistent project hooks is a supply-chain and trust decision.
+
+### Manual source install
+
+AOI is not published to PyPI yet. Until the next tagged release includes the
+current onboarding work, pin a reviewed commit instead of installing a moving
+branch:
 
 ```bash
-# Run from the target Git repository root.
-aoi config-check --file /path/to/candidate-aoi.toml --json
-aoi init --config /path/to/candidate-aoi.toml \
-  --expected-config-sha256 <approved-config-sha256> --json
-aoi doctor --json
-```
+# With uv:
+uv tool install "git+https://github.com/Ryan529616/aoi-orgware.git@<reviewed-commit-sha>"
 
-`config-check` is read-only and works even when an existing `aoi.toml` is
-malformed. `init --config` requires the full approved SHA-256, copies the exact
-validated bytes, refuses a different existing profile, and preflights the
-selected state tree's lock domain, managed paths, and project `.gitignore`
-before writing the configuration.
+# Or inside an activated virtual environment:
+python -m pip install "git+https://github.com/Ryan529616/aoi-orgware.git@<reviewed-commit-sha>"
 
-Re-running `aoi init` on an initialized project is a fenced mutation. Known
-AOI-managed v0.1.3 policy bytes upgrade automatically; a custom policy requires
-its exact reviewed digest through `--replace-policy-sha256`.
-
-If first initialization stops after publishing `aoi.toml` but before the state
-lock is initialized, `chief-acquire` can recover only the exact structural prefix: no
-authority, lifecycle payload, managed resource, or unknown entry may exist. It
-repairs the platform/lock, acquires the first Chief, and then requires an
-authenticated rerun of `aoi init` to finish POLICY, templates, and INDEX.
-
-### One-command Codex onboarding
-
-`aoi codex-init` is the explicit, repository-local onboarding path for Codex:
-
-```bash
-cd /path/to/project
+# Run one of these from the repository you want to govern.
 aoi codex-init --project-name "My Project" --json
-```
-
-It initializes AOI when needed, enables only `[hooks.codex].enabled`, merges the
-four protocol-v6 lifecycle hooks into `.codex/hooks.json`, enables the stable
-Codex hook feature in `.codex/config.toml`, and installs the generic AOI skill
-once at user scope under `$HOME/.agents/skills/aoi/SKILL.md`. Existing Codex
-settings and unrelated hooks are preserved. Re-running the command is
-idempotent. All destinations are preflighted before initialization; each file
-is replaced atomically, unchanged files are not rewritten, and a later failure
-can be resumed without discarding completed destinations. If the first run has
-already published `aoi.toml`, acquire/export a Chief credential and then rerun
-the same command. Project-specific
-instructions belong in the repository's `AGENTS.md` or a genuinely
-project-specific repo skill.
-
-For an existing AOI project the command is Chief-fenced. Enabling the hook
-policy is refused while an active or blocked task still binds the prior
-configuration digest. After onboarding, start a new Codex session in the
-trusted repository, open `/hooks`, and review/trust the exact definitions.
-`codex-init` cannot and does not mark hooks trusted for you.
-
-If AOI runs in WSL while the Codex host is Windows, pass an explicit launcher:
-
-```bash
-aoi codex-init \
-  --hook-command-windows \
-  "wsl.exe -d Ubuntu --cd /path/to/project aoi-codex-hook --hook-version 6" \
-  --user-skills-root /mnt/c/Users/<windows-user>/.agents/skills
-```
-
-Only a direct `aoi-codex-hook --hook-version 6` executable (including an
-absolute path) or the structured `wsl[.exe]` form above is accepted. Shell
-commands that merely contain the entry-point name are not treated as AOI-owned.
-
-`--user-skills-root` names the user-scope skill directory on the Codex host;
-it never writes `.agents/skills/aoi` inside the project. A differing existing
-AOI skill is not overwritten unless its reviewed exact digest is supplied with
-`--replace-user-skill-sha256`.
-
-This command configures AOI for Codex; it does not install Codex itself or
-change global model, sandbox, approval, provider, or notification defaults.
-Use OpenAI's standalone installer separately when the `codex` command is absent
-(`https://chatgpt.com/codex/install.ps1` on Windows or `install.sh` on POSIX).
-
-Claude Code has a separate client adapter. Its hooks remain repo-local, while
-the generic AOI skill is installed once at Claude user scope:
-
-```bash
+# or
 aoi claude-init --project-name "My Project" --json
 ```
 
-By default the skill is written to `$HOME/.claude/skills/aoi/SKILL.md` and no
-`.claude/skills/aoi` directory is created in the project. Project-specific
-instructions belong in the repository's `CLAUDE.md` or `AGENTS.md`. When AOI
-runs in WSL for a Windows-hosted Claude installation, pass
-`--user-skills-root /mnt/c/Users/<windows-user>/.claude/skills`. A differing
-existing user skill requires its exact reviewed SHA-256 through
-`--replace-user-skill-sha256` before AOI will replace it.
-Claude settings and the skill destination are preflighted before AOI
-initialization; changed files are atomic and an interrupted later stage is
-resumed by rerunning the same `claude-init` command (after acquiring a Chief
-credential if that first run already initialized AOI). Its governed `PreToolUse`
-gate allows a live arm only after the full Chief, digest, topology, lane, and
-resource authority check succeeds.
+The onboarding commands initialize AOI when needed, preserve unrelated client
+settings, install the generic AOI skill once at user scope, and wire the
+repository-local lifecycle hooks. Re-running is idempotently resumable. Existing
+AOI projects—and interrupted first runs that already published `aoi.toml`—
+require the current Chief credential before the command is rerun.
 
-## Minimal governed task
+| Client | Repository-local integration | User-scope skill |
+|---|---|---|
+| Codex | `.codex/config.toml` and `.codex/hooks.json` | `$HOME/.agents/skills/aoi/SKILL.md` |
+| Claude Code | `.claude/settings.json` | `$HOME/.claude/skills/aoi/SKILL.md` |
 
-```bash
-# 1. Create a task and edit the generated plan.
-aoi init-task \
-  --task-id docs-fix \
-  --title "Correct the setup guide" \
-  --objective "Make the documented setup reproducible" \
-  --owner root \
-  --completion-boundary "Fresh install succeeds and the commands are documented"
-$EDITOR .aoi/tasks/docs-fix/plan.md
-aoi approve-plan --task docs-fix --note "Scope and verification are explicit"
+Codex still requires the user to review and trust the exact hook definitions in
+its own `/hooks` UI. AOI does not cross that boundary on the user's behalf.
+For a Windows-hosted Codex client with AOI in WSL, `codex-init` may need both
+an explicit Windows hook launcher and a Windows user-skill path. `claude-init`
+exposes only the user-skill-root override for its supported cross-host setup.
+See each command's `--help` output and the
+[configuration guide](docs/configuration.md).
 
-# 2. Claim the exact write scope before mutation.
-aoi claim \
-  --task docs-fix \
-  --token docs-fix-claim \
-  --owner root \
-  --kind documentation \
-  --lock repo:file:docs/setup.md \
-  --intent "Correct the setup guide" \
-  --validation "Run the documented commands in a fresh environment" \
-  --expires-at 2099-01-01T00:00:00+00:00
+Requirements:
 
-# 3. Work, verify, and record the evidence boundary.
-aoi add-verification \
-  --task docs-fix \
-  --category documentation_check \
-  --status pass \
-  --evidence "Fresh environment completed every documented command" \
-  --command "./scripts/test-quickstart.sh" \
-  --boundary "The documented local installation and initialization path"
+- Python 3.11+
+- Git
+- Linux/WSL with reliable POSIX metadata, or native Windows on an ordinary
+  local filesystem
 
-# 4. Account for delivery, release ownership, checkpoint, and close.
-aoi set-delivery --task docs-fix --mode local-only \
-  --detail "Changes remain in the current local worktree"
-aoi release-claim --token docs-fix-claim --status done \
-  --reason "Scoped edit and verification completed"
-aoi checkpoint --task docs-fix --next-action "Close the task"
-aoi close-task --task docs-fix --summary "Setup guide is reproducible"
+Do not alternate WSL and native-Windows writers against one AOI state tree; the
+two lock domains do not interoperate.
+
+## Daily use
+
+After binding, ask for work normally:
+
+```text
+Fix the intermittent refresh-token race and add a regression test.
 ```
 
-## Dispatch a bounded Codex sub-agent
+For material work, the coding agent should detect the AOI-bound repository and
+perform the governed lifecycle itself: reconstruct or create the task, choose a
+task-appropriate topology, claim the exact mutation scope, dispatch bounded
+work, record real verification, checkpoint, and close only when every gate is
+accounted for.
 
-For ARISE-first resource control, first select execution topology. New
-selections automatically receive a dynamic envelope: `single` permits one
-active first-level agent; parallel/hybrid permits up to the selected lane count
-with a default soft cap of four; delegation remains hard-capped at depth two
-and the default total-agent cap is twice the first-level wave but never above
-twelve. Every depth-two leaf still needs its existing Capacity Planning decision.
-The exact envelope digest is copied into each packet and rechecked when it is
-armed or dispatched.
+Read-only questions do not need lifecycle ceremony. Small edits stay single;
+parallel lanes are used only when the work is genuinely independent.
 
-When the default envelope or project Codex profile is inappropriate, the User
-may propose a typed exception, but it has no authority until the Chief records
-an exact approval. The approval expires, is bound to one future selection or
-config event, and is consumed once. See
-[`docs/resource_control.md`](docs/resource_control.md) for the deliberation,
-configuration, rollback, and fresh-session commands.
+| Work shape | AOI execution |
+|---|---|
+| Read-only explanation | No task required |
+| Low-risk edit to 1–3 exact files | Mini / governed single |
+| Coupled implementation | Single causal chain |
+| Independent investigation or verification | Centralized parallel |
+| Cross-lane contract work with bounded coordination | Hybrid |
 
-Create the packet first. Immediately before the corresponding Codex spawn,
-issue a permit that expires within 15 minutes:
+The user keeps authority over goals, budgets, preferences, and irreversible
+risk. AOI should add organizational complexity only when the task earns it.
 
-```bash
-aoi create-packet \
-  --task <task-id> \
-  --packet-id <packet-id> \
-  --agent-role explorer \
-  --model-tier standard \
-  --objective "Inspect one bounded evidence question" \
-  --scope "Read only the named source and report one conclusion" \
-  --deliverable "Conclusion, exact evidence paths, risks, and next action" \
-  --validation "Chief checks every cited path"
+## What AOI is for
 
-aoi packet-arm \
-  --task <task-id> \
-  --packet-id <packet-id> \
-  --expected-agent-type explorer \
-  --expires-at <timezone-aware-timestamp-within-15-minutes>
+### Prevent overlapping cooperative work
 
-# Spawn exactly one matching Codex sub-agent now.
-```
+AOI claims exact files, trees, contracts, Git merge surfaces, or external output
+roots before mutation. Overlapping ownership is rejected, and exact-file claims
+retain a SHA-256 baseline.
 
-If the task-bound parent Codex session differs from the Chief credential's
-session assertion, add `--parent-session-id <task-bound-session-id>`.
+### Make delegation inspectable
 
-A trusted protocol-v6 `SubagentStart` hook consumes that arm and records the
-actual agent id as `codex_subagent_start_observed`. If no unique arm exists, AOI
-records an open incident and tells the already-created agent to stop without
-material work. The hook observes the start; it does not prevent the spawn.
+Delegated work receives a bounded packet: objective, scope, deliverable,
+validation boundary, capability tier, and a short-lived dispatch permit. AOI
+keeps requested routing separate from runtime-observed routing. A manual
+fallback remains explicitly unverified.
 
-When hooks are unavailable, use the same already-issued arm and register the
-fallback honestly:
+### Refuse unsupported “done” claims
 
-```bash
-aoi packet-update --task <task-id> --packet-id <packet-id> \
-  --status dispatched --agent-id <actual-agent-id> \
-  --manual-unverified-reason "Codex hook was not installed or trusted for this start"
-```
+AOI distinguishes acknowledgement, engineering inference, compile acceptance,
+runtime evidence, independent review, and other configured evidence classes.
+Task closure requires current qualifying evidence plus complete accounting for
+claims, packets, jobs, delivery, escalations, and checkpoints.
 
-For schema-v5 packets, this command succeeds only from `armed`. Direct
-`ready -> dispatched` registration is rejected; a ready v4 packet has a
-separately marked migration exception only when its immutable contract does not
-carry the native-v5 marker and its task has pre-marker legacy provenance. A
-native policy-v2 task cannot invoke that exception. Manual fallback also
-revalidates arm expiry, Chief epoch, plan, packet, topology, lane/Steward, and
-skill authority before it can consume the permit.
+### Recover across sessions
 
-For parallel work, first select `centralized_parallel` or `hybrid` with distinct
-specialist `--lane` values and `--steward-lane-id`. Unselected work is an
-implicit `single`; an explicit `single` occupies the task-global execution
-epoch even when another work unit has a different selection. Parallel modes
-permit one active chain per specialist lane only inside the same selection.
-Queued/running/unknown jobs obey the same epoch. Pass `--owner-packet-id` when a
-job is launched by an already-dispatched depth-one mutation packet; its locks
-must cover the job outputs (and an exact-command owner must bind the same
-command), and that packet must stay active until the job is terminal. AOI
-revalidates the physical owner contract plus canonical lock/command authority at
-job creation, each transition to running, and doctor. Independent centralized
-work does not require fake coordination records.
+Tasks bind the Git worktree, branch, configuration digest, plan, claims,
+decisions, dissent, verification, and a bounded semantic checkpoint. A resumed
+session reconstructs from the checkpoint and current repository state instead
+of relying on conversational memory.
 
-After all selected specialist packets are terminal, create one read-only packet
-on the Steward lane with
-`--steward-synthesis-for-selection-id <selection-id>`, arm and dispatch it, and
-record its terminal result. Once a live/successful synthesis packet exists, AOI
-freezes new specialist packets and jobs for that selection so the bound result
-set cannot change underneath it. Then `execution-brief-record` must name that exact
-result with `--steward-packet-id <packet-id>` and bind every terminal specialist
-packet before selection supersession or task close.
+## Core capabilities
 
-### Optional codebase-memory context
+| Area | What AOI records or enforces |
+|---|---|
+| Authority | One durable Chief lease, monotonic epochs, explicit handoff/takeover, repo-external credentials |
+| Ownership | Exact file/tree/contract/external locks, conflict detection, baseline hashes |
+| Delegation | Bounded packets, one-time arms, dispatch provenance, unmanaged-start incidents |
+| Organization | Lanes, dependencies, Steward synthesis, decisions, directives, dissent, user escalations |
+| Evidence | Content-addressed artifacts, evidence-strength boundaries, independent verification, close gates |
+| Recovery | Durable checkpoints, configuration binding, deterministic backup and integrity checks |
+| Resource control | Task-global execution envelopes, bounded depth, requested role/model policy without invented telemetry |
+| Improvement | Qualification, canary, rollback, adoption, and deprecation records for reusable skills |
 
-Phase 1 can import a reviewed codebase-memory v0.9.0 receipt without launching
-the provider, refreshing an index, or enabling a watcher:
+The complete semantics live in the [operating policy](docs/POLICY.md) and
+[architecture](docs/architecture.md), not in marketing copy.
 
-```bash
-aoi context-receipt-record \
-  --task <task-id> --provider codebase-memory \
-  --receipt-id <receipt-id> \
-  --receipt /absolute/path/to/receipt.json \
-  --receipt-sha256 <full-sha256> \
-  --requirement optional \
-  --freshness-profile codebase-memory-git-v1 \
-  --session-id <bound-root-session> --json
+## Runtime truth boundary
 
-aoi doctor --task <task-id> --json
-```
+AOI is strict about distinguishing control from observation:
 
-Only the Chief-fenced import mutates AOI state. Specialist access remains
-read-only graph query access, and Steward output is limited to receipt
-integrity, provider health, freshness, dissent, and a brief. Graph searches and
-navigation benchmarks are always `engineering_inference`, never compile,
-simulation, numeric, synthesis, physical, signoff, or other close-qualifying
-evidence. Optional stale/unverifiable receipts warn and fail open; a receipt
-blocks only when the task explicitly records it as `required`.
+| Surface | Current boundary |
+|---|---|
+| Post-initialization lifecycle writes | Deterministic and Chief-fenced, except narrowly pre-authorized hook consumption and incident recording |
+| Cooperative file ownership | Conflicts are rejected through AOI; AOI is not an OS sandbox |
+| Codex sub-agent start | Observed after creation when the trusted hook runs; not a pre-spawn boundary |
+| Claude governed `Agent` dispatch | `PreToolUse` can reject a missing or stale arm before that tool runs |
+| Claude paths that bypass `PreToolUse` | Observed and accounted for at `SubagentStart` when that hook runs successfully; not hard-blocked |
+| Model and capability tier | Requested policy unless the runtime exposes qualifying observation |
 
-The separate A/B protocol compares `rg_open` with
-`codebase_memory_assisted` using externally captured, mutation-free run records:
+AOI does not launch a model, store provider API keys, or replace the client's
+sandbox, permissions, worktrees, conversation UI, provider routing, or billing.
+It also cannot stop a non-cooperating process under the same OS account from
+editing source, Git, tools, or AOI state directly.
 
-```bash
-aoi codebase-memory-benchmark-validate --record run.json --json
-aoi codebase-memory-benchmark-record \
-  --task <task-id> --benchmark-id <benchmark-id> \
-  --receipt-id <receipt-id> \
-  --record rg-open.json --record graph-assisted.json \
-  --record-sha256 <rg-sha256> --record-sha256 <graph-sha256> \
-  --session-id <bound-root-session> --json
-```
+Read [SECURITY.md](SECURITY.md) before relying on AOI for sensitive workflows.
 
-See the [codebase-memory integration contract](docs/codebase-memory.md).
+## When AOI should pay for itself
 
-For a one-to-three-file, low-risk edit, `aoi start-mini` creates the task, plan,
-session binding, and exact-file claim atomically. It intentionally rejects tree
-claims, high-risk paths, delegation, and external jobs.
+AOI is most likely to help when work is:
 
-## Configuration
+- parallel enough for ownership or baseline conflicts to matter;
+- long-running enough to cross sessions or context compaction;
+- risky enough to require independent verification or explicit user decisions;
+- expensive enough that failed delegation, duplicate work, or false completion
+  is worth measuring.
 
-`aoi.toml` defines the project name, private state directory, departments,
-role-to-capability-tier map, evidence vocabulary, external-job receipt schema,
-high-risk paths, external lock namespace, and optional hooks. Task-local
-context-provider receipts do not alter this strict configuration schema. Tasks bind the exact
-configuration SHA-256; changing governance while a task is active fails closed.
+For a typo, a tightly coupled local edit, or a read-only question, a strong
+single agent is often the better tool. “More agents” is not a success metric.
 
-See [configuration](docs/configuration.md), [architecture](docs/architecture.md),
-the [v0.2 migration runbook](docs/v0.2-migration.md), and the
-[operating policy](docs/POLICY.md).
+## Test whether it actually helps
 
-## Run a small closed alpha
-
-AOI includes a self-contained kit for 3–5 classmates to test onboarding and
-feasibility before a larger evaluation:
+AOI ships a closed-alpha A/C kit for comparing a strong single agent with the
+AOI-governed path under matched tasks, tools, models, time limits, and external
+oracles:
 
 ```bash
 aoi pilot-init --output ./aoi-pilot-kit --json
-cd ./aoi-pilot-kit
 ```
 
-Native Windows cannot prove POSIX-style private permissions through the Python
-standard library. Review the destination ACL yourself, then acknowledge that
-boundary explicitly when generating private pilot material:
+On native Windows, the standard library cannot verify a POSIX-style private
+permission boundary. Review the destination ACL, then acknowledge that boundary
+explicitly:
 
 ```powershell
 aoi pilot-init --output .\aoi-pilot-kit --allow-unverified-windows-acl --json
 ```
 
-The kit contains a controlled A/C protocol (`single` versus `aoi`), Codex
-instructions, assignment and run-record templates, a private feedback form, and
-an intentionally broken onboarding sample. The pilot commands work outside an
-AOI-initialized project:
+Measure avoided ownership/baseline incidents, independent-review findings,
+regressions, rework, human intervention, tokens, cost, and wall time. Failed and
+abandoned runs stay in the denominator. A useful result is a better
+quality/cost frontier, not a larger state ledger.
+
+See the [evaluation protocol](docs/evaluation.md) and
+[closed-alpha guide](docs/PILOT.md).
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Operating policy](docs/POLICY.md)
+- [Configuration](docs/configuration.md)
+- [Resource control](docs/resource_control.md)
+- [v0.2 migration](docs/v0.2-migration.md)
+- [Release runbook](docs/RELEASE.md)
+- [Security boundary](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
+The full CLI remains available as a deterministic action surface for agent
+adapters, CI, recovery, audit, and power users:
 
 ```bash
-aoi pilot-validate --record records/run-001.json --json
-aoi pilot-summary \
-  --record records/run-001.json \
-  --record records/run-002.json \
-  --output summary.json \
-  --format json \
-  --json
+aoi --help
+aoi status --json
+aoi doctor --json
 ```
-
-Inside an initialized AOI project, pilot writers require that project's Chief
-lease. They refuse the project root, managed state, and a write set spanning
-multiple AOI projects even with `--force`.
-
-The validator fails closed on unknown fields, missing measurement provenance,
-unregistered oracles, and common private-path/credential patterns. The summary
-includes only records with coordinator-sharing and aggregate consent and never
-emits participant IDs. Closed-alpha public reporting is aggregate-only.
-Read the complete [closed-alpha guide](docs/PILOT.md) before collecting data.
-
-## Evaluate AOI instead of trusting the diagram
-
-Compare the same bounded task set under:
-
-1. one strong agent;
-2. a conventional supervisor plus specialists;
-3. AOI's Chief/Steward/governed-lane topology.
-
-Measure completion quality, human intervention, total tokens, high-capability
-model share, rework, stale-baseline conflicts, decision latency, unresolved
-directives, and regression recurrence. See [evaluation](docs/evaluation.md).
 
 ## Development
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
-  python3 -m unittest discover -s tests -v
+git clone https://github.com/Ryan529616/aoi-orgware.git
+cd aoi-orgware
+python -m venv .venv
+
+# PowerShell: .\.venv\Scripts\Activate.ps1
+# POSIX:      . .venv/bin/activate
+python -m pip install -e .
+python -m unittest discover -s tests -v
 ```
 
-Validate the bundled skill with Codex's `skill-creator` validator before a
-release. The skill is included in the Git repository and source distribution;
-installing the Python wheel does not silently install it into a user's Codex
-skill directory.
-
-The repository keeps the original sanitized import as an auditable first
-commit. [PROVENANCE.md](PROVENANCE.md) and `IMPORT_MANIFEST.json` document that
-history; neither file is included in release artifacts.
+AOI is pure Python with no runtime dependencies. CI covers Linux and Windows on
+Python 3.11 and 3.12.
 
 ## License
 
