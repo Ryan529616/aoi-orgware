@@ -93,8 +93,10 @@ enabled = false
 - `hooks.codex.enabled`: opt-in declaration. Plain `aoi init` does not install
   or trust hooks. Explicit `aoi codex-init` enables the declaration, merges
   protocol-v6 project hooks, enables Codex's stable hook feature, and installs
-  the repo-local AOI skill; the user must still review the exact commands
-  through Codex `/hooks`. Without that trust, arm the exact packet first and
+  the generic AOI skill at Codex user scope (`$HOME/.agents/skills`); the user
+  must still review the exact commands through Codex `/hooks`. Project-specific
+  instructions remain in the repository. Without hook trust, arm the exact
+  packet first and
   then use explicit manual-unverified packet dispatch before that short-lived
   arm expires. AOI revalidates the same authority snapshot at consumption.
 - `legacy.enabled`: enables compatibility-ledger import and reporting.
@@ -114,6 +116,8 @@ On an existing project, `aoi codex-init` is Chief-fenced and changes only the
 false-to-true Codex hook flag. It refuses the change while any active or blocked
 task binds the current digest. It does not rewrite model, reasoning, approval,
 sandbox, provider, notification, MCP, plugin, or global Codex settings.
+The separate user-scope skill write is preflighted before project mutation and
+refuses a differing existing skill without its reviewed SHA-256.
 
 Initialization is resumable and non-clobbering, but it is not a distributed
 multi-file transaction. If the first process stops after publishing `aoi.toml`

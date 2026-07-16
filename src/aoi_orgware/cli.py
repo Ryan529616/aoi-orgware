@@ -1810,7 +1810,7 @@ def _enable_codex_hook_policy(paths: HarnessPaths) -> tuple[HarnessPaths, bool]:
 
 
 def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    """Initialize AOI and wire repository-local Codex hooks and skill."""
+    """Initialize AOI, wire project hooks, and install the user AOI skill."""
 
     if not (paths.root / ".git").exists():
         raise HarnessError("aoi codex-init requires a Git repository root")
@@ -1825,13 +1825,24 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "cannot enable hooks.codex while active AOI tasks bind the current "
                 f"configuration digest: {sorted(active_tasks)}"
             )
+    user_skills_root = (
+        Path(args.user_skills_root).expanduser()
+        if args.user_skills_root
+        else Path.home() / ".agents" / "skills"
+    )
     try:
+        codex_skill_text = _resource_text("codex/SKILL.md")
+        skill_preflight = codex_onboarding_impl.preflight_codex_user_skill(
+            user_skills_root,
+            codex_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
         preflight = codex_onboarding_impl.preflight_codex_onboarding(
             paths.root,
             command=args.hook_command,
             command_windows=args.hook_command_windows,
         )
-        codex_skill_text = _resource_text("codex/SKILL.md")
+        preflight["user_skill"] = skill_preflight
     except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
         raise HarnessError(str(exc)) from exc
     init_ns = argparse.Namespace(
@@ -1867,9 +1878,10 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             command=args.hook_command,
             command_windows=args.hook_command_windows,
         )
-        skill_result = codex_onboarding_impl.install_codex_skill(
-            paths.root / ".agents" / "skills",
+        skill_result = codex_onboarding_impl.install_codex_user_skill(
+            user_skills_root,
             codex_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
         )
     except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
         raise HarnessError(str(exc)) from exc
@@ -1889,6 +1901,8 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "skill": skill_result,
         "next_steps": [
             "Install AOI on the Codex host PATH so aoi-codex-hook resolves.",
+            "The generic AOI skill is installed once at user scope; keep "
+            "project-specific instructions in the repository AGENTS.md.",
             "Start a new Codex session in this trusted repo, open /hooks, and "
             "review/trust the exact AOI hook definitions.",
             "Run aoi doctor --json after hook trust; structural PASS does not prove "

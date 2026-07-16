@@ -66,6 +66,36 @@ class HookMergeTests(unittest.TestCase):
             handler["commandWindows"], "wsl aoi-codex-hook --hook-version 6"
         )
 
+    def test_existing_aoi_handler_is_upgraded_without_dropping_other_hook(self) -> None:
+        old_command = "/opt/aoi-0.2.1/bin/aoi-codex-hook --hook-version 6"
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "other-stop"},
+                            {
+                                "type": "command",
+                                "command": old_command,
+                                "commandWindows": old_command,
+                                "timeout": 30,
+                            },
+                        ]
+                    }
+                ]
+            }
+        }
+        merged, added = co.merge_codex_hook_settings(existing)
+        self.assertEqual(
+            added, ["SessionStart", "UserPromptSubmit", "SubagentStart"]
+        )
+        stop_entries = merged["hooks"]["Stop"]
+        self.assertEqual(
+            stop_entries[0]["hooks"],
+            [{"type": "command", "command": "other-stop"}],
+        )
+        self.assertEqual(stop_entries[1]["hooks"][0]["command"], co.HOOK_COMMAND)
+
 
 class ConfigMergeTests(unittest.TestCase):
     def test_adds_features_table_without_rewriting_existing_toml(self) -> None:
@@ -117,20 +147,42 @@ class InstallHelperTests(unittest.TestCase):
             self.assertEqual(first_hooks["events_added"], list(co.CODEX_HOOK_EVENTS))
             second_hooks = co.install_codex_hooks(root / ".codex" / "hooks.json")
             self.assertEqual(second_hooks["events_added"], [])
+            self.assertEqual(second_hooks["events_updated"], [])
             config = co.install_codex_config(root / ".codex" / "config.toml")
             self.assertTrue(config["hooks_feature_enabled"])
             parsed = tomllib.loads(
                 (root / ".codex" / "config.toml").read_text(encoding="utf-8")
             )
             self.assertTrue(parsed["features"]["hooks"])
-            skill = co.install_codex_skill(root / ".agents" / "skills", "# AOI\n")
+            skill = co.install_codex_user_skill(
+                root / "user-skills", "# AOI\n"
+            )
             self.assertFalse(skill["updated"])
             self.assertEqual(
-                (root / ".agents" / "skills" / "aoi" / "SKILL.md").read_text(
+                (root / "user-skills" / "aoi" / "SKILL.md").read_text(
                     encoding="utf-8"
                 ),
                 "# AOI\n",
             )
+
+    def test_user_skill_requires_digest_to_replace_different_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            skills_root = Path(temporary) / ".agents" / "skills"
+            skill_path = skills_root / "aoi" / "SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("# local customization\n", encoding="utf-8")
+            digest = co.preflight_codex_user_skill(
+                skills_root, "# local customization\n"
+            )["existing_sha256"]
+            with self.assertRaises(co.CodexOnboardingError):
+                co.install_codex_user_skill(skills_root, "# packaged\n")
+            result = co.install_codex_user_skill(
+                skills_root,
+                "# packaged\n",
+                replace_sha256=digest,
+            )
+            self.assertTrue(result["updated"])
+            self.assertEqual(skill_path.read_text(encoding="utf-8"), "# packaged\n")
 
     def test_invalid_hook_json_is_not_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -139,6 +191,32 @@ class InstallHelperTests(unittest.TestCase):
             with self.assertRaises(co.CodexOnboardingError):
                 co.install_codex_hooks(path)
             self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+
+    def test_install_reports_existing_aoi_hook_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "hooks.json"
+            old_command = "/opt/aoi-0.2.1/bin/aoi-codex-hook --hook-version 6"
+            payload = {
+                "hooks": {
+                    event: [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": old_command,
+                                    "commandWindows": old_command,
+                                    "timeout": 30,
+                                }
+                            ]
+                        }
+                    ]
+                    for event in co.CODEX_HOOK_EVENTS
+                }
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            result = co.install_codex_hooks(path)
+            self.assertEqual(result["events_added"], [])
+            self.assertEqual(result["events_updated"], list(co.CODEX_HOOK_EVENTS))
 
 
 class WiringTests(unittest.TestCase):
@@ -197,6 +275,8 @@ class FreshCodexInitCliTests(unittest.TestCase):
                     "codex-init",
                     "--project-name",
                     "Fresh AOI",
+                    "--user-skills-root",
+                    str(root / "user-skills"),
                     "--json",
                 ],
                 cwd=root,
@@ -216,12 +296,26 @@ class FreshCodexInitCliTests(unittest.TestCase):
                 ]["codex"]["enabled"]
             )
             self.assertTrue((root / ".codex" / "hooks.json").is_file())
-            self.assertTrue((root / ".agents" / "skills" / "aoi" / "SKILL.md").is_file())
+            self.assertTrue(
+                (root / "user-skills" / "aoi" / "SKILL.md").is_file()
+            )
+            self.assertFalse((root / ".agents" / "skills" / "aoi").exists())
 
 
 class CodexInitCliTests(HarnessTestCase):
+    def codex_init(
+        self, *args: str, ok: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        return self.cli(
+            "codex-init",
+            "--user-skills-root",
+            str(self.root / "user-skills"),
+            *args,
+            ok=ok,
+        )
+
     def test_codex_init_wires_policy_hooks_config_and_skill(self) -> None:
-        result = json.loads(self.cli("codex-init", "--json").stdout)
+        result = json.loads(self.codex_init("--json").stdout)
         self.assertTrue(result["codex_init"])
         self.assertTrue(result["aoi_hook_policy_enabled"])
         self.assertTrue(result["aoi_hook_policy_changed"])
@@ -241,27 +335,29 @@ class CodexInitCliTests(HarnessTestCase):
             co.HOOK_COMMAND,
         )
         skill_text = (
-            self.root / ".agents" / "skills" / "aoi" / "SKILL.md"
+            self.root / "user-skills" / "aoi" / "SKILL.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("Operating under AOI in Codex", skill_text)
+        self.assertIn("Govern work with AOI", skill_text)
+        self.assertEqual(result["skill"]["scope"], "user")
+        self.assertFalse((self.root / ".agents" / "skills" / "aoi").exists())
         doctor = json.loads(self.cli("doctor", "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
 
     def test_codex_init_is_idempotent(self) -> None:
-        first = json.loads(self.cli("codex-init", "--json").stdout)
-        second = json.loads(self.cli("codex-init", "--json").stdout)
+        first = json.loads(self.codex_init("--json").stdout)
+        second = json.loads(self.codex_init("--json").stdout)
         self.assertTrue(first["aoi_hook_policy_changed"])
         self.assertFalse(second["aoi_hook_policy_changed"])
         self.assertEqual(second["hooks"]["events_added"], [])
 
     def test_codex_init_refuses_profile_change_with_active_task(self) -> None:
         self.init_task("active-config-digest")
-        result = self.cli("codex-init", "--json", ok=False)
+        result = self.codex_init("--json", ok=False)
         self.assertIn("active AOI tasks", result.stderr)
         self.assertFalse((self.root / ".codex" / "hooks.json").exists())
 
     def test_doctor_allows_unrelated_codex_hooks(self) -> None:
-        self.cli("codex-init", "--json")
+        self.codex_init("--json")
         path = self.root / ".codex" / "hooks.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["hooks"]["PreToolUse"] = [

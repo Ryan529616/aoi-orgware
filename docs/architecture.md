@@ -197,11 +197,13 @@ must also carry pre-marker legacy provenance. Other runtimes should integrate
 through equivalent observed-event adapters or the CLI/JSON contract without
 bypassing AOI authority rules.
 
-The `aoi codex-init` composition path is intentionally repository-local. It
+The `aoi codex-init` composition path keeps project integration repository-local
+while installing the generic AOI operating skill once at Codex user scope. It
 non-destructively merges hook definitions and the stable hook feature under
-`.codex/`, installs the AOI skill under `.agents/skills/`, and enables the AOI
-policy flag only when no active task binds the previous digest. It never edits
-global Codex state or bypasses Codex's exact-definition `/hooks` trust review.
+`.codex/`, installs the skill under `$HOME/.agents/skills/`, and enables the AOI
+policy flag only when no active task binds the previous digest. Project-specific
+instructions remain in that repository. It never edits global `CODEX_HOME`
+settings or bypasses Codex's exact-definition `/hooks` trust review.
 
 The optional codebase-memory Phase 1 adapter is a second, deliberately narrower
 integration. A Chief-fenced command imports an exact reviewed receipt into a
