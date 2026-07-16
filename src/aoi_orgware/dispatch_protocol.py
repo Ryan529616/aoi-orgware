@@ -41,6 +41,7 @@ class DispatchProtocolPolicy:
     subagent_parent_mapping_kind: str = "subagent_parent"
     observation_text_limit: int = 512
     dispatch_model_version: int = 1
+    dispatch_provenance: str = "codex_subagent_start_observed"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -54,6 +55,8 @@ class DispatchProtocolPolicy:
             raise ValueError("observation text limit must be positive")
         if self.dispatch_model_version < 1:
             raise ValueError("dispatch model version must be positive")
+        if not self.dispatch_provenance:
+            raise ValueError("dispatch provenance must be a non-empty label")
 
 
 class PacketById(Protocol):
@@ -516,7 +519,7 @@ def observe_subagent_start(
         attempt["observation"] = observation
         attempt["closed_at"] = observed_at
         packet["status"] = "dispatched"
-        packet["dispatch_provenance"] = "codex_subagent_start_observed"
+        packet["dispatch_provenance"] = policy.dispatch_provenance
         packet["dispatch_recorded_at"] = observed_at
         packet["agent_id"] = agent_id
         packet["updated_at"] = observed_at

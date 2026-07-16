@@ -207,6 +207,63 @@ authority, lifecycle payload, managed resource, or unknown entry may exist. It
 repairs the platform/lock, acquires the first Chief, and then requires an
 authenticated rerun of `aoi init` to finish POLICY, templates, and INDEX.
 
+### One-command Codex onboarding
+
+`aoi codex-init` is the explicit, repository-local onboarding path for Codex:
+
+```bash
+cd /path/to/project
+aoi codex-init --project-name "My Project" --json
+```
+
+It initializes AOI when needed, enables only `[hooks.codex].enabled`, merges the
+four protocol-v6 lifecycle hooks into `.codex/hooks.json`, enables the stable
+Codex hook feature in `.codex/config.toml`, and installs the generic AOI skill
+once at user scope under `$HOME/.agents/skills/aoi/SKILL.md`. Existing Codex
+settings and unrelated hooks are preserved. Re-running the command is
+idempotent. Project-specific instructions belong in the repository's
+`AGENTS.md` or a genuinely project-specific repo skill.
+
+For an existing AOI project the command is Chief-fenced. Enabling the hook
+policy is refused while an active or blocked task still binds the prior
+configuration digest. After onboarding, start a new Codex session in the
+trusted repository, open `/hooks`, and review/trust the exact definitions.
+`codex-init` cannot and does not mark hooks trusted for you.
+
+If AOI runs in WSL while the Codex host is Windows, pass an explicit launcher:
+
+```bash
+aoi codex-init \
+  --hook-command-windows \
+  "wsl.exe -d Ubuntu --cd /path/to/project aoi-codex-hook --hook-version 6" \
+  --user-skills-root /mnt/c/Users/<windows-user>/.agents/skills
+```
+
+`--user-skills-root` names the user-scope skill directory on the Codex host;
+it never writes `.agents/skills/aoi` inside the project. A differing existing
+AOI skill is not overwritten unless its reviewed exact digest is supplied with
+`--replace-user-skill-sha256`.
+
+This command configures AOI for Codex; it does not install Codex itself or
+change global model, sandbox, approval, provider, or notification defaults.
+Use OpenAI's standalone installer separately when the `codex` command is absent
+(`https://chatgpt.com/codex/install.ps1` on Windows or `install.sh` on POSIX).
+
+Claude Code has a separate client adapter. Its hooks remain repo-local, while
+the generic AOI skill is installed once at Claude user scope:
+
+```bash
+aoi claude-init --project-name "My Project" --json
+```
+
+By default the skill is written to `$HOME/.claude/skills/aoi/SKILL.md` and no
+`.claude/skills/aoi` directory is created in the project. Project-specific
+instructions belong in the repository's `CLAUDE.md` or `AGENTS.md`. When AOI
+runs in WSL for a Windows-hosted Claude installation, pass
+`--user-skills-root /mnt/c/Users/<windows-user>/.claude/skills`. A differing
+existing user skill requires its exact reviewed SHA-256 through
+`--replace-user-skill-sha256` before AOI will replace it.
+
 ## Minimal governed task
 
 ```bash

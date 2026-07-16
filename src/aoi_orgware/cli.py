@@ -158,6 +158,8 @@ from .commands.resource import (
     register_resource_commands,
 )
 from .commands.status import register_status_commands
+from .commands import claude_onboarding as claude_onboarding_impl
+from .commands import codex_onboarding as codex_onboarding_impl
 from .commands.task_lifecycle import (
     TaskLifecycleCmdServices,
     _chief_credential,
@@ -431,9 +433,13 @@ DISPATCH_ARM_MAX_SECONDS = 15 * 60
 HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
 ROOT_SESSION_MAPPING_KIND = "root"
 SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
+HOOK_OBSERVED_DISPATCH_PROVENANCES = {
+    "codex_subagent_start_observed",
+    "claude_subagent_start_observed",
+}
 DISPATCH_PROVENANCES = {
     "none",
-    "codex_subagent_start_observed",
+    *HOOK_OBSERVED_DISPATCH_PROVENANCES,
     "manual_unverified",
 }
 MINI_MAX_LOCKS = 3
@@ -623,7 +629,7 @@ class AOIArgumentParser(argparse.ArgumentParser):
 def command_requires_chief(command: str, *, initialized: bool) -> bool:
     """Default-fence every project command not explicitly proven exempt."""
 
-    if command == "init":
+    if command in {"init", "claude-init", "codex-init"}:
         return initialized
     return command not in (
         CHIEF_AUTHORITY_CONTROL_COMMANDS
@@ -833,6 +839,26 @@ def _dispatch_protocol_policy(
         executing_packet_statuses=frozenset(EXECUTING_PACKET_STATUSES),
         root_session_mapping_kind=ROOT_SESSION_MAPPING_KIND,
         subagent_parent_mapping_kind=SUBAGENT_PARENT_MAPPING_KIND,
+    )
+
+
+def _claude_dispatch_protocol_policy(
+) -> dispatch_protocol_impl.DispatchProtocolPolicy:
+    """Claude Code transport shares dispatch protocol v6; only provenance differs.
+
+    Consumption is observed at the Claude ``SubagentStart`` hook event, which
+    carries the same parent-session/agent-type/agent-id coordinates as the
+    Codex event. The distinct provenance label keeps the transport that
+    actually observed the dispatch auditable instead of implying a Codex
+    observation that never happened.
+    """
+    return dispatch_protocol_impl.DispatchProtocolPolicy(
+        hook_protocol_version=int(HOOK_PROTOCOL_VERSION),
+        hook_id_re=HOOK_ID_RE,
+        executing_packet_statuses=frozenset(EXECUTING_PACKET_STATUSES),
+        root_session_mapping_kind=ROOT_SESSION_MAPPING_KIND,
+        subagent_parent_mapping_kind=SUBAGENT_PARENT_MAPPING_KIND,
+        dispatch_provenance="claude_subagent_start_observed",
     )
 
 
@@ -1539,6 +1565,229 @@ def _resource_text(name: str) -> str:
     return resource.read_text(encoding="utf-8")
 
 
+def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """One command: initialize AOI and wire this repo's Claude Code sessions.
+
+    Combines the standard ``aoi init`` contract with client-side wiring — the
+    lifecycle hooks in ``.claude/settings.json`` and the user-scope AOI skill —
+    so a repo can be put under AOI governance in a single step. First-time use
+    on an uninitialized project needs no Chief credential (like ``aoi init``);
+    re-running on an initialized project is Chief-fenced.
+    """
+
+    if not (paths.root / ".git").exists():
+        raise HarnessError("aoi claude-init requires a Git repository root")
+    user_skills_root = (
+        Path(args.user_skills_root).expanduser()
+        if args.user_skills_root
+        else Path.home() / ".claude" / "skills"
+    )
+    claude_skill_text = _resource_text("claude/SKILL.md")
+    try:
+        skill_preflight = claude_onboarding_impl.preflight_claude_user_skill(
+            user_skills_root,
+            claude_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+    except (OSError, claude_onboarding_impl.ClaudeOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+    # 1. Initialize AOI if needed, reusing the exact init contract. Capture its
+    #    JSON emit so claude-init can print one combined summary.
+    init_ns = argparse.Namespace(
+        project_name=args.project_name,
+        config=None,
+        expected_config_sha256=None,
+        replace_policy_sha256=None,
+        json=True,
+    )
+    captured = io.StringIO()
+    saved_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        cmd_init(init_ns, paths)
+    finally:
+        sys.stdout = saved_stdout
+    try:
+        init_result = json.loads(captured.getvalue() or "{}")
+    except json.JSONDecodeError:
+        init_result = {}
+    paths = get_paths(paths.root)
+    project_name = init_result.get("project", paths.project.name)
+    # 2. Wire the Claude Code lifecycle hooks and install the AOI skill.
+    try:
+        hooks_result = claude_onboarding_impl.install_claude_hooks(
+            paths.root / ".claude" / "settings.json",
+            governed_agent_types=args.governed_agent_types,
+        )
+        skill_result = claude_onboarding_impl.install_claude_user_skill(
+            user_skills_root,
+            claude_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+    except claude_onboarding_impl.ClaudeOnboardingError as exc:
+        raise HarnessError(str(exc)) from exc
+    payload = {
+        "claude_init": True,
+        "project": project_name,
+        "root": str(paths.root),
+        "aoi_initialized": init_result.get("initialized", True),
+        "created_config": init_result.get("created_config", False),
+        "preflight": {"user_skill": skill_preflight},
+        "hooks": hooks_result,
+        "skill": skill_result,
+        "next_steps": [
+            "Install aoi on your PATH (e.g. pipx install aoi-orgware) so the "
+            "hook command 'aoi-claude-hook' resolves.",
+            "Open a NEW Claude Code session in this repo; the SessionStart hook "
+            f"will announce that AOI is active for {project_name!r}.",
+            "The generic AOI skill is installed once at Claude user scope; keep "
+            "project-specific instructions in the repository CLAUDE.md/AGENTS.md.",
+            "For governed work, acquire a Chief lease: aoi chief-acquire "
+            "--session-id <session-id> --json, then export the returned "
+            "AOI_CHIEF_* variables.",
+        ],
+    }
+    emit(payload, args.json)
+    return 0
+
+def _enable_codex_hook_policy(paths: HarnessPaths) -> tuple[HarnessPaths, bool]:
+    """Enable the explicit AOI Codex-hook policy without changing any other key."""
+
+    if paths.project.codex_hooks_enabled:
+        return paths, False
+    active_tasks = [
+        str(state.get("task_id", ""))
+        for state in load_all_tasks(paths)
+        if state.get("status") in {"active", "blocked"}
+    ]
+    if active_tasks:
+        raise HarnessError(
+            "cannot enable hooks.codex while active AOI tasks bind the current "
+            f"configuration digest: {sorted(active_tasks)}"
+        )
+    try:
+        current_text = paths.config.read_text(encoding="utf-8")
+        candidate, changed = codex_onboarding_impl.enable_aoi_codex_hooks_policy(
+            current_text
+        )
+    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+    if not changed:
+        return paths, False
+    atomic_write_text(paths.config, candidate)
+    updated = get_paths(paths.root)
+    if updated.harness != paths.harness or updated.lock != paths.lock:
+        raise HarnessError(
+            "codex-init changed an AOI path or lock domain unexpectedly; restore aoi.toml"
+        )
+    if not updated.project.codex_hooks_enabled:
+        raise HarnessError("codex-init failed to enable hooks.codex in aoi.toml")
+    write_index(updated)
+    return updated, True
+
+def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """Initialize AOI, wire project hooks, and install the user AOI skill."""
+
+    if not (paths.root / ".git").exists():
+        raise HarnessError("aoi codex-init requires a Git repository root")
+    if paths.config.is_file() and not paths.project.codex_hooks_enabled:
+        active_tasks = [
+            str(state.get("task_id", ""))
+            for state in load_all_tasks(paths)
+            if state.get("status") in {"active", "blocked"}
+        ]
+        if active_tasks:
+            raise HarnessError(
+                "cannot enable hooks.codex while active AOI tasks bind the current "
+                f"configuration digest: {sorted(active_tasks)}"
+            )
+    user_skills_root = (
+        Path(args.user_skills_root).expanduser()
+        if args.user_skills_root
+        else Path.home() / ".agents" / "skills"
+    )
+    try:
+        codex_skill_text = _resource_text("codex/SKILL.md")
+        skill_preflight = codex_onboarding_impl.preflight_codex_user_skill(
+            user_skills_root,
+            codex_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+        preflight = codex_onboarding_impl.preflight_codex_onboarding(
+            paths.root,
+            command=args.hook_command,
+            command_windows=args.hook_command_windows,
+        )
+        preflight["user_skill"] = skill_preflight
+    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+    init_ns = argparse.Namespace(
+        project_name=args.project_name,
+        config=None,
+        expected_config_sha256=None,
+        replace_policy_sha256=None,
+        json=True,
+    )
+    captured = io.StringIO()
+    saved_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        cmd_init(init_ns, paths)
+    finally:
+        sys.stdout = saved_stdout
+    try:
+        init_result = json.loads(captured.getvalue() or "{}")
+    except json.JSONDecodeError:
+        init_result = {}
+
+    paths = get_paths(paths.root)
+    # Existing projects arrive here under the Chief/state lock. Fresh projects
+    # have just completed init and have no task state yet. In both cases the
+    # change is limited to one reviewed boolean and refuses active task digests.
+    paths, policy_changed = _enable_codex_hook_policy(paths)
+    try:
+        config_result = codex_onboarding_impl.install_codex_config(
+            paths.root / ".codex" / "config.toml"
+        )
+        hooks_result = codex_onboarding_impl.install_codex_hooks(
+            paths.root / ".codex" / "hooks.json",
+            command=args.hook_command,
+            command_windows=args.hook_command_windows,
+        )
+        skill_result = codex_onboarding_impl.install_codex_user_skill(
+            user_skills_root,
+            codex_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+
+    payload = {
+        "codex_init": True,
+        "project": paths.project.name,
+        "root": str(paths.root),
+        "aoi_initialized": init_result.get("initialized", True),
+        "created_config": init_result.get("created_config", False),
+        "aoi_hook_policy_enabled": True,
+        "aoi_hook_policy_changed": policy_changed,
+        "config_sha256": paths.project.sha256,
+        "codex_config": config_result,
+        "preflight": preflight,
+        "hooks": hooks_result,
+        "skill": skill_result,
+        "next_steps": [
+            "Install AOI on the Codex host PATH so aoi-codex-hook resolves.",
+            "The generic AOI skill is installed once at user scope; keep "
+            "project-specific instructions in the repository AGENTS.md.",
+            "Start a new Codex session in this trusted repo, open /hooks, and "
+            "review/trust the exact AOI hook definitions.",
+            "Run aoi doctor --json after hook trust; structural PASS does not prove "
+            "that Codex executed or trusted a hook.",
+        ],
+    }
+    emit(payload, args.json)
+    return 0
+
 def _extend_unique(state: dict[str, Any], key: str, values: Iterable[str]) -> None:
     destination = state.setdefault(key, [])
     for value in values:
@@ -1572,7 +1821,7 @@ def _capacity_records(
         ]
         subagent_start_observed_at = (
             str(observed_starts[0].get("observed_at", ""))
-            if dispatch_provenance == "codex_subagent_start_observed"
+            if dispatch_provenance in HOOK_OBSERVED_DISPATCH_PROVENANCES
             and len(observed_starts) == 1
             else ""
         )
@@ -3474,6 +3723,17 @@ def observe_subagent_start(
         paths,
         payload,
         policy=_dispatch_protocol_policy(),
+        services=_dispatch_protocol_services(),
+    )
+
+
+def observe_claude_subagent_start(
+    paths: HarnessPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    return dispatch_protocol_impl.observe_subagent_start(
+        paths,
+        payload,
+        policy=_claude_dispatch_protocol_policy(),
         services=_dispatch_protocol_services(),
     )
 
@@ -5581,19 +5841,43 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 hook_payload = {}
             expected_events = {"SessionStart", "UserPromptSubmit", "SubagentStart", "Stop"}
             hooks = hook_payload.get("hooks", {})
-            if set(hooks) != expected_events:
-                errors.append(f"unexpected hook event set in {hook_path}: {sorted(hooks)}")
+            if not isinstance(hooks, dict):
+                errors.append(f"{hook_path} hooks must be a JSON object")
             else:
                 for event in expected_events:
                     entries = hooks.get(event, [])
-                    if len(entries) != 1 or len(entries[0].get("hooks", [])) != 1:
-                        errors.append(f"{hook_path} must have exactly one handler for {event}")
+                    if not isinstance(entries, list):
+                        errors.append(f"{hook_path} {event} must be a JSON array")
                         continue
-                    handler = entries[0]["hooks"][0]
+                    matching_handlers: list[dict[str, Any]] = []
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        handlers = entry.get("hooks", [])
+                        if not isinstance(handlers, list):
+                            continue
+                        for handler in handlers:
+                            if not isinstance(handler, dict):
+                                continue
+                            commands = (
+                                str(handler.get("command", "")),
+                                str(handler.get("commandWindows", "")),
+                            )
+                            if any("aoi-codex-hook" in command for command in commands):
+                                matching_handlers.append(handler)
+                    if len(matching_handlers) != 1:
+                        errors.append(
+                            f"{hook_path} must have exactly one AOI handler for {event}"
+                        )
+                        continue
+                    handler = matching_handlers[0]
                     if handler.get("type") != "command":
-                        errors.append(f"{hook_path} {event} handler is not a command")
-                    if handler.get("timeout", 0) < 30:
-                        errors.append(f"{hook_path} {event} timeout is below 30 seconds")
+                        errors.append(f"{hook_path} {event} AOI handler is not a command")
+                    timeout = handler.get("timeout", 0)
+                    if not isinstance(timeout, (int, float)) or timeout < 30:
+                        errors.append(
+                            f"{hook_path} {event} AOI handler timeout is below 30 seconds"
+                        )
                     for key in ("command", "commandWindows"):
                         command = str(handler.get(key, ""))
                         if "aoi-codex-hook" not in command:
@@ -6072,6 +6356,18 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    codex_onboarding_impl.register_codex_onboarding_commands(
+        sub,
+        handlers={"codex_init": cmd_codex_init},
+        add_json_argument=add_json_argument,
+    )
+
+    claude_onboarding_impl.register_claude_onboarding_commands(
+        sub,
+        handlers={"claude_init": cmd_claude_init},
+        add_json_argument=add_json_argument,
+    )
+
     register_backup_commands(
         sub,
         handlers={
@@ -6234,7 +6530,7 @@ def main(argv: list[str] | None = None) -> int:
             return int(args.handler(args, None))
         paths = get_paths()
         initialized = paths.config.is_file()
-        if command not in {"init", ""} and not initialized:
+        if command not in {"init", "claude-init", "codex-init", ""} and not initialized:
             raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
         if initialized:
             apply_project_config(paths.project)
