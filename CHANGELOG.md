@@ -28,6 +28,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   classifiers, and this changelog.
 
 ### Changed
+- Terminal-task doctor checks now preserve the complete packet graph while
+  classifying each packet's integrity independently, so valid Steward synthesis
+  bindings no longer become false stale-binding errors after task close while
+  real binding tamper remains an error. Duplicate packet IDs are reported as
+  global integrity errors instead of crossing legacy/v1 classifications.
 - Claude's `PreToolUse` gate now validates the full live arm authority before
   allowing a governed spawn: Chief epoch, plan and packet digests, execution
   topology, lane snapshots, and resource authority must all still match.

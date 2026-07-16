@@ -6186,8 +6186,175 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         self.assertTrue(doctor["ok"], doctor)
 
+        active_state = self.task_state(task_id)
+        filtered_errors = cli_impl.packet_integrity_errors(
+            h.get_paths(self.root),
+            active_state,
+            packet_ids={"parallel-review-steward-synthesis"},
+        )
+        self.assertEqual(filtered_errors, [])
+        self.assertEqual(
+            cli_impl.packet_integrity_errors(
+                h.get_paths(self.root),
+                active_state,
+                packet_ids={"missing-packet"},
+            ),
+            ["packet integrity filter references unknown packet ids: missing-packet"],
+        )
+        duplicate_active_state = copy.deepcopy(active_state)
+        duplicate_active_state["packets"].append(
+            copy.deepcopy(duplicate_active_state["packets"][0])
+        )
+        duplicate_packet_id = duplicate_active_state["packets"][0]["packet_id"]
+        self.assertIn(
+            f"duplicate packet id {duplicate_packet_id!r}",
+            cli_impl.packet_integrity_errors(
+                h.get_paths(self.root), duplicate_active_state
+            ),
+        )
+        self.assertEqual(
+            cli_impl.packet_integrity_errors(
+                h.get_paths(self.root),
+                duplicate_active_state,
+                packet_ids={duplicate_packet_id},
+            ),
+            [
+                "packet integrity filter requires exactly one state packet for "
+                f"{duplicate_packet_id!r}; found 2"
+            ],
+        )
+
+        for lane_id in ("rtl", "numeric", "steward"):
+            lane = self.lane_state(task_id, lane_id)
+            self.cli(
+                "lane-set-status",
+                "--task",
+                task_id,
+                "--lane-id",
+                lane_id,
+                "--expected-revision",
+                str(lane["revision"]),
+                "--expected-status",
+                str(lane["status"]),
+                "--status",
+                "done",
+                "--next-action",
+                "No further specialist work remains in this regression",
+                "--reason",
+                "All selected packets and the Steward synthesis are terminal",
+                "--session-id",
+                "chief-centralized",
+            )
+        self.add_passing_verification(task_id)
+        self.cli(
+            "set-delivery",
+            "--task",
+            task_id,
+            "--mode",
+            "none",
+            "--detail",
+            "Terminal doctor relational-context regression only",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            task_id,
+            "--next-action",
+            "Close and verify the terminal Steward synthesis packet",
+        )
+        self.cli(
+            "close-task",
+            "--task",
+            task_id,
+            "--summary",
+            "Closed with intact specialist and Steward synthesis evidence",
+        )
+        terminal_doctor = json.loads(
+            self.cli("doctor", "--task", task_id, "--json").stdout
+        )
+        self.assertTrue(terminal_doctor["ok"], terminal_doctor)
+
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         valid_state_bytes = state_path.read_bytes()
+        mixed_duplicate = json.loads(valid_state_bytes)
+        legacy_duplicate = copy.deepcopy(mixed_duplicate["packets"][0])
+        duplicate_packet_id = legacy_duplicate["packet_id"]
+        legacy_duplicate.pop("integrity_version", None)
+        legacy_duplicate["packet_purpose"] = "invalid-purpose"
+        mixed_duplicate["packets"].append(legacy_duplicate)
+        state_path.write_text(
+            json.dumps(mixed_duplicate, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        mixed_duplicate_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                task_id,
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        mixed_duplicate_payload = json.loads(mixed_duplicate_doctor.stdout)
+        self.assertEqual(
+            mixed_duplicate_doctor.returncode, 1, mixed_duplicate_doctor.stderr
+        )
+        self.assertIn(
+            f"terminal task {task_id}: duplicate packet id {duplicate_packet_id!r}",
+            mixed_duplicate_payload["errors"],
+        )
+        self.assertFalse(
+            any(
+                "invalid packet purpose" in item
+                for item in mixed_duplicate_payload["errors"]
+            ),
+            mixed_duplicate_payload,
+        )
+
+        state_path.write_bytes(valid_state_bytes)
+        stale_binding = json.loads(valid_state_bytes)
+        stale_synthesis = next(
+            packet
+            for packet in stale_binding["packets"]
+            if packet["packet_id"] == "parallel-review-steward-synthesis"
+        )
+        stale_synthesis["steward_input_bindings"][0]["result_sha256"] = "0" * 64
+        state_path.write_text(
+            json.dumps(stale_binding, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        stale_binding_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "doctor",
+                "--task",
+                task_id,
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            stale_binding_doctor.returncode, 1, stale_binding_doctor.stderr
+        )
+        self.assertIn(
+            "Steward synthesis specialist bindings are stale",
+            stale_binding_doctor.stdout,
+        )
+
+        state_path.write_bytes(valid_state_bytes)
         downgraded = json.loads(valid_state_bytes)
         downgraded["execution_selections"][0].pop("execution_selection_version")
         downgraded["execution_selections"][0].pop("steward_snapshot")

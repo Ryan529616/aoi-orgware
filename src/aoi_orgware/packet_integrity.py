@@ -459,11 +459,42 @@ def packet_integrity_errors(
     state: dict[str, Any],
     *,
     allow_done_lock_recovery: bool = False,
+    packet_ids: set[str] | None = None,
     services: PacketIntegrityServices,
 ) -> list[str]:
     errors: list[str] = []
-    for packet in state.get("packets", []):
+    packets = state.get("packets", [])
+    packet_id_counts: dict[str, int] = {}
+    for packet in packets:
         packet_id = str(packet.get("packet_id", ""))
+        packet_id_counts[packet_id] = packet_id_counts.get(packet_id, 0) + 1
+    if packet_ids is None:
+        errors.extend(
+            f"duplicate packet id {packet_id!r}"
+            for packet_id, count in sorted(packet_id_counts.items())
+            if count > 1
+        )
+    else:
+        unknown_packet_ids = packet_ids - {
+            str(packet.get("packet_id", "")) for packet in packets
+        }
+        if unknown_packet_ids:
+            errors.append(
+                "packet integrity filter references unknown packet ids: "
+                + ", ".join(sorted(unknown_packet_ids))
+            )
+        errors.extend(
+            f"packet integrity filter requires exactly one state packet for "
+            f"{packet_id!r}; found {packet_id_counts[packet_id]}"
+            for packet_id in sorted(packet_ids)
+            if packet_id_counts.get(packet_id, 0) > 1
+        )
+    for packet in packets:
+        packet_id = str(packet.get("packet_id", ""))
+        if packet_ids is not None and (
+            packet_id not in packet_ids or packet_id_counts.get(packet_id) != 1
+        ):
+            continue
         status = packet.get("status")
         mode = packet.get("packet_mode", "legacy")
         locks = packet.get("locks", [])

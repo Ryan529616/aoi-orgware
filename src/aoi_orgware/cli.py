@@ -1218,11 +1218,13 @@ def packet_integrity_errors(
     state: dict[str, Any],
     *,
     allow_done_lock_recovery: bool = False,
+    packet_ids: set[str] | None = None,
 ) -> list[str]:
     return packet_integrity_impl.packet_integrity_errors(
         paths,
         state,
         allow_done_lock_recovery=allow_done_lock_recovery,
+        packet_ids=packet_ids,
         services=_packet_integrity_services(),
     )
 
@@ -5741,8 +5743,26 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             # Grandfather only records that explicitly predate integrity v1.
             # Once a terminal artifact has a v1 attestation, any later mismatch
             # remains a doctor error even though the task is already closed.
-            for packet in task.get("packets", []):
-                packet_state = {**task, "packets": [packet]}
+            terminal_packets = task.get("packets", [])
+            terminal_packet_id_counts: dict[str, int] = {}
+            for packet in terminal_packets:
+                packet_id = str(packet.get("packet_id", ""))
+                terminal_packet_id_counts[packet_id] = (
+                    terminal_packet_id_counts.get(packet_id, 0) + 1
+                )
+            duplicate_terminal_packet_ids = {
+                packet_id
+                for packet_id, count in terminal_packet_id_counts.items()
+                if count > 1
+            }
+            errors.extend(
+                f"terminal task {task_id}: duplicate packet id {packet_id!r}"
+                for packet_id in sorted(duplicate_terminal_packet_ids)
+            )
+            for packet in terminal_packets:
+                packet_id = str(packet.get("packet_id", ""))
+                if packet_id in duplicate_terminal_packet_ids:
+                    continue
                 destination = (
                     warnings if packet.get("integrity_version") != 1 else errors
                 )
@@ -5751,7 +5771,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
                 destination.extend(
                     f"{prefix} {task_id}: {item}"
-                    for item in packet_integrity_errors(paths, packet_state)
+                    for item in packet_integrity_errors(
+                        paths, task, packet_ids={packet_id}
+                    )
                 )
             errors.extend(
                 f"terminal task {task_id}: {item}"
