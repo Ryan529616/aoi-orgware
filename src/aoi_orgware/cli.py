@@ -119,7 +119,13 @@ from .commands.coordination import (
     register_coordination_commands,
     register_cross_lane_commands,
 )
-from .commands.execution_selection import register_execution_selection_commands
+from .commands.execution_selection import (
+    ExecutionSelectionCmdServices,
+    cmd_execution_brief_record,
+    cmd_execution_select,
+    cmd_execution_select_plan,
+    register_execution_selection_commands,
+)
 from .commands.improvement import (
     ImprovementCmdServices,
     cmd_improvement_arbitrate,
@@ -2932,470 +2938,6 @@ def _execution_brief_coverage_error(
     return None
 
 
-def _validate_execution_selection_arguments(
-    args: argparse.Namespace,
-) -> tuple[str, str, list[str]]:
-    selection_id = validate_id(args.selection_id, "execution selection id")
-    work_unit_id = validate_id(args.work_unit_id, "execution work-unit id")
-    if args.supersedes_selection_id:
-        validate_id(args.supersedes_selection_id, "superseded execution selection id")
-    lane_ids = list(dict.fromkeys(args.lane))
-    if args.mode == "single" and len(lane_ids) != 1:
-        raise HarnessError("single execution mode requires exactly one lane")
-    if args.mode in {"centralized_parallel", "hybrid"} and len(lane_ids) < 2:
-        raise HarnessError(f"{args.mode} execution mode requires at least two lanes")
-    if args.mode == "centralized_parallel" and (
-        args.sequential_dependency == "high" or args.shared_context == "high"
-    ):
-        raise HarnessError(
-            "centralized_parallel is not allowed for high sequential dependency or shared context"
-        )
-    if args.mode == "single" and args.steward_lane_id:
-        raise HarnessError("single execution mode may not bind a Steward lane")
-    if args.mode in {"centralized_parallel", "hybrid"} and not args.steward_lane_id:
-        raise HarnessError(f"{args.mode} execution mode requires --steward-lane-id")
-    return selection_id, work_unit_id, lane_ids
-
-
-def _build_execution_selection_target_contract(
-    *,
-    state: dict[str, Any],
-    args: argparse.Namespace,
-    selection_id: str,
-    work_unit_id: str,
-    lanes: list[dict[str, Any]],
-    steward: dict[str, Any] | None,
-    override_settings: dict[str, str | int],
-) -> tuple[dict[str, Any], str]:
-    resource_envelope, resource_envelope_sha256 = _build_execution_resource_envelope(
-        mode=args.mode,
-        lanes=lanes,
-        steward=steward,
-        override_id=args.override_id,
-        override_settings=override_settings,
-    )
-    contract = {
-        "schema_version": 1,
-        "target_kind": "execution_resource",
-        "target_id": selection_id,
-        "target_task_id": state["task_id"],
-        "task_plan_sha256": state["plan_sha256"],
-        "override_id": args.override_id,
-        "work_unit_id": work_unit_id,
-        "supersedes_selection_id": args.supersedes_selection_id or "",
-        "scope": require_evidence_detail(args.scope, "execution selection scope"),
-        "mode": args.mode,
-        "lane_snapshots": [
-            _lane_authority_snapshot(lane)
-            for lane in sorted(lanes, key=lambda item: item["lane_id"])
-        ],
-        "steward_snapshot": (
-            _lane_authority_snapshot(steward) if steward is not None else {}
-        ),
-        "resource_envelope": resource_envelope,
-        "resource_envelope_sha256": resource_envelope_sha256,
-        "task_characteristics": {
-            "sequential_dependency": args.sequential_dependency,
-            "tool_density": args.tool_density,
-            "shared_context": args.shared_context,
-        },
-        "rationale": require_evidence_detail(
-            args.rationale, "execution topology rationale"
-        ),
-        "falsification_condition": require_evidence_detail(
-            args.falsification_condition,
-            "execution topology falsification condition",
-        ),
-        "escalation_condition": require_evidence_detail(
-            args.escalation_condition, "execution topology escalation condition"
-        ),
-    }
-    return contract, canonical_record_sha256(contract)
-
-
-def _execution_selection_target_contract_from_record(
-    state: dict[str, Any], selection: dict[str, Any]
-) -> dict[str, Any]:
-    return (
-        resource_governance_impl.execution_selection_target_contract_from_record(
-            state, selection
-        )
-    )
-
-
-def cmd_execution_select_plan(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    selection_id, work_unit_id, lane_ids = _validate_execution_selection_arguments(
-        args
-    )
-    proposed_settings = parse_override_settings(
-        args.proposed_setting,
-        roles=ROLE_TIER_MAP,
-        target_kind="execution_resource",
-    )
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "plan execution resource override for")
-        require_plan_ready(paths, state, "plan execution resource override")
-        require_root_session(paths, state, args.session_id)
-        lanes = [lane_by_id(state, lane_id) for lane_id in lane_ids]
-        if any(lane.get("status") in {"done", "parked"} for lane in lanes):
-            raise HarnessError("execution selection may not use done or parked lanes")
-        steward: dict[str, Any] | None = None
-        if args.mode in {"centralized_parallel", "hybrid"}:
-            steward = _engaged_steward_lane(state)
-            if steward.get("lane_id") != args.steward_lane_id:
-                raise HarnessError(
-                    "--steward-lane-id must name the one engaged coordination_steward lane"
-                )
-            if any(lane.get("lane_id") == steward.get("lane_id") for lane in lanes):
-                raise HarnessError("parallel specialist lanes may not include the Steward lane")
-        contract, digest = _build_execution_selection_target_contract(
-            state=state,
-            args=args,
-            selection_id=selection_id,
-            work_unit_id=work_unit_id,
-            lanes=lanes,
-            steward=steward,
-            override_settings=proposed_settings,
-        )
-    emit({**contract, "target_contract_sha256": digest}, args.json)
-    return 0
-
-
-def cmd_execution_select(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    selection_id, work_unit_id, lane_ids = _validate_execution_selection_arguments(
-        args
-    )
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "select execution topology for")
-        require_plan_ready(paths, state, "select execution topology")
-        _adopt_execution_policy_v2_for_new_work(state)
-        session_id = require_root_session(paths, state, args.session_id)
-        resource_override_settings = approved_override_settings(
-            state,
-            args.override_id,
-            target_kind="execution_resource",
-            target_id=selection_id,
-        )
-        if any(
-            item.get("selection_id") == selection_id
-            for item in state.get("execution_selections", [])
-        ):
-            raise HarnessError(f"execution selection already exists: {selection_id}")
-        active_same_work_unit = [
-            item
-            for item in state.get("execution_selections", [])
-            if item.get("status") == "active"
-            and item.get("work_unit_id") == work_unit_id
-        ]
-        if active_same_work_unit:
-            if (
-                len(active_same_work_unit) != 1
-                or args.supersedes_selection_id
-                != active_same_work_unit[0].get("selection_id")
-            ):
-                raise HarnessError(
-                    "active topology for this work unit requires exact --supersedes-selection-id"
-                )
-            prior_selection = active_same_work_unit[0]
-            prior_selection_id = str(prior_selection.get("selection_id", ""))
-            blocking_cross_sessions = []
-            for cross_session in state.get("cross_lane_sessions", []):
-                if cross_session.get("execution_selection_id") != prior_selection_id:
-                    continue
-                request = coordination_by_id(
-                    state, str(cross_session.get("request_id", ""))
-                )
-                if cross_session.get("status") == "open" or (
-                    cross_session.get("status") == "closed"
-                    and request.get("status")
-                    not in TERMINAL_COORDINATION_STATUSES | {"accepted"}
-                ):
-                    blocking_cross_sessions.append(
-                        str(cross_session.get("cross_lane_session_id", ""))
-                    )
-            active_records = [
-                f"packet:{item.get('packet_id')}"
-                for item in state.get("packets", [])
-                if item.get("execution_selection_id") == prior_selection_id
-                and item.get("status") in ACTIVE_PACKET_STATUSES
-            ] + [
-                f"job:{item.get('run_id')}"
-                for item in state.get("jobs", [])
-                if item.get("execution_selection_id") == prior_selection_id
-                and item.get("status") in ACTIVE_JOB_STATUSES
-            ]
-            if blocking_cross_sessions or active_records:
-                detail = ", ".join(blocking_cross_sessions + active_records)
-                raise HarnessError(
-                    "cannot supersede execution selection with active/unconsumed work; "
-                    f"cancel, complete, or arbitrate first: {detail}"
-                )
-            if prior_selection.get("mode") in {"centralized_parallel", "hybrid"}:
-                brief_error = _execution_brief_coverage_error(
-                    paths,
-                    state,
-                    prior_selection,
-                )
-                if brief_error:
-                    raise HarnessError(brief_error)
-            prior_selection["status"] = "superseded"
-            prior_selection["superseded_by"] = selection_id
-            prior_selection["superseded_at"] = now_iso()
-        elif args.supersedes_selection_id:
-            raise HarnessError("superseded execution selection is not active for this work unit")
-        lanes = [lane_by_id(state, lane_id) for lane_id in lane_ids]
-        if any(lane.get("status") in {"done", "parked"} for lane in lanes):
-            raise HarnessError("execution selection may not use done or parked lanes")
-        steward: dict[str, Any] | None = None
-        if args.mode in {"centralized_parallel", "hybrid"}:
-            steward = _engaged_steward_lane(state)
-            if steward.get("lane_id") != args.steward_lane_id:
-                raise HarnessError(
-                    "--steward-lane-id must name the one engaged coordination_steward lane"
-                )
-            if any(lane.get("lane_id") == steward.get("lane_id") for lane in lanes):
-                raise HarnessError("parallel specialist lanes may not include the Steward lane")
-        target_contract, target_contract_sha256 = (
-            _build_execution_selection_target_contract(
-                state=state,
-                args=args,
-                selection_id=selection_id,
-                work_unit_id=work_unit_id,
-                lanes=lanes,
-                steward=steward,
-                override_settings=resource_override_settings,
-            )
-        )
-        require_override_target_contract(
-            state, args.override_id, target_contract_sha256
-        )
-        resource_envelope = target_contract["resource_envelope"]
-        resource_envelope_sha256 = target_contract["resource_envelope_sha256"]
-        recorded = now_iso()
-        selection = {
-            "integrity_version": 1,
-            "execution_selection_version": 2,
-            "selection_id": selection_id,
-            "work_unit_id": work_unit_id,
-            "supersedes_selection_id": target_contract["supersedes_selection_id"],
-            "task_plan_sha256": target_contract["task_plan_sha256"],
-            "scope": target_contract["scope"],
-            "mode": target_contract["mode"],
-            "lane_snapshots": target_contract["lane_snapshots"],
-            "steward_snapshot": target_contract["steward_snapshot"],
-            "resource_envelope": resource_envelope,
-            "resource_envelope_sha256": resource_envelope_sha256,
-            "target_contract_sha256": target_contract_sha256,
-            "task_characteristics": target_contract["task_characteristics"],
-            "rationale": target_contract["rationale"],
-            "falsification_condition": target_contract["falsification_condition"],
-            "escalation_condition": target_contract["escalation_condition"],
-            "root_owner": state.get("owner"),
-            "root_session_id": session_id,
-            "status": "active",
-            "recorded_at": recorded,
-        }
-        if args.override_id:
-            refreshed_settings = approved_override_settings(
-                state,
-                args.override_id,
-                target_kind="execution_resource",
-                target_id=selection_id,
-            )
-            if refreshed_settings != resource_override_settings:
-                raise HarnessError(
-                    "execution resource override changed before consumption"
-                )
-        state["execution_model_version"] = 1
-        state.setdefault("execution_selections", []).append(selection)
-        if args.override_id:
-            resource_override = override_by_id(state, args.override_id)
-            if resource_override.get("status") != "approved":
-                raise HarnessError("execution resource override changed before consumption")
-            resource_override["version"] = int(resource_override["version"]) + 1
-            resource_override["status"] = "consumed"
-            resource_override["consumption"] = {
-                "consumer_command": "execution-select",
-                "selection_id": selection_id,
-                "resource_envelope_sha256": resource_envelope_sha256,
-                "target_contract_sha256": target_contract_sha256,
-                "root_session_id": session_id,
-                "recorded_at": recorded,
-            }
-            resource_override["updated_at"] = recorded
-        state.setdefault("cross_lane_sessions", [])
-        state.setdefault("needs_user_escalations", [])
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(selection, args.json)
-    return 0
-
-
-def cmd_execution_brief_record(
-    args: argparse.Namespace, paths: HarnessPaths
-) -> int:
-    brief_id = validate_id(args.brief_id, "execution brief id")
-    packet_ids = sorted(set(args.packet_id))
-    cross_session_ids = sorted(set(args.cross_lane_session_id))
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "record execution brief for")
-        require_plan_ready(paths, state, "record execution brief")
-        if any(
-            item.get("brief_id") == brief_id
-            for item in state.get("execution_briefs", [])
-        ):
-            raise HarnessError(f"execution brief already exists: {brief_id}")
-        selection = execution_selection_by_id(state, args.execution_selection_id)
-        if (
-            selection.get("status") != "active"
-            or not _is_exact_int(selection.get("execution_selection_version"), 2)
-            or selection.get("mode") not in {"centralized_parallel", "hybrid"}
-        ):
-            raise HarnessError(
-                "execution brief requires an active parallel/hybrid selection v2"
-            )
-        steward = _engaged_steward_lane(state)
-        selection_steward = selection.get("steward_snapshot", {})
-        if (
-            steward.get("lane_id") != args.steward_lane_id
-            or not isinstance(selection_steward, dict)
-            or selection_steward.get("lane_id") != steward.get("lane_id")
-        ):
-            raise HarnessError("execution brief Steward identity is missing or mismatched")
-        root_session_id = require_root_session(paths, state, args.session_id)
-        steward_packet_binding: dict[str, Any] | None = None
-        brief_version = 2
-        if _execution_policy_v2_enabled(state):
-            if not args.steward_packet_id:
-                raise HarnessError(
-                    "execution policy v2 requires --steward-packet-id for a terminal synthesis packet"
-                )
-            steward_packet_binding = _steward_packet_binding(
-                state, args.execution_selection_id, args.steward_packet_id
-            )
-            synthesis_packet = _packet_by_id(state, args.steward_packet_id)
-            authority_errors = packet_authority_integrity_errors(
-                paths, state, synthesis_packet, require_origin=False
-            )
-            result_errors = packet_result_integrity_errors(
-                paths,
-                state,
-                synthesis_packet,
-            )
-            specialist_errors = selection_done_packet_authority_errors(
-                paths,
-                state,
-                args.execution_selection_id,
-            )
-            if authority_errors or result_errors or specialist_errors:
-                raise HarnessError(
-                    "Steward synthesis evidence is missing or tampered: "
-                    + "; ".join(
-                        authority_errors + result_errors + specialist_errors
-                    )
-                )
-            brief_version = 3
-        elif args.steward_packet_id:
-            steward_packet_binding = _steward_packet_binding(
-                state, args.execution_selection_id, args.steward_packet_id
-            )
-            brief_version = 3
-        active_packets = [
-            str(packet.get("packet_id", ""))
-            for packet in state.get("packets", [])
-            if packet.get("execution_selection_id") == args.execution_selection_id
-            and packet.get("status") in ACTIVE_PACKET_STATUSES
-        ]
-        if active_packets:
-            raise HarnessError(
-                "execution brief requires terminal selected packets: "
-                + ", ".join(active_packets)
-            )
-        active_jobs = [
-            str(job.get("run_id", ""))
-            for job in state.get("jobs", [])
-            if job.get("execution_selection_id") == args.execution_selection_id
-            and job.get("status") in ACTIVE_JOB_STATUSES
-        ]
-        if active_jobs:
-            raise HarnessError(
-                "execution brief requires terminal selected jobs: "
-                + ", ".join(active_jobs)
-            )
-        bindings = _selection_terminal_packet_bindings(
-            state, args.execution_selection_id
-        )
-        expected_packet_ids = [item["packet_id"] for item in bindings]
-        if not bindings or packet_ids != expected_packet_ids:
-            raise HarnessError(
-                "execution brief --packet-id set must equal all terminal packets for the selection"
-            )
-        if selection.get("mode") == "centralized_parallel":
-            if cross_session_ids:
-                raise HarnessError(
-                    "centralized_parallel brief may not claim direct cross-lane sessions"
-                )
-            selected_lanes = {
-                str(item.get("lane_id", ""))
-                for item in selection.get("lane_snapshots", [])
-            }
-            result_lanes = {item["lane_id"] for item in bindings}
-            if result_lanes != selected_lanes:
-                raise HarnessError(
-                    "centralized_parallel brief requires terminal packet evidence from every selected lane"
-                )
-        else:
-            valid_closed = {
-                str(item.get("cross_lane_session_id", ""))
-                for item in state.get("cross_lane_sessions", [])
-                if item.get("execution_selection_id") == args.execution_selection_id
-                and item.get("status") == "closed"
-            }
-            if not cross_session_ids or not set(cross_session_ids) <= valid_closed:
-                raise HarnessError(
-                    "hybrid execution brief requires at least one exact closed cross-lane session"
-                )
-        context_provider_bindings = context_provider_brief_bindings(paths, state)
-        brief = {
-            "integrity_version": 1,
-            "brief_version": brief_version,
-            "brief_id": brief_id,
-            "execution_selection_id": args.execution_selection_id,
-            "mode": selection["mode"],
-            "steward_snapshot": copy.deepcopy(selection["steward_snapshot"]),
-            "recording_steward_snapshot": _lane_authority_snapshot(steward),
-            "packet_bindings": bindings,
-            **(
-                {"steward_packet_binding": steward_packet_binding}
-                if steward_packet_binding is not None
-                else {}
-            ),
-            "cross_lane_session_ids": cross_session_ids,
-            "context_provider_bindings": context_provider_bindings,
-            "summary": require_evidence_detail(
-                args.summary, "execution brief summary"
-            ),
-            "dissent": require_text(args.dissent, "execution brief dissent"),
-            "blockers": require_text(args.blocker, "execution brief blockers"),
-            "recommendation": require_evidence_detail(
-                args.recommendation, "execution brief recommendation"
-            ),
-            "root_session_id": root_session_id,
-            "recorded_at": now_iso(),
-        }
-        brief["brief_sha256"] = canonical_record_sha256(brief)
-        state.setdefault("execution_briefs", []).append(brief)
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(brief, args.json)
-    return 0
-
-
 def _resource_cmd_services() -> ResourceCmdServices:
     return ResourceCmdServices(
         state_lock=lambda *a, **kw: state_lock(*a, **kw),
@@ -3465,6 +3007,26 @@ def _coordination_cmd_services() -> CoordinationCmdServices:
         dependency_kinds=DEPENDENCY_KINDS,
         terminal_coordination_statuses=TERMINAL_COORDINATION_STATUSES,
         cooperative_authority_boundary=COOPERATIVE_AUTHORITY_BOUNDARY,
+    )
+
+
+def _execution_selection_cmd_services() -> ExecutionSelectionCmdServices:
+    return ExecutionSelectionCmdServices(
+        require_plan_ready=require_plan_ready,
+        require_root_session=require_root_session,
+        role_tier_map=lambda: ROLE_TIER_MAP,
+        terminal_coordination_statuses=TERMINAL_COORDINATION_STATUSES,
+        approved_override_settings=approved_override_settings,
+        require_override_target_contract=require_override_target_contract,
+        override_by_id=override_by_id,
+        build_execution_resource_envelope=_build_execution_resource_envelope,
+        lane_authority_snapshot=_lane_authority_snapshot,
+        execution_brief_coverage_error=_execution_brief_coverage_error,
+        steward_packet_binding=_steward_packet_binding,
+        selection_terminal_packet_bindings=_selection_terminal_packet_bindings,
+        packet_authority_integrity_errors=packet_authority_integrity_errors,
+        packet_result_integrity_errors=packet_result_integrity_errors,
+        selection_done_packet_authority_errors=selection_done_packet_authority_errors,
     )
 
 
@@ -7416,12 +6978,19 @@ def build_parser(
         vocab=vocab,
     )
 
+    execution_selection_services = _execution_selection_cmd_services()
     register_execution_selection_commands(
         sub,
         handlers={
-            "execution_select_plan": cmd_execution_select_plan,
-            "execution_select": cmd_execution_select,
-            "execution_brief_record": cmd_execution_brief_record,
+            "execution_select_plan": functools.partial(
+                cmd_execution_select_plan, services=execution_selection_services
+            ),
+            "execution_select": functools.partial(
+                cmd_execution_select, services=execution_selection_services
+            ),
+            "execution_brief_record": functools.partial(
+                cmd_execution_brief_record, services=execution_selection_services
+            ),
         },
         add_json_argument=add_json_argument,
         vocab=vocab,
