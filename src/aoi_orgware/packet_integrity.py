@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -421,6 +422,44 @@ def packet_integrity_warnings(state: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def packet_evidence_self_reference_error(
+    packet_id: str,
+    evidence: list[Any],
+    task_dir_path: Path,
+) -> str | None:
+    """Reject a completed packet whose only evidence is its own result file.
+
+    An ARISE reviewer packet closed as ``done`` while its Evidence section cited
+    nothing but its own ``results/<id>.md`` path, so the finding was unverifiable
+    against any primary artifact.  At least one reference must resolve to
+    something other than the packet's own result file; other packets' results,
+    artifact blobs, repo files, and external run roots all qualify.  Paths are
+    normalized (absolute/relative, host case) before comparison.
+    """
+
+    result_path = task_dir_path / "results" / f"{packet_id}.md"
+    own_key = os.path.normcase(os.path.normpath(str(result_path)))
+    references = [str(item).strip() for item in evidence if str(item).strip()]
+    if not references:
+        return (
+            f"packet {packet_id} completion requires at least one evidence "
+            "reference; result-as-own-evidence is unverifiable"
+        )
+    for reference in references:
+        keys = {os.path.normcase(os.path.normpath(reference))}
+        if not os.path.isabs(reference):
+            keys.add(
+                os.path.normcase(os.path.normpath(str(task_dir_path / reference)))
+            )
+        if own_key not in keys:
+            return None
+    return (
+        f"packet {packet_id} evidence cites only its own result file; "
+        "result-as-own-evidence is unverifiable and must include at least one "
+        "reference to a primary artifact outside the packet's own result"
+    )
+
+
 def packet_result_integrity_errors(
     paths: HarnessPaths,
     state: dict[str, Any],
@@ -790,6 +829,20 @@ def packet_integrity_errors(
                 )
         if status in TERMINAL_PACKET_STATUSES:
             errors.extend(packet_result_integrity_errors(paths, state, packet))
+            gate_version = packet.get("evidence_gate_version")
+            if (
+                status in {"done", "failed"}
+                and isinstance(gate_version, int)
+                and not isinstance(gate_version, bool)
+                and gate_version >= 1
+            ):
+                gate_error = packet_evidence_self_reference_error(
+                    packet_id,
+                    packet.get("evidence", []),
+                    task_dir(paths, state["task_id"]),
+                )
+                if gate_error:
+                    errors.append(gate_error)
     return errors
 
 
@@ -931,6 +984,7 @@ __all__ = [
     "packet_authority_integrity_errors",
     "packet_command_integrity_error",
     "packet_contract_integrity_error",
+    "packet_evidence_self_reference_error",
     "packet_input_integrity_errors",
     "packet_integrity_errors",
     "packet_integrity_warnings",

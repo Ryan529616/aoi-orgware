@@ -182,6 +182,110 @@ class PureValidatorTests(unittest.TestCase):
         )
 
 
+class EvidenceSelfReferenceGateTests(unittest.TestCase):
+    """The ARISE reviewer packet closed `done` while its only evidence bullet was
+    its own `results/<id>.md` path, making the finding unverifiable."""
+
+    def setUp(self) -> None:
+        self.task_dir = Path("/aoi/tasks/audit")
+        self.own_result = str(self.task_dir / "results" / "review.md")
+
+    def test_self_only_absolute_reference_is_rejected(self) -> None:
+        error = pi.packet_evidence_self_reference_error(
+            "review", [self.own_result], self.task_dir
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("its own result file", str(error))
+
+    def test_self_only_relative_reference_is_rejected(self) -> None:
+        self.assertIsNotNone(
+            pi.packet_evidence_self_reference_error(
+                "review", ["results/review.md"], self.task_dir
+            )
+        )
+
+    def test_empty_evidence_is_rejected(self) -> None:
+        error = pi.packet_evidence_self_reference_error("review", [], self.task_dir)
+        self.assertIsNotNone(error)
+        self.assertIn("at least one evidence reference", str(error))
+        # Whitespace-only references collapse to empty and are rejected too.
+        self.assertIsNotNone(
+            pi.packet_evidence_self_reference_error("review", ["   "], self.task_dir)
+        )
+
+    def test_other_packet_result_is_external(self) -> None:
+        other = str(self.task_dir / "results" / "explorer.md")
+        self.assertIsNone(
+            pi.packet_evidence_self_reference_error("review", [other], self.task_dir)
+        )
+
+    def test_artifact_blob_reference_is_external(self) -> None:
+        blob = "results/artifact-blobs/artifact-sha256-abc.blob"
+        self.assertIsNone(
+            pi.packet_evidence_self_reference_error("review", [blob], self.task_dir)
+        )
+
+    def test_descriptive_primary_artifact_is_external(self) -> None:
+        self.assertIsNone(
+            pi.packet_evidence_self_reference_error(
+                "review", ["/runs/vcs/driver.log lines 12-88"], self.task_dir
+            )
+        )
+
+    def test_mixed_self_and_external_is_accepted(self) -> None:
+        self.assertIsNone(
+            pi.packet_evidence_self_reference_error(
+                "review",
+                [self.own_result, "/runs/vcs/driver.log"],
+                self.task_dir,
+            )
+        )
+
+
+class EvidenceGateIntegrityWiringTests(HarnessTestCase):
+    """The re-validation runs ONLY for packets carrying evidence_gate_version>=1;
+    the surrounding fences are isolated so the assertion binds to the gate alone."""
+
+    def _run(self, *, gate: bool) -> list[str]:
+        paths = h.get_paths(self.root)
+        own_result = str(h.task_dir(paths, "audit") / "results" / "review.md")
+        packet = {
+            "packet_id": "review",
+            "status": "done",
+            "packet_purpose": "work",
+            "packet_mode": "read_only",
+            "evidence": [own_result],
+        }
+        if gate:
+            packet["evidence_gate_version"] = 1
+        state = {"task_id": "audit", "packets": [packet]}
+        with (
+            mock.patch.object(pi, "packet_lock_integrity_errors", return_value=[]),
+            mock.patch.object(
+                pi, "packet_resource_envelope_integrity_errors", return_value=[]
+            ),
+            mock.patch.object(pi, "packet_contract_integrity_error", return_value=None),
+            mock.patch.object(pi, "packet_input_integrity_errors", return_value=[]),
+            mock.patch.object(pi, "packet_command_integrity_error", return_value=None),
+            mock.patch.object(pi, "packet_result_integrity_errors", return_value=[]),
+        ):
+            return pi.packet_integrity_errors(
+                paths, state, services=_services()
+            )
+
+    def test_gate_version_revalidates_self_only_evidence(self) -> None:
+        errors = self._run(gate=True)
+        self.assertTrue(
+            any("cites only its own result file" in item for item in errors), errors
+        )
+
+    def test_legacy_packet_without_gate_version_is_untouched(self) -> None:
+        errors = self._run(gate=False)
+        self.assertFalse(
+            any("cites only its own result file" in item for item in errors), errors
+        )
+
+
 class CliFactoryWiringTests(unittest.TestCase):
     def test_cli_factory_wires_the_composition_root_callables(self) -> None:
         services = cli_impl._packet_integrity_services()
