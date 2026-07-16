@@ -167,10 +167,14 @@ trusted protocol-v6 hook can only consume one exact current arm or write an
 incident; it cannot create packets, choose an ambiguous candidate, resolve an
 incident, or obtain Chief authority.
 
-Hook consumption records `codex_subagent_start_observed` provenance and the
+Hook consumption records the transport-specific provenance
+(`codex_subagent_start_observed` or `claude_subagent_start_observed`) and the
 actual event identity. This proves only that the permit existed before AOI
 observed the start. Codex creates the sub-agent before `SubagentStart`, and hook
-output cannot terminate that agent. A start with no unique valid arm therefore
+output cannot terminate that agent; the Claude Code adapter additionally denies
+an unarmed governed spawn at `PreToolUse` before the sub-agent exists, but
+non-cooperating or workflow-orchestrated spawns still reach `SubagentStart`
+unblocked. A start with no unique valid arm therefore
 creates an idempotent open `unmanaged_subagent_start` incident and instructs the
 agent to stop without material work. Open incidents are visible in checkpoints,
 are doctor errors, and block close/cancel until the Chief records one of the

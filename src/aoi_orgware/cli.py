@@ -97,6 +97,7 @@ from .commands.lanes import register_lane_commands
 from .commands.packets import register_packet_commands
 from .commands.resource import register_resource_commands
 from .commands.status import register_status_commands
+from .commands import claude_onboarding as claude_onboarding_impl
 from .commands.task_lifecycle import (
     register_bootstrap_commands,
     register_chief_commands,
@@ -343,9 +344,13 @@ DISPATCH_ARM_MAX_SECONDS = 15 * 60
 HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
 ROOT_SESSION_MAPPING_KIND = "root"
 SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
+HOOK_OBSERVED_DISPATCH_PROVENANCES = {
+    "codex_subagent_start_observed",
+    "claude_subagent_start_observed",
+}
 DISPATCH_PROVENANCES = {
     "none",
-    "codex_subagent_start_observed",
+    *HOOK_OBSERVED_DISPATCH_PROVENANCES,
     "manual_unverified",
 }
 MINI_MAX_LOCKS = 3
@@ -535,7 +540,7 @@ class AOIArgumentParser(argparse.ArgumentParser):
 def command_requires_chief(command: str, *, initialized: bool) -> bool:
     """Default-fence every project command not explicitly proven exempt."""
 
-    if command == "init":
+    if command in {"init", "claude-init"}:
         return initialized
     return command not in (
         CHIEF_AUTHORITY_CONTROL_COMMANDS
@@ -745,6 +750,26 @@ def _dispatch_protocol_policy(
         executing_packet_statuses=frozenset(EXECUTING_PACKET_STATUSES),
         root_session_mapping_kind=ROOT_SESSION_MAPPING_KIND,
         subagent_parent_mapping_kind=SUBAGENT_PARENT_MAPPING_KIND,
+    )
+
+
+def _claude_dispatch_protocol_policy(
+) -> dispatch_protocol_impl.DispatchProtocolPolicy:
+    """Claude Code transport shares dispatch protocol v6; only provenance differs.
+
+    Consumption is observed at the Claude ``SubagentStart`` hook event, which
+    carries the same parent-session/agent-type/agent-id coordinates as the
+    Codex event. The distinct provenance label keeps the transport that
+    actually observed the dispatch auditable instead of implying a Codex
+    observation that never happened.
+    """
+    return dispatch_protocol_impl.DispatchProtocolPolicy(
+        hook_protocol_version=int(HOOK_PROTOCOL_VERSION),
+        hook_id_re=HOOK_ID_RE,
+        executing_packet_statuses=frozenset(EXECUTING_PACKET_STATUSES),
+        root_session_mapping_kind=ROOT_SESSION_MAPPING_KIND,
+        subagent_parent_mapping_kind=SUBAGENT_PARENT_MAPPING_KIND,
+        dispatch_provenance="claude_subagent_start_observed",
     )
 
 
@@ -1676,6 +1701,74 @@ def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         },
         args.json,
     )
+    return 0
+
+
+def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """One command: initialize AOI and wire this repo's Claude Code sessions.
+
+    Combines the standard ``aoi init`` contract with client-side wiring — the
+    lifecycle hooks in ``.claude/settings.json`` and the AOI skill — so a repo
+    can be put under AOI governance in a single step. First-time use on an
+    uninitialized project needs no Chief credential (like ``aoi init``); re-running
+    on an initialized project is Chief-fenced.
+    """
+
+    if not (paths.root / ".git").exists():
+        raise HarnessError("aoi claude-init requires a Git repository root")
+    # 1. Initialize AOI if needed, reusing the exact init contract. Capture its
+    #    JSON emit so claude-init can print one combined summary.
+    init_ns = argparse.Namespace(
+        project_name=args.project_name,
+        config=None,
+        expected_config_sha256=None,
+        replace_policy_sha256=None,
+        json=True,
+    )
+    captured = io.StringIO()
+    saved_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        cmd_init(init_ns, paths)
+    finally:
+        sys.stdout = saved_stdout
+    try:
+        init_result = json.loads(captured.getvalue() or "{}")
+    except json.JSONDecodeError:
+        init_result = {}
+    paths = get_paths(paths.root)
+    project_name = init_result.get("project", paths.project.name)
+    # 2. Wire the Claude Code lifecycle hooks and install the AOI skill.
+    try:
+        hooks_result = claude_onboarding_impl.install_claude_hooks(
+            paths.root / ".claude" / "settings.json",
+            governed_agent_types=args.governed_agent_types,
+        )
+        skill_result = claude_onboarding_impl.install_claude_skill(
+            paths.root / ".claude" / "skills",
+            _resource_text("claude/SKILL.md"),
+        )
+    except claude_onboarding_impl.ClaudeOnboardingError as exc:
+        raise HarnessError(str(exc)) from exc
+    payload = {
+        "claude_init": True,
+        "project": project_name,
+        "root": str(paths.root),
+        "aoi_initialized": init_result.get("initialized", True),
+        "created_config": init_result.get("created_config", False),
+        "hooks": hooks_result,
+        "skill": skill_result,
+        "next_steps": [
+            "Install aoi on your PATH (e.g. pipx install aoi-orgware) so the "
+            "hook command 'aoi-claude-hook' resolves.",
+            "Open a NEW Claude Code session in this repo; the SessionStart hook "
+            f"will announce that AOI is active for {project_name!r}.",
+            "For governed work, acquire a Chief lease: aoi chief-acquire "
+            "--session-id <session-id> --json, then export the returned "
+            "AOI_CHIEF_* variables.",
+        ],
+    }
+    emit(payload, args.json)
     return 0
 
 
@@ -2661,7 +2754,7 @@ def _capacity_records(
         ]
         subagent_start_observed_at = (
             str(observed_starts[0].get("observed_at", ""))
-            if dispatch_provenance == "codex_subagent_start_observed"
+            if dispatch_provenance in HOOK_OBSERVED_DISPATCH_PROVENANCES
             and len(observed_starts) == 1
             else ""
         )
@@ -7643,6 +7736,17 @@ def observe_subagent_start(
     )
 
 
+def observe_claude_subagent_start(
+    paths: HarnessPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    return dispatch_protocol_impl.observe_subagent_start(
+        paths,
+        payload,
+        policy=_claude_dispatch_protocol_policy(),
+        services=_dispatch_protocol_services(),
+    )
+
+
 def cmd_subagent_incident_account(
     args: argparse.Namespace, paths: HarnessPaths
 ) -> int:
@@ -10394,6 +10498,12 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    claude_onboarding_impl.register_claude_onboarding_commands(
+        sub,
+        handlers={"claude_init": cmd_claude_init},
+        add_json_argument=add_json_argument,
+    )
+
     register_backup_commands(
         sub,
         handlers={
@@ -10556,7 +10666,7 @@ def main(argv: list[str] | None = None) -> int:
             return int(args.handler(args, None))
         paths = get_paths()
         initialized = paths.config.is_file()
-        if command not in {"init", ""} and not initialized:
+        if command not in {"init", "claude-init", ""} and not initialized:
             raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
         if initialized:
             apply_project_config(paths.project)

@@ -55,9 +55,13 @@ NATIVE_V5_PACKET_CONTRACT_MARKER = "- AOI dispatch schema origin: `native_v5`"
 HOOK_PROTOCOL_VERSION = "6"
 HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
+HOOK_OBSERVED_DISPATCH_PROVENANCES = {
+    "codex_subagent_start_observed",
+    "claude_subagent_start_observed",
+}
 DISPATCH_PROVENANCES = {
     "none",
-    "codex_subagent_start_observed",
+    *HOOK_OBSERVED_DISPATCH_PROVENANCES,
     "manual_unverified",
 }
 
@@ -695,15 +699,13 @@ def packet_integrity_errors(
                 errors.append(
                     f"packet {packet_id} records dispatch timing without dispatch provenance"
                 )
-            if status == "dispatched" and provenance not in {
-                "codex_subagent_start_observed",
-                "manual_unverified",
-            }:
+            if status == "dispatched" and provenance not in (
+                HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
+            ):
                 errors.append(f"packet {packet_id} dispatched state lacks provenance")
-            if status in {"done", "failed"} and provenance not in {
-                "codex_subagent_start_observed",
-                "manual_unverified",
-            }:
+            if status in {"done", "failed"} and provenance not in (
+                HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
+            ):
                 errors.append(f"packet {packet_id} terminal work lacks dispatch provenance")
             if provenance == "manual_unverified":
                 if not packet.get("manual_unverified_reason"):
@@ -727,7 +729,7 @@ def packet_integrity_errors(
                     errors.append(
                         f"packet {packet_id} manual dispatch lacks a prior arm or legacy migration marker"
                     )
-            if provenance == "codex_subagent_start_observed":
+            if provenance in HOOK_OBSERVED_DISPATCH_PROVENANCES:
                 consumed = [
                     attempt
                     for attempt in attempts
@@ -749,10 +751,9 @@ def packet_integrity_errors(
                         errors.append(
                             f"packet {packet_id} observed dispatch lost packet/observation binding"
                         )
-            if provenance in {
-                "codex_subagent_start_observed",
-                "manual_unverified",
-            } and not packet.get("agent_id"):
+            if provenance in (
+                HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
+            ) and not packet.get("agent_id"):
                 errors.append(
                     f"packet {packet_id} dispatch provenance lacks an agent id"
                 )
