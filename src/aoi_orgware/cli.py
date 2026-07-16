@@ -5157,7 +5157,7 @@ def close_gate(
     if intended_outcome == "achieved":
         if not verification:
             failures.append("no verification/evidence record")
-        if verification and not any(
+        if not any(
             item.get("integrity_version") == 1
             and item.get("status") == "pass"
             and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
