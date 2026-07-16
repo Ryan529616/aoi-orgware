@@ -4,9 +4,15 @@ import ast
 import datetime as dt
 import inspect
 import re
+import sys
 import unittest
+from pathlib import Path
 
-from aoi_orgware import dispatch_protocol as dispatch
+HERE = Path(__file__).resolve().parent
+SRC = HERE.parent / "src"
+sys.path.insert(0, str(SRC))
+
+from aoi_orgware import dispatch_protocol as dispatch  # noqa: E402
 
 
 def protocol_policy(version: int = 6) -> dispatch.DispatchProtocolPolicy:
@@ -187,6 +193,166 @@ class DispatchProtocolTests(unittest.TestCase):
                 policy=policy,
             ),
             "duplicate_agent",
+        )
+
+    def test_wildcard_arm_matches_any_transport_but_not_by_role(self) -> None:
+        packet = armed_packet(
+            packet_role="reviewer",
+            expected_transport_type=dispatch.WILDCARD_AGENT_TYPE,
+        )
+        state = {"packets": [packet]}
+
+        for transport in ("default", "general-purpose", "reviewer"):
+            with self.subTest(transport=transport):
+                matches = dispatch.matching_armed_packets(
+                    state,
+                    parent_session_id="chief-session",
+                    transport_agent_type=transport,
+                )
+                self.assertEqual(len(matches), 1)
+                self.assertIs(matches[0][0], packet)
+
+        # A different parent session still never matches the wildcard slot.
+        self.assertEqual(
+            dispatch.matching_armed_packets(
+                state,
+                parent_session_id="other-parent",
+                transport_agent_type="default",
+            ),
+            [],
+        )
+
+    def test_wildcard_expiry_matches_any_transport(self) -> None:
+        current = dt.datetime(2026, 7, 15, 2, 0, tzinfo=dt.timezone.utc)
+        packet = armed_packet(
+            expires_at="2026-07-15T01:59:59+00:00",
+            expected_transport_type=dispatch.WILDCARD_AGENT_TYPE,
+        )
+        expired = dispatch.expire_dispatch_arms({"packets": [packet]}, current=current)
+        matched = dispatch.matching_expired_packet_ids(
+            expired,
+            parent_session_id="chief-session",
+            transport_agent_type="default",
+        )
+        self.assertEqual(matched, ["review-packet"])
+
+    def test_live_arm_snapshot_reports_slots_for_parent(self) -> None:
+        armed = armed_packet(
+            packet_id="armed-eda",
+            expected_transport_type="eda_operator",
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        other_parent = armed_packet(
+            packet_id="armed-other",
+            parent_session_id="different-parent",
+        )
+        ready = {"packet_id": "ready-one", "status": "ready", "dispatch_attempts": []}
+        state = {"packets": [armed, other_parent, ready]}
+
+        snapshot = dispatch.live_arm_snapshot(
+            state, parent_session_id="chief-session"
+        )
+
+        self.assertEqual(
+            snapshot,
+            [
+                {
+                    "packet_id": "armed-eda",
+                    "expected_agent_type": "eda_operator",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                }
+            ],
+        )
+
+    def test_incident_records_live_arms_snapshot(self) -> None:
+        # The exact ARISE shape: armed under an AOI role label, observed as
+        # transport "default"; the mismatch must be machine-readable.
+        armed = armed_packet(
+            packet_id="armed-eda",
+            expected_transport_type="eda_operator",
+        )
+        state = {"packets": [armed]}
+        payload = {
+            "session_id": "chief-session",
+            "turn_id": "turn-1",
+            "agent_id": "/root/unmanaged",
+            "agent_type": "default",
+        }
+        incident = dispatch.record_subagent_incident(
+            state,
+            payload,
+            reason_code="no_matching_arm",
+            candidate_packet_ids=[],
+            observed_at="2026-07-15T02:00:00+00:00",
+            policy=protocol_policy(),
+        )
+        self.assertEqual(
+            incident["live_arms"],
+            [
+                {
+                    "packet_id": "armed-eda",
+                    "expected_agent_type": "eda_operator",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                }
+            ],
+        )
+
+    def test_resumable_packet_requires_same_parent_and_agent(self) -> None:
+        dispatched = {
+            "packet_id": "work-packet",
+            "path": "/tmp/work-packet.md",
+            "status": "dispatched",
+            "agent_id": "agent-1",
+            "dispatch_attempts": [
+                {
+                    "status": "consumed",
+                    "parent_session_id": "chief-session",
+                    "expected_agent_type": "default",
+                }
+            ],
+        }
+        state = {"packets": [dispatched]}
+        policy = protocol_policy()
+
+        self.assertIs(
+            dispatch._resumable_packet(
+                state,
+                agent_id="agent-1",
+                parent_session_id="chief-session",
+                policy=policy,
+            ),
+            dispatched,
+        )
+        # Same agent id but a different parent stays suspicious (no resume).
+        self.assertIsNone(
+            dispatch._resumable_packet(
+                state,
+                agent_id="agent-1",
+                parent_session_id="stranger-session",
+                policy=policy,
+            )
+        )
+        # Unknown agent id never resumes.
+        self.assertIsNone(
+            dispatch._resumable_packet(
+                state,
+                agent_id="agent-other",
+                parent_session_id="chief-session",
+                policy=policy,
+            )
+        )
+
+    def test_helper_spawn_budget_reads_fail_closed(self) -> None:
+        self.assertEqual(dispatch._helper_spawn_budget({}), 0)
+        self.assertEqual(dispatch._helper_spawn_budget({"helper_spawn_budget": 3}), 3)
+        self.assertEqual(
+            dispatch._helper_spawn_budget({"helper_spawn_budget": True}), 0
+        )
+        self.assertEqual(
+            dispatch._helper_spawn_budget({"helper_spawn_budget": -2}), 0
+        )
+        self.assertEqual(
+            dispatch._helper_spawn_budget({"helper_spawn_budget": "5"}), 0
         )
 
     def test_module_has_no_cli_import(self) -> None:

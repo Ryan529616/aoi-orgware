@@ -182,6 +182,80 @@ class PureValidatorTests(unittest.TestCase):
         )
 
 
+class SubagentIncidentSchemaTests(unittest.TestCase):
+    def _state(self, incident: dict) -> dict:
+        return {
+            "dispatch_model_version": 1,
+            "subagent_incidents": [incident],
+            "packets": [],
+        }
+
+    def _incident(self, **overrides: object) -> dict:
+        base = {
+            "incident_id": "spawn-" + "a" * 32,
+            "kind": "unmanaged_subagent_start",
+            "status": "accounted",
+            "hook_protocol_version": 6,
+            "candidate_packet_ids": [],
+            "resolution": {"disposition": "no_material_work"},
+        }
+        base.update(overrides)
+        return base
+
+    def test_optional_disposition_kind_and_live_arms_are_additive(self) -> None:
+        # A legacy resolution without the new fields still validates.
+        self.assertEqual(
+            pi.subagent_incident_integrity_errors(
+                self._state(self._incident()), services=_services()
+            ),
+            [],
+        )
+        good = self._incident(
+            live_arms=[
+                {
+                    "packet_id": "p",
+                    "expected_agent_type": "eda_operator",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                }
+            ],
+            resolution={
+                "disposition": "no_material_work",
+                "disposition_kind": "false_positive_guard",
+            },
+        )
+        self.assertEqual(
+            pi.subagent_incident_integrity_errors(
+                self._state(good), services=_services()
+            ),
+            [],
+        )
+
+    def test_invalid_disposition_kind_and_live_arms_are_rejected(self) -> None:
+        bad_kind = self._incident(
+            resolution={
+                "disposition": "no_material_work",
+                "disposition_kind": "bogus",
+            }
+        )
+        self.assertTrue(
+            any(
+                "invalid disposition kind" in error
+                for error in pi.subagent_incident_integrity_errors(
+                    self._state(bad_kind), services=_services()
+                )
+            )
+        )
+        bad_arms = self._incident(live_arms="not-a-list")
+        self.assertTrue(
+            any(
+                "malformed live_arms" in error
+                for error in pi.subagent_incident_integrity_errors(
+                    self._state(bad_arms), services=_services()
+                )
+            )
+        )
+
+
 class CliFactoryWiringTests(unittest.TestCase):
     def test_cli_factory_wires_the_composition_root_callables(self) -> None:
         services = cli_impl._packet_integrity_services()
