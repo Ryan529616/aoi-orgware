@@ -1709,14 +1709,28 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """One command: initialize AOI and wire this repo's Claude Code sessions.
 
     Combines the standard ``aoi init`` contract with client-side wiring — the
-    lifecycle hooks in ``.claude/settings.json`` and the AOI skill — so a repo
-    can be put under AOI governance in a single step. First-time use on an
-    uninitialized project needs no Chief credential (like ``aoi init``); re-running
-    on an initialized project is Chief-fenced.
+    lifecycle hooks in ``.claude/settings.json`` and the user-scope AOI skill —
+    so a repo can be put under AOI governance in a single step. First-time use
+    on an uninitialized project needs no Chief credential (like ``aoi init``);
+    re-running on an initialized project is Chief-fenced.
     """
 
     if not (paths.root / ".git").exists():
         raise HarnessError("aoi claude-init requires a Git repository root")
+    user_skills_root = (
+        Path(args.user_skills_root).expanduser()
+        if args.user_skills_root
+        else Path.home() / ".claude" / "skills"
+    )
+    claude_skill_text = _resource_text("claude/SKILL.md")
+    try:
+        skill_preflight = claude_onboarding_impl.preflight_claude_user_skill(
+            user_skills_root,
+            claude_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+    except (OSError, claude_onboarding_impl.ClaudeOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
     # 1. Initialize AOI if needed, reusing the exact init contract. Capture its
     #    JSON emit so claude-init can print one combined summary.
     init_ns = argparse.Namespace(
@@ -1745,9 +1759,10 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             paths.root / ".claude" / "settings.json",
             governed_agent_types=args.governed_agent_types,
         )
-        skill_result = claude_onboarding_impl.install_claude_skill(
-            paths.root / ".claude" / "skills",
-            _resource_text("claude/SKILL.md"),
+        skill_result = claude_onboarding_impl.install_claude_user_skill(
+            user_skills_root,
+            claude_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
         )
     except claude_onboarding_impl.ClaudeOnboardingError as exc:
         raise HarnessError(str(exc)) from exc
@@ -1757,6 +1772,7 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "root": str(paths.root),
         "aoi_initialized": init_result.get("initialized", True),
         "created_config": init_result.get("created_config", False),
+        "preflight": {"user_skill": skill_preflight},
         "hooks": hooks_result,
         "skill": skill_result,
         "next_steps": [
@@ -1764,6 +1780,8 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "hook command 'aoi-claude-hook' resolves.",
             "Open a NEW Claude Code session in this repo; the SessionStart hook "
             f"will announce that AOI is active for {project_name!r}.",
+            "The generic AOI skill is installed once at Claude user scope; keep "
+            "project-specific instructions in the repository CLAUDE.md/AGENTS.md.",
             "For governed work, acquire a Chief lease: aoi chief-acquire "
             "--session-id <session-id> --json, then export the returned "
             "AOI_CHIEF_* variables.",

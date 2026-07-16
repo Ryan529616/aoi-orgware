@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -58,8 +61,6 @@ class MergeSettingsTests(unittest.TestCase):
 
 class InstallHelpersTests(unittest.TestCase):
     def test_install_hooks_round_trips_and_is_merge_safe(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / ".claude" / "settings.json"
             result = co.install_claude_hooks(settings, governed_agent_types="general-purpose,explorer")
@@ -73,8 +74,6 @@ class InstallHelpersTests(unittest.TestCase):
             self.assertEqual(again["events_added"], [])
 
     def test_install_hooks_rejects_invalid_json(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / "settings.json"
             settings.write_text("{ not json", encoding="utf-8")
@@ -82,26 +81,43 @@ class InstallHelpersTests(unittest.TestCase):
                 co.install_claude_hooks(settings)
 
     def test_install_hooks_rejects_non_object(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / "settings.json"
             settings.write_text("[1, 2, 3]", encoding="utf-8")
             with self.assertRaises(co.ClaudeOnboardingError):
                 co.install_claude_hooks(settings)
 
-    def test_install_skill_writes_named_skill(self) -> None:
-        import tempfile
-
+    def test_install_skill_writes_named_user_skill_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            result = co.install_claude_skill(Path(tmp) / "skills", "# skill body\n")
+            skills_root = Path(tmp) / ".claude" / "skills"
+            result = co.install_claude_user_skill(skills_root, "# skill body\n")
             skill_path = Path(result["skill_path"])
             self.assertTrue(skill_path.exists())
             self.assertEqual(skill_path.name, "SKILL.md")
             self.assertEqual(skill_path.parent.name, "aoi")
+            self.assertEqual(result["scope"], "user")
             self.assertFalse(result["updated"])
-            second = co.install_claude_skill(Path(tmp) / "skills", "# v2\n")
-            self.assertTrue(second["updated"])
+            second = co.install_claude_user_skill(skills_root, "# skill body\n")
+            self.assertFalse(second["changed"])
+
+    def test_user_skill_requires_digest_to_replace_different_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            skills_root = Path(tmp) / ".claude" / "skills"
+            skill_path = skills_root / "aoi" / "SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("# local customization\n", encoding="utf-8")
+            digest = co.preflight_claude_user_skill(
+                skills_root, "# local customization\n"
+            )["existing_sha256"]
+            with self.assertRaises(co.ClaudeOnboardingError):
+                co.install_claude_user_skill(skills_root, "# packaged\n")
+            result = co.install_claude_user_skill(
+                skills_root,
+                "# packaged\n",
+                replace_sha256=digest,
+            )
+            self.assertTrue(result["updated"])
+            self.assertEqual(skill_path.read_text(encoding="utf-8"), "# packaged\n")
 
 
 class WiringTests(unittest.TestCase):
@@ -122,11 +138,80 @@ class WiringTests(unittest.TestCase):
         self.assertTrue(cli_impl.command_requires_chief("claude-init", initialized=True))
 
 
+class FreshClaudeInitCliTests(unittest.TestCase):
+    def test_fresh_repo_uses_user_skill_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (root / "README.md").write_text("# Fresh\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Harness Test",
+                    "-c",
+                    "user.email=harness@test.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(HERE.parent / "src")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "aoi_orgware.cli",
+                    "claude-init",
+                    "--project-name",
+                    "Fresh AOI",
+                    "--user-skills-root",
+                    str(root / "user-skills"),
+                    "--json",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["created_config"])
+            self.assertTrue((root / ".claude" / "settings.json").is_file())
+            self.assertTrue(
+                (root / "user-skills" / "aoi" / "SKILL.md").is_file()
+            )
+            self.assertFalse((root / ".claude" / "skills" / "aoi").exists())
+
+
 class ClaudeInitCliTests(HarnessTestCase):
+    def claude_init(self, *args: str, ok: bool = True):
+        return self.cli(
+            "claude-init",
+            "--user-skills-root",
+            str(self.root / "user-skills"),
+            *args,
+            ok=ok,
+        )
+
     def test_claude_init_wires_hooks_and_skill(self) -> None:
         # HarnessTestCase.setUp already ran `aoi init` + chief-acquire, so this
         # exercises the Chief-fenced re-run path on an initialized project.
-        result = json.loads(self.cli("claude-init", "--json").stdout)
+        result = json.loads(self.claude_init("--json").stdout)
         self.assertTrue(result["claude_init"])
         self.assertEqual(result["hooks"]["events_added"], list(co.CLAUDE_HOOK_EVENTS))
         settings = json.loads(
@@ -135,10 +220,12 @@ class ClaudeInitCliTests(HarnessTestCase):
         self.assertEqual(
             settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], co.HOOK_COMMAND
         )
-        skill_text = (self.root / ".claude" / "skills" / "aoi" / "SKILL.md").read_text(
+        skill_text = (self.root / "user-skills" / "aoi" / "SKILL.md").read_text(
             encoding="utf-8"
         )
         self.assertIn("Operating under AOI", skill_text)
+        self.assertEqual(result["skill"]["scope"], "user")
+        self.assertFalse((self.root / ".claude" / "skills" / "aoi").exists())
 
 
 if __name__ == "__main__":

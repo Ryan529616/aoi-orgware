@@ -99,6 +99,11 @@ enabled = false
   packet first and
   then use explicit manual-unverified packet dispatch before that short-lived
   arm expires. AOI revalidates the same authority snapshot at consumption.
+- `aoi claude-init`: merges Claude lifecycle hooks into the repository's
+  `.claude/settings.json`, but installs the generic AOI skill only at Claude
+  user scope (`$HOME/.claude/skills`). It never creates the generic skill under
+  the project. A differing user skill is replaced only after its exact reviewed
+  SHA-256 is supplied.
 - `legacy.enabled`: enables compatibility-ledger import and reporting.
 
 The full default file is available at `examples/aoi.toml`.

@@ -249,11 +249,20 @@ change global model, sandbox, approval, provider, or notification defaults.
 Use OpenAI's standalone installer separately when the `codex` command is absent
 (`https://chatgpt.com/codex/install.ps1` on Windows or `install.sh` on POSIX).
 
-Claude Code has a separate client adapter and repo-local setup path:
+Claude Code has a separate client adapter. Its hooks remain repo-local, while
+the generic AOI skill is installed once at Claude user scope:
 
 ```bash
 aoi claude-init --project-name "My Project" --json
 ```
+
+By default the skill is written to `$HOME/.claude/skills/aoi/SKILL.md` and no
+`.claude/skills/aoi` directory is created in the project. Project-specific
+instructions belong in the repository's `CLAUDE.md` or `AGENTS.md`. When AOI
+runs in WSL for a Windows-hosted Claude installation, pass
+`--user-skills-root /mnt/c/Users/<windows-user>/.claude/skills`. A differing
+existing user skill requires its exact reviewed SHA-256 through
+`--replace-user-skill-sha256` before AOI will replace it.
 
 ## Minimal governed task
 
