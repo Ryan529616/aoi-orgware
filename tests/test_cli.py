@@ -6272,6 +6272,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 str(lane["status"]),
                 "--status",
                 "done",
+                "--closure-kind",
+                "completed_work",
                 "--next-action",
                 "No further specialist work remains in this regression",
                 "--reason",
