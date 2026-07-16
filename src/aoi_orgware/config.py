@@ -419,7 +419,23 @@ def load_config_path(root: Path, source: Path) -> tuple[ProjectConfig, bytes]:
         raise ValueError(
             f"AOI configuration must be 1-{MAX_CONFIG_BYTES} bytes: {source}"
         )
-    return _parse_config(root, raw, source), raw
+    return parse_config_bytes(root, raw, source), raw
+
+
+def parse_config_bytes(root: Path, raw: bytes, source: Path) -> ProjectConfig:
+    """Strictly parse one already identity-pinned AOI configuration snapshot.
+
+    Filesystem callers should use :func:`load_config_path`, which pins the
+    source identity and enforces the ordinary single-link file contract before
+    delegating the validated bytes here.
+    """
+
+    root = root.resolve()
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_CONFIG_BYTES:
+        raise ValueError(
+            f"AOI configuration must be 1-{MAX_CONFIG_BYTES} bytes: {source}"
+        )
+    return _parse_config(root, raw, source)
 
 
 def load_config(root: Path, *, allow_missing: bool = False) -> ProjectConfig:

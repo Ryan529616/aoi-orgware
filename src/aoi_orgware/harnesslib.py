@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import base64
+import contextvars
 import datetime as dt
 import errno
 import hmac
@@ -14,19 +15,22 @@ import os
 import re
 import secrets
 import stat
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 if os.name == "nt":
     import msvcrt
 else:
     import fcntl
 
-from .config import CONFIG_FILE, ProjectConfig, load_config
+from .config import (
+    CONFIG_FILE,
+    ProjectConfig,
+    load_config,
+)
 
 
 SCHEMA_VERSION = 1
@@ -80,6 +84,13 @@ CHIEF_CREDENTIAL_SCHEMA_VERSION = 1
 CHIEF_CREDENTIAL_MAX_BYTES = 8 * 1024
 WINDOWS_REPLACE_RETRY_SECONDS = 2.0
 TREE_IDENTITY_SCAN_MAX_ENTRIES = 100_000
+ATOMIC_TEMP_NAME_RE = re.compile(
+    r"^\.aoi-tmp-v1\.(write|create)\.([0-9a-f]{64})\.([0-9a-f]{32})\.tmp$"
+)
+LEGACY_ATOMIC_TEMP_NAME_RE = re.compile(r"^\..+\.tmp-[A-Za-z0-9_-]+$")
+ATOMIC_TEMP_SCAN_MAX_ENTRIES = 100_000
+INTERRUPTED_INIT_PREFIX_SCAN_MAX_ENTRIES = 4_096
+INTERRUPTED_INIT_STATE_LOCK_TEMP_MAX_COUNT = 32
 WINDOWS_RESERVED_BASENAMES = {
     "con",
     "prn",
@@ -127,6 +138,139 @@ TASK_OBJECT_LIST_FIELDS = {
 
 class HarnessError(RuntimeError):
     """Expected user-facing harness failure."""
+
+
+@dataclass(frozen=True)
+class _AtomicIOEvent:
+    """Private test observation at one exact atomic-publication boundary."""
+
+    operation: str
+    stage: str
+    destination: Path
+    temporary: Path | None
+
+
+@dataclass(frozen=True)
+class _StateLockAcquisitionEvent:
+    """Private test observation at one platform state-lock boundary."""
+
+    stage: str
+    path: Path
+    st_dev: int
+    st_ino: int
+
+
+@dataclass(frozen=True)
+class AtomicTemporaryRecord:
+    """One bounded managed-state temporary-file classification."""
+
+    path: Path
+    operation: str
+    target_name_sha256: str
+    classification: str
+    recoverable: bool
+    target: Path | None
+    st_dev: int
+    st_ino: int
+    st_nlink: int
+
+    def as_dict(self, paths: HarnessPaths) -> dict[str, Any]:
+        return {
+            "path": self.path.relative_to(paths.harness).as_posix(),
+            "operation": self.operation,
+            "target_name_sha256": self.target_name_sha256,
+            "classification": self.classification,
+            "recoverable": self.recoverable,
+            "target": (
+                self.target.relative_to(paths.harness).as_posix()
+                if self.target is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class _ProjectConfigBinding:
+    """Pinned config identity and the state paths derived from its exact bytes."""
+
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int | None
+    sha256: str
+    harness: Path
+    lock: Path
+
+
+_AtomicIOObserver = Callable[[_AtomicIOEvent], None]
+_ATOMIC_IO_OBSERVER: contextvars.ContextVar[_AtomicIOObserver | None] = (
+    contextvars.ContextVar("aoi_atomic_io_observer", default=None)
+)
+_StateLockAcquisitionObserver = Callable[[_StateLockAcquisitionEvent], None]
+_STATE_LOCK_ACQUISITION_OBSERVER: contextvars.ContextVar[
+    _StateLockAcquisitionObserver | None
+] = contextvars.ContextVar("aoi_state_lock_acquisition_observer", default=None)
+
+
+@contextlib.contextmanager
+def _observe_atomic_io(observer: _AtomicIOObserver) -> Iterator[None]:
+    """Install a process-local observer without exposing an environment kill switch."""
+
+    token = _ATOMIC_IO_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _ATOMIC_IO_OBSERVER.reset(token)
+
+
+@contextlib.contextmanager
+def _observe_state_lock_acquisition(
+    observer: _StateLockAcquisitionObserver,
+) -> Iterator[None]:
+    """Install a process-local observer for deterministic lock-contention tests."""
+
+    token = _STATE_LOCK_ACQUISITION_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _STATE_LOCK_ACQUISITION_OBSERVER.reset(token)
+
+
+def _emit_atomic_io_event(
+    operation: str,
+    stage: str,
+    destination: Path,
+    temporary: Path | None,
+) -> None:
+    observer = _ATOMIC_IO_OBSERVER.get()
+    if observer is not None:
+        observer(
+            _AtomicIOEvent(
+                operation=operation,
+                stage=stage,
+                destination=destination,
+                temporary=temporary,
+            )
+        )
+
+
+def _emit_state_lock_acquisition_event(
+    stage: str,
+    path: Path,
+    metadata: os.stat_result,
+) -> None:
+    if stage not in {"before_acquire", "acquired"}:
+        raise ValueError(f"unsupported state-lock acquisition stage: {stage}")
+    observer = _STATE_LOCK_ACQUISITION_OBSERVER.get()
+    if observer is not None:
+        observer(
+            _StateLockAcquisitionEvent(
+                stage=stage,
+                path=path,
+                st_dev=int(metadata.st_dev),
+                st_ino=int(metadata.st_ino),
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -231,6 +375,55 @@ def get_paths(root: Path | None = None) -> HarnessPaths:
     return paths_for_project(root, project)
 
 
+def _capture_project_config_binding(paths: HarnessPaths) -> _ProjectConfigBinding:
+    """Pin exact config identity, digest, and its derived state-lock paths."""
+
+    validate_existing_regular_file(paths.config, "AOI configuration")
+    if not paths.config.is_file():
+        raise HarnessError("AOI configuration is missing during bootstrap recovery")
+    try:
+        before = paths.config.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect AOI configuration binding: {exc}") from exc
+    reloaded = get_paths(paths.root)
+    try:
+        after = paths.config.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot recheck AOI configuration binding: {exc}") from exc
+    if (
+        _lock_identity(before) != _lock_identity(after)
+        or int(before.st_size) != int(after.st_size)
+        or getattr(before, "st_mtime_ns", None)
+        != getattr(after, "st_mtime_ns", None)
+    ):
+        raise HarnessError("aoi.toml changed while binding bootstrap recovery")
+    if (
+        reloaded.config != paths.config
+        or reloaded.project.sha256 != paths.project.sha256
+        or reloaded.harness != paths.harness
+        or reloaded.lock != paths.lock
+    ):
+        raise HarnessError("aoi.toml changed before bootstrap recovery")
+    return _ProjectConfigBinding(
+        st_dev=int(after.st_dev),
+        st_ino=int(after.st_ino),
+        st_size=int(after.st_size),
+        st_mtime_ns=getattr(after, "st_mtime_ns", None),
+        sha256=reloaded.project.sha256,
+        harness=reloaded.harness,
+        lock=reloaded.lock,
+    )
+
+
+def _require_project_config_binding(
+    paths: HarnessPaths,
+    expected: _ProjectConfigBinding,
+) -> None:
+    current = _capture_project_config_binding(paths)
+    if current != expected:
+        raise HarnessError("aoi.toml changed during bootstrap recovery")
+
+
 def ensure_layout(paths: HarnessPaths) -> None:
     preflight_layout(paths)
     _ensure_platform_domain(paths)
@@ -251,7 +444,9 @@ def ensure_layout(paths: HarnessPaths) -> None:
     preflight_layout(paths)
 
 
-def preflight_layout(paths: HarnessPaths) -> None:
+def preflight_layout(
+    paths: HarnessPaths, *, allow_recoverable_nonlock_aliases: bool = False
+) -> None:
     """Validate an existing state tree without creating or changing it."""
 
     managed_directories = [
@@ -285,16 +480,22 @@ def preflight_layout(paths: HarnessPaths) -> None:
         ),
     ]
     for managed_file in managed_files:
-        validate_existing_regular_file(managed_file, "AOI managed file")
+        try:
+            validate_existing_regular_file(managed_file, "AOI managed file")
+        except HarnessError:
+            if not (
+                allow_recoverable_nonlock_aliases
+                and managed_file != paths.lock
+                and _recoverable_create_alias_for_target(managed_file) is not None
+            ):
+                raise
 
     if not paths.harness.exists():
         return
-    try:
-        entries = list(paths.harness.iterdir())
-    except OSError as exc:
-        raise HarnessError(f"cannot inspect AOI state path {paths.harness}: {exc}") from exc
     if not paths.platform.exists():
-        if os.name == "nt" and entries:
+        if os.name == "nt" and directory_has_any_entry(
+            paths.harness, "AOI state path"
+        ):
             raise HarnessError(
                 "untagged pre-v0.1.2 AOI state cannot be opened by native Windows; "
                 "run one POSIX/WSL AOI command first or initialize a fresh state tree"
@@ -411,6 +612,16 @@ def validate_existing_regular_directory(path: Path, label: str) -> None:
         raise HarnessError(f"{label} must be a regular directory: {path}")
 
 
+def directory_has_any_entry(path: Path, label: str) -> bool:
+    """Return after at most one directory entry and always close the iterator."""
+
+    try:
+        with os.scandir(path) as entries:
+            return next(entries, None) is not None
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect {label} {path}: {exc}") from exc
+
+
 def validate_existing_regular_file(path: Path, label: str) -> None:
     """Reject linked, junction-backed, or non-file managed paths."""
 
@@ -504,119 +715,21 @@ def _create_platform_marker(path: Path) -> bool:
         raise
     return True
 
-
-def _platform_marker_partial_prefix(payload: bytes) -> bool:
-    """Recognize only a byte prefix emitted by this platform-marker writer."""
-
-    marker = "__AOI_CREATED_AT__"
-    template = _platform_marker_payload()
-    template["created_at"] = marker
-    rendered = (
-        json.dumps(template, indent=2, ensure_ascii=False) + "\n"
-    ).encode("utf-8")
-    before, after = rendered.split(marker.encode("ascii"), 1)
-    if len(payload) <= len(before):
-        return before.startswith(payload)
-    if not payload.startswith(before):
-        return False
-    remainder = payload[len(before) :]
-    if b'"' not in remainder:
-        return bool(
-            len(remainder) <= 64
-            and re.fullmatch(rb"[0-9T:+.\-Z]*", remainder) is not None
-        )
-    timestamp, suffix_tail = remainder.split(b'"', 1)
-    try:
-        timestamp_text = timestamp.decode("ascii")
-        normalized = (
-            timestamp_text[:-1] + "+00:00"
-            if timestamp_text.endswith("Z")
-            else timestamp_text
-        )
-        parsed = dt.datetime.fromisoformat(normalized)
-    except (UnicodeDecodeError, ValueError):
-        return False
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return False
-    observed_suffix = b'"' + suffix_tail
-    return len(observed_suffix) < len(after) and after.startswith(observed_suffix)
-
-
-def _torn_platform_marker_snapshot(
-    path: Path,
-) -> tuple[tuple[int, int], bytes] | None:
-    """Return a provable current-writer prefix; reject valid future schemas."""
-
-    identity, payload = _read_regular_file_snapshot(
-        path, "AOI platform marker", max_bytes=4096
-    )
-    try:
-        decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        if not _platform_marker_partial_prefix(payload):
-            raise HarnessError(
-                f"invalid AOI platform marker is not a recoverable current-schema prefix: {path}"
-            )
-        return identity, payload
-    if not isinstance(decoded, dict):
-        raise HarnessError(f"AOI platform marker must contain an object: {path}")
-    # Preserve unsupported/future schemas and wrong lock domains. Only malformed
-    # byte prefixes from this exact writer are eligible for in-place recovery.
-    _read_platform_marker(path)
-    return None
-
-
-def _rewrite_torn_platform_marker(
-    path: Path, snapshot: tuple[tuple[int, int], bytes]
-) -> None:
-    """Rewrite the pinned torn inode without unlinking a concurrent replacement."""
-
-    expected_identity, expected_payload = snapshot
-    path = canonicalize_no_link_traversal(path, "AOI platform marker")
-    validate_existing_regular_file(path, "AOI platform marker")
-    payload = (
-        json.dumps(_platform_marker_payload(), indent=2, ensure_ascii=False) + "\n"
-    ).encode("utf-8")
-    try:
-        before = path.lstat()
-        with path.open("r+b") as handle:
-            opened = os.fstat(handle.fileno())
-            if (
-                _lock_identity(before) != expected_identity
-                or _lock_identity(opened) != expected_identity
-            ):
-                raise HarnessError(
-                    "AOI platform marker changed before interrupted-init recovery"
-                )
-            current_payload = handle.read(4097)
-            if current_payload != expected_payload:
-                raise HarnessError(
-                    "AOI platform marker bytes changed before interrupted-init recovery"
-                )
-            handle.seek(0)
-            handle.truncate(0)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        after = path.lstat()
-    except OSError as exc:
-        raise HarnessError(f"cannot recover AOI platform marker {path}: {exc}") from exc
-    if _lock_identity(after) != expected_identity:
-        raise HarnessError(
-            "AOI platform marker path changed during interrupted-init recovery"
-        )
-    fsync_directory(path.parent)
-
-
 def _ensure_platform_domain(paths: HarnessPaths) -> None:
     existed = paths.harness.exists()
     if existed and (_path_is_link_like(paths.harness) or not paths.harness.is_dir()):
         raise HarnessError(f"AOI state path must be a regular directory: {paths.harness}")
-    legacy_nonempty = existed and any(paths.harness.iterdir())
+    marker_missing = not paths.platform.exists()
+    legacy_nonempty = bool(
+        existed
+        and marker_missing
+        and os.name == "nt"
+        and directory_has_any_entry(paths.harness, "AOI state path")
+    )
     paths.harness.mkdir(parents=True, exist_ok=True)
     _chmod_private(paths.harness, 0o700)
 
-    if not paths.platform.exists():
+    if marker_missing:
         if os.name == "nt" and legacy_nonempty:
             raise HarnessError(
                 "untagged pre-v0.1.2 AOI state cannot be opened by native Windows; "
@@ -687,7 +800,7 @@ def state_lock(
     paths: HarnessPaths,
     *,
     create_layout: bool = True,
-    bootstrap_empty_lock: bool = False,
+    allow_recoverable_nonlock_aliases: bool = False,
 ) -> Iterator[None]:
     """Hold one project state lock, with exact-path same-thread reentrancy.
 
@@ -697,8 +810,10 @@ def state_lock(
     processes, and project paths still acquire the platform lock normally.
     """
 
-    if create_layout and bootstrap_empty_lock:
-        raise HarnessError("bootstrap_empty_lock requires an existing validated layout")
+    if create_layout and allow_recoverable_nonlock_aliases:
+        raise HarnessError(
+            "recoverable non-lock aliases require an existing validated layout"
+        )
     lock_path = canonicalize_no_link_traversal(paths.lock, "AOI state lock")
     key = os.path.normcase(str(lock_path))
     held = _held_state_locks()
@@ -708,7 +823,10 @@ def state_lock(
         if create_layout:
             ensure_layout(paths)
         else:
-            preflight_layout(paths)
+            preflight_layout(
+                paths,
+                allow_recoverable_nonlock_aliases=allow_recoverable_nonlock_aliases,
+            )
         _validate_held_state_lock(paths, entry)
         entry["depth"] += 1
         try:
@@ -729,31 +847,35 @@ def state_lock(
                 if not paths.lock.exists():
                     raise
     else:
-        preflight_layout(paths)
+        preflight_layout(
+            paths,
+            allow_recoverable_nonlock_aliases=allow_recoverable_nonlock_aliases,
+        )
         if not paths.lock.is_file():
             raise HarnessError(
-                "AOI state lock is missing; initialize or repair Chief authority first"
+                "AOI state lock is missing; automatic mutation is disabled and "
+                "explicit offline/manual recovery is required"
             )
     current_lock_path = canonicalize_no_link_traversal(paths.lock, "AOI state lock")
     if current_lock_path != lock_path:
         raise HarnessError("AOI state lock path changed during layout validation")
-    mode = "r+b" if create_layout or bootstrap_empty_lock or os.name == "nt" else "rb"
+    mode = "r+b" if create_layout or os.name == "nt" else "rb"
     with lock_path.open(mode) as handle:
         before = lock_path.lstat()
         opened = os.fstat(handle.fileno())
         _validate_state_lock_metadata(
             before,
             lock_path,
-            require_private_mode=not (create_layout or bootstrap_empty_lock),
+            require_private_mode=not create_layout,
         )
         _validate_state_lock_metadata(
             opened,
             lock_path,
-            require_private_mode=not (create_layout or bootstrap_empty_lock),
+            require_private_mode=not create_layout,
         )
         if _lock_identity(before) != _lock_identity(opened):
             raise HarnessError("AOI state lock changed while being opened")
-        if create_layout or bootstrap_empty_lock:
+        if create_layout:
             _chmod_private(lock_path, 0o600)
             before = lock_path.lstat()
             opened = os.fstat(handle.fileno())
@@ -761,24 +883,18 @@ def state_lock(
             _validate_state_lock_metadata(opened, lock_path, require_private_mode=True)
             if _lock_identity(before) != _lock_identity(opened):
                 raise HarnessError("AOI state lock changed while permissions were set")
-        initialized_empty_lock = False
         lock_size = int(opened.st_size)
-        if lock_size == 0 and bootstrap_empty_lock:
-            handle.seek(0)
-            handle.write(b"\0")
-            handle.truncate(1)
-            handle.flush()
-            os.fsync(handle.fileno())
-            initialized_empty_lock = True
-        elif lock_size != 1:
+        if lock_size != 1:
             raise HarnessError(
                 "AOI state lock payload is invalid; expected one NUL sentinel byte"
             )
         acquired = False
+        _emit_state_lock_acquisition_event("before_acquire", lock_path, opened)
         _acquire_state_lock(handle)
         acquired = True
         acquisition_pid = os.getpid()
         try:
+            _emit_state_lock_acquisition_event("acquired", lock_path, opened)
             current = lock_path.lstat()
             locked = os.fstat(handle.fileno())
             _validate_state_lock_metadata(current, lock_path, require_private_mode=True)
@@ -788,6 +904,10 @@ def state_lock(
                 raise HarnessError("AOI state lock path changed during lock acquisition")
             if canonicalize_no_link_traversal(lock_path, "AOI state lock") != lock_path:
                 raise HarnessError("AOI state lock path changed during lock acquisition")
+            if int(locked.st_size) != 1:
+                raise HarnessError(
+                    "AOI state lock payload changed during lock acquisition"
+                )
             handle.seek(0)
             if handle.read(2) != b"\0":
                 raise HarnessError("AOI state lock payload changed during lock acquisition")
@@ -801,17 +921,6 @@ def state_lock(
                 yield
             finally:
                 held.pop(key, None)
-        except BaseException:
-            if (
-                bootstrap_empty_lock
-                and initialized_empty_lock
-                and os.getpid() == acquisition_pid
-            ):
-                handle.seek(0)
-                handle.truncate(0)
-                handle.flush()
-                os.fsync(handle.fileno())
-            raise
         finally:
             # A forked child inherits both this Python frame and the same flock
             # open-file description.  Calling LOCK_UN from the child would
@@ -1353,10 +1462,63 @@ def require_complete_layout(paths: HarnessPaths, *, include_lock: bool = True) -
         raise HarnessError("AOI layout is incomplete; missing: " + ", ".join(missing))
 
 
+def _validate_interrupted_state_lock_temporary(
+    path: Path,
+    metadata: os.stat_result,
+) -> None:
+    """Validate one inert current-writer temp without mutating it."""
+
+    if (
+        not _private_regular_atomic_file(path, metadata)
+        or int(metadata.st_nlink) != 1
+        or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600)
+    ):
+        raise HarnessError(
+            "interrupted initialization state-lock temporary must be one "
+            f"private regular non-linked file: {path}"
+        )
+    identity, payload = _read_regular_file_snapshot(
+        path,
+        "interrupted initialization state-lock temporary",
+        max_bytes=1,
+    )
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise HarnessError(
+            "interrupted initialization state-lock temporary changed during "
+            f"validation: {path}: {exc}"
+        ) from exc
+    if (
+        identity != _lock_identity(metadata)
+        or _lock_identity(after) != identity
+        or not _private_regular_atomic_file(path, after)
+        or int(after.st_nlink) != 1
+        or (os.name != "nt" and stat.S_IMODE(after.st_mode) != 0o600)
+        or int(after.st_size) != int(metadata.st_size)
+        or getattr(after, "st_mtime_ns", None)
+        != getattr(metadata, "st_mtime_ns", None)
+        or stat.S_IMODE(after.st_mode) != stat.S_IMODE(metadata.st_mode)
+    ):
+        raise HarnessError(
+            "interrupted initialization state-lock temporary changed during "
+            f"validation: {path}"
+        )
+    if payload not in {b"", b"\0"}:
+        raise HarnessError(
+            "interrupted initialization state-lock temporary has an unexpected "
+            f"payload: {path}"
+        )
+
+
 def _validate_interrupted_initialization_prefix(
     paths: HarnessPaths, *, initialized_lock: bool
-) -> tuple[tuple[int, int], bytes] | None:
-    """Validate the exact pre-lock init prefix and return a pinned torn marker."""
+) -> None:
+    """Validate the exact existing-NUL initialization prefix without mutation.
+
+    A bounded set of exact current-writer state-lock temporaries is inert here:
+    this validator neither promotes nor deletes them before Chief authority exists.
+    """
 
     validate_existing_regular_file(paths.config, "AOI configuration")
     if not paths.config.is_file():
@@ -1376,6 +1538,9 @@ def _validate_interrupted_initialization_prefix(
     if paths.project.legacy_enabled:
         allowed_directories.update((paths.legacy_pending, paths.legacy_decisions))
     allowed_files = {paths.platform, paths.lock}
+    expected_lock_hash = _atomic_target_name_sha256(paths.lock)
+    inspected_entry_count = 0
+    state_lock_temporary_count = 0
 
     if paths.harness.exists():
         validate_existing_regular_directory(paths.harness, "AOI state directory")
@@ -1383,37 +1548,76 @@ def _validate_interrupted_initialization_prefix(
         while pending:
             directory = pending.pop()
             try:
-                entries = list(directory.iterdir())
+                with os.scandir(directory) as entries:
+                    while True:
+                        if (
+                            inspected_entry_count
+                            >= INTERRUPTED_INIT_PREFIX_SCAN_MAX_ENTRIES
+                        ):
+                            raise HarnessError(
+                                "interrupted initialization prefix reached the "
+                                "bounded managed-state entry count"
+                            )
+                        try:
+                            raw_entry = next(entries)
+                        except StopIteration:
+                            break
+                        inspected_entry_count += 1
+                        entry = Path(raw_entry.path)
+                        if _path_is_link_like(entry):
+                            raise HarnessError(
+                                "interrupted initialization prefix contains a "
+                                f"linked entry: {entry}"
+                            )
+                        try:
+                            metadata = entry.lstat()
+                        except OSError as exc:
+                            raise HarnessError(
+                                "cannot inspect interrupted AOI initialization "
+                                f"entry {entry}: {exc}"
+                            ) from exc
+                        if stat.S_ISDIR(metadata.st_mode):
+                            if entry not in allowed_directories:
+                                raise HarnessError(
+                                    "interrupted initialization prefix contains an "
+                                    f"unknown directory: {entry}"
+                                )
+                            pending.append(entry)
+                            continue
+                        # A pre-link current-writer temp has no authority by itself.
+                        # Validate and leave it for the old writer or authenticated
+                        # temporary recovery after the canonical lock is established.
+                        temporary_match = ATOMIC_TEMP_NAME_RE.fullmatch(entry.name)
+                        if (
+                            directory == paths.harness
+                            and temporary_match is not None
+                            and temporary_match.group(1) == "create"
+                            and temporary_match.group(2) == expected_lock_hash
+                        ):
+                            state_lock_temporary_count += 1
+                            if (
+                                state_lock_temporary_count
+                                > INTERRUPTED_INIT_STATE_LOCK_TEMP_MAX_COUNT
+                            ):
+                                raise HarnessError(
+                                    "interrupted initialization prefix exceeded the "
+                                    "pre-link state-lock temporary limit"
+                                )
+                            _validate_interrupted_state_lock_temporary(entry, metadata)
+                            continue
+                        if (
+                            not stat.S_ISREG(metadata.st_mode)
+                            or metadata.st_nlink != 1
+                            or entry not in allowed_files
+                        ):
+                            raise HarnessError(
+                                "interrupted initialization prefix contains material "
+                                f"or unknown state: {entry}"
+                            )
             except OSError as exc:
                 raise HarnessError(
                     f"cannot inspect interrupted AOI initialization prefix {directory}: {exc}"
                 ) from exc
-            for entry in entries:
-                if _path_is_link_like(entry):
-                    raise HarnessError(
-                        f"interrupted initialization prefix contains a linked entry: {entry}"
-                    )
-                try:
-                    metadata = entry.lstat()
-                except OSError as exc:
-                    raise HarnessError(
-                        f"cannot inspect interrupted AOI initialization entry {entry}: {exc}"
-                    ) from exc
-                if stat.S_ISDIR(metadata.st_mode):
-                    if entry not in allowed_directories:
-                        raise HarnessError(
-                            f"interrupted initialization prefix contains an unknown directory: {entry}"
-                        )
-                    pending.append(entry)
-                    continue
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or entry not in allowed_files
-                ):
-                    raise HarnessError(
-                        f"interrupted initialization prefix contains material or unknown state: {entry}"
-                    )
 
     if paths.lock.exists():
         expected_lock_payload = b"\0" if initialized_lock else b""
@@ -1445,204 +1649,85 @@ def _validate_interrupted_initialization_prefix(
     elif initialized_lock:
         raise HarnessError("interrupted initialization recovery lost its state lock")
 
-    torn_platform: tuple[tuple[int, int], bytes] | None = None
     if paths.platform.exists():
-        torn_platform = _torn_platform_marker_snapshot(paths.platform)
-        if torn_platform is not None:
-            if initialized_lock:
-                raise HarnessError(
-                    "initialized interrupted-init prefix retains a torn platform marker"
-                )
-        else:
-            marker = _read_platform_marker(paths.platform)
-            if marker.get("lock_domain") != runtime_lock_domain():
-                raise HarnessError(
-                    "interrupted initialization prefix belongs to another lock domain"
-                )
+        marker = _read_platform_marker(paths.platform)
+        if marker.get("lock_domain") != runtime_lock_domain():
+            raise HarnessError(
+                "interrupted initialization prefix belongs to another lock domain"
+            )
     elif initialized_lock:
         raise HarnessError("interrupted initialization recovery lost its platform marker")
-    return torn_platform
 
 
-def _repair_interrupted_initialization_prefix(paths: HarnessPaths) -> None:
-    """Repair only the structural prefix that first ``aoi init`` may leave.
+def bootstrap_chief_state_lock(paths: HarnessPaths) -> None:
+    """Validate the only automatic Chief-bootstrap state: canonical NUL lock.
 
-    Before the first state lock is initialized, ``aoi init`` can only have
-    created the state directory, platform marker, structural directories, and
-    an empty lock.  Any authority, lifecycle payload, managed resource, or
-    unknown entry means this is an established/ambiguous tree and must not be
-    repaired without a Chief. The exact scan is repeated while holding the new
-    lock so two cooperative recovery attempts cannot widen the prefix.
+    No unauthenticated bootstrap path creates, rewrites, or unlinks project
+    state. Missing, empty, linked, or otherwise non-canonical locks require an
+    explicit offline/manual recovery. A valid existing NUL lock is still
+    revalidated under its platform lock against the exact config binding and
+    either a complete layout or the narrow existing-NUL interrupted prefix.
     """
 
-    torn_platform = _validate_interrupted_initialization_prefix(
-        paths, initialized_lock=False
-    )
-    if torn_platform is not None:
-        _rewrite_torn_platform_marker(paths.platform, torn_platform)
-
-    # This is the one narrow unauthenticated repair. It creates only structural
-    # directories/platform/empty lock. The sentinel is committed only while
-    # holding that same lock after an exact second scan; a failed scan restores
-    # the empty, untrusted legacy/bootstrap state.
-    paths.harness.mkdir(parents=True, exist_ok=True)
-    _chmod_private(paths.harness, 0o700)
-    if not paths.platform.exists():
-        _create_platform_marker(paths.platform)
-    ensure_layout(paths)
-    if not paths.lock.exists():
-        try:
-            atomic_create_bytes(paths.lock, b"")
-        except HarnessError:
-            if not paths.lock.exists():
-                raise
-    _identity, lock_payload = _read_regular_file_snapshot(
-        paths.lock, "AOI state lock", max_bytes=2
-    )
-    if lock_payload == b"":
-        with state_lock(
-            paths, create_layout=False, bootstrap_empty_lock=True
-        ):
-            _validate_interrupted_initialization_prefix(
-                paths, initialized_lock=True
-            )
-    elif lock_payload == b"\0":
-        # A concurrent cooperative recovery may have committed the sentinel.
-        # It is trusted only after this process locks and repeats the exact scan.
-        with state_lock(paths, create_layout=False):
-            _validate_interrupted_initialization_prefix(
-                paths, initialized_lock=True
-            )
-    else:
+    config_binding = _capture_project_config_binding(paths)
+    if _path_is_link_like(paths.lock):
         raise HarnessError(
-            "interrupted initialization recovery found an invalid state lock collision"
+            "automatic Chief bootstrap refuses a linked AOI state lock; "
+            "perform explicit offline/manual recovery"
         )
-
-
-def bootstrap_chief_state_lock(paths: HarnessPaths) -> bool:
-    """Create only a missing lock for a complete pre-v0.2/inactive state tree.
-
-    This is the narrow migration exception used by ``chief-acquire``.  It must
-    not repair directories, policies, or other state before a Chief exists.
-    """
-
-    if paths.lock.exists():
-        identity, lock_payload = _read_regular_file_snapshot(
-            paths.lock, "AOI state lock", max_bytes=2
-        )
+    try:
         metadata = paths.lock.lstat()
-        if _lock_identity(metadata) != identity:
-            raise HarnessError("AOI state lock changed during Chief bootstrap")
-        _validate_state_lock_metadata(
-            metadata,
-            paths.lock,
-            require_private_mode=lock_payload == b"\0",
+    except FileNotFoundError as exc:
+        raise HarnessError(
+            "automatic Chief bootstrap requires an existing canonical NUL state lock; "
+            "the lock is missing and requires explicit offline/manual recovery"
+        ) from exc
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect AOI state lock: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or int(metadata.st_nlink) != 1:
+        raise HarnessError(
+            "automatic Chief bootstrap requires one private regular non-linked "
+            "NUL state lock; this lock requires explicit offline/manual recovery"
         )
-        if lock_payload == b"\0":
-            # A committed sentinel is not a blanket fast path. Revalidate either
-            # the complete layout or the exact resumable prefix under the lock
-            # so a prior failed repair cannot authorize later material state.
-            with state_lock(paths, create_layout=False):
-                previous = load_chief_authority(paths, allow_missing=True)
-                try:
-                    require_complete_layout(paths)
-                except HarnessError as complete_exc:
-                    if previous is not None:
-                        raise HarnessError(
-                            "Chief lock bootstrap found incomplete established state: "
-                            f"{complete_exc}"
-                        ) from complete_exc
-                    try:
-                        _validate_interrupted_initialization_prefix(
-                            paths, initialized_lock=True
-                        )
-                    except HarnessError as recovery_exc:
-                        raise HarnessError(
-                            "Chief lock bootstrap requires a complete existing AOI layout or "
-                            "an exact interrupted-init prefix: "
-                            f"complete-layout check failed ({complete_exc}); "
-                            f"recovery refused ({recovery_exc})"
-                        ) from recovery_exc
-            return False
-        if lock_payload != b"":
-            raise HarnessError(
-                "AOI state lock payload is invalid; expected empty legacy lock or one NUL sentinel"
-            )
+    _validate_state_lock_metadata(
+        metadata,
+        paths.lock,
+        require_private_mode=True,
+    )
+    if int(metadata.st_size) != 1:
+        detail = "empty" if int(metadata.st_size) == 0 else "invalid"
+        raise HarnessError(
+            f"automatic Chief bootstrap refuses the {detail} AOI state lock; "
+            "perform explicit offline/manual recovery"
+        )
+
+    # Do not read the sentinel before taking the platform lock. Native Windows
+    # denies reads of the byte range held by another AOI process; state_lock
+    # waits for that holder, re-pins the path/inode, and validates exact NUL
+    # bytes only after acquisition.
+    with state_lock(paths, create_layout=False):
+        _require_project_config_binding(paths, config_binding)
+        validate_existing_regular_file(paths.chief_authority, "AOI Chief authority")
+        previous = load_chief_authority(paths, allow_missing=True)
         try:
-            preflight_layout(paths)
-            previous = load_chief_authority(paths, allow_missing=True)
-            if previous is not None and previous["status"] == "active":
-                raise HarnessError("active Chief authority has an empty state lock")
             require_complete_layout(paths)
         except HarnessError as complete_exc:
-            try:
-                _repair_interrupted_initialization_prefix(paths)
-            except HarnessError as recovery_exc:
+            if previous is not None:
                 raise HarnessError(
-                    "Chief lock bootstrap requires a complete existing AOI layout or "
-                    "an exact interrupted-init prefix: "
-                    f"complete-layout check failed ({complete_exc}); "
-                    f"recovery refused ({recovery_exc})"
-                ) from recovery_exc
-        else:
-            # POSIX AOI v0.1.3 used a legitimate zero-byte flock file. Convert
-            # it to the cross-platform one-byte sentinel only after validating
-            # the complete legacy layout and inactive/uninitialized authority,
-            # then repeat those checks while holding the converted lock.
-            with state_lock(
-                paths, create_layout=False, bootstrap_empty_lock=True
-            ):
-                previous = load_chief_authority(paths, allow_missing=True)
-                if previous is not None and previous["status"] == "active":
-                    raise HarnessError("active Chief authority has an empty state lock")
-                require_complete_layout(paths)
-        return True
-
-    try:
-        preflight_layout(paths)
-        previous = load_chief_authority(paths, allow_missing=True)
-        if previous is not None and previous["status"] == "active":
-            raise HarnessError("active Chief authority has a missing state lock")
-        require_complete_layout(paths, include_lock=False)
-    except HarnessError as exc:
-        try:
-            _repair_interrupted_initialization_prefix(paths)
-        except HarnessError as recovery_exc:
-            raise HarnessError(
-                "Chief lock bootstrap requires a complete existing AOI layout or "
-                "an exact interrupted-init prefix: "
-                f"complete-layout check failed ({exc}); recovery refused ({recovery_exc})"
-            ) from recovery_exc
-        return True
-    try:
-        atomic_create_bytes(paths.lock, b"")
-    except HarnessError:
-        if not paths.lock.exists():
-            raise
-    _identity, lock_payload = _read_regular_file_snapshot(
-        paths.lock, "AOI state lock", max_bytes=2
-    )
-    if lock_payload == b"":
-        with state_lock(
-            paths, create_layout=False, bootstrap_empty_lock=True
-        ):
-            previous = load_chief_authority(paths, allow_missing=True)
-            if previous is not None and previous["status"] == "active":
-                raise HarnessError("active Chief authority appeared during lock migration")
-            require_complete_layout(paths)
-    elif lock_payload == b"\0":
-        with state_lock(paths, create_layout=False):
-            previous = load_chief_authority(paths, allow_missing=True)
-            if previous is not None and previous["status"] == "active":
-                raise HarnessError("active Chief authority appeared during lock migration")
-            require_complete_layout(paths)
-    else:
-        raise HarnessError(
-            "AOI state lock collision produced neither an empty legacy lock nor the NUL sentinel"
-        )
-    return True
-
-
+                    "Chief bootstrap found incomplete established state: "
+                    f"{complete_exc}"
+                ) from complete_exc
+            try:
+                _validate_interrupted_initialization_prefix(
+                    paths, initialized_lock=True
+                )
+            except HarnessError as prefix_exc:
+                raise HarnessError(
+                    "Chief bootstrap requires a complete existing AOI layout or an "
+                    "exact existing-NUL interrupted prefix; automatic repair is "
+                    "disabled and ambiguous state requires explicit offline/manual "
+                    f"recovery: complete={complete_exc}; prefix={prefix_exc}"
+                ) from prefix_exc
 _CHIEF_CREDENTIAL_FIELDS = {
     "schema_version",
     "project_key",
@@ -2369,6 +2454,44 @@ def atomic_create_text(path: Path, text: str) -> None:
     atomic_create_bytes(path, text.encode("utf-8"))
 
 
+def _atomic_target_name_sha256(path: Path) -> str:
+    return hashlib.sha256(path.name.encode("utf-8")).hexdigest()
+
+
+def _atomic_temporary_basename(path: Path, operation: str) -> str:
+    if operation not in {"write", "create"}:
+        raise ValueError(f"unsupported atomic temporary operation: {operation}")
+    target_name_sha256 = _atomic_target_name_sha256(path)
+    return (
+        f".aoi-tmp-v1.{operation}.{target_name_sha256}."
+        f"{secrets.token_hex(16)}.tmp"
+    )
+
+
+def _open_atomic_temporary(path: Path, operation: str) -> tuple[int, Path]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for _attempt in range(128):
+        temporary = path.parent / _atomic_temporary_basename(path, operation)
+        try:
+            descriptor = os.open(temporary, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+        except BaseException:
+            # The caller cannot clean resources that have not yet been
+            # returned.  Keep allocation failure local and best-effort remove
+            # the private, unpublished entry before preserving the exception.
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            raise
+        return descriptor, temporary
+    raise HarnessError(f"could not allocate a private atomic temporary file for {path}")
+
+
 def atomic_create_bytes(path: Path, payload: bytes) -> None:
     """Atomically publish one complete private file without replacement."""
 
@@ -2377,42 +2500,72 @@ def atomic_create_bytes(path: Path, payload: bytes) -> None:
     if canonicalize_no_link_traversal(path, "atomic create destination") != path:
         raise HarnessError("atomic create destination changed during parent creation")
     descriptor: int | None = None
-    temp_name = ""
+    temporary: Path | None = None
+    publication_handle: Any | None = None
     try:
-        descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{path.name}.tmp-", dir=path.parent
-        )
-        if os.name != "nt":
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        descriptor, temporary = _open_atomic_temporary(path, "create")
+        publication_handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        publication_handle.write(payload)
+        publication_handle.flush()
+        os.fsync(publication_handle.fileno())
+        if os.name == "nt":
+            # Preserve the existing Windows close-before-observation and
+            # close-before-rename behavior. Windows does not use the POSIX
+            # hard-link publication window below.
+            publication_handle.close()
+            publication_handle = None
+        _emit_atomic_io_event("create", "temp_fsynced", path, temporary)
         if canonicalize_no_link_traversal(path, "atomic create destination") != path:
             raise HarnessError("atomic create destination changed before publication")
         try:
             if os.name == "nt":
                 # Windows rename is atomic and refuses an existing destination.
-                os.rename(temp_name, path)
-                temp_name = ""
+                os.rename(temporary, path)
+                published_temporary = temporary
+                temporary = None
             else:
-                os.link(temp_name, path, follow_symlinks=False)
-                Path(temp_name).unlink()
-                temp_name = ""
+                # POSIX no-replace publication briefly exposes two names for
+                # one inode. Managed-state recovery is serialized by the
+                # project state lock; root-config and state-lock aliases fail
+                # closed and require explicit offline/manual recovery.
+                os.link(temporary, path, follow_symlinks=False)
+                _emit_atomic_io_event("create", "linked", path, temporary)
+                published_temporary = temporary
+                temporary.unlink()
+                temporary = None
+                _emit_atomic_io_event(
+                    "create", "published", path, published_temporary
+                )
+                if (
+                    canonicalize_no_link_traversal(
+                        path, "atomic create destination"
+                    )
+                    != path
+                ):
+                    raise HarnessError(
+                        "atomic create destination changed after publication"
+                    )
+                fsync_directory(path.parent)
         except FileExistsError as exc:
             raise HarnessError(
                 f"refusing to replace existing file during create: {path}"
             ) from exc
-        if canonicalize_no_link_traversal(path, "atomic create destination") != path:
-            raise HarnessError("atomic create destination changed after publication")
-        fsync_directory(path.parent)
+        if os.name == "nt":
+            _emit_atomic_io_event("create", "published", path, published_temporary)
+            if canonicalize_no_link_traversal(path, "atomic create destination") != path:
+                raise HarnessError(
+                    "atomic create destination changed after publication"
+                )
+            fsync_directory(path.parent)
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        if temp_name:
+        if publication_handle is not None:
+            publication_handle.close()
+        if temporary is not None:
             with contextlib.suppress(FileNotFoundError):
-                Path(temp_name).unlink()
+                temporary.unlink()
 
 
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -2420,26 +2573,31 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if canonicalize_no_link_traversal(path, "atomic write destination") != path:
         raise HarnessError("atomic write destination changed during parent creation")
-    temp_name = ""
+    descriptor: int | None = None
+    temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
-            if os.name != "nt":
-                os.fchmod(handle.fileno(), 0o600)
+        descriptor, temporary = _open_atomic_temporary(path, "write")
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
             handle.write(payload)
-            temp_name = handle.name
             handle.flush()
             os.fsync(handle.fileno())
+        _emit_atomic_io_event("write", "temp_fsynced", path, temporary)
         if canonicalize_no_link_traversal(path, "atomic write destination") != path:
             raise HarnessError("atomic write destination changed before publication")
-        replace_file(Path(temp_name), path)
-        temp_name = ""
+        published_temporary = temporary
+        replace_file(temporary, path)
+        temporary = None
+        _emit_atomic_io_event("write", "published", path, published_temporary)
         if canonicalize_no_link_traversal(path, "atomic write destination") != path:
             raise HarnessError("atomic write destination changed after publication")
         fsync_directory(path.parent)
     finally:
-        if temp_name:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
             with contextlib.suppress(FileNotFoundError):
-                Path(temp_name).unlink()
+                temporary.unlink()
 
 
 def replace_file(source: Path, destination: Path) -> None:
@@ -2491,6 +2649,281 @@ def fsync_directory(path: Path) -> None:
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def _private_regular_atomic_file(path: Path, metadata: os.stat_result) -> bool:
+    return bool(
+        stat.S_ISREG(metadata.st_mode)
+        and not _path_is_link_like(path)
+        and (os.name == "nt" or not stat.S_IMODE(metadata.st_mode) & 0o077)
+    )
+
+
+def _create_alias_target_for_temporary(
+    temporary: Path,
+    metadata: os.stat_result,
+    target_name_sha256: str,
+    candidate_index: dict[tuple[int, int, str], list[Path]],
+) -> Path | None:
+    matches = candidate_index.get(
+        (*_lock_identity(metadata), target_name_sha256), []
+    )
+    if len(matches) != 1 or matches[0] == temporary:
+        return None
+    candidate = matches[0]
+    try:
+        candidate_metadata = candidate.lstat()
+    except OSError:
+        return None
+    if (
+        not _private_regular_atomic_file(candidate, candidate_metadata)
+        or int(candidate_metadata.st_nlink) != 2
+        or _lock_identity(candidate_metadata) != _lock_identity(metadata)
+        or _atomic_target_name_sha256(candidate) != target_name_sha256
+    ):
+        return None
+    return candidate
+
+
+def _recoverable_create_alias_for_target(target: Path) -> Path | None:
+    if not target.exists():
+        return None
+    try:
+        metadata = target.lstat()
+    except OSError:
+        return None
+    if not _private_regular_atomic_file(target, metadata) or metadata.st_nlink != 2:
+        return None
+    expected_hash = _atomic_target_name_sha256(target)
+    inspected = 0
+    aliases: list[Path] = []
+    try:
+        with os.scandir(target.parent) as candidates:
+            while True:
+                if inspected >= ATOMIC_TEMP_SCAN_MAX_ENTRIES:
+                    raise HarnessError(
+                        "AOI create-alias preflight reached the fail-closed "
+                        "directory entry limit"
+                    )
+                try:
+                    raw_candidate = next(candidates)
+                except StopIteration:
+                    break
+                inspected += 1
+                match = ATOMIC_TEMP_NAME_RE.fullmatch(raw_candidate.name)
+                if (
+                    not match
+                    or match.group(1) != "create"
+                    or match.group(2) != expected_hash
+                ):
+                    continue
+                candidate = Path(raw_candidate.path)
+                try:
+                    candidate_metadata = candidate.lstat()
+                except OSError:
+                    continue
+                if (
+                    _private_regular_atomic_file(candidate, candidate_metadata)
+                    and candidate_metadata.st_nlink == 2
+                    and _lock_identity(candidate_metadata) == _lock_identity(metadata)
+                ):
+                    aliases.append(candidate)
+                    if len(aliases) > 1:
+                        return None
+    except OSError:
+        return None
+    return aliases[0] if len(aliases) == 1 else None
+
+
+def _atomic_temporary_record(
+    path: Path,
+    candidate_index: dict[tuple[int, int, str], list[Path]] | None = None,
+) -> AtomicTemporaryRecord:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect AOI temporary file {path}: {exc}") from exc
+    match = ATOMIC_TEMP_NAME_RE.fullmatch(path.name)
+    if match is None:
+        operation = (
+            "legacy" if LEGACY_ATOMIC_TEMP_NAME_RE.fullmatch(path.name) else "unknown"
+        )
+        if operation == "legacy":
+            classification = (
+                "legacy_manual"
+                if _private_regular_atomic_file(path, metadata)
+                and metadata.st_nlink == 1
+                else "legacy_ambiguous"
+            )
+        else:
+            classification = "malformed_reserved"
+        return AtomicTemporaryRecord(
+            path=path,
+            operation=operation,
+            target_name_sha256="",
+            classification=classification,
+            recoverable=False,
+            target=None,
+            st_dev=int(metadata.st_dev),
+            st_ino=int(metadata.st_ino),
+            st_nlink=int(metadata.st_nlink),
+        )
+    operation, target_name_sha256, _nonce = match.groups()
+    classification = "ambiguous"
+    recoverable = False
+    target: Path | None = None
+    if _private_regular_atomic_file(path, metadata):
+        if metadata.st_nlink == 1:
+            classification = "unpublished"
+            recoverable = True
+        elif operation == "create" and metadata.st_nlink == 2:
+            target = _create_alias_target_for_temporary(
+                path, metadata, target_name_sha256, candidate_index or {}
+            )
+            if target is not None:
+                classification = "published_create_alias"
+                recoverable = True
+    return AtomicTemporaryRecord(
+        path=path,
+        operation=operation,
+        target_name_sha256=target_name_sha256,
+        classification=classification,
+        recoverable=recoverable,
+        target=target,
+        st_dev=int(metadata.st_dev),
+        st_ino=int(metadata.st_ino),
+        st_nlink=int(metadata.st_nlink),
+    )
+
+
+def scan_atomic_temporaries(paths: HarnessPaths) -> list[AtomicTemporaryRecord]:
+    """Classify only AOI-owned temporaries while the project state lock is held."""
+
+    _require_chief_lock(paths)
+    root = canonicalize_no_link_traversal(paths.harness, "AOI state directory")
+    if not root.is_dir():
+        return []
+    pending = [root]
+    records: list[AtomicTemporaryRecord] = []
+    entry_count = 0
+    while pending:
+        directory = pending.pop()
+        reserved_entries: list[Path] = []
+        candidate_index: dict[tuple[int, int, str], list[Path]] = {}
+        try:
+            with os.scandir(directory) as entries:
+                while True:
+                    if entry_count >= ATOMIC_TEMP_SCAN_MAX_ENTRIES:
+                        raise HarnessError(
+                            "AOI temporary scan reached the bounded managed-state "
+                            "entry count"
+                        )
+                    try:
+                        raw_entry = next(entries)
+                    except StopIteration:
+                        break
+                    entry_count += 1
+                    entry = Path(raw_entry.path)
+                    reserved = bool(
+                        entry.name.startswith(".aoi-tmp-v1.")
+                        or LEGACY_ATOMIC_TEMP_NAME_RE.fullmatch(entry.name)
+                    )
+                    if _path_is_link_like(entry):
+                        if reserved:
+                            reserved_entries.append(entry)
+                            continue
+                        raise HarnessError(
+                            "AOI temporary scan refuses linked managed-state "
+                            f"entry: {entry}"
+                        )
+                    try:
+                        metadata = entry.lstat()
+                    except OSError as exc:
+                        raise HarnessError(
+                            "cannot inspect managed-state entry during temporary "
+                            f"scan {entry}: {exc}"
+                        ) from exc
+                    if reserved:
+                        reserved_entries.append(entry)
+                    elif stat.S_ISDIR(metadata.st_mode):
+                        pending.append(entry)
+                    elif (
+                        int(metadata.st_nlink) == 2
+                        and _private_regular_atomic_file(entry, metadata)
+                    ):
+                        key = (
+                            *_lock_identity(metadata),
+                            _atomic_target_name_sha256(entry),
+                        )
+                        matches = candidate_index.setdefault(key, [])
+                        if len(matches) < 2:
+                            matches.append(entry)
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot inspect AOI state directory for temporaries {directory}: {exc}"
+            ) from exc
+        records.extend(
+            _atomic_temporary_record(entry, candidate_index)
+            for entry in reserved_entries
+        )
+    return sorted(records, key=lambda item: item.path.relative_to(root).as_posix())
+
+
+def _validate_atomic_temporary_record(record: AtomicTemporaryRecord) -> None:
+    try:
+        metadata = record.path.lstat()
+    except OSError as exc:
+        raise HarnessError(
+            f"AOI temporary changed before recovery: {record.path}: {exc}"
+        ) from exc
+    if (
+        int(metadata.st_dev) != record.st_dev
+        or int(metadata.st_ino) != record.st_ino
+        or int(metadata.st_nlink) != record.st_nlink
+        or not _private_regular_atomic_file(record.path, metadata)
+    ):
+        raise HarnessError(f"AOI temporary changed before recovery: {record.path}")
+    if record.classification == "published_create_alias":
+        if record.target is None:
+            raise HarnessError(f"AOI create alias lacks a target: {record.path}")
+        target_metadata = record.target.lstat()
+        if (
+            _lock_identity(target_metadata) != (record.st_dev, record.st_ino)
+            or int(target_metadata.st_nlink) != 2
+            or _atomic_target_name_sha256(record.target)
+            != record.target_name_sha256
+        ):
+            raise HarnessError(f"AOI create alias target changed: {record.target}")
+
+
+def recover_atomic_temporaries(
+    paths: HarnessPaths, records: list[AtomicTemporaryRecord] | None = None
+) -> list[AtomicTemporaryRecord]:
+    """Remove exact recoverable residues; ambiguous input causes zero deletions."""
+
+    _require_chief_lock(paths)
+    selected = scan_atomic_temporaries(paths) if records is None else list(records)
+    ambiguous = [record for record in selected if not record.recoverable]
+    if ambiguous:
+        detail = ", ".join(
+            f"{record.path.relative_to(paths.harness).as_posix()} "
+            f"({record.classification})"
+            for record in ambiguous
+        )
+        raise HarnessError(
+            "temporary recovery refused ambiguous or legacy entries; no files were "
+            f"removed: {detail}"
+        )
+    for record in selected:
+        _validate_atomic_temporary_record(record)
+    recovered: list[AtomicTemporaryRecord] = []
+    for record in selected:
+        _validate_atomic_temporary_record(record)
+        record.path.unlink()
+        fsync_directory(record.path.parent)
+        _emit_atomic_io_event("recovery", "unlinked", record.path, None)
+        recovered.append(record)
+    return recovered
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -2559,6 +2992,80 @@ def load_task(paths: HarnessPaths, task_id: str) -> dict[str, Any]:
     return state
 
 
+def _validate_mini_finish_record(
+    state: dict[str, Any], source: Path | None = None
+) -> None:
+    record = state.get("mini_finish")
+    if record is None:
+        return
+    where = f" in {source}" if source else ""
+    if state.get("profile") != "mini" or not isinstance(record, dict):
+        raise HarnessError(f"mini finish receipt is invalid{where}")
+    required = {
+        "version",
+        "mode",
+        "detail",
+        "summary",
+        "commit",
+        "remote",
+        "remote_ref",
+        "request_sha256",
+        "started_at",
+    }
+    if (
+        set(record) != required
+        or type(record.get("version")) is not int
+        or record.get("version") != 1
+    ):
+        raise HarnessError(f"mini finish receipt schema is invalid{where}")
+    string_fields = required - {"version"}
+    if any(not isinstance(record.get(field), str) for field in string_fields):
+        raise HarnessError(f"mini finish receipt fields are invalid{where}")
+    if not record["detail"].strip() or not record["summary"].strip():
+        raise HarnessError(f"mini finish receipt text is empty{where}")
+    if parse_time(record["started_at"]) is None:
+        raise HarnessError(f"mini finish receipt timestamp is invalid{where}")
+    mode = record["mode"]
+    commit = record["commit"].lower()
+    remote = record["remote"]
+    remote_ref = record["remote_ref"]
+    if mode not in {"none", "local-only", "pushed"}:
+        raise HarnessError(f"mini finish receipt delivery mode is invalid{where}")
+    if mode == "pushed":
+        if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+            raise HarnessError(f"mini finish receipt commit is invalid{where}")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", remote):
+            raise HarnessError(f"mini finish receipt remote is invalid{where}")
+        if (
+            not re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", remote_ref)
+            or ".." in remote_ref
+        ):
+            raise HarnessError(f"mini finish receipt remote ref is invalid{where}")
+    elif commit or remote or remote_ref:
+        raise HarnessError(
+            f"mini finish receipt has pushed fields for a local delivery{where}"
+        )
+    payload = {
+        field: record[field]
+        for field in (
+            "version",
+            "mode",
+            "detail",
+            "summary",
+            "commit",
+            "remote",
+            "remote_ref",
+        )
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    if record["request_sha256"] != digest:
+        raise HarnessError(f"mini finish receipt digest is invalid{where}")
+
+
 def validate_task_state(state: dict[str, Any], source: Path | None = None) -> None:
     where = f" in {source}" if source else ""
     schema_version = state.get("schema_version")
@@ -2603,6 +3110,7 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
             raise HarnessError(f"task field {field!r} must contain only {kind}{where}")
     if "delivery" in state and not isinstance(state["delivery"], dict):
         raise HarnessError(f"task field 'delivery' must be an object{where}")
+    _validate_mini_finish_record(state, source)
 
 
 def bump_task(state: dict[str, Any], checkpoint_required: bool = True) -> None:
@@ -2814,45 +3322,50 @@ def _validate_existing_tree_identity(
         directory = pending.pop()
         try:
             with os.scandir(directory) as entries:
-                children = list(entries)
+                while True:
+                    if inspected >= TREE_IDENTITY_SCAN_MAX_ENTRIES:
+                        raise HarnessError(
+                            f"{namespace} tree lock reached the fail-closed identity "
+                            f"scan limit of {TREE_IDENTITY_SCAN_MAX_ENTRIES} entries: "
+                            f"{raw_path}"
+                        )
+                    try:
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    inspected += 1
+                    child = Path(entry.path)
+                    try:
+                        if _path_is_link_like(child):
+                            raise HarnessError(
+                                f"{namespace} tree lock may not contain a symlink or "
+                                f"junction: {raw_path}"
+                            )
+                        child_metadata = child.lstat()
+                    except HarnessError:
+                        raise
+                    except OSError as exc:
+                        raise HarnessError(
+                            f"cannot inspect {namespace} tree lock target "
+                            f"{raw_path}: {exc}"
+                        ) from exc
+                    if stat.S_ISDIR(child_metadata.st_mode):
+                        pending.append(child)
+                    elif stat.S_ISREG(child_metadata.st_mode):
+                        if child_metadata.st_nlink != 1:
+                            raise HarnessError(
+                                f"{namespace} tree lock may not contain a hard-linked "
+                                f"file: {raw_path}"
+                            )
+                    else:
+                        raise HarnessError(
+                            f"{namespace} tree lock may not contain a special "
+                            f"filesystem node: {raw_path}"
+                        )
         except OSError as exc:
             raise HarnessError(
                 f"cannot inspect {namespace} tree lock target {raw_path}: {exc}"
             ) from exc
-        for entry in children:
-            inspected += 1
-            if inspected > TREE_IDENTITY_SCAN_MAX_ENTRIES:
-                raise HarnessError(
-                    f"{namespace} tree lock exceeds the fail-closed identity scan "
-                    f"limit of {TREE_IDENTITY_SCAN_MAX_ENTRIES} entries: {raw_path}"
-                )
-            child = Path(entry.path)
-            try:
-                if _path_is_link_like(child):
-                    raise HarnessError(
-                        f"{namespace} tree lock may not contain a symlink or "
-                        f"junction: {raw_path}"
-                    )
-                child_metadata = entry.stat(follow_symlinks=False)
-            except HarnessError:
-                raise
-            except OSError as exc:
-                raise HarnessError(
-                    f"cannot inspect {namespace} tree lock target {raw_path}: {exc}"
-                ) from exc
-            if stat.S_ISDIR(child_metadata.st_mode):
-                pending.append(child)
-            elif stat.S_ISREG(child_metadata.st_mode):
-                if child_metadata.st_nlink != 1:
-                    raise HarnessError(
-                        f"{namespace} tree lock may not contain a hard-linked "
-                        f"file: {raw_path}"
-                    )
-            else:
-                raise HarnessError(
-                    f"{namespace} tree lock may not contain a special filesystem "
-                    f"node: {raw_path}"
-                )
     return inspected
 
 

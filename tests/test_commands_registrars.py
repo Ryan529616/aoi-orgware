@@ -1263,6 +1263,7 @@ class TaskLifecycleCommandRegistryTests(unittest.TestCase):
     HANDLER_NAMES = {
         "init_task",
         "start_mini",
+        "finish_mini",
         "approve_plan",
         "bind_session",
         "unbind_session",
@@ -1307,6 +1308,24 @@ class TaskLifecycleCommandRegistryTests(unittest.TestCase):
             ]
         )
         self.assertIs(args.handler, handlers["init_task"])
+
+    def test_registry_injects_handler_and_accepts_finish_mini_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "finish-mini",
+                "--task",
+                "T1",
+                "--mode",
+                "local-only",
+                "--detail",
+                "bounded local delivery",
+                "--summary",
+                "verified mini task complete",
+            ]
+        )
+        self.assertIs(args.handler, handlers["finish_mini"])
+        self.assertEqual(args.mode, "local-only")
 
     def test_registry_uses_injected_vocab_for_claim_status_choices(self) -> None:
         parser, handlers = self.parser()

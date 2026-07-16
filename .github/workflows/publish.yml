@@ -43,14 +43,39 @@ jobs:
 
           project = tomllib.loads(
               Path("pyproject.toml").read_text(encoding="utf-8")
-          )["project"]
+          )
+          project_metadata = project["project"]
 
-          if project["name"] != "aoi-orgware":
+          if project_metadata["name"] != "aoi-orgware":
               raise SystemExit(
-                  f"Unexpected PyPI project name: {project['name']!r}"
+                  "Unexpected PyPI project name: "
+                  f"{project_metadata['name']!r}"
               )
+          if "version" in project_metadata:
+              raise SystemExit("pyproject.toml contains a second literal version")
+          if project_metadata.get("dynamic") != ["version"]:
+              raise SystemExit("pyproject.toml must declare dynamic = ['version']")
 
-          version = project["version"]
+          version_path = project["tool"]["hatch"]["version"]["path"]
+          if version_path != "src/aoi_orgware/_version.py":
+              raise SystemExit(f"Unexpected Hatch version path: {version_path!r}")
+
+          tree = ast.parse(Path(version_path).read_text(encoding="utf-8"))
+          source_versions = []
+          for node in ast.walk(tree):
+              if not isinstance(node, ast.Assign):
+                  continue
+              if any(
+                  isinstance(target, ast.Name)
+                  and target.id == "__version__"
+                  for target in node.targets
+              ):
+                  source_versions.append(ast.literal_eval(node.value))
+          if len(source_versions) != 1 or not isinstance(source_versions[0], str):
+              raise SystemExit(
+                  f"Canonical source version is invalid: {source_versions!r}"
+              )
+          version = source_versions[0]
           expected_tag = f"v{version}"
           ref_name = os.environ["GITHUB_REF_NAME"]
           full_ref = os.environ["GITHUB_REF"]
@@ -62,26 +87,6 @@ jobs:
               )
           if full_ref != f"refs/tags/{expected_tag}":
               raise SystemExit(f"Unexpected release ref: {full_ref!r}")
-
-          tree = ast.parse(
-              Path("src/aoi_orgware/__init__.py").read_text(encoding="utf-8")
-          )
-          source_versions = []
-          for node in ast.walk(tree):
-              if not isinstance(node, ast.Assign):
-                  continue
-              if any(
-                  isinstance(target, ast.Name)
-                  and target.id == "__version__"
-                  for target in node.targets
-              ):
-                  source_versions.append(ast.literal_eval(node.value))
-
-          if source_versions != [version]:
-              raise SystemExit(
-                  f"Source version {source_versions!r} does not match "
-                  f"pyproject version {version!r}"
-              )
 
           print(f"Verified aoi-orgware {version} from {full_ref}")
           PY
@@ -112,101 +117,13 @@ jobs:
       - name: Check package metadata
         run: python -m twine check --strict dist/*
 
-      - name: Verify artifact set and excluded files
+      - name: Verify isolated wheel and sdist installs
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path, PurePosixPath
-          import tarfile
-          import tomllib
-          import zipfile
-
-          version = tomllib.loads(
-              Path("pyproject.toml").read_text(encoding="utf-8")
-          )["project"]["version"]
-
-          dist = Path("dist")
-          expected = {
-              f"aoi_orgware-{version}-py3-none-any.whl",
-              f"aoi_orgware-{version}.tar.gz",
-          }
-          actual = {path.name for path in dist.iterdir() if path.is_file()}
-
-          if actual != expected:
-              raise SystemExit(
-                  f"Unexpected distribution set: "
-                  f"expected={sorted(expected)!r}, actual={sorted(actual)!r}"
-              )
-
-          forbidden = {"PROVENANCE.md", "IMPORT_MANIFEST.json"}
-          members = []
-
-          with zipfile.ZipFile(
-              dist / f"aoi_orgware-{version}-py3-none-any.whl"
-          ) as archive:
-              members.extend(archive.namelist())
-
-          with tarfile.open(
-              dist / f"aoi_orgware-{version}.tar.gz", "r:gz"
-          ) as archive:
-              members.extend(archive.getnames())
-
-          unexpected = sorted(
-              name
-              for name in members
-              if PurePosixPath(name).name in forbidden
-          )
-          if unexpected:
-              raise SystemExit(
-                  f"Forbidden files found in distributions: {unexpected!r}"
-              )
-
-          print("Verified distribution filenames and exclusions")
-          PY
-
-      - name: Smoke-test the installed wheel
-        shell: bash
-        run: |
-          python -m venv .smoke-env
-          .smoke-env/bin/python -m pip install \
-            --disable-pip-version-check \
-            --no-deps \
-            dist/*.whl
-
-          .smoke-env/bin/python - <<'PY'
-          from pathlib import Path
-          import subprocess
-          import tomllib
-
-          version = tomllib.loads(
-              Path("pyproject.toml").read_text(encoding="utf-8")
-          )["project"]["version"]
-
-          actual = subprocess.check_output(
-              [".smoke-env/bin/aoi", "--version"],
-              text=True,
-          ).strip()
-          if actual != f"AOI {version}":
-              raise SystemExit(
-                  f"Installed CLI version mismatch: {actual!r}"
-              )
-
-          commands = [
-              [".smoke-env/bin/aoi", "--help"],
-              [".smoke-env/bin/aoi", "codex-init", "--help"],
-              [".smoke-env/bin/aoi", "claude-init", "--help"],
-              [".smoke-env/bin/aoi-codex-hook", "--help"],
-              [".smoke-env/bin/aoi-claude-hook", "--help"],
-          ]
-          for command in commands:
-              subprocess.run(
-                  command,
-                  check=True,
-                  stdout=subprocess.DEVNULL,
-              )
-
-          print("Fresh-install smoke test passed")
-          PY
+          expected_version="$(python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])")"
+          python scripts/verify_dist.py \
+            --dist-dir dist \
+            --expected-version "$expected_version"
 
       - name: Upload verified distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

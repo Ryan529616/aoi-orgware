@@ -30,6 +30,7 @@ SRC = REPO / "src"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(SRC))
 
+from aoi_orgware import __version__ as AOI_VERSION  # noqa: E402
 from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
 
@@ -41,6 +42,30 @@ from tests.harness_case import HarnessTestCase  # noqa: E402
 
 
 class AtomicPrimitiveTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod allocation path")
+    def test_atomic_temporary_fchmod_failure_closes_and_unlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "state.json"
+            descriptors: list[int] = []
+            real_open = os.open
+
+            def capture_open(*args: object, **kwargs: object) -> int:
+                descriptor = real_open(*args, **kwargs)
+                descriptors.append(descriptor)
+                return descriptor
+
+            with mock.patch.object(h.os, "open", side_effect=capture_open), mock.patch.object(
+                h.os, "fchmod", side_effect=OSError("injected fchmod failure")
+            ):
+                with self.assertRaisesRegex(OSError, "injected fchmod failure"):
+                    h._open_atomic_temporary(destination, "write")
+
+            self.assertEqual(len(descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_atomic_create_publishes_complete_bytes_without_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "atomic" / "blob.bin"
@@ -66,8 +91,13 @@ class AtomicPrimitiveTests(unittest.TestCase):
 
             self.assertEqual(observed, [(False, payload)])
             self.assertEqual(destination.read_bytes(), payload)
-            self.assertFalse(
-                list(destination.parent.glob(f".{destination.name}.tmp-*"))
+            self.assertEqual(
+                [
+                    path.name
+                    for path in destination.parent.iterdir()
+                    if h.ATOMIC_TEMP_NAME_RE.fullmatch(path.name)
+                ],
+                [],
             )
 
             before = destination.read_bytes()
@@ -144,6 +174,144 @@ class AtomicPrimitiveTests(unittest.TestCase):
 
 
 class ChiefAuthorityTests(HarnessTestCase):
+    def filesystem_snapshot(self, root: Path) -> dict[str, tuple[object, ...]]:
+        """Capture identities, modes, link targets, and bytes without following links."""
+
+        if not os.path.lexists(root):
+            return {".": ("missing",)}
+        snapshot: dict[str, tuple[object, ...]] = {}
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            metadata = current.lstat()
+            relative = "." if current == root else current.relative_to(root).as_posix()
+            identity = (
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_nlink),
+                stat.S_IMODE(metadata.st_mode),
+            )
+            if h._path_is_link_like(current):
+                try:
+                    target = os.readlink(current)
+                except OSError:
+                    target = "<unreadable-reparse-target>"
+                snapshot[relative] = ("link", *identity, target)
+            elif stat.S_ISDIR(metadata.st_mode):
+                snapshot[relative] = ("directory", *identity)
+                pending.extend(sorted(current.iterdir(), reverse=True))
+            elif stat.S_ISREG(metadata.st_mode):
+                snapshot[relative] = ("file", *identity, current.read_bytes())
+            else:
+                snapshot[relative] = ("other", *identity)
+        return snapshot
+
+    def new_bootstrap_fixture(
+        self, name: str
+    ) -> tuple[Path, h.HarnessPaths, dict[str, str], Path]:
+        root = Path(self.backup_temp.name) / f"bootstrap-{name}"
+        root.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(root)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        (root / "aoi.toml").write_text(
+            cli_impl.default_config_text(f"Bootstrap {name}"), encoding="utf-8"
+        )
+        credential_home = Path(self.backup_temp.name) / f"credentials-{name}"
+        environment = self.env.copy()
+        environment["AOI_ROOT"] = str(root)
+        environment["AOI_CHIEF_CREDENTIAL_HOME"] = str(credential_home)
+        for variable in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            environment.pop(variable, None)
+        return root, h.get_paths(root), environment, credential_home
+
+    def write_bootstrap_platform_marker(self, paths: h.HarnessPaths) -> None:
+        paths.harness.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            paths.harness.chmod(0o700)
+        marker = {
+            "schema_version": h.PLATFORM_MARKER_SCHEMA_VERSION,
+            "lock_domain": h.runtime_lock_domain(),
+            "lock_backend": h.platform_capabilities()["lock_backend"],
+            "created_at": h.now_iso(),
+        }
+        paths.platform.write_text(
+            json.dumps(marker, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            paths.platform.chmod(0o600)
+
+    def write_bootstrap_lock(
+        self, paths: h.HarnessPaths, payload: bytes = b"\0"
+    ) -> None:
+        paths.harness.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            paths.harness.chmod(0o700)
+        paths.lock.write_bytes(payload)
+        if os.name != "nt":
+            paths.lock.chmod(0o600)
+
+    def assert_canonical_bootstrap_lock(self, paths: h.HarnessPaths) -> None:
+        metadata = paths.lock.lstat()
+        self.assertTrue(stat.S_ISREG(metadata.st_mode))
+        self.assertEqual(int(metadata.st_nlink), 1)
+        self.assertFalse(h._path_is_link_like(paths.lock))
+        self.assertEqual(paths.lock.read_bytes(), b"\0")
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+
+    def assert_chief_acquire_rejected_without_mutation(
+        self,
+        paths: h.HarnessPaths,
+        environment: dict[str, str],
+        credential_home: Path,
+        *,
+        session_id: str,
+        manual_recovery: bool = True,
+        authority_absent: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        before_config = self.filesystem_snapshot(paths.config)
+        before_state = self.filesystem_snapshot(paths.harness)
+        before_credentials = self.filesystem_snapshot(credential_home)
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                CLI_MODULE,
+                "chief-acquire",
+                "--session-id",
+                session_id,
+                "--json",
+            ],
+            cwd=paths.root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(rejected.returncode, 2, rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+        if manual_recovery:
+            self.assertIn("offline/manual recovery", rejected.stderr)
+        self.assertEqual(self.filesystem_snapshot(paths.config), before_config)
+        self.assertEqual(self.filesystem_snapshot(paths.harness), before_state)
+        self.assertEqual(
+            self.filesystem_snapshot(credential_home), before_credentials
+        )
+        if authority_absent:
+            self.assertFalse(os.path.lexists(paths.chief_authority))
+        return rejected
+
     def managed_state_bytes(self) -> dict[str, bytes]:
         state = self.root / ".aoi"
         return {
@@ -992,239 +1160,208 @@ class ChiefAuthorityTests(HarnessTestCase):
             cli_impl.KNOWN_MANAGED_POLICY_SHA256,
         )
 
-    def test_chief_acquire_bootstraps_only_a_complete_missing_lock(self) -> None:
-        self.cli("chief-release", "--reason", "prepare complete lock migration")
-        paths = h.get_paths(self.root)
-        paths.lock.unlink()
-        acquired = json.loads(
-            self.cli(
-                "chief-acquire",
-                "--session-id",
-                "lock-migration-chief",
-                "--json",
-            ).stdout
-        )
-        self.assertTrue(paths.lock.is_file())
-        self.assertEqual(acquired["authority"]["session_id"], "lock-migration-chief")
+    def unauthenticated_environment(self) -> dict[str, str]:
+        environment = self.env.copy()
+        for variable in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            environment.pop(variable, None)
+        return environment
 
-    def test_chief_acquire_migrates_complete_zero_byte_legacy_lock(self) -> None:
-        self.cli("chief-release", "--reason", "prepare zero-byte legacy lock")
+    def test_chief_acquire_refuses_complete_missing_lock_without_mutation(self) -> None:
+        self.cli("chief-release", "--reason", "prepare missing-lock refusal")
+        paths = h.get_paths(self.root)
+        paths.chief_authority.unlink()
+        paths.lock.unlink()
+        h.require_complete_layout(paths, include_lock=False)
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+
+        self.assert_chief_acquire_rejected_without_mutation(
+            paths,
+            self.unauthenticated_environment(),
+            credential_home,
+            session_id="missing-lock-chief",
+        )
+
+    def test_chief_acquire_refuses_complete_empty_lock_without_mutation(self) -> None:
+        self.cli("chief-release", "--reason", "prepare empty-lock refusal")
         paths = h.get_paths(self.root)
         paths.chief_authority.unlink()
         paths.lock.write_bytes(b"")
+        h.require_complete_layout(paths)
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+
+        self.assert_chief_acquire_rejected_without_mutation(
+            paths,
+            self.unauthenticated_environment(),
+            credential_home,
+            session_id="empty-lock-chief",
+        )
+        self.assertEqual(paths.lock.read_bytes(), b"")
+
+    def test_chief_acquire_accepts_complete_canonical_nul_lock(self) -> None:
+        self.cli("chief-release", "--reason", "prepare canonical-lock acquisition")
+        paths = h.get_paths(self.root)
+        paths.chief_authority.unlink()
+        self.assert_canonical_bootstrap_lock(paths)
+        h.require_complete_layout(paths)
+
         acquired = json.loads(
             self.cli(
                 "chief-acquire",
                 "--session-id",
-                "zero-byte-legacy-chief",
+                "canonical-lock-chief",
                 "--json",
             ).stdout
         )
-        self.assertEqual(paths.lock.read_bytes(), b"\0")
-        self.assertEqual(
-            acquired["authority"]["session_id"], "zero-byte-legacy-chief"
-        )
+
+        self.assertEqual(acquired["authority"]["session_id"], "canonical-lock-chief")
+        self.assert_canonical_bootstrap_lock(paths)
+        self.assertTrue(paths.chief_authority.is_file())
+        self.assertTrue(Path(acquired["credential_file"]).is_file())
         h.require_complete_layout(paths)
 
-    def test_chief_acquire_recovers_only_an_interrupted_init_prefix(self) -> None:
-        for case, empty_lock in (("config-only", False), ("empty-lock", True)):
+    def test_chief_acquire_refuses_noncanonical_interrupted_prefixes_without_mutation(
+        self,
+    ) -> None:
+        for case in ("config-only", "minimal", "structural"):
             with self.subTest(case=case):
-                root = Path(self.backup_temp.name) / case
-                root.mkdir()
-                subprocess.run(
-                    ["git", "init", "-b", "main", str(root)],
-                    check=True,
-                    text=True,
-                    capture_output=True,
+                _root, paths, environment, credential_home = (
+                    self.new_bootstrap_fixture(case)
                 )
-                config_bytes = cli_impl.default_config_text(
-                    f"Interrupted {case}"
-                ).encode("utf-8")
-                (root / "aoi.toml").write_bytes(config_bytes)
-                if empty_lock:
-                    (root / ".aoi").mkdir()
-                    (root / ".aoi" / ".state.lock").write_bytes(b"")
+                if case == "minimal":
+                    paths.harness.mkdir()
+                    if os.name != "nt":
+                        paths.harness.chmod(0o700)
+                elif case == "structural":
+                    self.write_bootstrap_platform_marker(paths)
+                    for directory in (
+                        paths.claims,
+                        paths.tasks,
+                        paths.claims_active,
+                        paths.claims_archive,
+                        paths.sessions,
+                        paths.templates,
+                    ):
+                        directory.mkdir(parents=True, exist_ok=True)
+                        if os.name != "nt":
+                            directory.chmod(0o700)
+                    self.write_bootstrap_lock(paths, b"")
 
-                environment = os.environ.copy()
-                environment["PYTHONPATH"] = str(SRC)
-                environment["PYTHONDONTWRITEBYTECODE"] = "1"
-                environment["AOI_ROOT"] = str(root)
-                environment["AOI_CHIEF_CREDENTIAL_HOME"] = str(
-                    Path(self.backup_temp.name) / f"credentials-{case}"
+                self.assert_chief_acquire_rejected_without_mutation(
+                    paths,
+                    environment,
+                    credential_home,
+                    session_id=f"refused-{case}-chief",
                 )
-                for name in (
-                    "AOI_CHIEF_SESSION_ID",
-                    "AOI_CHIEF_EPOCH",
-                    "AOI_CHIEF_CREDENTIAL_FILE",
-                    "AOI_CHIEF_TOKEN",
-                ):
-                    environment.pop(name, None)
-                acquired = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        CLI_MODULE,
-                        "chief-acquire",
-                        "--session-id",
-                        f"recovery-{case}",
-                        "--json",
-                    ],
-                    cwd=root,
-                    env=environment,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=20,
-                )
-                self.assertEqual(acquired.returncode, 0, acquired.stderr)
-                payload = json.loads(acquired.stdout)
-                paths = h.get_paths(root)
-                self.assertEqual(paths.lock.read_bytes(), b"\0")
-                self.assertTrue(paths.platform.is_file())
-                self.assertTrue(paths.chief_authority.is_file())
-                self.assertFalse(paths.index.exists())
-                self.assertFalse((paths.harness / "POLICY.md").exists())
-                self.assertEqual((root / "aoi.toml").read_bytes(), config_bytes)
 
-                environment["AOI_CHIEF_SESSION_ID"] = f"recovery-{case}"
-                environment["AOI_CHIEF_EPOCH"] = str(payload["authority"]["epoch"])
-                environment["AOI_CHIEF_CREDENTIAL_FILE"] = payload["credential_file"]
-                resumed = subprocess.run(
-                    [sys.executable, "-m", CLI_MODULE, "init", "--json"],
-                    cwd=root,
-                    env=environment,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=20,
-                )
-                self.assertEqual(resumed.returncode, 0, resumed.stderr)
-                h.require_complete_layout(h.get_paths(root))
-                self.assertEqual((root / "aoi.toml").read_bytes(), config_bytes)
-
-        ambiguous = Path(self.backup_temp.name) / "ambiguous-prefix"
-        ambiguous.mkdir()
-        subprocess.run(
-            ["git", "init", "-b", "main", str(ambiguous)],
-            check=True,
-            text=True,
-            capture_output=True,
+    def test_chief_acquire_accepts_exact_existing_nul_interrupted_prefix(self) -> None:
+        _root, paths, environment, _credential_home = self.new_bootstrap_fixture(
+            "exact-nul-prefix"
         )
-        (ambiguous / "aoi.toml").write_text(
-            cli_impl.default_config_text("Ambiguous Prefix"), encoding="utf-8"
-        )
-        state = ambiguous / ".aoi"
-        state.mkdir()
-        (state / "unexpected.txt").write_text("material state\n", encoding="utf-8")
-        environment["AOI_ROOT"] = str(ambiguous)
-        rejected = subprocess.run(
+        self.write_bootstrap_platform_marker(paths)
+        self.write_bootstrap_lock(paths)
+        self.assert_canonical_bootstrap_lock(paths)
+        before_config = paths.config.read_bytes()
+
+        acquired_process = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 CLI_MODULE,
                 "chief-acquire",
                 "--session-id",
-                "ambiguous-recovery",
+                "exact-nul-prefix-chief",
+                "--json",
             ],
-            cwd=ambiguous,
+            cwd=paths.root,
             env=environment,
             text=True,
             capture_output=True,
             check=False,
             timeout=20,
         )
-        self.assertEqual(rejected.returncode, 2, rejected.stderr)
-        self.assertIn("exact interrupted-init prefix", rejected.stderr)
-        self.assertFalse((state / ".state.lock").exists())
+
+        self.assertEqual(acquired_process.returncode, 0, acquired_process.stderr)
+        acquired = json.loads(acquired_process.stdout)
         self.assertEqual(
-            (state / "unexpected.txt").read_text(encoding="utf-8"),
-            "material state\n",
+            acquired["authority"]["session_id"], "exact-nul-prefix-chief"
         )
+        self.assertEqual(paths.config.read_bytes(), before_config)
+        self.assert_canonical_bootstrap_lock(paths)
+        self.assertTrue(paths.chief_authority.is_file())
+        self.assertTrue(Path(acquired["credential_file"]).is_file())
+        self.assertFalse(paths.index.exists())
+        self.assertFalse((paths.harness / "POLICY.md").exists())
+        self.assertFalse(paths.claims.exists())
 
-        raced = Path(self.backup_temp.name) / "raced-prefix"
-        raced.mkdir()
-        subprocess.run(
-            ["git", "init", "-b", "main", str(raced)],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-        (raced / "aoi.toml").write_text(
-            cli_impl.default_config_text("Raced Prefix"), encoding="utf-8"
-        )
-        raced_paths = h.get_paths(raced)
-        real_create_marker = h._create_platform_marker
-
-        def create_marker_then_inject(path: Path) -> bool:
-            created = real_create_marker(path)
-            raced_paths.tasks.mkdir(parents=True, exist_ok=True)
-            (raced_paths.tasks / "raced.json").write_text(
-                "material race\n", encoding="utf-8"
-            )
-            return created
-
-        with mock.patch.object(
-            h, "_create_platform_marker", side_effect=create_marker_then_inject
-        ):
-            with self.assertRaisesRegex(h.HarnessError, "material or unknown state"):
-                h.bootstrap_chief_state_lock(raced_paths)
-        self.assertFalse(raced_paths.chief_authority.exists())
-        self.assertEqual(
-            (raced_paths.tasks / "raced.json").read_text(encoding="utf-8"),
-            "material race\n",
-        )
-        self.assertEqual(raced_paths.lock.read_bytes(), b"")
-        with self.assertRaisesRegex(h.HarnessError, "material or unknown state"):
-            h.bootstrap_chief_state_lock(raced_paths)
-        self.assertEqual(raced_paths.lock.read_bytes(), b"")
-
-    def test_chief_lock_bootstrap_revalidates_publication_and_exact_sentinels(
+    def test_chief_lock_bootstrap_rejects_invalid_sentinels_without_mutation(
         self,
     ) -> None:
-        self.cli("chief-release", "--reason", "prepare bootstrap race regression")
+        self.cli("chief-release", "--reason", "prepare invalid sentinel refusal")
         paths = h.get_paths(self.root)
         paths.chief_authority.unlink()
-        paths.lock.unlink()
-        real_create = h.atomic_create_bytes
-
-        def publish_empty_then_remove_layout(path: Path, payload: bytes) -> None:
-            real_create(path, payload)
-            if path == paths.lock:
-                shutil.rmtree(paths.sessions)
-
-        with mock.patch.object(
-            h, "atomic_create_bytes", side_effect=publish_empty_then_remove_layout
-        ):
-            with self.assertRaisesRegex(h.HarnessError, "layout is incomplete"):
-                h.bootstrap_chief_state_lock(paths)
-        self.assertFalse(paths.sessions.exists())
-        self.assertEqual(paths.lock.read_bytes(), b"")
-
         for payload in (b"x", b"\0x"):
             with self.subTest(payload=payload):
                 paths.lock.write_bytes(payload)
-                with self.assertRaisesRegex(h.HarnessError, "state lock payload"):
+                before = self.filesystem_snapshot(paths.harness)
+                with self.assertRaisesRegex(
+                    h.HarnessError,
+                    "offline/manual recovery|payload changed during lock acquisition",
+                ):
                     h.bootstrap_chief_state_lock(paths)
-                self.assertEqual(paths.lock.read_bytes(), payload)
+                self.assertEqual(self.filesystem_snapshot(paths.harness), before)
+                self.assertFalse(os.path.lexists(paths.chief_authority))
 
-    def test_interrupted_init_preserves_future_or_replaced_platform_marker(self) -> None:
-        def make_prefix(name: str, marker_payload: bytes) -> tuple[Path, h.HarnessPaths]:
-            root = Path(self.backup_temp.name) / name
-            root.mkdir()
-            subprocess.run(
-                ["git", "init", "-b", "main", str(root)],
-                check=True,
+    def test_chief_acquire_refuses_dangling_authority_with_canonical_nul_lock(
+        self,
+    ) -> None:
+        self.cli("chief-release", "--reason", "prepare dangling-authority refusal")
+        paths = h.get_paths(self.root)
+        paths.chief_authority.unlink()
+        self.assert_canonical_bootstrap_lock(paths)
+        if os.name == "nt":
+            target = paths.harness / "missing-chief-authority-target"
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(paths.chief_authority), str(target)],
                 text=True,
                 capture_output=True,
+                check=False,
             )
-            (root / "aoi.toml").write_text(
-                cli_impl.default_config_text(name), encoding="utf-8"
+            if created.returncode != 0:
+                self.skipTest(
+                    "dangling Chief-authority junction unavailable: "
+                    + (created.stderr.strip() or created.stdout.strip())
+                )
+        else:
+            paths.chief_authority.symlink_to("missing-chief-authority.json")
+        self.assertTrue(h._path_is_link_like(paths.chief_authority))
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+        try:
+            rejected = self.assert_chief_acquire_rejected_without_mutation(
+                paths,
+                self.unauthenticated_environment(),
+                credential_home,
+                session_id="dangling-authority-chief",
+                manual_recovery=False,
+                authority_absent=False,
             )
-            paths = h.get_paths(root)
-            paths.harness.mkdir()
-            paths.platform.write_bytes(marker_payload)
-            return root, paths
+            self.assertRegex(rejected.stderr, "regular non-linked|symlink|junction")
+            self.assertTrue(h._path_is_link_like(paths.chief_authority))
+            self.assert_canonical_bootstrap_lock(paths)
+        finally:
+            if os.name == "nt":
+                os.rmdir(paths.chief_authority)
+            else:
+                paths.chief_authority.unlink()
 
+    def test_interrupted_init_preserves_future_platform_marker(self) -> None:
+        _root, paths, _environment, _credential_home = self.new_bootstrap_fixture(
+            "future-marker"
+        )
         future_payload = (
             json.dumps(
                 {
@@ -1237,23 +1374,19 @@ class ChiefAuthorityTests(HarnessTestCase):
             )
             + "\n"
         ).encode("utf-8")
-        _future_root, future_paths = make_prefix("future-marker", future_payload)
-        with self.assertRaisesRegex(h.HarnessError, "unsupported AOI platform marker"):
-            h.bootstrap_chief_state_lock(future_paths)
-        self.assertEqual(future_paths.platform.read_bytes(), future_payload)
-        self.assertFalse(future_paths.lock.exists())
+        paths.harness.mkdir()
+        if os.name != "nt":
+            paths.harness.chmod(0o700)
+        paths.platform.write_bytes(future_payload)
+        if os.name != "nt":
+            paths.platform.chmod(0o600)
+        self.write_bootstrap_lock(paths)
+        before = self.filesystem_snapshot(paths.harness)
 
-        _raced_root, raced_paths = make_prefix("replaced-marker", b"")
-        snapshot = h._torn_platform_marker_snapshot(raced_paths.platform)
-        self.assertIsNotNone(snapshot)
-        replacement = future_payload.replace(b"future-backend", b"future-backen2")
-        replacement_path = raced_paths.platform.with_suffix(".replacement")
-        replacement_path.write_bytes(replacement)
-        os.replace(replacement_path, raced_paths.platform)
-        with self.assertRaisesRegex(h.HarnessError, "changed before"):
-            assert snapshot is not None
-            h._rewrite_torn_platform_marker(raced_paths.platform, snapshot)
-        self.assertEqual(raced_paths.platform.read_bytes(), replacement)
+        with self.assertRaisesRegex(h.HarnessError, "unsupported AOI platform marker"):
+            h.bootstrap_chief_state_lock(paths)
+
+        self.assertEqual(self.filesystem_snapshot(paths.harness), before)
 
     def test_first_init_reloads_config_and_refuses_racing_authority(self) -> None:
         def new_root(name: str) -> tuple[Path, dict[str, str]]:
@@ -1317,6 +1450,10 @@ class ChiefAuthorityTests(HarnessTestCase):
         ) -> object:
             nonlocal authority_inserted
             if not authority_inserted:
+                # The racing Chief must now arrive through the only automatic
+                # bootstrap state: an existing canonical NUL interrupted prefix.
+                self.write_bootstrap_platform_marker(paths)
+                self.write_bootstrap_lock(paths)
                 acquired = subprocess.run(
                     [
                         sys.executable,
@@ -1351,22 +1488,22 @@ class ChiefAuthorityTests(HarnessTestCase):
         self.assertFalse((authority_paths.harness / "POLICY.md").exists())
         self.assertFalse(authority_paths.index.exists())
 
-    def test_chief_acquire_does_not_repair_incomplete_lock_migration(self) -> None:
-        self.cli("chief-release", "--reason", "prepare incomplete lock migration")
+    def test_chief_acquire_refuses_incomplete_missing_lock_without_mutation(self) -> None:
+        self.cli("chief-release", "--reason", "prepare incomplete-lock refusal")
         paths = h.get_paths(self.root)
+        paths.chief_authority.unlink()
         paths.lock.unlink()
         shutil.rmtree(paths.sessions)
-        before = self.managed_state_bytes()
-        rejected = self.cli(
-            "chief-acquire",
-            "--session-id",
-            "incomplete-migration-chief",
-            ok=False,
+        credential_home = Path(self.env["AOI_CHIEF_CREDENTIAL_HOME"])
+
+        self.assert_chief_acquire_rejected_without_mutation(
+            paths,
+            self.unauthenticated_environment(),
+            credential_home,
+            session_id="incomplete-missing-lock-chief",
         )
-        self.assertIn("complete existing AOI layout", rejected.stderr)
         self.assertFalse(paths.lock.exists())
         self.assertFalse(paths.sessions.exists())
-        self.assertEqual(self.managed_state_bytes(), before)
 
     def test_default_credential_home_uses_platform_user_state_location(self) -> None:
         paths = h.get_paths(self.root)
@@ -12387,7 +12524,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertEqual(version.stdout.strip(), "AOI 0.2.3")
+            self.assertEqual(version.stdout.strip(), f"AOI {AOI_VERSION}")
             help_result = subprocess.run(
                 [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
                 cwd=directory,

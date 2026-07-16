@@ -157,7 +157,22 @@ from .commands.resource import (
     cmd_override_revoke,
     register_resource_commands,
 )
-from .commands.status import register_status_commands
+from .commands.status import (
+    StatusCmdServices,
+    _clip_critical,
+    cmd_render_index,
+    cmd_resume,
+    cmd_status,
+    critical_projection,
+    register_status_commands,
+    resolve_resume_task,
+)
+from .commands.temporary_recovery import (
+    TemporaryRecoveryServices,
+    cmd_recover_temporaries,
+    register_temporary_recovery_commands,
+)
+from .commands.mini_completion import MiniCompletionServices, cmd_finish_mini
 from .commands import claude_onboarding as claude_onboarding_impl
 from .commands import codex_onboarding as codex_onboarding_impl
 from .commands.task_lifecycle import (
@@ -326,7 +341,6 @@ from .harnesslib import (
     parse_time,
     platform_capabilities,
     preflight_layout,
-    paths_for_project,
     prepare_checkpoint,
     release_chief_authority,
     remove_chief_credential,
@@ -335,6 +349,7 @@ from .harnesslib import (
     renew_chief_authority,
     require_complete_layout,
     require_chief_authority,
+    scan_atomic_temporaries,
     session_path,
     sha256_file,
     state_lock,
@@ -586,6 +601,7 @@ CHIEF_AUTHORITY_CONTROL_COMMANDS = {
     "chief-renew",
     "chief-release",
     "chief-takeover",
+    "recover-temporaries",
 }
 CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "chief-status",
@@ -2245,280 +2261,58 @@ def _task_lifecycle_cmd_services() -> TaskLifecycleCmdServices:
     )
 
 
+def _status_cmd_services() -> StatusCmdServices:
+    return StatusCmdServices(
+        check_session_id=check_session_id,
+        plan_digest=plan_digest,
+        terminal_coordination_statuses=TERMINAL_COORDINATION_STATUSES,
+        terminal_improvement_statuses=TERMINAL_IMPROVEMENT_STATUSES,
+        max_engaged_lanes=MAX_ENGAGED_LANES,
+        critical_view_max_bytes=CRITICAL_VIEW_MAX_BYTES,
+        critical_text_limit=CRITICAL_TEXT_LIMIT,
+    )
+
+
+def _mini_completion_services(
+    task_services: TaskLifecycleCmdServices,
+) -> MiniCompletionServices:
+    return MiniCompletionServices(
+        close_gate=close_gate,
+        prepare_delivery=prepare_delivery,
+        set_delivery=cmd_set_delivery,
+        release_claim=cmd_release_claim,
+        checkpoint=functools.partial(cmd_checkpoint, services=task_services),
+        close_task=cmd_close_task,
+        delivery_integrity_errors=delivery_integrity_errors,
+        validate_mini_locks=validate_mini_locks,
+    )
+
+
+def _authorize_temporary_recovery_chief(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> None:
+    """Verify current Chief authority from within the recovery-held state lock."""
+
+    session_id, epoch, token, _credential_path = _chief_credential(args, paths)
+    require_chief_authority(
+        paths,
+        session_id=session_id,
+        epoch=epoch,
+        token=token,
+    )
+
+
+def _temporary_recovery_services() -> TemporaryRecoveryServices:
+    return TemporaryRecoveryServices(
+        authorize_chief=_authorize_temporary_recovery_chief,
+        reload_locked_paths=_reload_locked_paths,
+    )
+
+
 def cmd_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """Re-export the relocated body with composition-root services bound."""
 
     return _cmd_init(args, paths, services=_task_lifecycle_cmd_services())
-
-
-def _clip_critical(value: Any) -> str:
-    text_value = str(value or "")
-    if len(text_value.encode("utf-8")) <= CRITICAL_TEXT_LIMIT:
-        return text_value
-    encoded = text_value.encode("utf-8")[: CRITICAL_TEXT_LIMIT - 3]
-    return encoded.decode("utf-8", "ignore") + "..."
-
-
-def critical_projection(paths: HarnessPaths, state: dict[str, Any]) -> dict[str, Any]:
-    state_path = task_state_path(paths, state["task_id"])
-    lanes = sorted(
-        [
-            lane
-            for lane in state.get("lanes", [])
-            if lane.get("status") in ENGAGED_LANE_STATUSES
-        ],
-        key=lambda lane: lane["lane_id"],
-    )
-    standby_count = sum(
-        lane.get("status") in {"standby", "parked"} for lane in state.get("lanes", [])
-    )
-    active_requests = sorted(
-        [
-            request
-            for request in state.get("coordination_requests", [])
-            if request.get("status") not in TERMINAL_COORDINATION_STATUSES
-        ],
-        key=lambda request: (
-            {"hard_gate": 0, "soft_dependency": 1, "informational": 2}.get(
-                request.get("severity"), 3
-            ),
-            request.get("needed_by_gate", ""),
-            request.get("request_id", ""),
-        ),
-    )
-    request_tail = active_requests[:8]
-    active_capacity = sorted(
-        [
-            review
-            for review in state.get("capacity_reviews", [])
-            if review.get("status") not in {"rejected", "consumed", "superseded"}
-        ],
-        key=lambda review: str(review.get("review_id", "")),
-    )
-    active_improvements = sorted(
-        [
-            request
-            for request in state.get("improvement_requests", [])
-            if request.get("status") not in TERMINAL_IMPROVEMENT_STATUSES
-        ],
-        key=lambda request: str(request.get("request_id", "")),
-    )
-    open_cross_sessions = sorted(
-        [
-            item
-            for item in state.get("cross_lane_sessions", [])
-            if item.get("status") == "open"
-        ],
-        key=lambda item: str(item.get("cross_lane_session_id", "")),
-    )
-    needs_user = sorted(
-        [
-            item
-            for item in state.get("needs_user_escalations", [])
-            if item.get("status") == "needs_user"
-        ],
-        key=lambda item: str(item.get("escalation_id", "")),
-    )
-    open_spawn_incidents = sorted(
-        [
-            item
-            for item in state.get("subagent_incidents", [])
-            if item.get("status") == "open"
-        ],
-        key=lambda item: str(item.get("incident_id", "")),
-    )
-    baseline = state.get("integration_baselines", [])[-1:] or []
-    payload: dict[str, Any] = {
-        "view_version": 1,
-        "task_id": state["task_id"],
-        "task_revision": state.get("revision"),
-        "root_authority": {
-            "owner": state.get("owner"),
-            "session_ids": sorted(state.get("session_ids", [])),
-            "role": "chief_architect_arbitrator_release_authority",
-        },
-        "authority_mode": "lane_modeled" if state.get("lanes") else "legacy_unmodeled",
-        "artifact_mode": "manifest_attested"
-        if any(job.get("job_schema_version") == 2 for job in state.get("jobs", []))
-        else "legacy_unattested",
-        "baseline": baseline[0] if baseline else None,
-        "execution_topology": [
-            {
-                "selection_id": item.get("selection_id"),
-                "mode": item.get("mode"),
-                "status": item.get("status"),
-                "lanes": [
-                    lane.get("lane_id") for lane in item.get("lane_snapshots", [])
-                ],
-                "scope": _clip_critical(item.get("scope")),
-            }
-            for item in state.get("execution_selections", [])[-4:]
-        ],
-        "lanes": [
-            {
-                "lane_id": lane["lane_id"],
-                "kind": lane["kind"],
-                "status": lane["status"],
-                "owner": lane["owner"],
-                "revision": lane["revision"],
-                "authority_commit": lane["authority_commit"],
-                "contract_version": lane["contract_version"],
-                "generator_version": lane["generator_version"],
-                "next_action": _clip_critical(lane["next_action"]),
-                "active_packets": sorted(
-                    packet.get("packet_id")
-                    for packet in state.get("packets", [])
-                    if packet.get("lane_id") == lane["lane_id"]
-                    and packet.get("status") in ACTIVE_PACKET_STATUSES
-                ),
-                "active_jobs": sorted(
-                    job.get("run_id")
-                    for job in state.get("jobs", [])
-                    if job.get("lane_id") == lane["lane_id"]
-                    and job.get("status") in ACTIVE_JOB_STATUSES
-                ),
-            }
-            for lane in lanes[:MAX_ENGAGED_LANES]
-        ],
-        "coordination_inbox": [
-            {
-                "request_id": request["request_id"],
-                "source_lane": request["source_lane"],
-                "target_lane": request["target_lane"],
-                "steward_lane": request.get("steward_lane"),
-                "severity": request["severity"],
-                "status": request["status"],
-                "control_phase": request.get("control_phase"),
-                "needed_by_gate": request.get("needed_by_gate", ""),
-                "request": _clip_critical(request.get("request")),
-            }
-            for request in request_tail
-        ],
-        "capacity_inbox": [
-            {
-                "review_id": review.get("review_id"),
-                "status": review.get("status"),
-                "version": review.get("version"),
-                "target_lane_id": review.get("scope", {}).get("target_lane_id"),
-                "task_type": review.get("scope", {}).get("task_type"),
-                "leaf_role": review.get("scope", {}).get("leaf_role"),
-                "capability_tier": (review.get("recommendation") or {}).get(
-                    "capability_tier"
-                ),
-                "record_count": review.get("dataset", {}).get("record_count"),
-            }
-            for review in active_capacity[:8]
-        ],
-        "improvement_inbox": [
-            {
-                "request_id": request.get("request_id"),
-                "status": request.get("status"),
-                "version": request.get("version"),
-                "source_lane_id": request.get("source_lane_id"),
-                "task_type": request.get("task_type"),
-                "trigger_class": request.get("trigger_class"),
-                "selected_option_id": (request.get("chief_decision") or {}).get(
-                    "selected_option_id"
-                ),
-                "project_task_id": request.get("project", {}).get("task_id"),
-                "release_blocking": bool(request.get("release_blocking")),
-            }
-            for request in active_improvements[:8]
-        ],
-        "controlled_cross_lane_sessions": [
-            {
-                "cross_lane_session_id": item.get("cross_lane_session_id"),
-                "request_id": item.get("request_id"),
-                "execution_selection_id": item.get("execution_selection_id"),
-                "participants": [
-                    lane.get("lane_id")
-                    for lane in item.get("participant_snapshots", [])
-                ],
-                "expires_at": item.get("expires_at"),
-            }
-            for item in open_cross_sessions[:6]
-        ],
-        "needs_user": [
-            {
-                "escalation_id": item.get("escalation_id"),
-                "category": item.get("category"),
-                "source_lane_id": item.get("source_lane_id"),
-                "request_id": item.get("request_id"),
-                "problem": _clip_critical(item.get("problem")),
-                "chief_recommendation": _clip_critical(
-                    item.get("chief_recommendation")
-                ),
-            }
-            for item in needs_user[:8]
-        ],
-        "subagent_spawn_incidents": [
-            {
-                "incident_id": item.get("incident_id"),
-                "reason_code": item.get("reason_code"),
-                "agent_id": item.get("agent_id"),
-                "agent_type": item.get("agent_type"),
-                "observed_at": item.get("observed_at"),
-            }
-            for item in open_spawn_incidents[:8]
-        ],
-        "execution_briefs": [
-            {
-                "brief_id": item.get("brief_id"),
-                "execution_selection_id": item.get("execution_selection_id"),
-                "packet_count": len(item.get("packet_bindings", [])),
-                "recommendation": _clip_critical(item.get("recommendation")),
-            }
-            for item in state.get("execution_briefs", [])[-4:]
-        ],
-        "open_hard_gates": sorted(
-            dependency.get("dependency_id")
-            for dependency in state.get("lane_dependencies", [])
-            if dependency.get("kind") == "hard_gate" and dependency.get("status") == "open"
-        ),
-        "task_level_active": {
-            "packets": sorted(
-                packet.get("packet_id")
-                for packet in state.get("packets", [])
-                if packet.get("status") in ACTIVE_PACKET_STATUSES
-                and not packet.get("lane_id")
-            ),
-            "jobs": sorted(
-                job.get("run_id")
-                for job in state.get("jobs", [])
-                if job.get("status") in ACTIVE_JOB_STATUSES and not job.get("lane_id")
-            ),
-        },
-        "omitted": {
-            "standby_or_parked_lanes": standby_count,
-            "coordination_requests": max(0, len(active_requests) - len(request_tail)),
-            "capacity_reviews": max(0, len(active_capacity) - 8),
-            "improvement_requests": max(0, len(active_improvements) - 8),
-            "cross_lane_sessions": max(0, len(open_cross_sessions) - 6),
-            "needs_user": max(0, len(needs_user) - 8),
-            "subagent_spawn_incidents": max(
-                0, len(open_spawn_incidents) - 8
-            ),
-            "execution_briefs": max(
-                0, len(state.get("execution_briefs", [])) - 4
-            ),
-        },
-        "full_state": {"path": str(state_path), "sha256": sha256_file(state_path)},
-    }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    if len(raw) > CRITICAL_VIEW_MAX_BYTES:
-        payload["coordination_inbox"] = []
-        payload["omitted"]["coordination_requests"] = len(active_requests)
-        payload["improvement_inbox"] = []
-        payload["omitted"]["improvement_requests"] = len(active_improvements)
-        payload["controlled_cross_lane_sessions"] = []
-        payload["omitted"]["cross_lane_sessions"] = len(open_cross_sessions)
-        payload["view_complete"] = False
-    else:
-        payload["view_complete"] = not any(payload["omitted"].values())
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    if len(raw) > CRITICAL_VIEW_MAX_BYTES:
-        raise HarnessError("critical status projection exceeds 12 KiB")
-    return payload
 
 
 def cmd_reconcile(args: argparse.Namespace, paths: HarnessPaths) -> int:
@@ -5023,80 +4817,101 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
-def cmd_set_delivery(args: argparse.Namespace, paths: HarnessPaths) -> int:
+def prepare_delivery(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Validate one delivery record without mutating AOI state."""
+
+    detail = require_text(args.detail, "delivery detail")
+    commit = args.commit or ""
+    if args.mode == "pushed":
+        if not COMMIT_RE.fullmatch(commit):
+            raise HarnessError("pushed delivery requires a 7-64 hex --commit")
+        if not args.remote or not args.remote_ref:
+            raise HarnessError("pushed delivery requires --remote and --remote-ref")
+        worktree_errors, current = worktree_integrity_errors(paths, state)
+        if worktree_errors or current is None:
+            raise HarnessError(
+                "task worktree identity is not current: " + "; ".join(worktree_errors)
+            )
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(state_worktree(paths, state)),
+                    "rev-parse",
+                    f"{commit}^{{commit}}",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HarnessError(f"could not resolve pushed commit: {exc}") from exc
+        if result.returncode != 0:
+            raise HarnessError(f"pushed commit is not present in task worktree: {commit}")
+        commit = result.stdout.strip().lower()
+        if not FULL_COMMIT_RE.fullmatch(commit):
+            raise HarnessError("could not resolve pushed commit to a full commit id")
+        if current["head_sha"] != commit:
+            raise HarnessError(
+                f"pushed commit {commit} is not the recorded worktree HEAD {current['head_sha']}"
+            )
+        remote_sha = remote_ref_tip(
+            state_worktree(paths, state), args.remote, args.remote_ref
+        )
+        if remote_sha != commit:
+            raise HarnessError(
+                f"remote {args.remote} {args.remote_ref} points to {remote_sha}, not {commit}"
+            )
+    elif commit or args.remote or args.remote_ref:
+        raise HarnessError(
+            "--commit/--remote/--remote-ref are valid only with --mode pushed"
+        )
+    return {
+        "mode": args.mode,
+        "detail": detail,
+        "commit": commit,
+        "remote": args.remote or "",
+        "remote_ref": args.remote_ref or "",
+        "remote_sha": commit if args.mode == "pushed" else "",
+        "verified_at": now_iso() if args.mode == "pushed" else "",
+    }
+
+
+def cmd_set_delivery(
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+    *,
+    emit_result: bool = True,
+) -> int:
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "set delivery for")
-        detail = require_text(args.detail, "delivery detail")
-        commit = args.commit or ""
-        if args.mode == "pushed":
-            if not COMMIT_RE.fullmatch(commit):
-                raise HarnessError("pushed delivery requires a 7-64 hex --commit")
-            if not args.remote or not args.remote_ref:
-                raise HarnessError("pushed delivery requires --remote and --remote-ref")
-            worktree_errors, current = worktree_integrity_errors(paths, state)
-            if worktree_errors or current is None:
-                raise HarnessError(
-                    "task worktree identity is not current: " + "; ".join(worktree_errors)
-                )
-            try:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(state_worktree(paths, state)),
-                        "rev-parse",
-                        f"{commit}^{{commit}}",
-                    ],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise HarnessError(f"could not resolve pushed commit: {exc}") from exc
-            if result.returncode != 0:
-                raise HarnessError(f"pushed commit is not present in task worktree: {commit}")
-            commit = result.stdout.strip().lower()
-            if not FULL_COMMIT_RE.fullmatch(commit):
-                raise HarnessError("could not resolve pushed commit to a full commit id")
-            if current["head_sha"] != commit:
-                raise HarnessError(
-                    f"pushed commit {commit} is not the recorded worktree HEAD {current['head_sha']}"
-                )
-            remote_sha = remote_ref_tip(
-                state_worktree(paths, state), args.remote, args.remote_ref
-            )
-            if remote_sha != commit:
-                raise HarnessError(
-                    f"remote {args.remote} {args.remote_ref} points to {remote_sha}, not {commit}"
-                )
-        elif commit or args.remote or args.remote_ref:
-            raise HarnessError(
-                "--commit/--remote/--remote-ref are valid only with --mode pushed"
-            )
-        state["delivery"] = {
-            "mode": args.mode,
-            "detail": detail,
-            "commit": commit,
-            "remote": args.remote or "",
-            "remote_ref": args.remote_ref or "",
-            "remote_sha": commit if args.mode == "pushed" else "",
-            "verified_at": now_iso() if args.mode == "pushed" else "",
-        }
+        state["delivery"] = prepare_delivery(paths, state, args)
         bump_task(state)
         write_task(paths, state)
         write_index(paths)
-    emit(state["delivery"], args.json)
+    if emit_result:
+        emit(state["delivery"], args.json)
     return 0
 
 
-def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
+def close_gate(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    preparing_mini: bool = False,
+) -> list[str]:
     failures: list[str] = []
     if not state.get("completion_boundary"):
         failures.append("completion boundary is empty")
     checkpoint_ok, checkpoint_reason = checkpoint_matches(paths, state)
-    if not checkpoint_ok:
+    if not checkpoint_ok and not preparing_mini:
         failures.append(f"checkpoint is stale: {checkpoint_reason}")
     try:
         require_plan_ready(paths, state, "close task")
@@ -5117,7 +4932,7 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
         for claim in claims
         if claim.get("status") not in TERMINAL_CLAIM_STATUSES
     ]
-    if nonterminal:
+    if nonterminal and not preparing_mini:
         failures.append("non-terminal claims: " + ", ".join(nonterminal))
     running = [
         str(job.get("run_id"))
@@ -5223,7 +5038,7 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     verification = state.get("verification", [])
     if not verification:
         failures.append("no verification/evidence record")
-    if verification and not any(
+    if not any(
         item.get("integrity_version") == 1
         and item.get("status") == "pass"
         and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
@@ -5239,11 +5054,17 @@ def close_gate(paths: HarnessPaths, state: dict[str, Any]) -> list[str]:
     ]
     if unaccounted:
         failures.append("unaccounted verification: " + ", ".join(unaccounted))
-    failures.extend(delivery_integrity_errors(paths, state, verify_remote=True))
+    if not preparing_mini:
+        failures.extend(delivery_integrity_errors(paths, state, verify_remote=True))
     return failures
 
 
-def cmd_close_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
+def cmd_close_task(
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+    *,
+    emit_result: bool = True,
+) -> int:
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "close")
@@ -5265,10 +5086,11 @@ def cmd_close_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
         checkpoint = commit_checkpoint(paths, state)
         unbind_all_sessions_unlocked(paths, state)
         write_index(paths)
-    emit(
-        {"task_id": args.task, "status": "done", "checkpoint": str(checkpoint)},
-        args.json,
-    )
+    if emit_result:
+        emit(
+            {"task_id": args.task, "status": "done", "checkpoint": str(checkpoint)},
+            args.json,
+        )
     return 0
 
 
@@ -5387,122 +5209,6 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
         {"task_id": args.task, "status": "cancelled", "checkpoint": str(checkpoint)},
         args.json,
     )
-    return 0
-
-
-def resolve_resume_task(
-    paths: HarnessPaths, task_id: str | None, session_id: str | None
-) -> dict[str, Any]:
-    if task_id:
-        return load_task(paths, task_id)
-    if session_id:
-        mapping = load_json(session_path(paths, check_session_id(session_id)))
-        return load_task(paths, str(mapping.get("task_id")))
-    raise HarnessError("provide --task or --session-id")
-
-
-def cmd_resume(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    state = resolve_resume_task(paths, args.task, args.session_id)
-    checkpoint_path = task_dir(paths, state["task_id"]) / "checkpoint.md"
-    checkpoint_ok, checkpoint_reason = checkpoint_matches(paths, state)
-    try:
-        plan_current = bool(
-            state.get("plan_ready") and state.get("plan_sha256") == plan_digest(paths, state)
-        )
-    except HarnessError:
-        plan_current = False
-    payload = task_summary(state)
-    payload.update(
-        {
-            "objective": state.get("objective"),
-            "completion_boundary": state.get("completion_boundary"),
-            "plan_path": str(task_dir(paths, state["task_id"]) / "plan.md"),
-            "checkpoint_path": str(checkpoint_path),
-            "checkpoint_exists": checkpoint_path.exists(),
-            "warnings": [
-                warning
-                for warning in (
-                    f"checkpoint is stale: {checkpoint_reason}" if not checkpoint_ok else "",
-                    "plan is not approved/current" if not plan_current else "",
-                    "task is not active" if state.get("status") not in {"active", "blocked"} else "",
-                )
-                if warning
-            ],
-        }
-    )
-    emit(payload, args.json)
-    return 0
-
-
-def cmd_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    if args.critical:
-        if not args.task:
-            raise HarnessError("status --critical requires --task")
-        emit(critical_projection(paths, load_task(paths, args.task)), args.json)
-        return 0
-    if args.task:
-        emit(task_summary(load_task(paths, args.task)), args.json)
-        return 0
-    require_complete_layout(paths)
-    tasks = load_all_tasks(paths)
-    claims = load_all_claims(paths)
-    structured = [claim for claim in claims if not claim.get("legacy")]
-    legacy = [claim for claim in claims if claim.get("legacy")]
-    payload: dict[str, Any] = {
-        "root": str(paths.root),
-        "chief_authority": chief_authority_summary(paths),
-        "tasks": [task_summary(task) for task in tasks],
-        "structured_claims": [
-            {
-                "token": claim.get("token"),
-                "task_id": claim.get("task_id"),
-                "owner": claim.get("owner"),
-                "status": claim.get("status"),
-                "expires_at": claim.get("expires_at"),
-                "expired_still_reserved": bool(
-                    claim.get("status") in RESERVING_CLAIM_STATUSES
-                    and is_expired(claim.get("expires_at"))
-                ),
-                "locks": claim.get("locks", []),
-            }
-            for claim in structured
-        ],
-        "legacy_pending_count": len(
-            [claim for claim in legacy if claim.get("status") in RESERVING_CLAIM_STATUSES]
-        ),
-        "legacy_expired_unverified_count": len(
-            [
-                claim
-                for claim in legacy
-                if claim.get("legacy_classification") == "expired_unverified"
-            ]
-        ),
-    }
-    if args.legacy:
-        payload["legacy_pending"] = [
-            {
-                "token": claim.get("token"),
-                "owner": claim.get("owner"),
-                "status": claim.get("status"),
-                "classification": claim.get("legacy_classification"),
-                "expires_at": claim.get("expires_at"),
-                "locks": claim.get("locks", []),
-                "raw_scope": claim.get("raw_scope"),
-                "scope_parse_warnings": claim.get("scope_parse_warnings", []),
-                "source_file": claim.get("source_file"),
-                "source_line": claim.get("source_line"),
-                "pending_file": claim.get("_path"),
-            }
-            for claim in legacy
-        ]
-    emit(payload, args.json)
-    return 0
-
-
-def cmd_render_index(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        write_index(paths)
-    emit({"index": str(paths.index)}, args.json)
     return 0
 
 
@@ -6033,6 +5739,34 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             except HarnessError as exc:
                 errors.append(str(exc))
 
+    temporary_records = []
+    try:
+        with state_lock(
+            paths,
+            create_layout=False,
+            allow_recoverable_nonlock_aliases=True,
+        ):
+            temporary_records = scan_atomic_temporaries(paths)
+    except HarnessError as exc:
+        errors.append(f"AOI temporary-file scan failed: {exc}")
+    else:
+        for record in temporary_records:
+            relative = record.path.relative_to(paths.harness).as_posix()
+            if record.classification == "legacy_manual":
+                warnings.append(
+                    f"legacy AOI temporary requires manual audit and cleanup: {relative}"
+                )
+            elif record.recoverable:
+                errors.append(
+                    "recoverable AOI temporary residue requires "
+                    f"`aoi recover-temporaries`: {relative}"
+                )
+            else:
+                errors.append(
+                    "ambiguous AOI temporary residue blocks automatic recovery: "
+                    f"{relative} ({record.classification})"
+                )
+
     if not paths.config.is_file():
         errors.append(f"AOI configuration is missing: {paths.config}")
     if os.name == "nt":
@@ -6055,6 +5789,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "claim_count": len(claims),
         "context_providers": provider_reports,
         "context_provider_benchmarks": benchmark_reports,
+        "temporary_files": [
+            record.as_dict(paths) for record in temporary_records
+        ],
         "platform": platform_capabilities(),
     }
     emit(payload, args.json)
@@ -6219,6 +5956,7 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    mini_completion_services = _mini_completion_services(task_lifecycle_services)
     register_task_lifecycle_commands(
         sub,
         handlers={
@@ -6227,6 +5965,9 @@ def build_parser(
             ),
             "start_mini": functools.partial(
                 cmd_start_mini, services=task_lifecycle_services
+            ),
+            "finish_mini": functools.partial(
+                cmd_finish_mini, services=mini_completion_services
             ),
             "approve_plan": functools.partial(
                 cmd_approve_plan, services=task_lifecycle_services
@@ -6486,11 +6227,12 @@ def build_parser(
     add_json_argument(p)
     p.set_defaults(handler=cmd_cancel_task)
 
+    status_services = _status_cmd_services()
     register_status_commands(
         sub,
         handlers={
-            "resume": cmd_resume,
-            "status": cmd_status,
+            "resume": functools.partial(cmd_resume, services=status_services),
+            "status": functools.partial(cmd_status, services=status_services),
             "render_index": cmd_render_index,
         },
         add_json_argument=add_json_argument,
@@ -6513,6 +6255,17 @@ def build_parser(
         handlers={
             "backup_state": cmd_backup_state,
             "verify_backup": cmd_verify_backup,
+        },
+        add_json_argument=add_json_argument,
+    )
+
+    register_temporary_recovery_commands(
+        sub,
+        handlers={
+            "recover_temporaries": functools.partial(
+                cmd_recover_temporaries,
+                services=_temporary_recovery_services(),
+            )
         },
         add_json_argument=add_json_argument,
     )

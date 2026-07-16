@@ -97,6 +97,7 @@ from ..harnesslib import (
     claim_path,
     claims_for_task,
     claims_owned_by_task,
+    directory_has_any_entry,
     discover_root,
     find_conflicts,
     get_paths,
@@ -158,6 +159,7 @@ _HANDLER_NAMES = frozenset(
     {
         "init_task",
         "start_mini",
+        "finish_mini",
         "approve_plan",
         "bind_session",
         "unbind_session",
@@ -328,12 +330,9 @@ def _require_pristine_bootstrap_state(paths: HarnessPaths) -> None:
     preflight_layout(paths)
     if not paths.harness.exists():
         return
-    try:
-        populated = any(paths.harness.iterdir())
-    except OSError as exc:
-        raise HarnessError(
-            f"cannot inspect unconfigured AOI state directory {paths.harness}: {exc}"
-        ) from exc
+    populated = directory_has_any_entry(
+        paths.harness, "unconfigured AOI state directory"
+    )
     if populated:
         raise HarnessError(
             "aoi.toml is missing while an AOI state tree already exists; restore the "
@@ -923,7 +922,10 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths, *, services: T
             "context_provider_benchmarks": [],
             "override_requests": [],
             "resource_config_events": [],
-            "facts": ["Mini lifecycle atomically initialized, approved, bound, and claimed."],
+            "facts": [
+                "Mini lifecycle initialized, approved, bound, and claimed with "
+                "ordinary-exception rollback; process termination may require recovery."
+            ],
             "decisions": [],
             "rejected_paths": [],
             "changed_files": [],
@@ -1245,7 +1247,12 @@ def cmd_set_claim_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
-def cmd_release_claim(args: argparse.Namespace, paths: HarnessPaths) -> int:
+def cmd_release_claim(
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+    *,
+    emit_result: bool = True,
+) -> int:
     if args.status not in TERMINAL_CLAIM_STATUSES:
         raise HarnessError("release status must be done, released, or stale")
     with state_lock(paths):
@@ -1296,10 +1303,11 @@ def cmd_release_claim(args: argparse.Namespace, paths: HarnessPaths) -> int:
         atomic_write_json(destination, claim)
         source.unlink()
         write_index(paths)
-    emit(
-        {"token": args.token, "status": args.status, "baseline_changed": changed},
-        args.json,
-    )
+    if emit_result:
+        emit(
+            {"token": args.token, "status": args.status, "baseline_changed": changed},
+            args.json,
+        )
     return 0
 
 
@@ -1431,7 +1439,13 @@ def cmd_adopt_current_branch(args: argparse.Namespace, paths: HarnessPaths, *, s
     return 0
 
 
-def cmd_checkpoint(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices) -> int:
+def cmd_checkpoint(
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+    *,
+    services: TaskLifecycleCmdServices,
+    emit_result: bool = True,
+) -> int:
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "checkpoint")
@@ -1450,14 +1464,15 @@ def cmd_checkpoint(args: argparse.Namespace, paths: HarnessPaths, *, services: T
         state["checkpoint_required"] = False
         checkpoint = services.commit_checkpoint(paths, state)
         write_index(paths)
-    emit(
-        {
-            "task_id": state["task_id"],
-            "revision": state["revision"],
-            "checkpoint": str(checkpoint),
-        },
-        args.json,
-    )
+    if emit_result:
+        emit(
+            {
+                "task_id": state["task_id"],
+                "revision": state["revision"],
+                "checkpoint": str(checkpoint),
+            },
+            args.json,
+        )
     return 0
 
 
@@ -1660,6 +1675,28 @@ def register_task_lifecycle_commands(
     parser.add_argument("--expires-at", required=True)
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["start_mini"])
+
+    parser = subparsers.add_parser(
+        "finish-mini",
+        help="finish one verified mini task through delivery, release, checkpoint, and close",
+    )
+    parser.add_argument("--task", required=True)
+    parser.add_argument(
+        "--mode", choices=["local-only", "none", "pushed"], required=True
+    )
+    parser.add_argument("--detail", required=True)
+    parser.add_argument("--summary", required=True)
+    parser.add_argument(
+        "--commit",
+        help=(
+            "full 40-64 hex commit id; required with pushed so an interrupted "
+            "finish request remains unambiguous"
+        ),
+    )
+    parser.add_argument("--remote")
+    parser.add_argument("--remote-ref")
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["finish_mini"])
 
     parser = subparsers.add_parser("approve-plan")
     parser.add_argument("--task", required=True)
