@@ -2331,6 +2331,53 @@ class LockTests(HarnessTestCase):
                 h.normalize_lock(lock),
             )
 
+    def test_repo_lock_colon_typo_is_rejected_with_separator_hint(self) -> None:
+        # ARISE defect: `repo:file:rtl/adfp/tests:test_x.py` carried a ':'-for-'/'
+        # typo, was accepted with a null baseline, and silently never matched its
+        # correctly spelled twin so mutual exclusion never fired.
+        for typo in (
+            "repo:file:rtl/adfp/tests:test_dense_weight_cache.py",
+            "external:file:/srv/data:cache.bin",
+        ):
+            with self.subTest(typo=typo):
+                with self.assertRaisesRegex(
+                    h.HarnessError, r"may not contain ':'.*use '/'"
+                ):
+                    h.normalize_lock(typo)
+        self.init_task("colon-typo")
+        rejected = self.cli(
+            "claim",
+            "--task",
+            "colon-typo",
+            "--token",
+            "colon-typo-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "RTL",
+            "--lock",
+            "repo:file:rtl/adfp/tests:test_dense_weight_cache.py",
+            "--intent",
+            "reproduce the ARISE colon typo",
+            "--validation",
+            "must be rejected structurally",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("may not contain ':'", rejected.stderr)
+        self.assertIn(
+            "rtl/adfp/tests:test_dense_weight_cache.py", rejected.stderr
+        )
+
+    def test_host_lock_drive_colon_allowed_but_second_colon_rejected(self) -> None:
+        self.assertEqual(
+            h.normalize_lock("host:file:C:/Users/x/file.py"),
+            "host:file:C:/users/x/file.py",
+        )
+        with self.assertRaises(h.HarnessError):
+            h.normalize_lock("host:file:C:/Users/x:y.py")
+
 
 class LifecycleTests(HarnessTestCase):
     def test_plan_approval_gates_claims(self) -> None:

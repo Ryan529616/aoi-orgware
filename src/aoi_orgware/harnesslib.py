@@ -2620,6 +2620,10 @@ def write_task(paths: HarnessPaths, state: dict[str, Any]) -> None:
 def _normalize_repo_path(raw: str) -> str:
     if "\x00" in raw or "\\" in raw:
         raise HarnessError(f"repo lock must use POSIX separators: {raw!r}")
+    if ":" in raw:
+        raise HarnessError(
+            f"repo lock path may not contain ':'; use '/' as the separator: {raw!r}"
+        )
     if not raw or raw.startswith("/"):
         raise HarnessError(f"repo lock path must be relative: {raw!r}")
     if any(marker in raw for marker in ("*", "?", "[", "]", "{", "}")):
@@ -2645,6 +2649,10 @@ def _normalize_repo_path(raw: str) -> str:
 def _normalize_external_path(raw: str) -> str:
     if not raw or "\x00" in raw or "\\" in raw:
         raise HarnessError(f"external lock must use POSIX separators: {raw!r}")
+    if ":" in raw:
+        raise HarnessError(
+            f"external lock path may not contain ':'; use '/' as the separator: {raw!r}"
+        )
     if raw.startswith("//"):
         raise HarnessError(f"external lock path may not use a double-slash root: {raw!r}")
     path = PurePosixPath(raw)
