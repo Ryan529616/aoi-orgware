@@ -1276,6 +1276,8 @@ class TaskLifecycleCommandRegistryTests(unittest.TestCase):
         "set_phase",
         "adopt_current_branch",
         "checkpoint",
+        "retarget_task",
+        "retire_risk",
     }
 
     def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:

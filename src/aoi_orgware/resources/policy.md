@@ -140,6 +140,15 @@ therefore retain only the cooperative path boundary. Expiry is a warning, not
 automatic release: an expired claim reserves scope until it is explicitly
 marked terminal.
 
+Path remainders in `repo:` and external-namespace locks may not contain `:`
+(a `host:` path carries exactly its drive colon); a colon typo would otherwise
+mint a second lock identity that never collides with the real path, silently
+disabling mutual exclusion. New file claims are admitted against the
+filesystem: a missing target whose parent directory also does not exist is
+rejected as a probable typo, and a genuinely planned file must be admitted
+explicitly (`--allow-nonexistent`), which records a `planned` baseline instead
+of a silent `exists: false`.
+
 Locks coordinate cooperative agents. They cannot stop an unrelated process
 from changing a file.
 
@@ -180,12 +189,29 @@ they cite remains physically validated. They cannot qualify evidence.
 
 A new packet starts `ready`. Before a Codex sub-agent is launched, the Chief may
 issue one short-lived `packet-arm` permit bound to the current Chief epoch,
-parent session, expected Codex `agent_type`, plan, packet contract, lane, and
+parent session, expected transport `agent_type` (or an explicit any-type
+wildcard that owns the whole parent slot), plan, packet contract, lane, and
 execution selection. At most one arm may occupy the same parent-session/type
-slot because the `SubagentStart` payload does not identify an AOI packet. A
+slot because the `SubagentStart` payload does not identify an AOI packet; a
+wildcard arm collides with every other arm for its parent. The AOI role label
+is never a transport label: arming by role instead of the observed transport
+type produces a permit nothing can consume, so when the transport label is not
+known in advance the wildcard is the correct permit. A
 trusted protocol-v6 hook can only consume one exact current arm or write an
 incident; it cannot create packets, choose an ambiguous candidate, resolve an
 incident, or obtain Chief authority.
+
+A start whose agent identity matches an already-dispatched packet from the
+same parent session is a resume of that packet's thread, recorded on the
+packet, not a new unmanaged agent; the same identity under a different parent
+remains an incident. The Chief may grant a packet a bounded depth-two helper
+budget at creation; budgeted helper starts under that packet are recorded and
+bounded read-only support whose output is the packet agent's working material,
+never independent packet evidence. Every denial incident records the live-arm
+snapshot for its parent slot, and incident accounting may classify the guard
+outcome (`true_positive`, `false_positive_guard`, `benign_no_work`,
+`unverified`) so the guard's false-positive rate is measurable instead of
+anecdotal.
 
 Hook consumption records the transport-specific provenance
 (`codex_subagent_start_observed` or `claude_subagent_start_observed`) and the
@@ -370,7 +396,20 @@ proxy is not direct system evidence; acknowledgement is not verification.
 A successful close requires at least one passing close-qualifying verification,
 an approved plan, a current checkpoint, terminal claims/packets/jobs, resolved
 coordination and user escalations, a valid delivery disposition, and intact
-Git worktree identity.
+Git worktree identity. An `achieved` close additionally requires a passing
+close-qualifying verification that explicitly asserts coverage of the
+registered completion boundary; verification boundaries that exclude the
+boundary's own claim cannot close it.
+
+A packet result may not cite itself as its only evidence: completion requires
+at least one evidence reference outside the packet's own result file, and
+packets sealed under the evidence gate are re-validated at close. External
+jobs record their registration time separately from the observed physical
+launch; a registration lag is a computed, visible quantity, and a launch that
+preceded registration by more than the tolerance requires an explicit
+retroactive reason. Lane closure is derived, not narrated: a lane closes with
+an explicit closure kind checked against its own packet ledger, so a lane that
+owns completed work cannot close as `no_work`.
 
 ## Capacity Planning
 

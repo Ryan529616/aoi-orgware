@@ -7,6 +7,63 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-17 (alpha)
+
+Governance-honesty release. Every change traces to a defect found by the
+2026-07 evidence audit of AOI 0.2.1 governing the ARISE RTL project (12/12
+subagent incidents were guard friendly fire; a task closed `achieved` beside
+an unmet completion boundary; a lock-URI typo silently disabled mutual
+exclusion for 31 hours; reviewer results cited themselves as evidence).
+
+### Added
+- **Honest close outcomes.** `close-task --outcome
+  {achieved,scope_changed,partial,superseded}` is required; `achieved`
+  additionally requires a passing close-qualifying verification recorded with
+  `--asserts-completion-boundary`, non-achieved outcomes require
+  `--boundary-disposition`, and closing `achieved` over recorded blockers
+  requires `--blockers-disposition`.
+- **Scope retargeting.** `retarget-task` re-anchors title / objective /
+  completion boundary on an open task, appends an immutable
+  `scope_revisions[]` entry (old/new/reason), and invalidates plan approval
+  until re-approval. `approve-plan` now accumulates `plan_approvals[]`
+  history; replacing an approved plan after packets/jobs ran requires
+  `--coverage-note`.
+- **Typed, retirable risks.** `checkpoint --risk` records
+  `{id,text,status}` entries; `retire-risk` retires or marks a risk
+  materialized (legacy string risks retire via `--text-exact`); checkpoints
+  render open risks only plus an accounted summary line.
+- **Expressive dispatch match model.** `packet-arm --any-agent-type`
+  wildcard arms own the whole parent slot (AOI role labels are never
+  transport labels); a SubagentStart whose agent identity matches an
+  already-dispatched packet from the same parent is a recorded resume, not a
+  `duplicate_agent` incident; `create-packet --helper-spawn-budget N` grants
+  bounded depth-two read-only helper spawns (recorded on the packet, contract-
+  sealed); incidents carry a `live_arms` snapshot and
+  `subagent-incident-account --disposition-kind` classifies guard outcomes,
+  surfaced in `task_summary.subagent_guard`.
+- **Lock-URI admission gates.** `:` in `repo:`/external path remainders is
+  rejected (the ARISE typo class); new file claims check the filesystem —
+  missing target with a missing parent is rejected, and planned files require
+  `--allow-nonexistent`, recording a `planned` baseline.
+- **Evidence self-reference gate.** A packet result cannot cite itself as
+  its only evidence; gated packets are re-validated at close/cancel.
+- **Job launch/registration split.** `job-start --observed-start-at` records
+  the physical launch separately from `registered_at`, computes
+  `registration_lag_seconds`, and demands `--retroactive-reason` past the
+  tolerance; `task_summary` surfaces the worst lag.
+- **Derived lane closure.** Closing a lane requires `--closure-kind
+  {completed_work,no_work,aborted,superseded}` checked against the lane's own
+  packet ledger with `packet_terminal_stats` stored on the terminal event.
+- **Cancel/record cross-checks.** `cancel-task` with recorded changed files
+  requires `--changed-files-disposition`; `checkpoint --changed-file` rejects
+  absolute paths outside the bound worktree without
+  `--allow-outside-worktree`.
+
+### Changed
+- The managed policy template documents the close-honesty contract, the
+  wildcard/resume/helper dispatch semantics, lock admission gates, and
+  derived lane closure.
+
 ## [0.2.3] - 2026-07-16 (alpha)
 
 ### Added
