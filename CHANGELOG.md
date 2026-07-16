@@ -7,13 +7,14 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
-## [0.2.4] - 2026-07-17 (alpha)
+## [0.3.0a2] - 2026-07-17 (alpha)
 
-Governance-honesty release. Every change traces to a defect found by the
-2026-07 evidence audit of AOI 0.2.1 governing the ARISE RTL project (12/12
-subagent incidents were guard friendly fire; a task closed `achieved` beside
-an unmet completion boundary; a lock-URI typo silently disabled mutual
-exclusion for 31 hours; reviewer results cited themselves as evidence).
+Governance-honesty pre-release on the v0.3 line. Every change traces to a
+defect found by the 2026-07 evidence audit of AOI 0.2.1 governing the ARISE
+RTL project (12/12 subagent incidents were guard friendly fire; a task closed
+`achieved` beside an unmet completion boundary; a lock-URI typo silently
+disabled mutual exclusion for 31 hours; reviewer results cited themselves as
+evidence).
 
 ### Added
 - **Honest close outcomes.** `close-task --outcome
@@ -64,9 +65,76 @@ exclusion for 31 hours; reviewer results cited themselves as evidence).
   wildcard/resume/helper dispatch semantics, lock admission gates, and
   derived lane closure.
 
+## [0.3.0a1] - 2026-07-16 (alpha)
+
+### Added
+
+- **Constrained mini completion** (`aoi finish-mini`). After explicit passing,
+  close-qualifying verification exists, it automates delivery disposition,
+  claim release, checkpointing, and closure through the existing fail-closed
+  gates. It accepts only the mini profile and exact `repo:file` claims. An
+  argument-bound receipt supports fail-closed retries; tests cover interruption
+  after claim release and after terminal state publication, not process-kill or
+  power-loss durability. Its `pushed` mode requires the full 40–64-hex commit
+  ID rather than an ambiguous short SHA.
+- **Evidence-first v0.3 plan.** The `0.3.0a1` line prioritizes lower ceremony,
+  command/domain boundaries, reproducible package artifacts, deterministic
+  resilience testing, and a separate A/B/C evaluation protocol.
+- **Reliability test infrastructure.** Parent-released subprocess harnesses and
+  process-local atomic-I/O observation points cover the intended Chief, claim,
+  packet-arm, publication, reader, checkpoint, index, and interrupted-cleanup
+  boundaries. Chief, claim, and packet-arm race workers now pause at the actual
+  state-lock acquisition boundary. Passing local runs are development receipts;
+  Linux/Windows CI release receipts remain pending.
+- **Fail-closed interrupted bootstrap.** `chief-acquire` now accepts only an
+  existing private regular `nlink=1` canonical `.state.lock` containing exactly
+  one NUL byte. It takes that lock, reloads the same config binding, and accepts
+  only a complete layout or the exact existing-NUL interrupted-init prefix
+  before publishing first-Chief authority. Missing or empty locks, every
+  state-lock alias, every root `aoi.toml` alias, and other ambiguous bootstrap
+  objects are rejected with zero automatic bootstrap mutation on POSIX and
+  Windows. They require explicit offline/manual recovery; the former
+  alias-repair receipt fields were removed.
+- **Authenticated atomic-temporary recovery**
+  (`aoi recover-temporaries`). AOI state writes use identifiable private
+  same-directory temporaries. Recovery accepts no arbitrary path, refuses all
+  ordinary cleanup when any entry is ambiguous or legacy, and is retryable.
+  It requires the normal canonical NUL state lock; every state-tree residue
+  deletion requires an under-lock config reload and the current Chief. Eligible
+  pre-link state-lock temporaries remain inert until authenticated cleanup;
+  pre-link root-config residue is outside the state scan and remains manual.
+
+### Changed
+
+- Package and runtime metadata now share one PEP 440 version source
+  (`0.3.0a1`). The CI workflow targets Python 3.11–3.13 on Linux and Windows and
+  includes separate jobs to build, strictly check, and isolated-install test
+  both wheel and sdist.
+- Status, resume, and index command bodies moved out of the CLI composition
+  root. AST boundary tests reject reverse imports and ratchet the remaining
+  local `cmd_*` body allowlist.
+- `start-mini` now records its actual boundary: best-effort rollback on ordinary
+  exceptions while holding the state lock, not a multi-file atomic transaction.
+  Hard process termination may require explicit audit and recovery.
+
+### Notes
+
+- Process-termination tests may support only a process-crash claim on the
+  operating systems and filesystems where they pass. Successful raw reads must
+  be complete old or new bytes, but managed reads may transiently fail closed;
+  this is atomic visibility, not seamless availability. The tests do not prove
+  power-loss durability. POSIX fsyncs the parent directory; native Windows
+  cannot provide equivalent directory-entry durability through the Python
+  standard library.
+- State-tree recovery does not scan repo-external Chief credential
+  temporaries, published-but-orphaned credentials, obsolete takeover
+  credentials, or custom credential roots. Stale tuples cannot authorize the
+  current authority, but secret-at-rest cleanup remains an a2 follow-up.
+
 ## [0.2.3] - 2026-07-16 (alpha)
 
 ### Added
+
 - **One-command Codex onboarding** (`aoi codex-init`). It initializes AOI when
   needed, enables the explicit Codex-hook policy, non-destructively merges the
   protocol-v6 lifecycle hooks and stable hook feature, and installs the
@@ -87,6 +155,7 @@ exclusion for 31 hours; reviewer results cited themselves as evidence).
   classifiers, and this changelog.
 
 ### Changed
+
 - Terminal-task doctor checks now preserve the complete packet graph while
   classifying each packet's integrity independently, so valid Steward synthesis
   bindings no longer become false stale-binding errors after task close while
@@ -103,10 +172,11 @@ exclusion for 31 hours; reviewer results cited themselves as evidence).
   entry point (plus the documented structured WSL launcher for Codex); embedded
   strings, mixed-platform handlers, shell chains, and malformed inner hook
   shapes are preserved or rejected without unsafe rewrites. A fresh partial
-  install that already initialized AOI now gives the exact Chief-acquire/rerun
+  install that already initialized AOI gives the exact Chief-acquire/rerun
   recovery sequence.
 
 ### Notes
+
 - First public PyPI release. It rolls up the internal 0.2.1 and 0.2.2 alpha
   milestones in addition to the onboarding and integrity changes above.
 - The hook adapter remains a cooperative, fail-open procedural guardrail, not a
@@ -130,7 +200,7 @@ exclusion for 31 hours; reviewer results cited themselves as evidence).
   hardening.
 - This internal milestone had no tag, GitHub Release, or PyPI distribution.
 
-## [0.1.2] - alpha
+## [0.1.2-alpha]
 
 - First packaged alpha. Includes the Windows path-canonicalization fix for the
   symlink-traversal false positive. See the GitHub release for details.
@@ -139,4 +209,4 @@ exclusion for 31 hours; reviewer results cited themselves as evidence).
 [0.2.3]: https://github.com/Ryan529616/aoi-orgware/compare/v0.1.2-alpha...v0.2.3
 [0.2.2]: https://github.com/Ryan529616/aoi-orgware/commit/8ea308046f37e4cb73e7b0f0e56c1c80d71a8da4
 [0.2.1]: https://github.com/Ryan529616/aoi-orgware/commit/a56a20e5bdb9cf1fb6cba0483e4c82678d10d5cf
-[0.1.2]: https://github.com/Ryan529616/aoi-orgware/releases/tag/v0.1.2-alpha
+[0.1.2-alpha]: https://github.com/Ryan529616/aoi-orgware/releases/tag/v0.1.2-alpha

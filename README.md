@@ -81,8 +81,11 @@ For a repeatable deployment, pin the reviewed release as
 The onboarding commands initialize AOI when needed, preserve unrelated client
 settings, install the generic AOI skill once at user scope, and wire the
 repository-local lifecycle hooks. Re-running is idempotently resumable. Existing
-AOI projects—and interrupted first runs that already published `aoi.toml`—
-require the current Chief credential before the command is rerun.
+AOI projects require the current Chief credential before the command is rerun.
+An interrupted first run can acquire that Chief automatically only when it
+already has the exact private, non-linked, one-byte-NUL canonical state lock and
+matches either a complete layout or the narrow interrupted-init prefix; every
+other bootstrap state needs explicit offline/manual recovery first.
 
 | Client | Repository-local integration | User-scope skill |
 |---|---|---|
@@ -124,6 +127,20 @@ accounted for.
 Read-only questions do not need lifecycle ceremony. Small edits stay single;
 parallel lanes are used only when the work is genuinely independent.
 
+For a bounded mini task, the agent records verification explicitly and then
+uses `finish-mini` to perform the mechanical delivery, claim-release,
+checkpoint, and close transitions through the existing gates. The command does
+not run a verifier or create evidence on the agent's behalf. Its `pushed` mode
+requires the full 40–64-hex commit ID so an interrupted request can be retried
+without an ambiguous SHA prefix.
+
+`start-mini` is not a multi-file atomic transaction. While the project state
+lock is held, an ordinary Python exception triggers best-effort removal of the
+new task, claim, and session artifacts plus an index rebuild. Hard process
+termination, `KeyboardInterrupt`, or cleanup failure may leave partial semantic
+artifacts that require audit; `recover-temporaries` repairs only atomic-I/O
+residues, not an inferred mini-task rollback.
+
 | Work shape | AOI execution |
 |---|---|
 | Read-only explanation | No task required |
@@ -164,6 +181,47 @@ decisions, dissent, verification, and a bounded semantic checkpoint. A resumed
 session reconstructs from the checkpoint and current repository state instead
 of relying on conversational memory.
 
+### Recover interrupted atomic publication
+
+AOI deliberately does not auto-repair bootstrap publication. `chief-acquire`
+accepts only an existing canonical `.state.lock` that is one private regular
+non-linked file containing exactly one NUL byte. After taking that platform
+lock, it reloads the same configuration and accepts either a complete layout or
+the exact existing-NUL interrupted-init prefix before publishing first-Chief
+authority. The returned credential can then authorize the identical `init`
+retry.
+
+A missing or empty state lock, any state-lock alias, any root `aoi.toml` alias,
+or any other linked/ambiguous bootstrap object is rejected without automatically
+mutating those objects on either POSIX or Windows. These blocking states require
+explicit offline/manual audit and recovery; AOI does not guess ownership or
+rollback another writer's inode. A root config temporary left before link
+publication is non-stranding—the identical `init` can still proceed—but it is
+outside `.aoi/` scanning and remains manual root residue for audit and cleanup.
+
+After a writer process terminates, the current Chief can explicitly remove
+eligible state-tree temporaries and then re-audit the state tree:
+
+```bash
+aoi recover-temporaries --json
+aoi doctor --json
+```
+
+The command accepts no target path and requires the normal canonical NUL state
+lock. Every state-tree residue deletion occurs only after an under-lock
+`aoi.toml` reload and current-Chief validation. Any malformed, ambiguous, or
+legacy entry prevents all ordinary deletion. A create alias at
+`chief-authority.json` is not a bootstrap exception and may require manual
+repair because it blocks authority validation.
+
+Repo-external Chief credential temporaries, published-but-orphaned credentials,
+obsolete credential files, and custom credential roots are not scanned by
+`recover-temporaries`. Stale credentials cannot authorize a current authority
+tuple, but secret-at-rest cleanup remains a separate follow-up.
+
+This bounded cleanup addresses process-crash residue; it is not evidence of
+power-loss durability or automatic bootstrap repair.
+
 ## Core capabilities
 
 | Area | What AOI records or enforces |
@@ -186,8 +244,10 @@ AOI is strict about distinguishing control from observation:
 
 | Surface | Current boundary |
 |---|---|
-| Post-initialization lifecycle writes | Deterministic and Chief-fenced, except narrowly pre-authorized hook consumption and incident recording |
+| Post-initialization lifecycle writes | Chief-fenced, except narrowly pre-authorized hook consumption and incident recording; temporary recovery performs no pre-authentication state-tree deletion |
+| Interrupted project bootstrap | `chief-acquire` accepts only an existing private `nlink=1` canonical NUL lock plus a complete layout or exact existing-NUL interrupted prefix. Missing/empty/aliased locks and root-config aliases require offline/manual recovery with zero automatic bootstrap mutation |
 | Cooperative file ownership | Conflicts are rejected through AOI; AOI is not an OS sandbox |
+| State-file publication | Successful raw reads see complete old or new bytes; managed reads may transiently fail closed on replacement identity drift or native-Windows sharing. This is not seamless availability, a multi-file transaction, or power-loss proof |
 | Codex sub-agent start | Observed after creation when the trusted hook runs; not a pre-spawn boundary |
 | Claude governed `Agent` dispatch | `PreToolUse` can reject a missing or stale arm before that tool runs |
 | Claude paths that bypass `PreToolUse` | Observed and accounted for at `SubagentStart` when that hook runs successfully; not hard-blocked |
@@ -241,6 +301,7 @@ See the [evaluation protocol](docs/evaluation.md) and
 
 ## Documentation
 
+- [v0.3 development plan](docs/v0.3-plan.md)
 - [Architecture](docs/architecture.md)
 - [Operating policy](docs/POLICY.md)
 - [Configuration](docs/configuration.md)
@@ -272,8 +333,12 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-AOI is pure Python with no runtime dependencies. CI covers Linux and Windows on
-Python 3.11 and 3.12.
+AOI is pure Python with no runtime dependencies and requires Python 3.11 or
+newer. The CI workflow targets Linux and Windows on Python 3.11, 3.12, and
+3.13. A separate packaging job is configured to build the wheel and sdist,
+check their metadata, and smoke-test both artifacts in isolated Linux and
+Windows environments. The publication workflow repeats those checks on its
+same-run release artifacts and publishes exactly that verified pair.
 
 ## License
 

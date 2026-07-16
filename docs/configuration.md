@@ -25,11 +25,12 @@ before writing the config. A review workflow must bind approval to
 `config_sha256` and revalidate that digest immediately before init; apply fails
 if the candidate changes after approval.
 
-The first init of a pristine state location is the sole unauthenticated
-lifecycle write. Any later `aoi init` is Chief-fenced. Authenticated init may
-replace the exact known v0.1.3 managed policy automatically; an unrecognized or
-locally customized policy requires `--replace-policy-sha256` with its reviewed
-current digest.
+The normal first init of a pristine state location is the sole unauthenticated
+lifecycle write. Any later `aoi init` is Chief-fenced. Interrupted bootstrap
+objects follow the fail-closed rules below; AOI does not repair them before
+authentication. Authenticated init may replace an exact known managed
+predecessor policy automatically. An unrecognized or locally customized policy
+requires `--replace-policy-sha256` with its reviewed current digest.
 
 ```toml
 schema_version = 1
@@ -111,6 +112,39 @@ enabled = false
 
 The full default file is available at `examples/aoi.toml`.
 
+## Interrupted publication and initialization
+
+Root configuration and the state lock have separate fail-closed boundaries:
+
+- For `chief-acquire` and recovery, root `aoi.toml` must already be one normal
+  non-linked configuration file. A post-link alias blocks normal loading and
+  remains unchanged for explicit offline/manual audit and recovery. A pre-link
+  temporary is not repaired and is outside `.aoi/` scanning, but does not block
+  the identical `init`; it remains manual root residue for audit and cleanup.
+- Automatic `chief-acquire` accepts only an existing canonical `.state.lock`
+  that is one private regular non-linked file containing exactly one NUL byte.
+  After taking that platform lock, AOI reloads the same configuration binding
+  and accepts only a complete layout or the exact existing-NUL interrupted-init
+  prefix before publishing first-Chief authority.
+- A missing or empty state lock, any state-lock alias, or any other linked or
+  ambiguous bootstrap object is rejected with zero automatic bootstrap mutation
+  on POSIX and Windows. AOI currently has no ownership ledger: it does not create
+  a lock, upgrade empty to NUL, unlink an alias, or attempt automatic bootstrap
+  rollback.
+- Bounded exact pre-link state-lock temporaries may remain inert in an otherwise
+  exact existing-NUL interrupted prefix. They are not consumed before Chief
+  authentication. After valid first-Chief acquisition, the current Chief can
+  run `recover-temporaries`.
+
+`recover-temporaries` requires the normal canonical NUL state lock. Every
+configured state-tree temporary deletion requires an under-lock config reload
+and current-Chief validation. A malformed, legacy, or ambiguous entry blocks
+all ordinary deletion. Repo-external credential temporaries,
+published-but-orphaned credentials, obsolete takeover credentials, and custom
+credential roots are also outside this command. Stale credential tuples cannot
+authorize current authority, but their secret-at-rest cleanup is a separate
+follow-up.
+
 ## Change discipline
 
 Tasks bind both `profile_id` and the file's SHA-256. Change configuration only
@@ -125,22 +159,25 @@ false-to-true Codex hook flag. It refuses the change while any active or blocked
 task binds the current digest. It does not rewrite model, reasoning, approval,
 sandbox, provider, notification, MCP, plugin, or global Codex settings.
 The separate user-scope skill write is preflighted before project mutation and
-refuses a differing existing skill without its reviewed SHA-256.
-After a fresh bootstrap, onboarding reacquires the project state lock, rechecks
-that no competing Chief or task appeared, and retains the lock across the
-remaining policy and client-file writes.
+refuses a differing existing skill without its reviewed SHA-256. After a
+successful fresh init or strict existing-NUL Chief acquisition, onboarding
+reacquires the project state lock, rechecks that no competing Chief or task
+appeared, and retains the lock across the remaining policy and client-file
+writes.
 Both client onboarding commands preflight existing client files, atomically
 replace only changed destinations, and are idempotently resumable by rerunning
-the same command if a later destination fails. When the interrupted first run
+the same command if a later destination fails. When an interrupted first run
 already published `aoi.toml`, acquire/export the project Chief credential before
-rerunning. They are intentionally not one distributed filesystem transaction.
+rerunning only if the strict canonical-NUL bootstrap boundary above is met;
+otherwise perform offline/manual recovery first. They are intentionally not one
+distributed filesystem transaction.
 
 Initialization is resumable and non-clobbering, but it is not a distributed
-multi-file transaction. If the first process stops after publishing `aoi.toml`
-but before initializing the state lock, `chief-acquire` accepts only the exact
-structural prefix (no authority, lifecycle payload, managed resource, or unknown
-entry), repairs the platform/lock, and acquires the first Chief. Use that
-credential to rerun the same digest-bound `aoi init --config ...` command. If
-the interruption happened later while creating templates or the index, acquire
-or use the project Chief credential and rerun the same command. Never substitute
-a different candidate.
+multi-file transaction. `chief-acquire` can resume only a complete layout or
+exact interrupted prefix that already has the private non-linked canonical NUL
+state lock. Missing, empty, or aliased locks and all root-config aliases remain
+unchanged and require offline/manual recovery. After a valid first-Chief
+acquisition, use that credential to rerun the same digest-bound
+`aoi init --config ...` command. If the interruption happened later while
+creating templates or the index, acquire or use the project Chief credential
+and rerun the same command. Never substitute a different candidate.

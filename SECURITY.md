@@ -28,6 +28,27 @@ AOI is a cooperative governance layer, not a sandbox.
   validates owner-only credential directories/files and safe ancestors; native
   Windows encrypts the token with CurrentUser DPAPI. A process under the same OS
   account may still use that account's credential, so this is not a sandbox.
+- Automatic Chief bootstrap accepts only an existing `.state.lock` that is one
+  private regular non-linked file containing exactly one NUL byte. AOI takes
+  that platform lock, reloads the same configuration, and accepts only a
+  complete layout or the exact existing-NUL interrupted-init prefix before it
+  may publish first-Chief authority.
+- Missing or empty state locks, every state-lock alias, every root `aoi.toml`
+  alias, and other linked or ambiguous bootstrap objects fail closed with zero
+  automatic bootstrap mutation on POSIX and Windows. These blocking cases
+  require explicit offline/manual audit and recovery; AOI has no ownership
+  ledger with which to infer a safe rollback. A pre-link root config temporary
+  does not block the identical `init`, but remains outside `.aoi/` scanning and
+  requires manual residue audit and cleanup.
+- `recover-temporaries` has no pre-authentication deletion exception. It
+  requires the normal canonical NUL state lock, an under-lock config reload,
+  and current-Chief validation before every state-tree residue deletion. Any
+  malformed, legacy, or ambiguous entry prevents all ordinary deletion. A
+  Chief-authority create alias is not a bootstrap and may require manual repair.
+- `recover-temporaries` never scans repo-external credential temporaries,
+  published-but-orphaned credentials, obsolete takeover credentials, or custom
+  credential roots. Stale tuples cannot authorize current authority, but those
+  residues may still expose a secret at rest and require separate cleanup.
 - `AOI_CHIEF_TOKEN` and `--chief-token` are deprecated compatibility inputs.
   AOI removes Chief environment values before child processes, but command-line
   arguments, shell history, transcripts, crash dumps, and same-user process
@@ -48,12 +69,16 @@ AOI is a cooperative governance layer, not a sandbox.
   Windows `msvcrt` locking. Never alternate or concurrently write the same
   `.aoi/` tree from both environments. UNC/network shares and case-sensitive
   NTFS are outside the supported native-Windows boundary.
+- Atomic publication gives successful raw readers complete old or new bytes;
+  managed readers may transiently fail closed on replacement identity drift or
+  native-Windows sharing. Process-termination tests do not prove seamless
+  availability, multi-file transactions, or power-loss durability.
 - WSL requires a native filesystem or a mount that reliably exposes POSIX mode
   metadata. A metadata-less DrvFs mount will normally fail AOI's private-mode
   checks; this is deliberate fail-closed behavior, not permission emulation.
 - Existing repo/host tree claims are recursively checked for filesystem
   aliases. AOI rejects nested symlinks, junctions, hard-linked files, special
-  nodes, and trees beyond the bounded scan limit. This fail-closed audit runs
+  nodes, and trees that reach the fail-closed scan limit. This audit runs
   when claims are issued and released; it cannot prevent unrelated processes
   from changing a tree between those checkpoints.
 - `aoi.toml` is trusted project policy. Tasks bind its SHA-256 and fail closed

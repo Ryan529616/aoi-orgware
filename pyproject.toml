@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aoi-orgware"
-version = "0.2.4"
+dynamic = ["version"]
 description = "Agent Organization Infrastructure for governed multi-agent engineering work"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,6 +42,9 @@ aoi-claude-hook = "aoi_orgware.claude_hook:main"
 # Scope collection to the real suite; the pilot sample project under
 # src/aoi_orgware/resources/ ships an intentionally-failing test fixture.
 testpaths = ["tests"]
+
+[tool.hatch.version]
+path = "src/aoi_orgware/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aoi_orgware"]

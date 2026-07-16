@@ -1,8 +1,8 @@
 # AOI operating policy
 
-This document defines the default v0.2 governance contract. `aoi.toml` may
-change the vocabulary and capability tiers, but it must not silently erase the
-authority and evidence boundaries below.
+This document defines the default governance contract for the v0.3 alpha line.
+`aoi.toml` may change the vocabulary and capability tiers, but it must not
+silently erase the authority and evidence boundaries below.
 
 ## Authority
 
@@ -36,13 +36,48 @@ processes, but command-line tokens can still be exposed by the operating
 system. Credentials must never enter packets, checkpoints, hooks, backups,
 shell history, or shared artifacts.
 
-First `aoi init` is the sole unauthenticated mutation and only accepts a
-pristine state location. Re-initialization of an existing project is fenced.
+Repo-external credential publication is outside state-tree temporary recovery.
+Process termination may leave a credential temporary, a published credential
+whose authority commit did not complete, or an obsolete credential after
+takeover, including under a custom credential root. A stale project/session/
+epoch/token tuple cannot authorize the current authority, but these files may
+still contain secrets at rest and require separate audit and cleanup.
+
+First `aoi init` is the sole unauthenticated operation that creates a project
+and only accepts a pristine state location. Re-initialization of an existing
+project is fenced. Automatic Chief bootstrap accepts only an existing
+`.state.lock` that is one private regular non-linked file containing exactly one
+NUL byte. AOI takes that platform lock, reloads the same configuration binding,
+and accepts only a complete layout or the exact existing-NUL interrupted-init
+prefix before publishing first-Chief authority. It does not create, rewrite, or
+unlink the root config or state-lock object as part of this bootstrap.
+
+A missing or empty state lock, any state-lock alias, any root `aoi.toml` alias,
+or any other linked or ambiguous bootstrap object is rejected with zero
+automatic bootstrap mutation on POSIX and Windows. Root config temporaries left
+before link publication are outside `.aoi/` recovery as well. The blocking
+states require explicit offline/manual audit and recovery. A pre-link root
+config temporary does not block the identical `init`, but remains manual root
+residue for audit and cleanup.
+
 `chief-acquire` is used for an uninitialized or explicitly released authority;
-expired leases require `chief-takeover --expected-epoch` with an audit reason.
-Replacing a live lease additionally requires `--force-live`. There is no
-silent auto-steal. Wall-clock jitter up to five seconds is clamped to the last
-renewal timestamp; a larger rollback fails closed.
+expired leases require
+`chief-takeover --expected-epoch` with an audit reason. Replacing a live lease
+additionally requires `--force-live`. There is no silent auto-steal. Wall-clock
+jitter up to five seconds is clamped to the last renewal timestamp; a larger
+rollback fails closed.
+
+`recover-temporaries` has no pre-authentication deletion exception and accepts
+no caller-supplied path. It requires the normal canonical NUL state lock. Every
+state-tree temporary deletion requires an under-lock configuration reload
+matching the original digest, state root, and lock path, followed by
+current-Chief validation. Recovery may unlink only a current-schema AOI
+temporary whose private regular-file, device, inode, link count, and target-name
+binding still match. Any ambiguous or malformed current entry, or any legacy
+temporary, prevents all ordinary cleanup. A create alias at the established
+Chief-authority path is not a bootstrap exception: authority validation fails
+closed and may require manual repair. No semantic task, claim, packet,
+verification, or delivery state may be inferred or deleted by this recovery.
 
 Pilot validation is standalone and read-only. Pilot writers remain standalone
 only when their complete write set does not overlap an initialized AOI project.
@@ -96,6 +131,15 @@ Risks are typed records (`open`, `retired`, `materialized`), never
 append-only prose: a risk leaves the active picture only through an explicit
 retirement with a reason, and checkpoints render open risks only.
 
+`start-mini` publishes its plan, claim, task, checkpoint, session binding, and
+index while holding the project state lock. If an ordinary `Exception` escapes,
+it attempts to remove the newly created task, claim, and session artifacts and
+rebuild the index before re-raising. This is best-effort ordinary-exception
+rollback, not a multi-file transaction. Process termination,
+`KeyboardInterrupt`, or cleanup failure may leave partial semantic artifacts
+requiring explicit audit. Atomic-temporary recovery does not authorize guessing
+that rollback.
+
 Cancellation is not an escape hatch from user authority. A task with an open
 `needs_user` escalation cannot be cancelled until the bound user disposition is
 recorded. Cancelling a task that recorded changed files requires an explicit
@@ -110,6 +154,45 @@ semantic detail is never hidden: the compact form may grow to a 32 KiB hard
 ceiling, after which checkpoint creation fails without changing state or the
 previous checkpoint. Raw logs remain outside state. The separate critical-status
 projection remains capped at 12 KiB.
+
+## Atomic publication and temporary recovery
+
+One-file publication writes a private same-directory temporary, flushes and
+fsyncs its complete bytes, and then performs atomic replacement or no-replace
+creation. POSIX additionally fsyncs the parent directory after publication or
+recovery unlink. Native Windows has no portable parent-directory fsync through
+the Python standard library. This gives one-file atomic visibility; it does not
+make task, checkpoint, claim, session, and index updates one transaction.
+Atomic visibility is not seamless read availability: successful raw reads see
+complete old or new bytes, while a managed read that detects replacement-time
+identity drift—or a transient native-Windows sharing failure—fails closed and
+may be retried.
+
+Current temporaries carry a version, operation, SHA-256 of the destination
+basename, and random nonce. Ordinary exceptions attempt to remove the
+temporary. A terminated process may leave an unpublished temporary or, on the
+POSIX no-replace path, a two-link publication alias.
+
+The only automatic Chief-bootstrap lock state is the existing private regular
+`nlink=1` canonical NUL file. After acquiring it, AOI revalidates the exact config
+binding and accepts either the complete layout or the exact existing-NUL
+interrupted prefix. Missing and empty locks are never created or upgraded;
+state-lock aliases and root-config aliases are never unlinked. All such states
+remain unchanged for explicit offline/manual recovery.
+
+Bounded exact pre-link state-lock temporaries may be classified as inert members
+of an otherwise exact existing-NUL interrupted prefix. They are never consumed
+or removed before Chief authentication. After first-Chief acquisition, the
+current Chief may run `recover-temporaries`. Root `aoi.toml` temporaries and
+aliases, plus repo-external credential residues, are outside this scan.
+
+`doctor` scans for residues only while holding the same project state lock used
+by cooperative writers. It therefore uses no age heuristic: a live cooperative
+writer finishes or releases the lock before scanning proceeds. Recoverable
+current residues are errors, ambiguous current residues are errors, legacy
+private regular-file residues are manual-audit warnings, and structurally
+ambiguous legacy entries are errors. Non-cooperating same-account writers remain
+outside this guarantee.
 
 `acknowledged` means a directive was received. Resolution additionally requires
 implementation evidence against the selected baseline and verification by a

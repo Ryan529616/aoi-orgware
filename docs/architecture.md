@@ -74,13 +74,26 @@ closed on digest drift. Changing `state_dir` remains an explicit state migration
 ## Chief fencing
 
 The first initialization of a pristine project is the sole unauthenticated
-lifecycle write. Acquisition stages a high-entropy credential in a repo-external
-user store before atomically publishing authority. Every non-exempt project
-mutation then holds the exact project state lock, reloads `aoi.toml`, validates
-session/epoch/token/expiry, and only then enters its handler. Acquire/takeover
-increment the epoch; renew/release do not. Expired takeover uses expected-epoch
-CAS, and live takeover additionally requires an explicit force acknowledgement
-and audit reason.
+project-creation path. Acquisition stages a high-entropy credential in a
+repo-external user store before atomically publishing authority. Every
+non-exempt project mutation then holds the exact project state lock, reloads
+`aoi.toml`, validates session/epoch/token/expiry, and only then enters its
+handler. Acquire/takeover increment the epoch; renew/release do not. Expired
+takeover uses expected-epoch CAS, and live takeover additionally requires an
+explicit force acknowledgement and audit reason.
+
+Automatic Chief bootstrap has no publication-repair exception. It accepts only
+an existing `.state.lock` that is one private regular non-linked file containing
+exactly one NUL byte. After taking that platform lock, AOI revalidates the exact
+configuration binding and accepts either a complete layout or the exact
+existing-NUL interrupted-init prefix before publishing first-Chief authority.
+
+Missing or empty state locks, every state-lock alias, every root `aoi.toml`
+alias, and every other linked or ambiguous bootstrap object fail closed with
+zero automatic bootstrap mutation on POSIX and Windows. They require explicit
+offline/manual audit and recovery. `recover-temporaries` likewise requires the
+normal canonical NUL lock, and every state-tree residue deletion occurs only
+after an under-lock config reload and current-Chief validation.
 
 The outer command lock is reentrant only for the same thread and exact lock-file
 identity so existing transactional handlers can nest safely. A five-second
@@ -174,6 +187,87 @@ decisions.
   supported). Native Windows ACL equivalence is reported as unverified.
 - Chief secrets live outside the repository. POSIX validates owner-only
   directories/files and safe ancestors; native Windows uses CurrentUser DPAPI.
+  Process termination can leave credential temporaries, published-but-orphaned
+  credentials, or obsolete takeover/custom-root credentials. Stale tuples
+  cannot authorize current authority, but state-tree recovery does not remove
+  these secret-at-rest residues.
+
+## Crash consistency and recovery boundary
+
+Atomic publication uses an identifiable private temporary in the destination
+directory. The file is completed and fsynced before no-replace creation or
+replacement; POSIX then fsyncs the parent directory. Native Windows has no
+portable parent-directory fsync in the Python standard library.
+
+The a2 resilience suite contains a process-local observation hook rather than a
+production environment kill switch. A parent process can pause a worker after
+temporary fsync or after publication but before directory fsync, terminate it,
+and inspect the resulting bytes. The asserted single-file contract is that a
+kill before replacement leaves the complete old destination and one complete
+named temporary, while a kill after replacement leaves the complete new
+destination. Successful raw concurrent reads must contain a complete old or
+new JSON generation. This is atomic visibility, not seamless availability:
+`load_json` fails closed if it detects replacement-time identity drift, and a
+native-Windows reader may transiently fail on file sharing; callers may retry
+those bounded failures. Linux and Windows receipts remain release evidence, not
+an inference from the test design.
+
+The deterministic Chief, claim, and one-time packet-arm races pause workers at
+the actual state-lock acquisition boundary, rather than at a nearby test-only
+barrier. Passing local platform runs are development receipts only; the
+Linux/Windows CI release receipts remain pending.
+
+The state-lock bootstrap is deliberately non-constructive. POSIX `flock` and
+native-Windows `msvcrt` operate only on the already canonical private `nlink=1`
+NUL lock; AOI does not create a missing lock, upgrade an empty lock, or unlink
+an alias. The locked revalidation accepts a complete layout or the narrow
+existing-NUL interrupted prefix. Bounded exact pre-link state-lock temporaries
+may be inert members of that prefix, but they remain untouched until a later
+current-Chief `recover-temporaries` run.
+
+Checkpoint publication remains an ordered multi-file operation, not a
+transaction. The suite exercises a checkpoint published before task state as a
+detectable mismatch repaired by retrying the exact checkpoint command, and
+task state published before the index as a rebuildable stale index. Those cases
+do not establish recovery for every command or persistence boundary.
+
+`doctor` and `recover-temporaries` scan under the project state lock, so they do
+not classify an active cooperative writer's temporary by age. Recovery
+reloads `aoi.toml` after acquisition and refuses a changed digest, state root, or
+lock path before scanning. It preflights every selected entry, refuses all
+ordinary cleanup when any entry is ambiguous or legacy, revalidates filesystem
+identity before each unlink, and is retryable after termination during cleanup.
+There is no pre-authentication deletion exception: every state-tree residue
+deletion requires the current Chief. A linked state lock prevents the command
+from acquiring its lock and therefore requires offline/manual recovery. Any
+create alias at the established Chief authority path likewise fails authority
+validation and is left for manual audit and repair.
+
+This state-tree scan intentionally excludes every root `aoi.toml` temporary or
+alias and all repo-external Chief credential files. A root alias blocks normal
+loading and requires offline/manual recovery. A pre-link root temporary does not
+block the identical `init`, but remains manual residue for audit and cleanup.
+Credential residue cannot authenticate after its tuple becomes stale, but may
+still expose a secret at rest; automated credential garbage collection is an a2
+follow-up.
+
+Process termination does not simulate storage power loss, controller-cache
+loss, or filesystem-journal failure. POSIX directory fsync improves the intended
+durability ordering but is not power-loss evidence. Native Windows provides
+atomic visibility and flushed file contents, not POSIX-equivalent directory-
+entry durability. AOI therefore makes no power-loss-durability claim.
+
+### Future bootstrap protocol — not implemented
+
+A future C→S protocol would enforce the fixed lock order `stable root-scoped
+bootstrap lease → project state lock` for every cooperating AOI actor. An
+ownership ledger would record only inodes and empty directories created by that
+attempt. Rollback would run in reverse order only when exact identity and
+unchanged payload still match, and would never chmod or delete a pre-existing
+entry. This is a roadmap requirement, not current behavior or evidence. Even if
+implemented, it would govern cooperating AOI actors only; external same-user
+mutation, process-crash recovery, and power-loss durability would still require
+separate evidence and boundaries.
 
 ## Integrations
 
@@ -221,7 +315,7 @@ active receipt as required treats non-healthy/non-fresh status as a doctor,
 Steward-brief, and close-gate error. See
 [the codebase-memory contract](codebase-memory.md).
 
-## Known v0.2 boundaries
+## Known v0.3 alpha boundaries
 
 - One state tree may be written from POSIX/WSL or native Windows, not both.
   WSL support assumes its native filesystem or a mount that reliably exposes
@@ -243,10 +337,11 @@ Steward-brief, and close-gate error. See
   same OS account may be able to use that account's credential store; mutually
   untrusted writers require an external broker, sandbox, or identity boundary.
 - Initialization is resumable and non-clobbering, but its multiple filesystem
-  writes are not one atomic transaction. If `aoi.toml` was published before the
-  first lock, `chief-acquire` repairs only an exact structural prefix with no
-  authority, lifecycle payload, managed resource, or unknown entry. It then
-  acquires the first Chief; rerun the identical profile with that credential.
+  writes are not one atomic transaction. `chief-acquire` can resume only a
+  complete layout or exact interrupted prefix that already has the canonical
+  private `nlink=1` NUL state lock. Missing/empty/aliased locks and all root-config
+  aliases remain unchanged and require offline/manual recovery. After a valid
+  first-Chief acquisition, rerun the identical profile with that credential.
 - Capability tiers are policy labels, not calibrated cross-provider scores.
 - Project Codex model/reasoning settings and packet model tiers are requested
   routes, not observations. AOI has no authoritative per-spawn token/price
