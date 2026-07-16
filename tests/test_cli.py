@@ -3909,6 +3909,205 @@ class LifecycleTests(HarnessTestCase):
             "EDA lifecycle gate verified",
         )
 
+    def test_packet_completion_rejects_result_as_own_evidence(self) -> None:
+        self.init_task("evidence-gate")
+        self.cli(
+            "create-packet",
+            "--task",
+            "evidence-gate",
+            "--packet-id",
+            "review",
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Inspect source",
+            "--scope",
+            "Read-only inspection",
+            "--deliverable",
+            "Bounded result",
+            "--validation",
+            "Cross-check",
+        )
+        self.dispatch_packet(
+            "evidence-gate",
+            "review",
+            "agent-1",
+            "--actual-role",
+            "explorer",
+            "--actual-model-tier",
+            "standard",
+            "--routing-evidence",
+            "test dispatcher exposed exact custom role and tier",
+        )
+        own_result = (
+            self.root / ".aoi" / "tasks" / "evidence-gate" / "results" / "review.md"
+        )
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            "evidence-gate",
+            "--packet-id",
+            "review",
+            "--status",
+            "done",
+            "--summary",
+            "Source inspection complete",
+            "--evidence",
+            str(own_result),
+            ok=False,
+        )
+        self.assertIn("its own result file", rejected.stderr)
+        # A single external primary artifact reference (alongside the self-ref)
+        # satisfies the gate and stamps evidence_gate_version.
+        self.cli(
+            "packet-update",
+            "--task",
+            "evidence-gate",
+            "--packet-id",
+            "review",
+            "--status",
+            "done",
+            "--summary",
+            "Source inspection complete",
+            "--evidence",
+            str(own_result),
+            "--evidence",
+            "/runs/vcs/driver.log lines 12-88",
+        )
+        state = json.loads(
+            (self.root / ".aoi" / "tasks" / "evidence-gate" / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        packet = next(p for p in state["packets"] if p["packet_id"] == "review")
+        self.assertEqual(packet["evidence_gate_version"], 1)
+
+    def test_job_start_records_observed_launch_and_flags_retroactive(self) -> None:
+        self.init_task("job-lag")
+        receipt, receipt_sha = self.write_source_receipt("lag-receipt.json")
+        self.cli(
+            "claim",
+            "--task",
+            "job-lag",
+            "--token",
+            "job-lag-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "EDA-RUN",
+            "--lock",
+            "external:tree:/tmp/aoi-lag",
+            "--intent",
+            "bounded lag test",
+            "--validation",
+            "job gate",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+
+        def start(run_id: str, *extra: str, ok: bool = True):
+            work_root = f"/tmp/aoi-lag/{run_id}"
+            return self.cli(
+                "job-start",
+                "--task",
+                "job-lag",
+                "--run-id",
+                run_id,
+                "--host",
+                "eda",
+                "--tool",
+                "VCS",
+                "--work-root",
+                work_root,
+                "--status",
+                "queued",
+                "--log",
+                f"{work_root}/driver.log",
+                "--stop-condition",
+                "PASS or first fatal",
+                "--source-sha",
+                receipt_sha,
+                "--source-manifest",
+                str(receipt),
+                "--tool-path",
+                "/tools/vcs",
+                "--tool-version",
+                "VCS-test",
+                "--command",
+                "timeout 1m run.sh",
+                "--json",
+                *extra,
+                ok=ok,
+            )
+
+        def stop(run_id: str) -> None:
+            # Implicit single-execution allows one active chain; retire each job
+            # before starting the next so this stays a per-job timing test.
+            self.cli(
+                "job-update",
+                "--task",
+                "job-lag",
+                "--run-id",
+                run_id,
+                "--status",
+                "stopped",
+                "--evidence",
+                "isolated harness retired the queued job",
+                "--exit-code",
+                "1",
+            )
+
+        now = dt.datetime.now().astimezone()
+        observed_recent = (now - dt.timedelta(seconds=30)).isoformat()
+        observed_old = (now - dt.timedelta(minutes=10)).isoformat()
+        observed_future = (now + dt.timedelta(minutes=5)).isoformat()
+
+        recent = json.loads(
+            start("run-recent", "--observed-start-at", observed_recent).stdout
+        )
+        self.assertIn("observed_start_at", recent)
+        self.assertGreater(recent["registration_lag_seconds"], 0)
+        self.assertLess(recent["registration_lag_seconds"], 120)
+        self.assertNotIn("retroactive_reason", recent)
+        stop("run-recent")
+
+        missing_reason = start(
+            "run-old-noreason", "--observed-start-at", observed_old, ok=False
+        )
+        self.assertIn("--retroactive-reason", missing_reason.stderr)
+
+        old = json.loads(
+            start(
+                "run-old",
+                "--observed-start-at",
+                observed_old,
+                "--retroactive-reason",
+                "tmux launch physically preceded AOI job registration",
+            ).stdout
+        )
+        self.assertGreater(old["registration_lag_seconds"], 120)
+        self.assertEqual(
+            old["retroactive_reason"],
+            "tmux launch physically preceded AOI job registration",
+        )
+        stop("run-old")
+
+        future = start("run-future", "--observed-start-at", observed_future, ok=False)
+        self.assertIn("future", future.stderr)
+
+        legacy = json.loads(start("run-legacy").stdout)
+        self.assertIn("registered_at", legacy)
+        self.assertNotIn("registration_lag_seconds", legacy)
+        self.assertNotIn("observed_start_at", legacy)
+        stop("run-legacy")
+
+        summary = json.loads(
+            self.cli("status", "--task", "job-lag", "--json").stdout
+        )
+        self.assertGreater(summary["max_job_registration_lag_seconds"], 120)
+
     def test_legacy_import_quarantines_expired_active_and_conflicts(self) -> None:
         legacy = self.root / "LEGACY_CONTROL.md"
         original = (

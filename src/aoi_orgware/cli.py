@@ -324,6 +324,7 @@ from .harnesslib import (
     parse_legacy_table,
     parse_lock,
     parse_time,
+    parse_tz_aware_time,
     platform_capabilities,
     preflight_layout,
     paths_for_project,
@@ -4519,6 +4520,14 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 require_evidence_detail(item, "terminal packet evidence")
                 for item in args.evidence
             ]
+            if args.status in {"done", "failed"}:
+                gate_error = packet_integrity_impl.packet_evidence_self_reference_error(
+                    args.packet_id,
+                    terminal_evidence,
+                    task_dir(paths, args.task),
+                )
+                if gate_error:
+                    raise HarnessError(gate_error)
         elif args.summary or args.evidence:
             raise HarnessError("summary/evidence are accepted only for terminal packet status")
 
@@ -4597,6 +4606,8 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             packet["result_path"] = str(result)
             packet["result_sha256"] = sha256_file(result)
             packet["integrity_version"] = 1
+            if args.status in {"done", "failed"}:
+                packet["evidence_gate_version"] = 1
             packet["completed_at"] = now_iso()
         bump_task(state)
         write_task(paths, state)
@@ -4687,6 +4698,40 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         raise HarnessError("job-start must record status queued before any launch")
     tool_version = require_text(args.tool_version, "tool version")
     command = require_text(args.command, "command")
+    registered_at = now_iso()
+    observed_start_at: str | None = None
+    registration_lag_seconds: float | None = None
+    retroactive_reason: str | None = None
+    if args.observed_start_at:
+        observed_dt = parse_tz_aware_time(args.observed_start_at)
+        if observed_dt is None:
+            raise HarnessError(
+                "--observed-start-at must be a timezone-aware ISO-8601 timestamp"
+            )
+        registered_dt = parse_tz_aware_time(registered_at)
+        assert registered_dt is not None  # now_iso() is always tz-aware
+        registration_lag_seconds = (registered_dt - observed_dt).total_seconds()
+        lag_limit = job_integrity_impl.JOB_REGISTRATION_LAG_LIMIT_SECONDS
+        if registration_lag_seconds < 0:
+            raise HarnessError(
+                "--observed-start-at is in the future relative to job registration; "
+                "an observed launch cannot post-date its own registration"
+            )
+        if registration_lag_seconds > lag_limit and not (
+            args.retroactive_reason or ""
+        ).strip():
+            raise HarnessError(
+                f"a job registered more than {lag_limit}s after its observed "
+                "start is retroactive; supply --retroactive-reason to account "
+                "for the inversion"
+            )
+        observed_start_at = observed_dt.isoformat()
+        if args.retroactive_reason:
+            retroactive_reason = require_evidence_detail(
+                args.retroactive_reason, "retroactive reason"
+            )
+    elif args.retroactive_reason:
+        raise HarnessError("--retroactive-reason requires --observed-start-at")
     _, source_receipt_data = validate_source_receipt(
         source_manifest,
         source_sha,
@@ -4837,9 +4882,15 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "command_size_bytes": command_snapshot.stat().st_size,
             "success_exit_code": args.success_exit_code,
             "evidence": "queued before launch" if args.status == "queued" else "launch recorded",
+            "registered_at": registered_at,
             "started_at": now_iso(),
             "updated_at": now_iso(),
         }
+        if observed_start_at is not None:
+            job["observed_start_at"] = observed_start_at
+            job["registration_lag_seconds"] = registration_lag_seconds
+            if retroactive_reason is not None:
+                job["retroactive_reason"] = retroactive_reason
         state.setdefault("jobs", []).append(job)
         bump_task(state)
         write_task(paths, state)
