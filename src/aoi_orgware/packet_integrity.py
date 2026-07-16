@@ -52,6 +52,9 @@ from .state_lookup import _packet_by_id, execution_selection_by_id
 
 TERMINAL_PACKET_STATUSES = PACKET_STATUSES - ACTIVE_PACKET_STATUSES
 NATIVE_V5_PACKET_CONTRACT_MARKER = "- AOI dispatch schema origin: `native_v5`"
+HELPER_SPAWN_BUDGET_CONTRACT_PREFIX = "- AOI helper spawn budget:"
+HELPER_SPAWN_BUDGET_MAX = 8
+DISPATCH_WILDCARD_AGENT_TYPE = "*"
 HOOK_PROTOCOL_VERSION = "6"
 HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
@@ -182,6 +185,22 @@ def packet_contract_integrity_error(
             return f"packet {packet_id} contract lost its exact resource authority"
     elif resource_digest_lines or "## AOI resource authority" in contract_lines:
         return f"packet {packet_id} contract resource authority was removed from state"
+    helper_budget = packet.get("helper_spawn_budget", 0)
+    helper_budget_lines = [
+        line
+        for line in contract_lines
+        if line.startswith(HELPER_SPAWN_BUDGET_CONTRACT_PREFIX)
+    ]
+    if (
+        isinstance(helper_budget, int)
+        and not isinstance(helper_budget, bool)
+        and helper_budget > 0
+    ):
+        expected_helper_line = f"{HELPER_SPAWN_BUDGET_CONTRACT_PREFIX} `{helper_budget}`"
+        if helper_budget_lines != [expected_helper_line]:
+            return f"packet {packet_id} contract lost its helper spawn budget authority"
+    elif helper_budget_lines:
+        return f"packet {packet_id} helper spawn budget authority was removed from state"
     has_native_v5_marker = NATIVE_V5_PACKET_CONTRACT_MARKER in contract_lines
     dispatch_origin = packet.get("dispatch_schema_origin")
     if schema_version < 5 and (
@@ -532,6 +551,26 @@ def packet_integrity_errors(
             errors.append(f"packet {packet_id} read_only mode has mutation locks")
         if mode in {"bounded_mutation", "exact_command"} and not locks:
             errors.append(f"packet {packet_id} {mode} mode lacks mutation authority")
+        helper_budget = packet.get("helper_spawn_budget")
+        if helper_budget is not None:
+            if (
+                isinstance(helper_budget, bool)
+                or not isinstance(helper_budget, int)
+                or helper_budget < 0
+                or helper_budget > HELPER_SPAWN_BUDGET_MAX
+            ):
+                errors.append(f"packet {packet_id} has an invalid helper spawn budget")
+            elif helper_budget > 0 and not (
+                isinstance(packet.get("delegation_depth"), int)
+                and not isinstance(packet.get("delegation_depth"), bool)
+                and packet.get("delegation_depth") == 1
+            ):
+                errors.append(
+                    f"packet {packet_id} helper spawn budget requires a depth-one packet"
+                )
+        helper_spawns = packet.get("helper_spawns")
+        if helper_spawns is not None and not isinstance(helper_spawns, list):
+            errors.append(f"packet {packet_id} helper spawns record is malformed")
         contract_error = packet_contract_integrity_error(paths, state, packet)
         if contract_error:
             errors.append(contract_error)
@@ -687,8 +726,12 @@ def packet_integrity_errors(
                             != services.subagent_event_id(observation_payload)
                             or observation.get("parent_session_id")
                             != attempt.get("parent_session_id")
-                            or observation.get("agent_type")
-                            != attempt.get("expected_agent_type")
+                            or (
+                                observation.get("agent_type")
+                                != attempt.get("expected_agent_type")
+                                and attempt.get("expected_agent_type")
+                                != DISPATCH_WILDCARD_AGENT_TYPE
+                            )
                             or not HOOK_ID_RE.fullmatch(
                                 str(observation.get("parent_session_id", ""))
                             )
@@ -832,6 +875,12 @@ def subagent_incident_integrity_errors(
         if incident_id in seen:
             errors.append(f"duplicate spawn incident id {incident_id}")
         seen.add(incident_id)
+        live_arms = incident.get("live_arms")
+        if live_arms is not None and (
+            not isinstance(live_arms, list)
+            or not all(isinstance(item, dict) for item in live_arms)
+        ):
+            errors.append(f"spawn incident {incident_id} has a malformed live_arms snapshot")
         if (
             incident.get("kind") != "unmanaged_subagent_start"
             or incident.get("status") not in {"open", "accounted"}
@@ -851,6 +900,18 @@ def subagent_incident_integrity_errors(
                 not in {"no_material_work", "work_discarded", "manual_unverified"}
             ):
                 errors.append(f"accounted spawn incident {incident_id} lacks disposition")
+            elif resolution.get("disposition_kind") is not None and (
+                resolution.get("disposition_kind")
+                not in {
+                    "true_positive",
+                    "false_positive_guard",
+                    "benign_no_work",
+                    "unverified",
+                }
+            ):
+                errors.append(
+                    f"accounted spawn incident {incident_id} has an invalid disposition kind"
+                )
     return errors
 
 
