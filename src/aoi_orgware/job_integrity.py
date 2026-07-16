@@ -36,10 +36,18 @@ from .harnesslib import (
     HarnessPaths,
     load_json,
     now_iso,
+    parse_tz_aware_time,
     sha256_file,
     task_dir,
 )
 from .state_lookup import execution_selection_by_id
+
+
+# A job registered more than this many seconds after its observed physical launch
+# is retroactive: the ARISE ledger hid ~1-minute "tmux launch preceded AOI
+# registration" inversions because start time WAS registration time.  Beyond this
+# bound a reason must account for the gap.
+JOB_REGISTRATION_LAG_LIMIT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -160,6 +168,63 @@ def validate_source_receipt(
     return payload, source_data
 
 
+def _job_registration_lag_errors(job: dict[str, Any], run_id: str) -> list[str]:
+    """Validate observed-launch vs registration timing for jobs that record it.
+
+    Legacy jobs (no ``registered_at``/``observed_start_at``) validate exactly as
+    before.  When the fields are present the stamps must parse tz-aware, the
+    stored lag must recompute within a second, and any lag beyond the retroactive
+    bound must carry a reason so ledger-order inversions stop being invisible.
+    """
+
+    registered_raw = job.get("registered_at")
+    observed_raw = job.get("observed_start_at")
+    lag = job.get("registration_lag_seconds")
+    retroactive_reason = job.get("retroactive_reason")
+    if (
+        registered_raw is None
+        and observed_raw is None
+        and lag is None
+        and retroactive_reason is None
+    ):
+        return []
+    errors: list[str] = []
+    registered_dt = parse_tz_aware_time(str(registered_raw or ""))
+    if registered_dt is None:
+        errors.append(
+            f"job {run_id} registration time is missing or not timezone-aware"
+        )
+    if observed_raw is None:
+        if lag is not None or retroactive_reason is not None:
+            errors.append(
+                f"job {run_id} carries registration lag without an observed start"
+            )
+        return errors
+    observed_dt = parse_tz_aware_time(str(observed_raw))
+    if observed_dt is None:
+        errors.append(f"job {run_id} observed start is missing or not timezone-aware")
+    if not isinstance(lag, (int, float)) or isinstance(lag, bool):
+        errors.append(f"job {run_id} registration lag is not numeric")
+    if registered_dt is None or observed_dt is None or not isinstance(lag, (int, float)):
+        return errors
+    recomputed = (registered_dt - observed_dt).total_seconds()
+    if recomputed < 0:
+        errors.append(f"job {run_id} observed start post-dates its registration time")
+    if abs(recomputed - float(lag)) > 1.0:
+        errors.append(
+            f"job {run_id} registration lag does not match its recorded timestamps"
+        )
+    if (
+        recomputed > JOB_REGISTRATION_LAG_LIMIT_SECONDS
+        and not str(retroactive_reason or "").strip()
+    ):
+        errors.append(
+            f"job {run_id} registration lag exceeds "
+            f"{JOB_REGISTRATION_LAG_LIMIT_SECONDS}s without a retroactive reason"
+        )
+    return errors
+
+
 def job_integrity_errors(
     paths: HarnessPaths,
     state: dict[str, Any],
@@ -181,6 +246,7 @@ def job_integrity_errors(
             continue
         if job.get("integrity_version") != 1:
             errors.append(f"job {run_id} lacks integrity_version=1")
+        errors.extend(_job_registration_lag_errors(job, run_id))
         owner_packet_id = str(job.get("owner_packet_id", ""))
         if owner_packet_id:
             try:
@@ -425,11 +491,13 @@ def _job_launch_authority_errors(
 
 
 __all__ = [
+    "JOB_REGISTRATION_LAG_LIMIT_SECONDS",
     "JobIntegrityPolicy",
     "JobIntegrityServices",
     "ValidateSkillCanaryWorkUnitBinding",
     "_job_launch_authority_errors",
     "_job_launch_authority_record",
+    "_job_registration_lag_errors",
     "job_integrity_errors",
     "validate_source_receipt",
 ]
