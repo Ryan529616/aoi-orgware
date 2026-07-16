@@ -887,6 +887,30 @@ def parse_time(value: str | None) -> dt.datetime | None:
     return parsed
 
 
+def parse_tz_aware_time(value: str | None) -> dt.datetime | None:
+    """Parse an ISO-8601 timestamp, rejecting naive values instead of coercing.
+
+    Unlike :func:`parse_time`, this never appends a local zone to a naive
+    timestamp: a value without an explicit offset returns ``None`` so callers can
+    fail closed.  Observed-launch timestamps must carry their own zone.
+    """
+
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
 def is_expired(value: str | None) -> bool:
     parsed = parse_time(value)
     return parsed is not None and parsed < dt.datetime.now().astimezone()
@@ -4700,7 +4724,7 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
             and resolution.get("disposition_kind") == "false_positive_guard"
         ):
             false_positive_guard += 1
-    return {
+    summary: dict[str, Any] = {
         "task_id": state["task_id"],
         "profile": state.get("profile", "full"),
         "title": state.get("title"),
@@ -4778,3 +4802,12 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
             for packet in state.get("packets", [])
         ],
     }
+    job_registration_lags = [
+        job.get("registration_lag_seconds")
+        for job in state.get("jobs", [])
+        if isinstance(job.get("registration_lag_seconds"), (int, float))
+        and not isinstance(job.get("registration_lag_seconds"), bool)
+    ]
+    if job_registration_lags:
+        summary["max_job_registration_lag_seconds"] = max(job_registration_lags)
+    return summary

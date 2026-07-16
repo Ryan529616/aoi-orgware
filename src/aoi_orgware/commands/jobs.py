@@ -55,6 +55,8 @@ def register_job_commands(
     parser.add_argument("--tool-version", required=True)
     parser.add_argument("--command", required=True)
     parser.add_argument("--success-exit-code", type=int, default=0)
+    parser.add_argument("--observed-start-at")
+    parser.add_argument("--retroactive-reason")
     parser.add_argument("--lane-id")
     parser.add_argument("--execution-selection-id")
     parser.add_argument("--owner-packet-id")

@@ -203,6 +203,93 @@ class JobLaunchAuthorityErrorsTests(unittest.TestCase):
         )
 
 
+class JobRegistrationLagTests(unittest.TestCase):
+    """The ARISE ledger hid ~1-minute tmux-before-registration inversions because
+    the recorded start time WAS the registration time."""
+
+    REGISTERED = "2026-07-16T10:02:00+00:00"
+
+    def _job(self, **overrides: object) -> dict:
+        job = {"run_id": "run-1"}
+        job.update(overrides)
+        return job
+
+    def test_legacy_job_without_fields_is_untouched(self) -> None:
+        self.assertEqual(
+            ji._job_registration_lag_errors(self._job(), "run-1"), []
+        )
+
+    def test_observed_launch_within_bound_validates(self) -> None:
+        job = self._job(
+            registered_at=self.REGISTERED,
+            observed_start_at="2026-07-16T10:01:30+00:00",
+            registration_lag_seconds=30.0,
+        )
+        self.assertEqual(ji._job_registration_lag_errors(job, "run-1"), [])
+
+    def test_lag_recompute_mismatch_is_detected(self) -> None:
+        job = self._job(
+            registered_at=self.REGISTERED,
+            observed_start_at="2026-07-16T10:01:30+00:00",
+            registration_lag_seconds=5.0,
+        )
+        errors = ji._job_registration_lag_errors(job, "run-1")
+        self.assertTrue(any("does not match" in item for item in errors), errors)
+
+    def test_naive_observed_start_is_rejected(self) -> None:
+        job = self._job(
+            registered_at=self.REGISTERED,
+            observed_start_at="2026-07-16T10:01:30",
+            registration_lag_seconds=30.0,
+        )
+        errors = ji._job_registration_lag_errors(job, "run-1")
+        self.assertTrue(any("not timezone-aware" in item for item in errors), errors)
+
+    def test_retroactive_lag_requires_reason(self) -> None:
+        job = self._job(
+            registered_at="2026-07-16T10:05:00+00:00",
+            observed_start_at="2026-07-16T10:00:00+00:00",
+            registration_lag_seconds=300.0,
+        )
+        errors = ji._job_registration_lag_errors(job, "run-1")
+        self.assertTrue(
+            any(
+                f"{ji.JOB_REGISTRATION_LAG_LIMIT_SECONDS}s without a retroactive reason"
+                in item
+                for item in errors
+            ),
+            errors,
+        )
+
+    def test_retroactive_lag_with_reason_validates(self) -> None:
+        job = self._job(
+            registered_at="2026-07-16T10:05:00+00:00",
+            observed_start_at="2026-07-16T10:00:00+00:00",
+            registration_lag_seconds=300.0,
+            retroactive_reason="tmux launch preceded AOI registration by 5 minutes",
+        )
+        self.assertEqual(ji._job_registration_lag_errors(job, "run-1"), [])
+
+    def test_observed_after_registration_is_rejected(self) -> None:
+        job = self._job(
+            registered_at="2026-07-16T10:00:00+00:00",
+            observed_start_at="2026-07-16T10:05:00+00:00",
+            registration_lag_seconds=-300.0,
+        )
+        errors = ji._job_registration_lag_errors(job, "run-1")
+        self.assertTrue(any("post-dates" in item for item in errors), errors)
+
+    def test_lag_without_observed_start_is_rejected(self) -> None:
+        job = self._job(
+            registered_at=self.REGISTERED,
+            registration_lag_seconds=30.0,
+        )
+        errors = ji._job_registration_lag_errors(job, "run-1")
+        self.assertTrue(
+            any("without an observed start" in item for item in errors), errors
+        )
+
+
 class ImportBoundaryTests(unittest.TestCase):
     def test_module_does_not_depend_on_monolithic_cli(self) -> None:
         path = SRC / "aoi_orgware" / "job_integrity.py"
