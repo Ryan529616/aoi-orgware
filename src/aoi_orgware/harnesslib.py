@@ -4688,6 +4688,18 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
         if lane.get("status") in {"active", "waiting", "recovering", "blocked"}
     ]
     engaged_lanes.sort(key=lambda item: str(item.get("lane_id", "")))
+    subagent_incidents = state.get("subagent_incidents", [])
+    incidents_by_reason: dict[str, int] = {}
+    false_positive_guard = 0
+    for incident in subagent_incidents:
+        reason = str(incident.get("reason_code", ""))
+        incidents_by_reason[reason] = incidents_by_reason.get(reason, 0) + 1
+        resolution = incident.get("resolution")
+        if (
+            isinstance(resolution, dict)
+            and resolution.get("disposition_kind") == "false_positive_guard"
+        ):
+            false_positive_guard += 1
     return {
         "task_id": state["task_id"],
         "profile": state.get("profile", "full"),
@@ -4743,6 +4755,11 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
                 for item in state.get("subagent_incidents", [])
             ),
             "execution_brief_count": len(state.get("execution_briefs", [])),
+        },
+        "subagent_guard": {
+            "incidents": len(subagent_incidents),
+            "by_reason": incidents_by_reason,
+            "false_positive_guard": false_positive_guard,
         },
         "packets": [
             {

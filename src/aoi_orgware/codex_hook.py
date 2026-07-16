@@ -205,7 +205,26 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
 
     outcome = observe_subagent_start(paths, payload)
     status = outcome.get("status")
-    if status == "authorized":
+    if status == "authorized" and outcome.get("resumed"):
+        context = (
+            f"AOI observed a resumed dispatch of an existing packet thread for "
+            f"{paths.project.name!r}: task={outcome.get('task_id')}, "
+            f"packet={outcome.get('packet_id')}, contract={outcome.get('packet_path')}. "
+            f"This is the same packet agent resuming (Codex transport "
+            f"agent_type={agent_type}), not a fresh dispatch: stay inside the original "
+            f"packet contract scope and do not edit {paths.harness}."
+        )
+    elif status == "authorized" and outcome.get("helper"):
+        remaining = outcome.get("remaining_helper_budget")
+        context = (
+            f"AOI authorized a budgeted depth-two helper under parent packet "
+            f"{outcome.get('packet_id')} for {paths.project.name!r} "
+            f"(remaining helper budget={remaining}). This is bounded read-only support: "
+            "your output is the parent agent's working material, NOT independent packet "
+            f"evidence. Do not mutate AOI state under {paths.harness}, do not spawn "
+            "further sub-agents, and report a bounded conclusion to the parent agent."
+        )
+    elif status == "authorized":
         context = (
             f"AOI observed a valid pre-armed dispatch for {paths.project.name!r}: "
             f"task={outcome.get('task_id')}, packet={outcome.get('packet_id')}, "
