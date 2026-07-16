@@ -155,6 +155,24 @@ def require_evidence_detail(value: str, label: str) -> str:
     return detail
 
 
+LANE_CLOSURE_KINDS = ("completed_work", "no_work", "aborted", "superseded")
+
+
+def _lane_packet_terminal_stats(packets: list[dict[str, Any]]) -> dict[str, Any]:
+    by_status: dict[str, int] = {}
+    by_task_type: dict[str, int] = {}
+    for packet in packets:
+        status = str(packet.get("status", ""))
+        task_type = str(packet.get("task_type", ""))
+        by_status[status] = by_status.get(status, 0) + 1
+        by_task_type[task_type] = by_task_type.get(task_type, 0) + 1
+    return {
+        "total": len(packets),
+        "by_status": dict(sorted(by_status.items())),
+        "by_task_type": dict(sorted(by_task_type.items())),
+    }
+
+
 def cmd_lane_set_status(
     args: argparse.Namespace, paths: HarnessPaths, *, services: LanesCmdServices
 ) -> int:
@@ -210,20 +228,49 @@ def cmd_lane_set_status(
                 for review in state.get("capacity_reviews", [])
             ):
                 raise HarnessError("cannot park Capacity Planning with an active review")
+        closure_kind = args.closure_kind
+        terminal_stats: dict[str, Any] | None = None
+        if args.status == "done":
+            if not closure_kind:
+                raise HarnessError("closing a lane to done requires --closure-kind")
+            owned_packets = [
+                packet
+                for packet in state.get("packets", [])
+                if packet.get("lane_id") == lane["lane_id"]
+            ]
+            done_packet_ids = sorted(
+                str(packet.get("packet_id"))
+                for packet in owned_packets
+                if packet.get("status") == "done"
+            )
+            if closure_kind == "no_work" and done_packet_ids:
+                raise HarnessError(
+                    "no_work lane closure contradicts done packets: "
+                    + ", ".join(done_packet_ids)
+                )
+            if closure_kind == "completed_work" and not done_packet_ids:
+                raise HarnessError(
+                    "completed_work lane closure requires at least one done owned packet"
+                )
+            terminal_stats = _lane_packet_terminal_stats(owned_packets)
+        elif closure_kind is not None:
+            raise HarnessError("--closure-kind applies only when closing a lane to done")
         recorded = now_iso()
         old_status = lane["status"]
         lane["status"] = args.status
         lane["next_action"] = require_text(args.next_action, "lane next action")
         lane["status_updated_at"] = recorded
-        lane.setdefault("status_events", []).append(
-            {
-                "old_status": old_status,
-                "new_status": args.status,
-                "root_session_id": session_id,
-                "reason": require_evidence_detail(args.reason, "lane status reason"),
-                "recorded_at": recorded,
-            }
-        )
+        status_event = {
+            "old_status": old_status,
+            "new_status": args.status,
+            "root_session_id": session_id,
+            "reason": require_evidence_detail(args.reason, "lane status reason"),
+            "recorded_at": recorded,
+        }
+        if terminal_stats is not None:
+            status_event["closure_kind"] = closure_kind
+            status_event["packet_terminal_stats"] = terminal_stats
+        lane.setdefault("status_events", []).append(status_event)
         bump_task(state)
         write_task(paths, state)
         write_index(paths)
@@ -504,6 +551,7 @@ def register_lane_commands(
     parser.add_argument("--status", choices=sorted(vocab.lane_statuses), required=True)
     parser.add_argument("--next-action", required=True)
     parser.add_argument("--reason", required=True)
+    parser.add_argument("--closure-kind", choices=list(LANE_CLOSURE_KINDS))
     parser.add_argument("--session-id", required=True)
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["lane_set_status"])
