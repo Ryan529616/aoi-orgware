@@ -2372,6 +2372,85 @@ class LockTests(HarnessTestCase):
             "rtl/adfp/tests:test_dense_weight_cache.py", rejected.stderr
         )
 
+    def test_persisted_malformed_lock_degrades_instead_of_bricking_reads(self) -> None:
+        # Tightened admission rules must not make a pre-existing state tree
+        # unreadable: ARISE's claims/archive really contains the colon-typo
+        # lock, and one such record previously aborted status/doctor entirely.
+        self.init_task("legacy-colon")
+        typo_lock = "repo:file:rtl/adfp/tests:test_dense_weight_cache.py"
+        claim = {
+            "schema_version": 1,
+            "legacy": False,
+            "source": "structured",
+            "token": "legacy-colon-claim",
+            "task_id": "legacy-colon",
+            "owner": "codex-root",
+            "kind": "RTL",
+            "locks": [typo_lock],
+            "intent": "reproduce the ARISE archive record",
+            "validation": "read paths must degrade",
+            "status": "released",
+            "created_at": "2026-07-15T07:16:46+08:00",
+            "updated_at": "2026-07-16T13:54:28+08:00",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "worktree": str(self.root),
+            "baselines": [{"lock": typo_lock, "exists": False, "sha256": None}],
+        }
+        archive = self.root / ".aoi" / "claims" / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / "legacy-colon-claim.json").write_text(
+            json.dumps(claim, indent=1), encoding="utf-8"
+        )
+        status = json.loads(self.cli("status", "--json").stdout)
+        loaded = [
+            item
+            for item in status["structured_claims"]
+            if item["token"] == "legacy-colon-claim"
+        ]
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["locks"], [])
+
+        def run_doctor() -> tuple[int, dict]:
+            result = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
+                cwd=self.root,
+                env=self.env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            return result.returncode, json.loads(result.stdout)
+
+        returncode, doctor = run_doctor()
+        self.assertTrue(
+            any(
+                "malformed lock excluded from mutual exclusion" in warning
+                and "legacy-colon-claim" in warning
+                for warning in doctor["warnings"]
+            ),
+            doctor["warnings"],
+        )
+        # A still-reserving claim with a malformed lock is the live fail-open
+        # hazard and must be a doctor ERROR, not a warning.
+        claim["status"] = "active"
+        claim["token"] = "legacy-colon-active"
+        active_dir = self.root / ".aoi" / "claims" / "active"
+        active_dir.mkdir(parents=True, exist_ok=True)
+        (active_dir / "legacy-colon-active.json").write_text(
+            json.dumps(claim, indent=1), encoding="utf-8"
+        )
+        returncode, doctor = run_doctor()
+        self.assertEqual(returncode, 1, doctor)
+        self.assertTrue(
+            any(
+                "malformed lock excluded from mutual exclusion" in error
+                and "legacy-colon-active" in error
+                for error in doctor["errors"]
+            ),
+            doctor["errors"],
+        )
+
     def test_host_lock_drive_colon_allowed_but_second_colon_rejected(self) -> None:
         self.assertEqual(
             h.normalize_lock("host:file:C:/Users/x/file.py"),

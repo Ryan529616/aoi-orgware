@@ -3334,7 +3334,21 @@ def load_claim_file(path: Path) -> dict[str, Any]:
     locks = claim.get("locks", [])
     if not isinstance(locks, list):
         raise HarnessError(f"claim locks must be a list: {path}")
-    claim["locks"] = [normalize_lock(str(item)) for item in locks]
+    # Lock admission rules may tighten between releases (e.g. the ':' typo
+    # class). A persisted claim that predates a tightened rule must still
+    # LOAD, or one malformed archive entry bricks status/doctor for the whole
+    # project. The malformed lock never matched any other lock (that is the
+    # defect), so it is excluded from overlap math and kept for audit.
+    normalized: list[str] = []
+    malformed: list[dict[str, str]] = []
+    for item in locks:
+        try:
+            normalized.append(normalize_lock(str(item)))
+        except HarnessError as exc:
+            malformed.append({"lock": str(item), "error": str(exc)})
+    claim["locks"] = normalized
+    if malformed:
+        claim["malformed_locks"] = malformed
     return claim
 
 

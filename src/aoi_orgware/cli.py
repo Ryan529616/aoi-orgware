@@ -5760,6 +5760,17 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             claim.get("expires_at")
         ):
             warnings.append(f"expired but still reserving: {token}")
+        for item in claim.get("malformed_locks", []):
+            message = (
+                f"claim {token} carries a malformed lock excluded from "
+                f"mutual exclusion: {item.get('lock')} ({item.get('error')})"
+            )
+            if claim.get("status") in RESERVING_CLAIM_STATUSES:
+                # The reservation never actually covered this path (fail-open
+                # defect class); release and re-acquire the corrected lock.
+                errors.append(message)
+            else:
+                warnings.append(message)
         if claim.get("legacy") and claim.get("scope_parse_warnings"):
             warnings.append(f"legacy scope needs audit: {token}")
         try:
