@@ -22,6 +22,8 @@ from __future__ import annotations
 import ast
 import dataclasses
 import functools
+import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -36,6 +38,7 @@ sys.path.insert(0, str(SRC))
 
 from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware.commands import lanes as lane_cmds  # noqa: E402
+from tests.harness_case import HarnessTestCase  # noqa: E402
 
 
 class ImportBoundaryTests(unittest.TestCase):
@@ -172,6 +175,332 @@ class MutableVocabLateBindingSentinelTests(unittest.TestCase):
         with mock.patch.object(cli_impl, "LANE_KINDS", sentinel):
             self.assertIs(services.lane_kinds(), sentinel)
             self.assertIsNot(build_time_snapshot, sentinel)
+
+
+class LaneClosureConsistencyTests(HarnessTestCase):
+    """Terminal lane closure records derived packet stats and refuses a
+    closure kind that contradicts the lane's own packet ledger.
+
+    Guards the ARISE audit defect where lane ``rtl`` was closed with the
+    narrative "No RTL implementation was authorized" while it owned two
+    ``rtl_implementation`` done packets and a ``...-vcs-v1..v7`` series: free
+    text must not overwrite what the ledger shows.
+    """
+
+    def git_commit(self, name: str) -> str:
+        marker = self.root / f"authority-{name}.txt"
+        marker.write_text(f"{name}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", marker.name], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", f"authority {name}"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+    def task_state(self, task_id: str) -> dict:
+        return json.loads(
+            (self.root / ".aoi" / "tasks" / task_id / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def lane_state(self, task_id: str, lane_id: str) -> dict:
+        return next(
+            lane
+            for lane in self.task_state(task_id)["lanes"]
+            if lane["lane_id"] == lane_id
+        )
+
+    def create_rtl_lane(self, task_id: str, commit: str, lane_id: str = "rtl") -> None:
+        self.cli(
+            "lane-create",
+            "--task",
+            task_id,
+            "--lane-id",
+            lane_id,
+            "--kind",
+            "implementation",
+            "--status",
+            "active",
+            "--owner",
+            f"{lane_id}-agent",
+            "--role",
+            "implementation_specialist",
+            "--authority-commit",
+            commit,
+            "--contract-version",
+            "cv1",
+            "--generator-version",
+            "gv1",
+            "--adapter-version",
+            "av1",
+            "--next-action",
+            f"Advance {lane_id} implementation independently",
+        )
+
+    def create_lane_packet(
+        self, task_id: str, packet_id: str, lane_id: str, task_type: str
+    ) -> None:
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--agent-role",
+            "implementation_specialist",
+            "--model-tier",
+            cli_impl.ROLE_TIER_MAP["implementation_specialist"],
+            "--objective",
+            f"Implement the bounded {lane_id} unit tracked by {packet_id}",
+            "--scope",
+            "One bounded specialist implementation under the lane authority",
+            "--deliverable",
+            "One committed implementation with exact evidence",
+            "--validation",
+            "The Chief checks the result against the lane authority",
+            "--lane-id",
+            lane_id,
+            "--task-type",
+            task_type,
+        )
+
+    def drive_packet_done(self, task_id: str, packet_id: str) -> None:
+        self.dispatch_packet(task_id, packet_id, f"/root/{packet_id}")
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "done",
+            "--summary",
+            f"Completed the bounded {packet_id} implementation under its lane",
+            "--evidence",
+            f"The canonical result for {packet_id} is bound to the lane authority",
+        )
+
+    def cancel_packet(self, task_id: str, packet_id: str) -> None:
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "cancelled",
+            "--summary",
+            f"The {packet_id} packet was cancelled without material work",
+        )
+
+    def close_lane(
+        self,
+        task_id: str,
+        lane_id: str,
+        closure_kind: str,
+        *,
+        ok: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        lane = self.lane_state(task_id, lane_id)
+        return self.cli(
+            "lane-set-status",
+            "--task",
+            task_id,
+            "--lane-id",
+            lane_id,
+            "--expected-revision",
+            str(lane["revision"]),
+            "--expected-status",
+            str(lane["status"]),
+            "--status",
+            "done",
+            "--closure-kind",
+            closure_kind,
+            "--next-action",
+            f"No further specialist work remains in {lane_id}",
+            "--reason",
+            "The lane owns no active packets or jobs and is terminal",
+            "--session-id",
+            f"chief-{task_id}",
+            ok=ok,
+        )
+
+    def test_no_work_closure_contradicting_done_packet_is_rejected(self) -> None:
+        # Exact ARISE shape: no_work narrative over a lane that owns a done packet.
+        task_id = "lane-close-nowork"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        self.create_lane_packet(task_id, "rtl-impl-1", "rtl", "rtl_implementation")
+        self.drive_packet_done(task_id, "rtl-impl-1")
+        rejected = self.close_lane(task_id, "rtl", "no_work", ok=False)
+        self.assertIn("no_work lane closure contradicts done packets", rejected.stderr)
+        self.assertIn("rtl-impl-1", rejected.stderr)
+        # The lane stays open because the contradictory close was refused.
+        self.assertEqual(self.lane_state(task_id, "rtl")["status"], "active")
+
+    def test_completed_work_closure_records_derived_packet_stats(self) -> None:
+        task_id = "lane-close-completed"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        self.create_lane_packet(task_id, "rtl-impl-1", "rtl", "rtl_implementation")
+        self.create_lane_packet(task_id, "rtl-vcs-1", "rtl", "rtl_vcs")
+        self.create_lane_packet(task_id, "rtl-vcs-2", "rtl", "rtl_vcs")
+        self.drive_packet_done(task_id, "rtl-impl-1")
+        self.drive_packet_done(task_id, "rtl-vcs-1")
+        self.cancel_packet(task_id, "rtl-vcs-2")
+        self.close_lane(task_id, "rtl", "completed_work")
+        lane = self.lane_state(task_id, "rtl")
+        self.assertEqual(lane["status"], "done")
+        event = lane["status_events"][-1]
+        self.assertEqual(event["new_status"], "done")
+        self.assertEqual(event["closure_kind"], "completed_work")
+        self.assertEqual(
+            event["packet_terminal_stats"],
+            {
+                "total": 3,
+                "by_status": {"cancelled": 1, "done": 2},
+                "by_task_type": {"rtl_implementation": 1, "rtl_vcs": 2},
+            },
+        )
+
+    def test_completed_work_closure_without_a_done_packet_is_rejected(self) -> None:
+        task_id = "lane-close-completed-empty"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        self.create_lane_packet(task_id, "rtl-vcs-1", "rtl", "rtl_vcs")
+        self.cancel_packet(task_id, "rtl-vcs-1")
+        rejected = self.close_lane(task_id, "rtl", "completed_work", ok=False)
+        self.assertIn(
+            "completed_work lane closure requires at least one done owned packet",
+            rejected.stderr,
+        )
+        self.assertEqual(self.lane_state(task_id, "rtl")["status"], "active")
+
+    def test_aborted_closure_over_mixed_packets_is_allowed_and_records_stats(
+        self,
+    ) -> None:
+        task_id = "lane-close-aborted"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        self.create_lane_packet(task_id, "rtl-impl-1", "rtl", "rtl_implementation")
+        self.create_lane_packet(task_id, "rtl-vcs-1", "rtl", "rtl_vcs")
+        self.drive_packet_done(task_id, "rtl-impl-1")
+        self.cancel_packet(task_id, "rtl-vcs-1")
+        self.close_lane(task_id, "rtl", "aborted")
+        lane = self.lane_state(task_id, "rtl")
+        self.assertEqual(lane["status"], "done")
+        event = lane["status_events"][-1]
+        self.assertEqual(event["closure_kind"], "aborted")
+        self.assertEqual(
+            event["packet_terminal_stats"],
+            {
+                "total": 2,
+                "by_status": {"cancelled": 1, "done": 1},
+                "by_task_type": {"rtl_implementation": 1, "rtl_vcs": 1},
+            },
+        )
+
+    def test_closing_a_lane_to_done_requires_closure_kind(self) -> None:
+        task_id = "lane-close-missing-kind"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        lane = self.lane_state(task_id, "rtl")
+        rejected = self.cli(
+            "lane-set-status",
+            "--task",
+            task_id,
+            "--lane-id",
+            "rtl",
+            "--expected-revision",
+            str(lane["revision"]),
+            "--expected-status",
+            str(lane["status"]),
+            "--status",
+            "done",
+            "--next-action",
+            "No further specialist work remains in rtl",
+            "--reason",
+            "The lane owns no active packets or jobs and is terminal",
+            "--session-id",
+            f"chief-{task_id}",
+            ok=False,
+        )
+        self.assertIn("closing a lane to done requires --closure-kind", rejected.stderr)
+
+    def test_closure_kind_rejects_an_invalid_choice_at_argparse(self) -> None:
+        task_id = "lane-close-bad-kind"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        lane = self.lane_state(task_id, "rtl")
+        rejected = self.cli(
+            "lane-set-status",
+            "--task",
+            task_id,
+            "--lane-id",
+            "rtl",
+            "--expected-revision",
+            str(lane["revision"]),
+            "--expected-status",
+            str(lane["status"]),
+            "--status",
+            "done",
+            "--closure-kind",
+            "no_such_kind",
+            "--next-action",
+            "No further specialist work remains in rtl",
+            "--reason",
+            "The lane owns no active packets or jobs and is terminal",
+            "--session-id",
+            f"chief-{task_id}",
+            ok=False,
+        )
+        self.assertIn("--closure-kind", rejected.stderr)
+
+    def test_closure_kind_is_rejected_on_a_non_closing_transition(self) -> None:
+        task_id = "lane-close-nonterminal"
+        self.init_task(task_id, session_id=f"chief-{task_id}")
+        commit = self.git_commit(task_id)
+        self.create_rtl_lane(task_id, commit)
+        lane = self.lane_state(task_id, "rtl")
+        rejected = self.cli(
+            "lane-set-status",
+            "--task",
+            task_id,
+            "--lane-id",
+            "rtl",
+            "--expected-revision",
+            str(lane["revision"]),
+            "--expected-status",
+            str(lane["status"]),
+            "--status",
+            "standby",
+            "--closure-kind",
+            "completed_work",
+            "--next-action",
+            "Hold rtl until the next authorized phase",
+            "--reason",
+            "The lane is paused with no active packets or jobs",
+            "--session-id",
+            f"chief-{task_id}",
+            ok=False,
+        )
+        self.assertIn(
+            "--closure-kind applies only when closing a lane to done", rejected.stderr
+        )
 
 
 if __name__ == "__main__":
