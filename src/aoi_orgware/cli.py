@@ -402,6 +402,7 @@ ROLE_TIER_MAP = {
 TERMINAL_PACKET_STATUSES = PACKET_STATUSES - ACTIVE_PACKET_STATUSES
 EXECUTING_PACKET_STATUSES = {"armed", "dispatched"}
 NATIVE_V5_PACKET_CONTRACT_MARKER = "- AOI dispatch schema origin: `native_v5`"
+HELPER_SPAWN_BUDGET_CONTRACT_PREFIX = "- AOI helper spawn budget:"
 VERIFICATION_CATEGORIES = {
     "static_check",
     "unit_test",
@@ -430,6 +431,7 @@ RECEIPT_COMPONENTS = ("source", "runner", "config", "dependencies", "other")
 REQUIRED_RECEIPT_COMPONENTS = ("source", "runner")
 HOOK_PROTOCOL_VERSION = "6"
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
+HELPER_SPAWN_BUDGET_MAX = 8
 HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
 ROOT_SESSION_MAPPING_KIND = "root"
 SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
@@ -3542,9 +3544,18 @@ def _expire_dispatch_arms(
 
 
 def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    expected_agent_type = _validate_hook_identity(
-        args.expected_agent_type, "expected Codex transport agent type"
-    )
+    if bool(args.any_agent_type) == bool(args.expected_agent_type):
+        raise HarnessError(
+            "packet arm requires exactly one of --expected-agent-type or --any-agent-type"
+        )
+    if args.any_agent_type:
+        # The wildcard sentinel is a deliberate non-identity value; it owns the
+        # whole parent slot and bypasses the transport-id regex on purpose.
+        expected_agent_type = dispatch_protocol_impl.WILDCARD_AGENT_TYPE
+    else:
+        expected_agent_type = _validate_hook_identity(
+            args.expected_agent_type, "expected Codex transport agent type"
+        )
     expires_at = parse_time(args.expires_at)
     current = dt.datetime.now().astimezone()
     if expires_at is None or expires_at <= current:
@@ -3586,14 +3597,22 @@ def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 raise HarnessError(
                     "depth-two packet arm parent session must equal its dispatched parent agent id"
                 )
+        wildcard = dispatch_protocol_impl.WILDCARD_AGENT_TYPE
         collisions: list[str] = []
         for other in state.get("packets", []):
             if other.get("status") != "armed":
                 continue
             attempt = _active_dispatch_attempt(other)
+            if attempt.get("parent_session_id") != parent_session_id:
+                continue
+            other_type = attempt.get("expected_agent_type")
+            # A wildcard on either side owns the whole parent slot, so it
+            # collides with any armed type; two exact types collide only when
+            # equal. This preserves the exactly-one-candidate invariant.
             if (
-                attempt.get("parent_session_id") == parent_session_id
-                and attempt.get("expected_agent_type") == expected_agent_type
+                expected_agent_type == wildcard
+                or other_type == wildcard
+                or other_type == expected_agent_type
             ):
                 collisions.append(str(other.get("packet_id", "")))
         if collisions:
@@ -3779,9 +3798,10 @@ def _validate_observed_arm(
     transport_agent_type: str,
     current: dt.datetime,
 ) -> None:
-    if (
-        attempt.get("parent_session_id") != parent_session_id
-        or attempt.get("expected_agent_type") != transport_agent_type
+    if attempt.get("parent_session_id") != parent_session_id or not (
+        dispatch_protocol_impl._expected_type_matches(
+            attempt.get("expected_agent_type"), transport_agent_type
+        )
     ):
         raise HarnessError("packet arm no longer matches the observed parent/type")
     _validate_current_dispatch_arm(
@@ -3852,6 +3872,19 @@ def observe_claude_subagent_start(
     )
 
 
+def validate_claude_helper_slot(
+    paths: HarnessPaths, *, parent_session_id: str
+) -> dict[str, Any]:
+    """Read-only helper-budget check for Claude's depth-two pre-spawn gate."""
+
+    return dispatch_protocol_impl.helper_budget_slot(
+        paths,
+        parent_session_id=parent_session_id,
+        policy=_claude_dispatch_protocol_policy(),
+        services=_dispatch_protocol_services(),
+    )
+
+
 def cmd_subagent_incident_account(
     args: argparse.Namespace, paths: HarnessPaths
 ) -> int:
@@ -3870,7 +3903,7 @@ def cmd_subagent_incident_account(
         if incident.get("status") != "open":
             raise HarnessError("only an open spawn incident can be accounted")
         incident["status"] = "accounted"
-        incident["resolution"] = {
+        resolution = {
             "disposition": args.disposition,
             "reason": require_evidence_detail(
                 args.reason, "spawn incident accounting reason"
@@ -3881,6 +3914,11 @@ def cmd_subagent_incident_account(
             "root_session_id": session_id,
             "recorded_at": now_iso(),
         }
+        if args.disposition_kind:
+            # Machine-readable guard-outcome tag alongside the free-text
+            # disposition; legacy resolutions without it stay valid.
+            resolution["disposition_kind"] = args.disposition_kind
+        incident["resolution"] = resolution
         bump_task(state)
         write_task(paths, state)
         write_index(paths)
@@ -3949,6 +3987,15 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             )
         if CAPABILITY_TIER_MAP.get(args.capability_tier) != args.model_tier:
             raise HarnessError("packet model tier differs from requested capability tier")
+    helper_spawn_budget = int(args.helper_spawn_budget or 0)
+    if helper_spawn_budget < 0 or helper_spawn_budget > HELPER_SPAWN_BUDGET_MAX:
+        raise HarnessError(
+            f"--helper-spawn-budget must be between 0 and {HELPER_SPAWN_BUDGET_MAX}"
+        )
+    if helper_spawn_budget and args.delegation_depth != 1:
+        raise HarnessError("only a depth-one packet may carry a helper spawn budget")
+    if helper_spawn_budget and synthesis_selection_id:
+        raise HarnessError("Steward synthesis packets may not carry a helper spawn budget")
     packet_locks = list(dict.fromkeys(normalize_lock(item) for item in args.lock))
     if args.packet_mode == "read_only" and packet_locks:
         raise HarnessError("read_only packet may not request mutation locks")
@@ -4285,6 +4332,10 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             },
         )
         text += f"\n## AOI dispatch authority\n\n{NATIVE_V5_PACKET_CONTRACT_MARKER}\n"
+        if helper_spawn_budget:
+            text += (
+                f"{HELPER_SPAWN_BUDGET_CONTRACT_PREFIX} `{helper_spawn_budget}`\n"
+            )
         if resource_envelope_sha256:
             text += (
                 "\n## AOI resource authority\n\n"
@@ -4356,6 +4407,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "packet_mode": args.packet_mode,
                 "task_type": task_type,
                 "delegation_depth": args.delegation_depth,
+                "helper_spawn_budget": helper_spawn_budget,
                 "parent_packet_id": args.parent_packet_id or "",
                 "requested_capability_tier": args.capability_tier or "",
                 "capacity_decision_id": args.capacity_decision_id or "",

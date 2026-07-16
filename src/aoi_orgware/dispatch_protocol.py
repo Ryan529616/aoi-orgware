@@ -30,6 +30,28 @@ from .harnesslib import (
 )
 
 
+# A wildcard arm owns its parent-session slot for any observed transport type.
+# It is a deliberate sentinel that never matches the transport-id regex, so every
+# match and validation site accepts it through an explicit branch rather than by
+# widening ``hook_id_re``.
+WILDCARD_AGENT_TYPE = "*"
+
+
+def _expected_type_matches(expected: Any, transport_agent_type: str) -> bool:
+    """An arm's expected transport matches a concrete observed transport."""
+
+    return expected == transport_agent_type or expected == WILDCARD_AGENT_TYPE
+
+
+def _helper_spawn_budget(packet: dict[str, Any]) -> int:
+    """Read a packet's Chief-granted depth-two helper budget, fail closed to 0."""
+
+    value = packet.get("helper_spawn_budget", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 @dataclass(frozen=True)
 class DispatchProtocolPolicy:
     """Immutable protocol constants used while observing one hook event."""
@@ -212,6 +234,35 @@ def subagent_event_id(
     return "spawn-" + _canonical_record_sha256(identity)[:32]
 
 
+def live_arm_snapshot(
+    state: dict[str, Any], *, parent_session_id: str
+) -> list[dict[str, str]]:
+    """Machine-readable armed slots for one parent session at observation time.
+
+    A guard misfire (armed under an AOI role label while the transport reported
+    a different type) is otherwise only diagnosable by prose archaeology; this
+    snapshot records the exact armed slots the observed transport failed to
+    match.  Callers invoke it after the expiry sweep so it reflects live arms.
+    """
+
+    arms: list[dict[str, str]] = []
+    for packet in state.get("packets", []):
+        if packet.get("status") != "armed":
+            continue
+        attempt = active_dispatch_attempt(packet)
+        if attempt.get("parent_session_id") != parent_session_id:
+            continue
+        arms.append(
+            {
+                "packet_id": str(packet.get("packet_id", "")),
+                "expected_agent_type": str(attempt.get("expected_agent_type", "")),
+                "expires_at": str(attempt.get("expires_at", "")),
+            }
+        )
+    arms.sort(key=lambda item: item["packet_id"])
+    return arms
+
+
 def record_subagent_incident(
     state: dict[str, Any],
     payload: dict[str, Any],
@@ -250,6 +301,9 @@ def record_subagent_incident(
         "observed_at": observed_at,
         "reason_code": reason_code,
         "candidate_packet_ids": sorted(set(candidate_packet_ids)),
+        "live_arms": live_arm_snapshot(
+            state, parent_session_id=str(payload.get("session_id", ""))
+        ),
         "hook_protocol_version": policy.hook_protocol_version,
         "resolution": None,
     }
@@ -271,9 +325,10 @@ def matching_armed_packets(
         if packet.get("status") != "armed":
             continue
         attempt = active_dispatch_attempt(packet)
-        if (
-            attempt.get("parent_session_id") == parent_session_id
-            and attempt.get("expected_agent_type") == transport_agent_type
+        if attempt.get("parent_session_id") == parent_session_id and (
+            _expected_type_matches(
+                attempt.get("expected_agent_type"), transport_agent_type
+            )
         ):
             matches.append((packet, attempt))
     return matches
@@ -289,7 +344,7 @@ def matching_expired_packet_ids(
         item["packet_id"]
         for item in expired_arms
         if item["parent_session_id"] == parent_session_id
-        and item["expected_agent_type"] == transport_agent_type
+        and _expected_type_matches(item["expected_agent_type"], transport_agent_type)
     ]
 
 
@@ -299,7 +354,7 @@ def _load_mapped_task_unlocked(
     *,
     policy: DispatchProtocolPolicy,
     services: DispatchProtocolServices,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load and validate the session-to-task backlink under the state lock."""
 
     mapping = load_json(session_path(paths, parent_session_id))
@@ -323,7 +378,7 @@ def _load_mapped_task_unlocked(
             raise HarnessError("subagent parent mapping lost packet identity")
     else:
         raise HarnessError("session mapping kind is invalid")
-    return state
+    return state, mapping
 
 
 def _arm_validation_rejection_reason(exc: HarnessError) -> str:
@@ -364,6 +419,37 @@ def initial_rejection_reason(
     return ""
 
 
+def _resumable_packet(
+    state: dict[str, Any],
+    *,
+    agent_id: str,
+    parent_session_id: str,
+    policy: DispatchProtocolPolicy,
+) -> dict[str, Any] | None:
+    """Locate the executing packet this SubagentStart resumes, if any.
+
+    A resume (the Chief re-entering an already-dispatched packet thread) shares
+    the dispatched packet's ``agent_id`` and its consumed attempt's parent
+    session.  That is the same packet thread, not a new unmanaged agent; a
+    matching ``agent_id`` under a *different* parent stays a duplicate_agent
+    incident because it is genuinely suspicious.
+    """
+
+    for packet in state.get("packets", []):
+        if packet.get("status") not in policy.executing_packet_statuses:
+            continue
+        if packet.get("agent_id") != agent_id:
+            continue
+        consumed_parent = None
+        for attempt in packet.get("dispatch_attempts", []):
+            if isinstance(attempt, dict) and attempt.get("status") == "consumed":
+                consumed_parent = attempt.get("parent_session_id")
+                break
+        if consumed_parent is not None and consumed_parent == parent_session_id:
+            return packet
+    return None
+
+
 def validate_pre_spawn_arm(
     paths: HarnessPaths,
     *,
@@ -385,7 +471,7 @@ def validate_pre_spawn_arm(
     current = current or dt.datetime.now().astimezone()
     with state_lock(paths, create_layout=False):
         try:
-            state = _load_mapped_task_unlocked(
+            state, _mapping = _load_mapped_task_unlocked(
                 paths,
                 parent_session_id,
                 policy=policy,
@@ -448,6 +534,65 @@ def validate_pre_spawn_arm(
         }
 
 
+def helper_budget_slot(
+    paths: HarnessPaths,
+    *,
+    parent_session_id: str,
+    policy: DispatchProtocolPolicy,
+    services: DispatchProtocolServices,
+) -> dict[str, Any]:
+    """Read-only: does this depth-one agent have remaining helper spawn budget?"""
+
+    if not policy.hook_id_re.fullmatch(parent_session_id):
+        return {"status": "denied", "reason_code": "invalid_parent_session"}
+    mapping_path = session_path(paths, parent_session_id)
+    if not mapping_path.exists():
+        return {"status": "unbound", "reason_code": "no_task_mapping"}
+    with state_lock(paths, create_layout=False):
+        try:
+            state, mapping = _load_mapped_task_unlocked(
+                paths,
+                parent_session_id,
+                policy=policy,
+                services=services,
+            )
+        except HarnessError:
+            return {"status": "corrupt", "reason_code": "corrupt_task_mapping"}
+        if (
+            mapping.get("mapping_kind", policy.root_session_mapping_kind)
+            != policy.subagent_parent_mapping_kind
+        ):
+            return {"status": "denied", "reason_code": "not_subagent_parent"}
+        try:
+            parent_packet = services.packet_by_id(
+                state, str(mapping.get("packet_id", ""))
+            )
+        except HarnessError:
+            return {"status": "corrupt", "reason_code": "corrupt_task_mapping"}
+        budget = _helper_spawn_budget(parent_packet)
+        used = len(parent_packet.get("helper_spawns", []))
+        remaining = max(budget - used, 0)
+        if (
+            parent_packet.get("status") in policy.executing_packet_statuses
+            and used < budget
+        ):
+            return {
+                "status": "authorized",
+                "task_id": state["task_id"],
+                "packet_id": parent_packet.get("packet_id"),
+                "helper_spawn_budget": budget,
+                "remaining_helper_budget": remaining,
+            }
+        return {
+            "status": "denied",
+            "reason_code": "no_helper_budget",
+            "task_id": state["task_id"],
+            "packet_id": parent_packet.get("packet_id"),
+            "helper_spawn_budget": budget,
+            "remaining_helper_budget": remaining,
+        }
+
+
 def observe_subagent_start(
     paths: HarnessPaths,
     payload: dict[str, Any],
@@ -465,7 +610,7 @@ def observe_subagent_start(
         return {"status": "unbound", "reason_code": "no_task_mapping"}
     with state_lock(paths, create_layout=False):
         try:
-            state = _load_mapped_task_unlocked(
+            state, mapping = _load_mapped_task_unlocked(
                 paths,
                 parent_session_id,
                 policy=policy,
@@ -523,6 +668,38 @@ def observe_subagent_start(
                 "idempotent": True,
             }
 
+        for packet in state.get("packets", []):
+            for resumption in packet.get("agent_resumptions", []):
+                if (
+                    isinstance(resumption, dict)
+                    and resumption.get("event_id") == event_id
+                ):
+                    return {
+                        "status": "authorized",
+                        "resumed": True,
+                        "task_id": state["task_id"],
+                        "packet_id": packet.get("packet_id"),
+                        "packet_path": packet.get("path"),
+                        "event_id": event_id,
+                        "idempotent": True,
+                    }
+            helper_spawns = packet.get("helper_spawns", [])
+            for helper in helper_spawns:
+                if isinstance(helper, dict) and helper.get("event_id") == event_id:
+                    budget = _helper_spawn_budget(packet)
+                    return {
+                        "status": "authorized",
+                        "helper": True,
+                        "task_id": state["task_id"],
+                        "packet_id": packet.get("packet_id"),
+                        "packet_path": packet.get("path"),
+                        "remaining_helper_budget": max(
+                            budget - len(helper_spawns), 0
+                        ),
+                        "event_id": event_id,
+                        "idempotent": True,
+                    }
+
         observed_at = now_iso()
         current = dt.datetime.now().astimezone()
         transport_agent_type = str(payload.get("agent_type", ""))
@@ -568,6 +745,83 @@ def observe_subagent_start(
                 )
             except HarnessError as exc:
                 reason_code = _arm_validation_rejection_reason(exc)
+
+        if reason_code == "duplicate_agent":
+            resumed_packet = _resumable_packet(
+                state,
+                agent_id=agent_id,
+                parent_session_id=parent_session_id,
+                policy=policy,
+            )
+            if resumed_packet is not None:
+                resumed_packet.setdefault("agent_resumptions", []).append(
+                    {
+                        "event_id": event_id,
+                        "turn_id": safe_hook_observation_text(
+                            payload.get("turn_id", ""), policy=policy
+                        ),
+                        "agent_type": transport_agent_type,
+                        "observed_at": observed_at,
+                    }
+                )
+                state["dispatch_model_version"] = policy.dispatch_model_version
+                bump_task(state)
+                write_task(paths, state)
+                index_refreshed = services.refresh_index_after_commit(paths)
+                return {
+                    "status": "authorized",
+                    "resumed": True,
+                    "task_id": state["task_id"],
+                    "packet_id": resumed_packet["packet_id"],
+                    "packet_path": resumed_packet["path"],
+                    "event_id": event_id,
+                    "idempotent": False,
+                    "index_refresh_deferred": not index_refreshed,
+                }
+
+        if reason_code == "no_matching_arm" and (
+            mapping.get("mapping_kind", policy.root_session_mapping_kind)
+            == policy.subagent_parent_mapping_kind
+        ):
+            try:
+                parent_packet = services.packet_by_id(
+                    state, str(mapping.get("packet_id", ""))
+                )
+            except HarnessError:
+                parent_packet = None
+            if parent_packet is not None:
+                budget = _helper_spawn_budget(parent_packet)
+                used = len(parent_packet.get("helper_spawns", []))
+                if (
+                    parent_packet.get("status") in policy.executing_packet_statuses
+                    and used < budget
+                ):
+                    parent_packet.setdefault("helper_spawns", []).append(
+                        {
+                            "event_id": event_id,
+                            "agent_id": agent_id,
+                            "agent_type": transport_agent_type,
+                            "turn_id": safe_hook_observation_text(
+                                payload.get("turn_id", ""), policy=policy
+                            ),
+                            "observed_at": observed_at,
+                        }
+                    )
+                    state["dispatch_model_version"] = policy.dispatch_model_version
+                    bump_task(state)
+                    write_task(paths, state)
+                    index_refreshed = services.refresh_index_after_commit(paths)
+                    return {
+                        "status": "authorized",
+                        "helper": True,
+                        "task_id": state["task_id"],
+                        "packet_id": parent_packet["packet_id"],
+                        "packet_path": parent_packet["path"],
+                        "remaining_helper_budget": budget - used - 1,
+                        "event_id": event_id,
+                        "idempotent": False,
+                        "index_refresh_deferred": not index_refreshed,
+                    }
 
         if reason_code:
             incident = record_subagent_incident(

@@ -69,6 +69,15 @@ def register_packet_commands(
     parser.add_argument("--skill-canary-event-id")
     parser.add_argument("--task-type", default="general")
     parser.add_argument("--delegation-depth", type=int, choices=[1, 2], default=1)
+    parser.add_argument(
+        "--helper-spawn-budget",
+        type=int,
+        default=0,
+        help=(
+            "Chief-granted budget (0..8) of depth-two read-only helper spawns this "
+            "depth-one packet may make without a per-helper arm"
+        ),
+    )
     parser.add_argument("--parent-packet-id")
     parser.add_argument(
         "--capability-tier", choices=sorted(vocab.capability_tier_map)
@@ -90,12 +99,20 @@ def register_packet_commands(
     parser = subparsers.add_parser("packet-arm")
     parser.add_argument("--task", required=True)
     parser.add_argument("--packet-id", required=True)
-    parser.add_argument(
+    agent_type_group = parser.add_mutually_exclusive_group(required=True)
+    agent_type_group.add_argument(
         "--expected-agent-type",
-        required=True,
         help=(
             "Codex transport agent_type expected from SubagentStart; independent "
             "of the packet's AOI technical role"
+        ),
+    )
+    agent_type_group.add_argument(
+        "--any-agent-type",
+        action="store_true",
+        help=(
+            "Arm a wildcard that matches any observed transport agent_type for "
+            "this parent session; it owns the whole parent slot"
         ),
     )
     parser.add_argument("--expires-at", required=True)
@@ -144,6 +161,19 @@ def register_packet_commands(
         "--disposition",
         choices=["no_material_work", "work_discarded", "manual_unverified"],
         required=True,
+    )
+    parser.add_argument(
+        "--disposition-kind",
+        choices=[
+            "true_positive",
+            "false_positive_guard",
+            "benign_no_work",
+            "unverified",
+        ],
+        help=(
+            "Machine-readable guard-outcome tag recorded alongside the free-text "
+            "disposition"
+        ),
     )
     parser.add_argument("--reason", required=True)
     parser.add_argument("--evidence", required=True)
