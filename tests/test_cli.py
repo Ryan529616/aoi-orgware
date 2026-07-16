@@ -1695,6 +1695,7 @@ class LockTests(HarnessTestCase):
             "A double-slash spelling must not bypass ownership",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
         )
         rejected = self.cli(
             "claim",
@@ -2018,6 +2019,7 @@ class LockTests(HarnessTestCase):
             "test",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
         )
 
     def test_exact_file_claim_records_sha256_baseline(self) -> None:
@@ -2331,6 +2333,53 @@ class LockTests(HarnessTestCase):
                 h.normalize_lock(lock),
             )
 
+    def test_repo_lock_colon_typo_is_rejected_with_separator_hint(self) -> None:
+        # ARISE defect: `repo:file:rtl/adfp/tests:test_x.py` carried a ':'-for-'/'
+        # typo, was accepted with a null baseline, and silently never matched its
+        # correctly spelled twin so mutual exclusion never fired.
+        for typo in (
+            "repo:file:rtl/adfp/tests:test_dense_weight_cache.py",
+            "external:file:/srv/data:cache.bin",
+        ):
+            with self.subTest(typo=typo):
+                with self.assertRaisesRegex(
+                    h.HarnessError, r"may not contain ':'.*use '/'"
+                ):
+                    h.normalize_lock(typo)
+        self.init_task("colon-typo")
+        rejected = self.cli(
+            "claim",
+            "--task",
+            "colon-typo",
+            "--token",
+            "colon-typo-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "RTL",
+            "--lock",
+            "repo:file:rtl/adfp/tests:test_dense_weight_cache.py",
+            "--intent",
+            "reproduce the ARISE colon typo",
+            "--validation",
+            "must be rejected structurally",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("may not contain ':'", rejected.stderr)
+        self.assertIn(
+            "rtl/adfp/tests:test_dense_weight_cache.py", rejected.stderr
+        )
+
+    def test_host_lock_drive_colon_allowed_but_second_colon_rejected(self) -> None:
+        self.assertEqual(
+            h.normalize_lock("host:file:C:/Users/x/file.py"),
+            "host:file:C:/users/x/file.py",
+        )
+        with self.assertRaises(h.HarnessError):
+            h.normalize_lock("host:file:C:/Users/x:y.py")
+
 
 class LifecycleTests(HarnessTestCase):
     def test_plan_approval_gates_claims(self) -> None:
@@ -2375,7 +2424,7 @@ class LifecycleTests(HarnessTestCase):
             "--note",
             "Generated plan has concrete lifecycle and verification sections",
         )
-        self.cli(*claim_args)
+        self.cli(*claim_args, "--allow-nonexistent")
 
     def test_oversized_checkpoint_and_close_roll_back_state(self) -> None:
         self.init_task("rollback-task")
@@ -2692,7 +2741,7 @@ class LifecycleTests(HarnessTestCase):
             ]
             for lock in locks:
                 claim_args.extend(["--lock", lock])
-            self.cli(*claim_args)
+            self.cli(*claim_args, "--allow-nonexistent")
         self.cli(
             "release-claim",
             "--token",
@@ -3271,7 +3320,7 @@ class LifecycleTests(HarnessTestCase):
         ]
         for lock in locks:
             claim_args.extend(["--lock", lock])
-        self.cli_in_process(*claim_args)
+        self.cli_in_process(*claim_args, "--allow-nonexistent")
         paths = h.get_paths(self.root)
         state = h.load_task(paths, "active-claim-oversized-checkpoint")
         compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
@@ -3302,6 +3351,7 @@ class LifecycleTests(HarnessTestCase):
             "content check",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
         )
         self.add_passing_verification("close-task")
         self.cli(
@@ -4064,6 +4114,111 @@ class LifecycleTests(HarnessTestCase):
             )
         )
 
+    def test_planned_repo_file_requires_allow_nonexistent(self) -> None:
+        self.init_task("planned-task")
+        (self.root / "notes").mkdir()
+        base = [
+            "claim",
+            "--task",
+            "planned-task",
+            "--token",
+            "planned-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "DOC",
+            "--lock",
+            "repo:file:notes/plan.md",
+            "--intent",
+            "reserve a not-yet-created planned file",
+            "--validation",
+            "planned admission",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        ]
+        rejected = self.cli(*base, ok=False)
+        self.assertIn("planned file", rejected.stderr)
+        self.assertIn("--allow-nonexistent", rejected.stderr)
+        self.assertFalse(
+            (h.get_paths(self.root).claims_active / "planned-claim.json").exists()
+        )
+        self.cli(*base, "--allow-nonexistent")
+        claim = json.loads(
+            (
+                h.get_paths(self.root).claims_active / "planned-claim.json"
+            ).read_text(encoding="utf-8")
+        )
+        baseline = claim["baselines"]["repo:file:notes/plan.md"]
+        self.assertFalse(baseline["exists"])
+        self.assertIsNone(baseline["sha256"])
+        self.assertTrue(baseline["planned"])
+
+    def test_missing_parent_repo_file_names_the_absent_parent(self) -> None:
+        self.init_task("typo-parent-task")
+        base = [
+            "claim",
+            "--task",
+            "typo-parent-task",
+            "--token",
+            "typo-parent-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "RTL",
+            "--lock",
+            "repo:file:rtl/adfp/tests/test_missing.py",
+            "--intent",
+            "a directory misspelling leaves both target and parent missing",
+            "--validation",
+            "must name the absent parent, not offer the planned-file flag alone",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        ]
+        rejected = self.cli(*base, ok=False)
+        self.assertIn("parent directory", rejected.stderr)
+        self.assertIn("path typo", rejected.stderr)
+        self.assertNotIn("(planned file)", rejected.stderr)
+        # The same flag still admits an explicitly planned deep target.
+        self.cli(*base, "--allow-nonexistent")
+
+    def test_mini_rejects_planned_or_missing_targets(self) -> None:
+        rejected = self.cli(
+            "start-mini",
+            "--task-id",
+            "mini-missing",
+            "--title",
+            "Mini with an absent target",
+            "--objective",
+            "A mini task may not reserve planned or missing files",
+            "--owner",
+            "root",
+            "--completion-boundary",
+            "Rejected atomically before any state is written",
+            "--session-id",
+            "mini-missing-session",
+            "--token",
+            "mini-missing-claim",
+            "--lock",
+            "repo:file:notes/mini.md",
+            "--intent",
+            "planned mini edit",
+            "--validation",
+            "must reject",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            ok=False,
+        )
+        self.assertIn("mini task", rejected.stderr)
+        self.assertIn("--allow-nonexistent", rejected.stderr)
+        self.assertFalse(
+            h.task_state_path(h.get_paths(self.root), "mini-missing").exists()
+        )
+        self.assertFalse(
+            h.session_path(
+                h.get_paths(self.root), "mini-missing-session"
+            ).exists()
+        )
+
 
 class HardeningTests(HarnessTestCase):
     def test_legacy_brace_duplicate_and_code_spans_fail_closed(self) -> None:
@@ -4242,6 +4397,7 @@ class HardeningTests(HarnessTestCase):
             "packet owns the same file",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
         )
         packet = self.cli(
             "create-packet",
@@ -11867,6 +12023,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
 
 class V5FeatureTests(HarnessTestCase):
     def test_start_mini_is_atomic_constrained_and_preapproved(self) -> None:
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "note.md").write_text("draft\n", encoding="utf-8")
         result = self.cli(
             "start-mini",
             "--task-id",
@@ -13529,6 +13687,13 @@ class ConcurrencyTests(HarnessTestCase):
         return results
 
     def test_concurrent_overlapping_and_disjoint_claims(self) -> None:
+        # Targets exist so this race exercises mutual exclusion, not the
+        # acquire-time existence gate.
+        (self.root / "rtl" / "adfp").mkdir(parents=True)
+        (self.root / "rtl" / "adfp" / "a.sv").write_text("module a; endmodule\n", encoding="utf-8")
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "one.md").write_text("one\n", encoding="utf-8")
+        (self.root / "docs" / "two.md").write_text("two\n", encoding="utf-8")
         self.init_task("race-a")
         self.init_task("race-b")
         overlapping = self.run_pair(

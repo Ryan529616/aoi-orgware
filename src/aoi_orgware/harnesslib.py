@@ -2644,6 +2644,10 @@ def write_task(paths: HarnessPaths, state: dict[str, Any]) -> None:
 def _normalize_repo_path(raw: str) -> str:
     if "\x00" in raw or "\\" in raw:
         raise HarnessError(f"repo lock must use POSIX separators: {raw!r}")
+    if ":" in raw:
+        raise HarnessError(
+            f"repo lock path may not contain ':'; use '/' as the separator: {raw!r}"
+        )
     if not raw or raw.startswith("/"):
         raise HarnessError(f"repo lock path must be relative: {raw!r}")
     if any(marker in raw for marker in ("*", "?", "[", "]", "{", "}")):
@@ -2669,6 +2673,10 @@ def _normalize_repo_path(raw: str) -> str:
 def _normalize_external_path(raw: str) -> str:
     if not raw or "\x00" in raw or "\\" in raw:
         raise HarnessError(f"external lock must use POSIX separators: {raw!r}")
+    if ":" in raw:
+        raise HarnessError(
+            f"external lock path may not contain ':'; use '/' as the separator: {raw!r}"
+        )
     if raw.startswith("//"):
         raise HarnessError(f"external lock path may not use a double-slash root: {raw!r}")
     path = PurePosixPath(raw)
@@ -3205,6 +3213,74 @@ def baselines_for_locks(
         else:
             result[lock] = {"exists": False, "sha256": None}
     return result
+
+
+def admit_new_claim_locks(
+    paths: HarnessPaths,
+    locks: Iterable[str],
+    repo_root: Path | None = None,
+    *,
+    allow_nonexistent: bool,
+    mini: bool = False,
+) -> set[str]:
+    """Gate NEW claim admission on file-lock target existence.
+
+    A ``:``-for-``/`` path typo (the ARISE ``rtl/adfp/tests:test_x.py`` defect)
+    now fails structural normalization, but a merely misspelled directory still
+    resolves to a nonexistent target that mutual exclusion can never match.  For
+    each ``file`` lock this rejects a target that does not exist unless the
+    caller admits it explicitly: a missing target whose parent directory is also
+    missing is the typo signature and names the absent parent; a missing target
+    under an existing parent is a planned file.  Both are overridable by
+    ``--allow-nonexistent`` on a full claim; a mini task admits neither.  Returns
+    the set of canonical locks admitted as planned so the caller can annotate
+    their baselines additively.
+    """
+
+    baseline_root = (repo_root or paths.root).resolve()
+    if mini:
+        remediation = (
+            "planned or missing lock targets are not allowed in a mini task; "
+            "use a full claim with --allow-nonexistent"
+        )
+    else:
+        remediation = "pass --allow-nonexistent to reserve a planned target"
+    planned: set[str] = set()
+    for lock in locks:
+        canonical = validate_persisted_lock_identity(
+            paths, str(lock), repo_root=baseline_root
+        )
+        namespace, kind, raw_path = parse_lock(canonical)
+        if kind != "file":
+            continue
+        if namespace == "repo":
+            candidate = baseline_root / raw_path
+        elif namespace == "host":
+            candidate = host_path_to_runtime(raw_path)
+        elif namespace == EXTERNAL_LOCK_NAMESPACE:
+            candidate = Path(raw_path)
+        else:
+            continue
+        if candidate.exists():
+            continue
+        if not allow_nonexistent:
+            if namespace == EXTERNAL_LOCK_NAMESPACE:
+                raise HarnessError(
+                    f"external file lock target is not locally resolvable: "
+                    f"{raw_path!r}; {remediation}"
+                )
+            if candidate.parent.exists():
+                raise HarnessError(
+                    f"{namespace} file lock target does not exist yet (planned "
+                    f"file): {raw_path!r}; {remediation}"
+                )
+            raise HarnessError(
+                f"{namespace} file lock target is missing and its parent directory "
+                f"{candidate.parent} does not exist: {raw_path!r} - this is the "
+                f"signature of a ':'-for-'/' path typo; {remediation}"
+            )
+        planned.add(canonical)
+    return planned
 
 
 def claim_path(paths: HarnessPaths, token: str, active: bool = True) -> Path:
