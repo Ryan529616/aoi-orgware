@@ -11,6 +11,7 @@ sys.dont_write_bytecode = True
 import argparse
 import copy
 import datetime as dt
+import functools
 import gzip
 import hashlib
 import importlib.resources
@@ -95,7 +96,16 @@ from .commands.improvement import register_improvement_commands
 from .commands.jobs import register_job_commands
 from .commands.lanes import register_lane_commands
 from .commands.packets import register_packet_commands
-from .commands.resource import register_resource_commands
+from .commands.resource import (
+    ResourceCmdServices,
+    cmd_codex_config_apply,
+    cmd_codex_config_plan,
+    cmd_codex_config_rollback,
+    cmd_override_arbitrate,
+    cmd_override_request,
+    cmd_override_revoke,
+    register_resource_commands,
+)
 from .commands.status import register_status_commands
 from .commands.task_lifecycle import (
     register_bootstrap_commands,
@@ -4451,574 +4461,17 @@ def cmd_needs_user_resolve(args: argparse.Namespace, paths: HarnessPaths) -> int
     return 0
 
 
-def cmd_override_request(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    override_id = validate_id(args.override_id, "override id")
-    target_id = validate_id(args.target_id, "override target id")
-    target_contract_sha256 = args.target_contract_sha256.lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", target_contract_sha256):
-        raise HarnessError("--target-contract-sha256 must be full lowercase SHA-256")
-    settings = parse_override_settings(
-        args.setting,
-        roles=ROLE_TIER_MAP,
-        target_kind=args.target_kind,
+def _resource_cmd_services() -> ResourceCmdServices:
+    return ResourceCmdServices(
+        state_lock=lambda *a, **kw: state_lock(*a, **kw),
+        write_task=lambda *a, **kw: write_task(*a, **kw),
+        write_index=lambda *a, **kw: write_index(*a, **kw),
+        role_tier_map=lambda: ROLE_TIER_MAP,
+        require_plan_ready=require_plan_ready,
+        require_root_session=require_root_session,
+        approved_override_settings=approved_override_settings,
+        validate_selection_resource_envelope=_validate_selection_resource_envelope,
     )
-    expires_at = parse_time(args.expires_at)
-    if expires_at is None or expires_at <= dt.datetime.now(dt.timezone.utc):
-        raise HarnessError("override expiry must be in the future")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "request Chief override for")
-        require_plan_ready(paths, state, "request Chief override")
-        session_id = require_root_session(paths, state, args.session_id)
-        if any(
-            item.get("override_id") == override_id
-            for item in state.get("override_requests", [])
-        ):
-            raise HarnessError(f"override already exists: {override_id}")
-        recorded = now_iso()
-        item = {
-            "integrity_version": 1,
-            "version": 1,
-            "override_id": override_id,
-            "status": "awaiting_chief",
-            "target_kind": args.target_kind,
-            "target_id": target_id,
-            "target_task_id": state["task_id"],
-            "task_plan_sha256": state["plan_sha256"],
-            "target_contract_sha256": target_contract_sha256,
-            "scope": require_evidence_detail(args.scope, "override scope"),
-            "requested_settings": settings,
-            "user_position": {
-                "rationale": require_evidence_detail(
-                    args.user_rationale, "user override rationale"
-                ),
-                "evidence": require_evidence_detail(
-                    args.user_evidence, "user override evidence"
-                ),
-                "authority_boundary": (
-                    "root attestation of direct user discussion; AOI does not "
-                    "authenticate the human speaker"
-                ),
-            },
-            "deliberation": {
-                "chief_preliminary_assessment": require_evidence_detail(
-                    args.chief_assessment, "Chief preliminary assessment"
-                ),
-                "alternatives": [
-                    require_evidence_detail(value, "override alternative")
-                    for value in args.alternative
-                ],
-            },
-            "root_session_id": session_id,
-            "root_owner": state.get("owner"),
-            "chief_decision": None,
-            "consumption": None,
-            "revocation": None,
-            "expires_at": expires_at.isoformat(timespec="microseconds"),
-            "created_at": recorded,
-            "updated_at": recorded,
-        }
-        state.setdefault("override_requests", []).append(item)
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(item, args.json)
-    return 0
-
-
-def cmd_override_arbitrate(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "arbitrate Chief override for")
-        item = override_by_id(state, args.override_id)
-        if item.get("version") != args.expected_version:
-            raise HarnessError("override arbitration CAS failed")
-        if item.get("status") != "awaiting_chief" or is_expired(
-            item.get("expires_at")
-        ):
-            raise HarnessError("override is not awaiting a current Chief decision")
-        session_id = require_root_session(paths, state, args.session_id)
-        if args.decision == "approved":
-            approved = parse_override_settings(
-                args.approved_setting or [
-                    f"{key}={value}"
-                    for key, value in item["requested_settings"].items()
-                ],
-                roles=ROLE_TIER_MAP,
-                target_kind=str(item.get("target_kind", "")),
-            )
-            if approved != item.get("requested_settings"):
-                raise HarnessError(
-                    "changing approved settings requires a new target contract and "
-                    "override request"
-                )
-            item["status"] = "approved"
-        else:
-            if args.approved_setting:
-                raise HarnessError("rejected override may not carry approved settings")
-            approved = {}
-            item["status"] = "rejected"
-        recorded = now_iso()
-        item["version"] = int(item["version"]) + 1
-        item["chief_decision"] = {
-            "decision": args.decision,
-            "approved_settings": approved,
-            "target_contract_sha256": item["target_contract_sha256"],
-            "rationale": require_evidence_detail(
-                args.rationale, "Chief override rationale"
-            ),
-            "risk_boundary": require_evidence_detail(
-                args.risk_boundary, "Chief override risk boundary"
-            ),
-            "rollback_condition": require_evidence_detail(
-                args.rollback_condition, "Chief override rollback condition"
-            ),
-            "compensating_controls": [
-                require_evidence_detail(value, "override compensating control")
-                for value in args.compensating_control
-            ],
-            "non_overridable_guardrails": [
-                "Chief lease and task-bound session authority",
-                "current approved plan and exact claim coverage",
-                "dispatch-before-work and packet/result integrity",
-                "evidence-strength and technical PASS boundaries",
-                "ARISE 12-thread and AOI depth-two hard ceilings",
-                "Codex project trust, sandbox, and provider availability",
-            ],
-            "root_session_id": session_id,
-            "recorded_at": recorded,
-        }
-        item["updated_at"] = recorded
-        state.setdefault("decisions", []).append(
-            f"Chief {args.decision} override {item['override_id']}: "
-            f"{item['chief_decision']['rationale']}"
-        )
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(item, args.json)
-    return 0
-
-
-def cmd_override_revoke(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "revoke Chief override for")
-        item = override_by_id(state, args.override_id)
-        if item.get("version") != args.expected_version:
-            raise HarnessError("override revocation CAS failed")
-        if item.get("status") != "approved":
-            raise HarnessError("only an approved, unconsumed override may be revoked")
-        session_id = require_root_session(paths, state, args.session_id)
-        recorded = now_iso()
-        item["version"] = int(item["version"]) + 1
-        item["status"] = "revoked"
-        item["revocation"] = {
-            "reason": require_evidence_detail(args.reason, "override revocation reason"),
-            "root_session_id": session_id,
-            "recorded_at": recorded,
-        }
-        item["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(item, args.json)
-    return 0
-
-
-def _codex_home(args: argparse.Namespace) -> Path:
-    if args.codex_home:
-        return Path(args.codex_home)
-    configured = os.environ.get("CODEX_HOME")
-    return Path(configured) if configured else Path.home() / ".codex"
-
-
-def _task_resource_worktree(paths: HarnessPaths, state: dict[str, Any]) -> Path:
-    worktree = validated_state_worktree(paths, state)
-    if worktree != Path(state.get("worktree", "")).resolve():
-        raise HarnessError("task resource worktree identity changed")
-    return worktree
-
-
-def _require_task_lock_coverage(
-    paths: HarnessPaths, state: dict[str, Any], locks: Iterable[str]
-) -> list[str]:
-    worktree = _task_resource_worktree(paths, state)
-    normalized = [
-        validate_lock_identity(paths, lock, repo_root=worktree) for lock in locks
-    ]
-    held = [
-        str(lock)
-        for claim in claims_owned_by_task(paths, state["task_id"])
-        if claim.get("status") in RESERVING_CLAIM_STATUSES
-        for lock in claim.get("locks", [])
-    ]
-    missing = [
-        lock for lock in normalized if not any(lock_covers(owner, lock) for owner in held)
-    ]
-    if missing:
-        raise HarnessError(
-            "Codex resource targets lack reserving claim coverage: "
-            + ", ".join(missing)
-        )
-    return normalized
-
-
-def _resource_plan(
-    args: argparse.Namespace,
-    paths: HarnessPaths,
-    state: dict[str, Any],
-    *,
-    proposed_override_settings: dict[str, str | int] | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    active_selections = [
-        item
-        for item in state.get("execution_selections", [])
-        if item.get("status") == "active"
-        and (
-            not args.execution_selection_id
-            or item.get("selection_id") == args.execution_selection_id
-        )
-    ]
-    if args.execution_selection_id and len(active_selections) != 1:
-        raise HarnessError("Codex resource plan selection is missing or inactive")
-    if not args.execution_selection_id and len(active_selections) > 1:
-        raise HarnessError(
-            "multiple active execution selections exist; pass --execution-selection-id"
-        )
-    if active_selections:
-        _require_execution_selection_snapshots_current(
-            state, active_selections[0], include_steward=True
-        )
-        _validate_selection_resource_envelope(state, active_selections[0])
-    if proposed_override_settings is not None:
-        if not args.override_id:
-            raise HarnessError("proposed resource settings require --override-id")
-        override_settings = proposed_override_settings
-    else:
-        override_settings = approved_override_settings(
-            state,
-            args.override_id,
-            target_kind="resource_config",
-            target_id=args.event_id,
-        )
-    return build_codex_resource_plan(
-        event_id=args.event_id,
-        root=_task_resource_worktree(paths, state),
-        config=paths.project,
-        state=state,
-        codex_home=_codex_home(args),
-        managed_roles=args.role,
-        platform_max_threads=args.max_threads,
-        platform_max_depth=args.max_depth,
-        execution_selection_id=args.execution_selection_id,
-        override_id=args.override_id,
-        override_settings=override_settings,
-    )
-
-
-def cmd_codex_config_plan(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    validate_id(args.event_id, "resource config event id")
-    proposed_settings: dict[str, str | int] | None = None
-    if args.proposed_setting:
-        proposed_settings = parse_override_settings(
-            args.proposed_setting,
-            roles=ROLE_TIER_MAP,
-            target_kind="resource_config",
-        )
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "plan Codex resource configuration for")
-        require_plan_ready(paths, state, "plan Codex resource configuration")
-        plan, _files = _resource_plan(
-            args,
-            paths,
-            state,
-            proposed_override_settings=proposed_settings,
-        )
-        if args.override_id and proposed_settings is None:
-            require_override_target_contract(
-                state, args.override_id, plan["plan_sha256"]
-            )
-    emit(plan, args.json)
-    return 0
-
-
-def cmd_codex_config_apply(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    event_id = validate_id(args.event_id, "resource config event id")
-    expected_plan = args.expected_plan_sha256.lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_plan):
-        raise HarnessError("--expected-plan-sha256 must be full lowercase SHA-256")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "apply Codex resource configuration for")
-        require_plan_ready(paths, state, "apply Codex resource configuration")
-        session_id = require_root_session(paths, state, args.session_id)
-        if any(
-            event.get("event_id") == event_id
-            for event in state.get("resource_config_events", [])
-        ):
-            raise HarnessError(f"resource config event already exists: {event_id}")
-        plan, files = _resource_plan(args, paths, state)
-        require_override_target_contract(state, args.override_id, plan["plan_sha256"])
-        if plan["plan_sha256"] != expected_plan:
-            raise HarnessError("Codex resource plan changed after Chief review")
-        _require_task_lock_coverage(paths, state, plan["required_locks"])
-        recorded = now_iso()
-        receipt = make_resource_receipt(
-            event_id=event_id,
-            plan=plan,
-            files=files,
-            applied_at=recorded,
-            root_session_id=session_id,
-        )
-        receipt_path = task_dir(paths, state["task_id"]) / "results" / (
-            f"resource-config-{event_id}.json"
-        )
-        receipt_payload = (
-            json.dumps(receipt, indent=2, ensure_ascii=False) + "\n"
-        ).encode("utf-8")
-        receipt_sha = hashlib.sha256(receipt_payload).hexdigest()
-        if args.override_id:
-            refreshed_settings = approved_override_settings(
-                state,
-                args.override_id,
-                target_kind="resource_config",
-                target_id=event_id,
-            )
-            if refreshed_settings != plan["override_settings"]:
-                raise HarnessError("resource override changed before file mutation")
-        atomic_create_bytes(receipt_path, receipt_payload)
-        applied = False
-        state_published = False
-        try:
-            apply_resource_files(files)
-            applied = True
-            if args.override_id:
-                refreshed_settings = approved_override_settings(
-                    state,
-                    args.override_id,
-                    target_kind="resource_config",
-                    target_id=event_id,
-                )
-                if refreshed_settings != plan["override_settings"]:
-                    raise HarnessError("resource override changed during file apply")
-            event = {
-                "integrity_version": 1,
-                "event_id": event_id,
-                "status": "applied",
-                "plan_sha256": plan["plan_sha256"],
-                "task_plan_sha256": plan["approved_task_plan_sha256"],
-                "override_id": args.override_id,
-                "receipt_path": str(receipt_path),
-                "receipt_sha256": receipt_sha,
-                "resolved": plan["resolved"],
-                "dynamic_envelope": plan["dynamic_envelope"],
-                "execution_selection_id": plan["dynamic_envelope"].get(
-                    "execution_selection_id", ""
-                ),
-                "required_locks": plan["required_locks"],
-                "restart_required": True,
-                "root_session_id": session_id,
-                "applied_at": recorded,
-                "rollback": None,
-            }
-            state.setdefault("resource_config_events", []).append(event)
-            if args.override_id:
-                override = override_by_id(state, args.override_id)
-                if override.get("status") != "approved":
-                    raise HarnessError("override authority changed before consumption")
-                override["version"] = int(override["version"]) + 1
-                override["status"] = "consumed"
-                override["consumption"] = {
-                    "consumer_command": "codex-config-apply",
-                    "event_id": event_id,
-                    "plan_sha256": plan["plan_sha256"],
-                    "target_contract_sha256": plan["plan_sha256"],
-                    "root_session_id": session_id,
-                    "recorded_at": recorded,
-                }
-                override["updated_at"] = recorded
-            _extend_unique(
-                state,
-                "changed_files",
-                [item["relative_path"] for item in plan["files"]],
-            )
-            state.setdefault("facts", []).append(
-                f"Applied Codex resource event {event_id}; a fresh trusted session "
-                "is still required before claiming activation."
-            )
-            bump_task(state)
-            write_task(paths, state)
-            state_published = True
-        except BaseException as exc:
-            rollback_uncertain = isinstance(exc, ResourceApplyRollbackError)
-            if applied and not state_published:
-                try:
-                    published_state = load_task(paths, args.task)
-                except (HarnessError, OSError, ValueError):
-                    published_state = {}
-                published_events = [
-                    item
-                    for item in published_state.get("resource_config_events", [])
-                    if item.get("event_id") == event_id
-                    and item.get("plan_sha256") == plan["plan_sha256"]
-                    and item.get("receipt_sha256") == receipt_sha
-                    and item.get("status") == "applied"
-                ]
-                state_published = len(published_events) == 1
-            if applied and not state_published:
-                rollback_files_from_receipt(
-                    root=_task_resource_worktree(paths, state), receipt=receipt
-                )
-            if not state_published and not rollback_uncertain:
-                try:
-                    receipt_path.unlink()
-                except FileNotFoundError:
-                    pass
-            if rollback_uncertain:
-                raise HarnessError(
-                    "Codex resource apply and automatic rollback both failed; "
-                    f"recovery receipt retained at {receipt_path}"
-                ) from exc
-            if state_published:
-                raise HarnessError(
-                    "Codex resource state and files were published, but the final "
-                    "durability step reported an error; event retained for doctor/reconcile"
-                ) from exc
-            raise
-        write_index(paths)
-    emit(
-        {
-            "event_id": event_id,
-            "status": "applied",
-            "plan_sha256": plan["plan_sha256"],
-            "receipt_path": str(receipt_path),
-            "receipt_sha256": receipt_sha,
-            "restart_required": True,
-            "routing_verified": False,
-        },
-        args.json,
-    )
-    return 0
-
-
-def cmd_codex_config_rollback(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "roll back Codex resource configuration for")
-        session_id = require_root_session(paths, state, args.session_id)
-        matches = [
-            event
-            for event in state.get("resource_config_events", [])
-            if event.get("event_id") == args.event_id
-        ]
-        if len(matches) != 1 or matches[0].get("status") != "applied":
-            raise HarnessError("resource config event is not uniquely applied")
-        event = matches[0]
-        receipt_path = Path(str(event.get("receipt_path", "")))
-        expected_receipt_path = (
-            task_dir(paths, state["task_id"])
-            / "results"
-            / f"resource-config-{args.event_id}.json"
-        )
-        if (
-            receipt_path != expected_receipt_path
-            or not receipt_path.is_file()
-            or receipt_path.is_symlink()
-            or sha256_file(receipt_path) != event.get("receipt_sha256")
-        ):
-            raise HarnessError("resource config rollback receipt is missing or changed")
-        receipt = load_json(receipt_path)
-        receipt_plan = receipt.get("plan")
-        if (
-            receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION
-            or receipt.get("event_id") != event.get("event_id")
-            or receipt.get("plan_sha256") != event.get("plan_sha256")
-            or receipt_plan.get("approved_task_plan_sha256")
-            != event.get("task_plan_sha256")
-            or receipt.get("task_id") != state.get("task_id")
-            or receipt.get("root_session_id") != event.get("root_session_id")
-            or receipt.get("applied_at") != event.get("applied_at")
-            or receipt.get("restart_required") != event.get("restart_required")
-            or not isinstance(receipt_plan, dict)
-            or receipt_plan.get("plan_sha256") != event.get("plan_sha256")
-            or resource_plan_sha256(receipt_plan) != event.get("plan_sha256")
-            or receipt_plan.get("resolved") != event.get("resolved")
-            or receipt_plan.get("dynamic_envelope")
-            != event.get("dynamic_envelope")
-            or receipt_plan.get("required_locks") != event.get("required_locks")
-        ):
-            raise HarnessError("resource config receipt binding is invalid")
-        _require_task_lock_coverage(paths, state, event.get("required_locks", []))
-        rollback_reason = require_evidence_detail(
-            args.reason, "resource config rollback reason"
-        )
-        prior_event = copy.deepcopy(event)
-        rollback_files_from_receipt(
-            root=_task_resource_worktree(paths, state), receipt=receipt
-        )
-        recorded = now_iso()
-        event["status"] = "rolled_back"
-        event["rollback"] = {
-            "reason": rollback_reason,
-            "root_session_id": session_id,
-            "recorded_at": recorded,
-        }
-        bump_task(state)
-        state_published = False
-        try:
-            write_task(paths, state)
-            state_published = True
-            write_index(paths)
-        except BaseException as exc:
-            if not state_published:
-                try:
-                    published_state = load_task(paths, args.task)
-                except (HarnessError, OSError, ValueError) as probe_exc:
-                    raise HarnessError(
-                        "Codex resource files were rolled back, but task-state "
-                        "publication failed and the published state cannot be read; "
-                        f"receipt retained at {receipt_path}"
-                    ) from probe_exc
-                published_events = [
-                    item
-                    for item in published_state.get("resource_config_events", [])
-                    if item == event
-                ]
-                state_published = len(published_events) == 1
-                if not state_published:
-                    prior_events = [
-                        item
-                        for item in published_state.get("resource_config_events", [])
-                        if item == prior_event
-                    ]
-                    if len(prior_events) != 1:
-                        raise HarnessError(
-                            "Codex resource rollback state publication is ambiguous; "
-                            f"receipt retained at {receipt_path}"
-                        ) from exc
-            if state_published:
-                raise HarnessError(
-                    "Codex resource files and rolled-back state were published, but "
-                    "the final durability/index step reported an error"
-                ) from exc
-            try:
-                reapply_files_from_receipt(
-                    root=_task_resource_worktree(paths, state), receipt=receipt
-                )
-            except BaseException as recovery_exc:
-                raise HarnessError(
-                    "Codex resource files were rolled back, task-state publication "
-                    "failed, and exact re-apply also failed; "
-                    f"receipt retained at {receipt_path}"
-                ) from recovery_exc
-            raise HarnessError(
-                "Codex resource rollback state publication failed; exact applied "
-                "bytes were restored and the event remains applied"
-            ) from exc
-    emit(event, args.json)
-    return 0
 
 
 def cmd_lane_set_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
@@ -10274,15 +9727,28 @@ def build_parser(
         vocab=vocab,
     )
 
+    resource_services = _resource_cmd_services()
     register_resource_commands(
         sub,
         handlers={
-            "override_request": cmd_override_request,
-            "override_arbitrate": cmd_override_arbitrate,
-            "override_revoke": cmd_override_revoke,
-            "codex_config_plan": cmd_codex_config_plan,
-            "codex_config_apply": cmd_codex_config_apply,
-            "codex_config_rollback": cmd_codex_config_rollback,
+            "override_request": functools.partial(
+                cmd_override_request, services=resource_services
+            ),
+            "override_arbitrate": functools.partial(
+                cmd_override_arbitrate, services=resource_services
+            ),
+            "override_revoke": functools.partial(
+                cmd_override_revoke, services=resource_services
+            ),
+            "codex_config_plan": functools.partial(
+                cmd_codex_config_plan, services=resource_services
+            ),
+            "codex_config_apply": functools.partial(
+                cmd_codex_config_apply, services=resource_services
+            ),
+            "codex_config_rollback": functools.partial(
+                cmd_codex_config_rollback, services=resource_services
+            ),
         },
         add_json_argument=add_json_argument,
     )
