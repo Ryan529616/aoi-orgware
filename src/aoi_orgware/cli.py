@@ -117,7 +117,15 @@ from .commands.improvement import (
     register_improvement_commands,
 )
 from .commands.jobs import register_job_commands
-from .commands.lanes import register_lane_commands
+from .commands.lanes import (
+    LanesCmdServices,
+    cmd_lane_create,
+    cmd_lane_dependency_add,
+    cmd_lane_dependency_update,
+    cmd_lane_revise,
+    cmd_lane_set_status,
+    register_lane_commands,
+)
 from .commands.packets import register_packet_commands
 from .commands.resource import (
     ResourceCmdServices,
@@ -3718,316 +3726,19 @@ def _improvement_cmd_services() -> ImprovementCmdServices:
     )
 
 
-def cmd_lane_set_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "set lane status for")
-        session_id = require_root_session(paths, state, args.session_id)
-        lane = lane_by_id(state, args.lane_id)
-        if (
-            lane.get("revision") != args.expected_revision
-            or lane.get("status") != args.expected_status
-        ):
-            raise HarnessError("lane status CAS failed")
-        if args.status == lane.get("status"):
-            raise HarnessError("lane status transition must change status")
-        if args.status in ENGAGED_LANE_STATUSES and lane.get("status") not in ENGAGED_LANE_STATUSES:
-            engaged = sum(
-                item.get("status") in ENGAGED_LANE_STATUSES
-                for item in state.get("lanes", [])
-            )
-            if engaged >= MAX_ENGAGED_LANES:
-                raise HarnessError(f"engaged lane ceiling is {MAX_ENGAGED_LANES}")
-        if args.status not in ENGAGED_LANE_STATUSES:
-            active_packets = [
-                packet.get("packet_id")
-                for packet in state.get("packets", [])
-                if packet.get("lane_id") == lane["lane_id"]
-                and packet.get("status") in ACTIVE_PACKET_STATUSES
-            ]
-            active_jobs = [
-                job.get("run_id")
-                for job in state.get("jobs", [])
-                if job.get("lane_id") == lane["lane_id"]
-                and job.get("status") in ACTIVE_JOB_STATUSES
-            ]
-            if active_packets or active_jobs:
-                raise HarnessError("cannot park a lane with active packets or jobs")
-            if lane.get("kind") == "coordination_steward":
-                if any(
-                    request.get("status") not in TERMINAL_COORDINATION_STATUSES
-                    for request in state.get("coordination_requests", [])
-                ) or any(
-                    review.get("status") not in {"rejected", "consumed", "superseded"}
-                    for review in state.get("capacity_reviews", [])
-                ) or any(
-                    request.get("status") not in TERMINAL_IMPROVEMENT_STATUSES
-                    for request in state.get("improvement_requests", [])
-                ):
-                    raise HarnessError("cannot park the steward while its control-plane inbox is active")
-            if lane.get("kind") == "capacity_planning" and any(
-                review.get("capacity_lane_id") == lane["lane_id"]
-                and review.get("status") not in {"rejected", "consumed", "superseded"}
-                for review in state.get("capacity_reviews", [])
-            ):
-                raise HarnessError("cannot park Capacity Planning with an active review")
-        recorded = now_iso()
-        old_status = lane["status"]
-        lane["status"] = args.status
-        lane["next_action"] = require_text(args.next_action, "lane next action")
-        lane["status_updated_at"] = recorded
-        lane.setdefault("status_events", []).append(
-            {
-                "old_status": old_status,
-                "new_status": args.status,
-                "root_session_id": session_id,
-                "reason": require_evidence_detail(args.reason, "lane status reason"),
-                "recorded_at": recorded,
-            }
-        )
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(lane, args.json)
-    return 0
-
-
-def cmd_lane_create(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    lane_id = validate_id(args.lane_id, "lane id")
-    if args.kind not in LANE_KINDS:
-        raise HarnessError(f"unknown lane kind: {args.kind}")
-    if args.role not in ROLE_TIER_MAP:
-        raise HarnessError(f"unknown lane role: {args.role}")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "create lane for")
-        require_plan_ready(paths, state, "create lane")
-        if state.get("profile") == "mini":
-            raise HarnessError("mini task may not use lane orchestration")
-        authority_commit = resolve_task_commit(
-            state, args.authority_commit, "lane authority commit"
-        )
-        if any(lane.get("lane_id") == lane_id for lane in state.get("lanes", [])):
-            raise HarnessError(f"lane already exists: {lane_id}")
-        engaged = sum(
-            lane.get("status") in ENGAGED_LANE_STATUSES for lane in state.get("lanes", [])
-        )
-        if args.status in ENGAGED_LANE_STATUSES and engaged >= MAX_ENGAGED_LANES:
-            raise HarnessError(f"engaged lane ceiling is {MAX_ENGAGED_LANES}")
-        recorded = now_iso()
-        revision = {
-            "revision": 1,
-            "authority_commit": authority_commit,
-            "contract_version": require_text(args.contract_version, "contract version"),
-            "generator_version": require_text(
-                args.generator_version, "generator version"
-            ),
-            "adapter_version": require_text(args.adapter_version, "adapter version"),
-            "change_class": "genesis",
-            "coordination_request_ids": [],
-            "root_decision": "initial lane authority recorded by root",
-            "recorded_at": recorded,
-        }
-        lane = {
-            "integrity_version": 1,
-            "lane_id": lane_id,
-            "kind": args.kind,
-            "status": args.status,
-            "owner": require_text(args.owner, "lane owner"),
-            "role": args.role,
-            "revision": 1,
-            "authority_commit": authority_commit,
-            "contract_version": revision["contract_version"],
-            "generator_version": revision["generator_version"],
-            "adapter_version": revision["adapter_version"],
-            "next_action": require_text(args.next_action, "lane next action"),
-            "revisions": [revision],
-            "created_at": recorded,
-            "updated_at": recorded,
-        }
-        state["lane_model_version"] = 1
-        state.setdefault("lanes", []).append(lane)
-        state.setdefault("lane_dependencies", [])
-        state.setdefault("coordination_requests", [])
-        state.setdefault("integration_baselines", [])
-        errors = portfolio_integrity_errors(state)
-        if errors:
-            raise HarnessError("invalid lane portfolio: " + "; ".join(errors))
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(lane, args.json)
-    return 0
-
-
-def cmd_lane_revise(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "revise lane for")
-        require_plan_ready(paths, state, "revise lane")
-        lane = lane_by_id(state, args.lane_id)
-        if lane.get("revision") != args.expected_revision:
-            raise HarnessError(
-                f"lane revision CAS failed: expected {args.expected_revision}, "
-                f"current {lane.get('revision')}"
-            )
-        if args.change_class not in CHANGE_CLASSES - {"genesis"}:
-            raise HarnessError(f"invalid lane change class: {args.change_class}")
-        authority_commit = resolve_task_commit(
-            state, args.authority_commit, "lane authority commit"
-        )
-        if not git_is_ancestor(
-            state_worktree(paths, state), str(lane.get("authority_commit")), authority_commit
-        ):
-            raise HarnessError("new lane authority commit must descend from current lane authority")
-        contract = require_text(args.contract_version, "contract version")
-        generator = require_text(args.generator_version, "generator version")
-        adapter = require_text(args.adapter_version, "adapter version")
-        old_tuple = (
-            str(lane.get("contract_version")),
-            str(lane.get("generator_version")),
-            str(lane.get("adapter_version")),
-        )
-        new_tuple = (contract, generator, adapter)
-        if args.change_class in {"evidence_only", "same_contract_implementation"}:
-            if new_tuple != old_tuple:
-                raise HarnessError(
-                    f"{args.change_class} must keep contract, generator, and adapter versions fixed"
-                )
-        elif args.change_class == "semantic_change":
-            if contract == old_tuple[0] or generator == old_tuple[1] or adapter != old_tuple[2]:
-                raise HarnessError(
-                    "semantic_change must change contract and generator together while keeping adapter fixed"
-                )
-        elif args.change_class == "transport_layout_change":
-            if contract != old_tuple[0] or generator != old_tuple[1] or adapter == old_tuple[2]:
-                raise HarnessError(
-                    "transport_layout_change must change only the adapter version"
-                )
-        coordination_ids = list(dict.fromkeys(args.coord))
-        for request_id in coordination_ids:
-            request = coordination_by_id(state, request_id)
-            if request.get("status") != "accepted" or not request.get("root_arbitrations"):
-                raise HarnessError(
-                    f"coordination request {request_id} lacks accepted root arbitration"
-                )
-            if lane.get("lane_id") not in {
-                request.get("source_lane"),
-                request.get("target_lane"),
-            }:
-                raise HarnessError(
-                    f"coordination request {request_id} does not concern lane {lane.get('lane_id')}"
-                )
-        if args.change_class == "semantic_change" and not coordination_ids:
-            raise HarnessError("semantic_change requires an accepted --coord request")
-        root_session_id = require_root_session(paths, state, args.session_id)
-        revision_number = int(lane["revision"]) + 1
-        recorded = now_iso()
-        revision = {
-            "revision": revision_number,
-            "authority_commit": authority_commit,
-            "contract_version": contract,
-            "generator_version": generator,
-            "adapter_version": adapter,
-            "change_class": args.change_class,
-            "coordination_request_ids": coordination_ids,
-            "root_decision": require_text(args.decision, "root lane decision"),
-            "root_session_id": root_session_id,
-            "recorded_at": recorded,
-        }
-        lane["revision"] = revision_number
-        lane["authority_commit"] = authority_commit
-        lane["contract_version"] = contract
-        lane["generator_version"] = generator
-        lane["adapter_version"] = adapter
-        lane["next_action"] = require_text(args.next_action, "lane next action")
-        lane["updated_at"] = recorded
-        lane.setdefault("revisions", []).append(revision)
-        errors = portfolio_integrity_errors(state)
-        if errors:
-            raise HarnessError("invalid lane portfolio: " + "; ".join(errors))
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(lane, args.json)
-    return 0
-
-
-def cmd_lane_dependency_add(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    dependency_id = validate_id(args.dependency_id, "dependency id")
-    if args.kind not in DEPENDENCY_KINDS:
-        raise HarnessError(f"invalid dependency kind: {args.kind}")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "add lane dependency to")
-        require_plan_ready(paths, state, "add lane dependency")
-        lane_by_id(state, args.source_lane)
-        lane_by_id(state, args.target_lane)
-        if args.source_lane == args.target_lane:
-            raise HarnessError("lane dependency may not be a self-edge")
-        if any(
-            item.get("dependency_id") == dependency_id
-            for item in state.get("lane_dependencies", [])
-        ):
-            raise HarnessError(f"dependency already exists: {dependency_id}")
-        dependency = {
-            "integrity_version": 1,
-            "dependency_id": dependency_id,
-            "source_lane": args.source_lane,
-            "target_lane": args.target_lane,
-            "kind": args.kind,
-            "status": "open",
-            "reason": require_text(args.reason, "dependency reason"),
-            "needed_by_gate": str(args.needed_by_gate or ""),
-            "created_at": now_iso(),
-        }
-        proposed = [*state.get("lane_dependencies", []), dependency]
-        if _hard_dependency_cycle(proposed):
-            raise HarnessError("hard-gate dependency would create a cycle")
-        state.setdefault("lane_dependencies", []).append(dependency)
-        errors = portfolio_integrity_errors(state)
-        if errors:
-            raise HarnessError("invalid lane portfolio: " + "; ".join(errors))
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(dependency, args.json)
-    return 0
-
-
-def cmd_lane_dependency_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "update lane dependency for")
-        session_id = require_root_session(paths, state, args.session_id)
-        matches = [
-            item
-            for item in state.get("lane_dependencies", [])
-            if item.get("dependency_id") == args.dependency_id
-        ]
-        if len(matches) != 1:
-            raise HarnessError("dependency id does not name exactly one lane dependency")
-        dependency = matches[0]
-        if dependency.get("status") != "open":
-            raise HarnessError("only an open dependency can be updated")
-        dependency["status"] = args.status
-        dependency["root_owner"] = state.get("owner")
-        dependency["root_session_id"] = session_id
-        dependency["source_revision"] = lane_by_id(
-            state, str(dependency["source_lane"])
-        )["revision"]
-        dependency["target_revision"] = lane_by_id(
-            state, str(dependency["target_lane"])
-        )["revision"]
-        dependency["evidence"] = require_evidence_detail(
-            args.evidence, "dependency update evidence"
-        )
-        dependency["updated_at"] = now_iso()
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(dependency, args.json)
-    return 0
+def _lanes_cmd_services() -> LanesCmdServices:
+    return LanesCmdServices(
+        require_plan_ready=require_plan_ready,
+        require_root_session=require_root_session,
+        portfolio_integrity_errors=portfolio_integrity_errors,
+        lane_kinds=lambda: LANE_KINDS,
+        role_tier_map=lambda: ROLE_TIER_MAP,
+        max_engaged_lanes=MAX_ENGAGED_LANES,
+        terminal_coordination_statuses=TERMINAL_COORDINATION_STATUSES,
+        terminal_improvement_statuses=TERMINAL_IMPROVEMENT_STATUSES,
+        change_classes=CHANGE_CLASSES,
+        dependency_kinds=DEPENDENCY_KINDS,
+    )
 
 
 def cmd_coordination_create(args: argparse.Namespace, paths: HarnessPaths) -> int:
@@ -8765,14 +8476,25 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    lanes_services = _lanes_cmd_services()
     register_lane_commands(
         sub,
         handlers={
-            "lane_set_status": cmd_lane_set_status,
-            "lane_create": cmd_lane_create,
-            "lane_revise": cmd_lane_revise,
-            "lane_dependency_add": cmd_lane_dependency_add,
-            "lane_dependency_update": cmd_lane_dependency_update,
+            "lane_set_status": functools.partial(
+                cmd_lane_set_status, services=lanes_services
+            ),
+            "lane_create": functools.partial(
+                cmd_lane_create, services=lanes_services
+            ),
+            "lane_revise": functools.partial(
+                cmd_lane_revise, services=lanes_services
+            ),
+            "lane_dependency_add": functools.partial(
+                cmd_lane_dependency_add, services=lanes_services
+            ),
+            "lane_dependency_update": functools.partial(
+                cmd_lane_dependency_update, services=lanes_services
+            ),
         },
         add_json_argument=add_json_argument,
         vocab=vocab,
