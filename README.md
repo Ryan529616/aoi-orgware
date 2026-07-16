@@ -207,6 +207,45 @@ authority, lifecycle payload, managed resource, or unknown entry may exist. It
 repairs the platform/lock, acquires the first Chief, and then requires an
 authenticated rerun of `aoi init` to finish POLICY, templates, and INDEX.
 
+### One-command Codex onboarding
+
+`aoi codex-init` is the explicit, repository-local onboarding path for Codex:
+
+```bash
+cd /path/to/project
+aoi codex-init --project-name "My Project" --json
+```
+
+It initializes AOI when needed, enables only `[hooks.codex].enabled`, merges the
+four protocol-v6 lifecycle hooks into `.codex/hooks.json`, enables the stable
+Codex hook feature in `.codex/config.toml`, and installs the AOI repo skill at
+`.agents/skills/aoi/SKILL.md`. Existing Codex settings and unrelated hooks are
+preserved. Re-running the command is idempotent.
+
+For an existing AOI project the command is Chief-fenced. Enabling the hook
+policy is refused while an active or blocked task still binds the prior
+configuration digest. After onboarding, start a new Codex session in the
+trusted repository, open `/hooks`, and review/trust the exact definitions.
+`codex-init` cannot and does not mark hooks trusted for you.
+
+If AOI runs in WSL while the Codex host is Windows, pass an explicit launcher:
+
+```powershell
+aoi codex-init --hook-command-windows `
+  "wsl.exe -d Ubuntu --cd /path/to/project aoi-codex-hook --hook-version 6"
+```
+
+This command configures AOI for Codex; it does not install Codex itself or
+change global model, sandbox, approval, provider, or notification defaults.
+Use OpenAI's standalone installer separately when the `codex` command is absent
+(`https://chatgpt.com/codex/install.ps1` on Windows or `install.sh` on POSIX).
+
+Claude Code has a separate client adapter and repo-local setup path:
+
+```bash
+aoi claude-init --project-name "My Project" --json
+```
+
 ## Minimal governed task
 
 ```bash

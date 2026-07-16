@@ -53,7 +53,9 @@ python -m venv .smoke-env
 . .smoke-env/bin/activate
 python -m pip install dist/aoi_orgware-<version>-py3-none-any.whl
 aoi --version
-aoi --help | grep -E "quickstart|init|doctor"   # sanity: entry point resolves
+aoi --help | grep -E "codex-init|claude-init|init|doctor"   # entry points resolve
+aoi codex-init --help
+aoi claude-init --help
 # Confirm both hook entry points are installed:
 aoi-codex-hook --hook-version 6 < /dev/null || true
 aoi-claude-hook --hook-version 1 < /dev/null || true
@@ -89,6 +91,6 @@ section and attaching the `dist/` artifacts and their SHA-256 sums.
 
 - The sdist intentionally excludes `PROVENANCE.md` and `IMPORT_MANIFEST.json`;
   confirm they are absent from the built `.tar.gz` before uploading.
-- Nothing in this flow installs or trusts hooks in a user environment. Hook
-  wiring into a project's `.claude/settings.json` is a separate, explicitly
-  user-reviewed action.
+- Nothing in this flow installs or trusts hooks in a user environment. Project
+  wiring through `aoi codex-init` or `aoi claude-init` is a separate, explicit
+  action. Codex hook definitions still require exact review/trust via `/hooks`.

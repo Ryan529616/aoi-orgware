@@ -8,6 +8,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 ## [Unreleased]
 
 ### Added
+- **One-command Codex onboarding** (`aoi codex-init`). It initializes AOI when
+  needed, enables the explicit Codex-hook policy, non-destructively merges the
+  protocol-v6 lifecycle hooks and stable hook feature, and installs the
+  repo-local AOI skill under `.agents/skills/aoi`. It preserves unrelated
+  project hooks/settings and leaves exact-definition trust to Codex `/hooks`.
 - **Claude Code lifecycle hook adapter** (`aoi-claude-hook`,
   `aoi_orgware.claude_hook`). It shares the runtime-neutral
   `SessionStart` / `UserPromptSubmit` / `Stop` handlers with the Codex adapter
@@ -25,6 +30,9 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 - The hook adapter remains a cooperative, fail-open procedural guardrail, not a
   security sandbox. Workflow-orchestrated spawns bypass `PreToolUse`; the
   `SubagentStart` observation still accounts for them.
+- Codex onboarding does not install Codex, edit global `CODEX_HOME` settings,
+  or bypass hook trust. Existing AOI projects require the Chief credential and
+  no active task before the configuration digest can change.
 
 ## [0.2.2] - alpha
 

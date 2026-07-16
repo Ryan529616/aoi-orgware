@@ -197,6 +197,12 @@ must also carry pre-marker legacy provenance. Other runtimes should integrate
 through equivalent observed-event adapters or the CLI/JSON contract without
 bypassing AOI authority rules.
 
+The `aoi codex-init` composition path is intentionally repository-local. It
+non-destructively merges hook definitions and the stable hook feature under
+`.codex/`, installs the AOI skill under `.agents/skills/`, and enables the AOI
+policy flag only when no active task binds the previous digest. It never edits
+global Codex state or bypasses Codex's exact-definition `/hooks` trust review.
+
 The optional codebase-memory Phase 1 adapter is a second, deliberately narrower
 integration. A Chief-fenced command imports an exact reviewed receipt into a
 task-local immutable snapshot. `doctor` and a Steward execution brief may

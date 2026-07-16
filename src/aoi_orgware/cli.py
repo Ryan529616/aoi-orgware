@@ -98,6 +98,7 @@ from .commands.packets import register_packet_commands
 from .commands.resource import register_resource_commands
 from .commands.status import register_status_commands
 from .commands import claude_onboarding as claude_onboarding_impl
+from .commands import codex_onboarding as codex_onboarding_impl
 from .commands.task_lifecycle import (
     register_bootstrap_commands,
     register_chief_commands,
@@ -540,7 +541,7 @@ class AOIArgumentParser(argparse.ArgumentParser):
 def command_requires_chief(command: str, *, initialized: bool) -> bool:
     """Default-fence every project command not explicitly proven exempt."""
 
-    if command in {"init", "claude-init"}:
+    if command in {"init", "claude-init", "codex-init"}:
         return initialized
     return command not in (
         CHIEF_AUTHORITY_CONTROL_COMMANDS
@@ -1766,6 +1767,132 @@ def cmd_claude_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "For governed work, acquire a Chief lease: aoi chief-acquire "
             "--session-id <session-id> --json, then export the returned "
             "AOI_CHIEF_* variables.",
+        ],
+    }
+    emit(payload, args.json)
+    return 0
+
+
+def _enable_codex_hook_policy(paths: HarnessPaths) -> tuple[HarnessPaths, bool]:
+    """Enable the explicit AOI Codex-hook policy without changing any other key."""
+
+    if paths.project.codex_hooks_enabled:
+        return paths, False
+    active_tasks = [
+        str(state.get("task_id", ""))
+        for state in load_all_tasks(paths)
+        if state.get("status") in {"active", "blocked"}
+    ]
+    if active_tasks:
+        raise HarnessError(
+            "cannot enable hooks.codex while active AOI tasks bind the current "
+            f"configuration digest: {sorted(active_tasks)}"
+        )
+    try:
+        current_text = paths.config.read_text(encoding="utf-8")
+        candidate, changed = codex_onboarding_impl.enable_aoi_codex_hooks_policy(
+            current_text
+        )
+    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+    if not changed:
+        return paths, False
+    atomic_write_text(paths.config, candidate)
+    updated = get_paths(paths.root)
+    if updated.harness != paths.harness or updated.lock != paths.lock:
+        raise HarnessError(
+            "codex-init changed an AOI path or lock domain unexpectedly; restore aoi.toml"
+        )
+    if not updated.project.codex_hooks_enabled:
+        raise HarnessError("codex-init failed to enable hooks.codex in aoi.toml")
+    write_index(updated)
+    return updated, True
+
+
+def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    """Initialize AOI and wire repository-local Codex hooks and skill."""
+
+    if not (paths.root / ".git").exists():
+        raise HarnessError("aoi codex-init requires a Git repository root")
+    if paths.config.is_file() and not paths.project.codex_hooks_enabled:
+        active_tasks = [
+            str(state.get("task_id", ""))
+            for state in load_all_tasks(paths)
+            if state.get("status") in {"active", "blocked"}
+        ]
+        if active_tasks:
+            raise HarnessError(
+                "cannot enable hooks.codex while active AOI tasks bind the current "
+                f"configuration digest: {sorted(active_tasks)}"
+            )
+    try:
+        preflight = codex_onboarding_impl.preflight_codex_onboarding(
+            paths.root,
+            command=args.hook_command,
+            command_windows=args.hook_command_windows,
+        )
+        codex_skill_text = _resource_text("codex/SKILL.md")
+    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+    init_ns = argparse.Namespace(
+        project_name=args.project_name,
+        config=None,
+        expected_config_sha256=None,
+        replace_policy_sha256=None,
+        json=True,
+    )
+    captured = io.StringIO()
+    saved_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        cmd_init(init_ns, paths)
+    finally:
+        sys.stdout = saved_stdout
+    try:
+        init_result = json.loads(captured.getvalue() or "{}")
+    except json.JSONDecodeError:
+        init_result = {}
+
+    paths = get_paths(paths.root)
+    # Existing projects arrive here under the Chief/state lock. Fresh projects
+    # have just completed init and have no task state yet. In both cases the
+    # change is limited to one reviewed boolean and refuses active task digests.
+    paths, policy_changed = _enable_codex_hook_policy(paths)
+    try:
+        config_result = codex_onboarding_impl.install_codex_config(
+            paths.root / ".codex" / "config.toml"
+        )
+        hooks_result = codex_onboarding_impl.install_codex_hooks(
+            paths.root / ".codex" / "hooks.json",
+            command=args.hook_command,
+            command_windows=args.hook_command_windows,
+        )
+        skill_result = codex_onboarding_impl.install_codex_skill(
+            paths.root / ".agents" / "skills",
+            codex_skill_text,
+        )
+    except (OSError, codex_onboarding_impl.CodexOnboardingError) as exc:
+        raise HarnessError(str(exc)) from exc
+
+    payload = {
+        "codex_init": True,
+        "project": paths.project.name,
+        "root": str(paths.root),
+        "aoi_initialized": init_result.get("initialized", True),
+        "created_config": init_result.get("created_config", False),
+        "aoi_hook_policy_enabled": True,
+        "aoi_hook_policy_changed": policy_changed,
+        "config_sha256": paths.project.sha256,
+        "codex_config": config_result,
+        "preflight": preflight,
+        "hooks": hooks_result,
+        "skill": skill_result,
+        "next_steps": [
+            "Install AOI on the Codex host PATH so aoi-codex-hook resolves.",
+            "Start a new Codex session in this trusted repo, open /hooks, and "
+            "review/trust the exact AOI hook definitions.",
+            "Run aoi doctor --json after hook trust; structural PASS does not prove "
+            "that Codex executed or trusted a hook.",
         ],
     }
     emit(payload, args.json)
@@ -10105,19 +10232,43 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 hook_payload = {}
             expected_events = {"SessionStart", "UserPromptSubmit", "SubagentStart", "Stop"}
             hooks = hook_payload.get("hooks", {})
-            if set(hooks) != expected_events:
-                errors.append(f"unexpected hook event set in {hook_path}: {sorted(hooks)}")
+            if not isinstance(hooks, dict):
+                errors.append(f"{hook_path} hooks must be a JSON object")
             else:
                 for event in expected_events:
                     entries = hooks.get(event, [])
-                    if len(entries) != 1 or len(entries[0].get("hooks", [])) != 1:
-                        errors.append(f"{hook_path} must have exactly one handler for {event}")
+                    if not isinstance(entries, list):
+                        errors.append(f"{hook_path} {event} must be a JSON array")
                         continue
-                    handler = entries[0]["hooks"][0]
+                    matching_handlers: list[dict[str, Any]] = []
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        handlers = entry.get("hooks", [])
+                        if not isinstance(handlers, list):
+                            continue
+                        for handler in handlers:
+                            if not isinstance(handler, dict):
+                                continue
+                            commands = (
+                                str(handler.get("command", "")),
+                                str(handler.get("commandWindows", "")),
+                            )
+                            if any("aoi-codex-hook" in command for command in commands):
+                                matching_handlers.append(handler)
+                    if len(matching_handlers) != 1:
+                        errors.append(
+                            f"{hook_path} must have exactly one AOI handler for {event}"
+                        )
+                        continue
+                    handler = matching_handlers[0]
                     if handler.get("type") != "command":
-                        errors.append(f"{hook_path} {event} handler is not a command")
-                    if handler.get("timeout", 0) < 30:
-                        errors.append(f"{hook_path} {event} timeout is below 30 seconds")
+                        errors.append(f"{hook_path} {event} AOI handler is not a command")
+                    timeout = handler.get("timeout", 0)
+                    if not isinstance(timeout, (int, float)) or timeout < 30:
+                        errors.append(
+                            f"{hook_path} {event} AOI handler timeout is below 30 seconds"
+                        )
                     for key in ("command", "commandWindows"):
                         command = str(handler.get(key, ""))
                         if "aoi-codex-hook" not in command:
@@ -10498,6 +10649,12 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    codex_onboarding_impl.register_codex_onboarding_commands(
+        sub,
+        handlers={"codex_init": cmd_codex_init},
+        add_json_argument=add_json_argument,
+    )
+
     claude_onboarding_impl.register_claude_onboarding_commands(
         sub,
         handlers={"claude_init": cmd_claude_init},
@@ -10666,7 +10823,7 @@ def main(argv: list[str] | None = None) -> int:
             return int(args.handler(args, None))
         paths = get_paths()
         initialized = paths.config.is_file()
-        if command not in {"init", "claude-init", ""} and not initialized:
+        if command not in {"init", "claude-init", "codex-init", ""} and not initialized:
             raise HarnessError(f"AOI is not initialized at {paths.root}; run 'aoi init' first")
         if initialized:
             apply_project_config(paths.project)

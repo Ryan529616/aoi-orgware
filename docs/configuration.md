@@ -90,9 +90,11 @@ enabled = false
   convenience flow. The configured `state_dir` must be covered by one entry.
   At least one entry must cover the configured `state_dir`.
 - `external_lock_namespace`: prefix for external file/tree locks.
-- `hooks.codex.enabled`: opt-in declaration; it does not install or trust hooks.
-  AOI doctor expects protocol v6 when enabled. The user must review the command
-  through Codex `/hooks`; without that trust, arm the exact packet first and
+- `hooks.codex.enabled`: opt-in declaration. Plain `aoi init` does not install
+  or trust hooks. Explicit `aoi codex-init` enables the declaration, merges
+  protocol-v6 project hooks, enables Codex's stable hook feature, and installs
+  the repo-local AOI skill; the user must still review the exact commands
+  through Codex `/hooks`. Without that trust, arm the exact packet first and
   then use explicit manual-unverified packet dispatch before that short-lived
   arm expires. AOI revalidates the same authority snapshot at consumption.
 - `legacy.enabled`: enables compatibility-ledger import and reporting.
@@ -107,6 +109,11 @@ bind one config digest, so a reviewed same-`state_dir` change does not strand
 lease recovery; each fenced command reloads the config while holding the state
 lock. Changing `state_dir` is a separate state migration and must not be
 simulated by swapping `aoi.toml` under a live lease.
+
+On an existing project, `aoi codex-init` is Chief-fenced and changes only the
+false-to-true Codex hook flag. It refuses the change while any active or blocked
+task binds the current digest. It does not rewrite model, reasoning, approval,
+sandbox, provider, notification, MCP, plugin, or global Codex settings.
 
 Initialization is resumable and non-clobbering, but it is not a distributed
 multi-file transaction. If the first process stops after publishing `aoi.toml`
