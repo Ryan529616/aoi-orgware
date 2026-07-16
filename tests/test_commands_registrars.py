@@ -69,6 +69,7 @@ REGISTRAR_MODULES = [
     SRC / "aoi_orgware" / "commands" / "status.py",
     SRC / "aoi_orgware" / "commands" / "backup.py",
     SRC / "aoi_orgware" / "commands" / "context_memory.py",
+    SRC / "aoi_orgware" / "commands" / "resource.py",
 ]
 
 
