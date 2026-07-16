@@ -39,39 +39,44 @@ baseline, or whether “tests passed” meant that a test actually ran.
 
 From the repository you want to govern, paste this into Codex or Claude Code:
 
-> Inspect https://github.com/Ryan529616/aoi-orgware and my current repository
-> without modifying my project. Resolve AOI `main` to an exact commit and show
-> me the proposed AOI revision, project files, user-scope files, hooks, and trust
-> boundary. Wait for my approval. Then install that exact commit in an isolated
-> tool environment, use AOI's bootstrap flow when a project-specific profile is
-> justified, bind this repository to the current coding-agent client, preserve
-> unrelated settings, run AOI doctor and the integration smoke checks, and use
-> AOI for future material work. Do not claim that hooks are trusted or that a
-> model route was observed unless the runtime provides evidence for it.
+> Inspect https://github.com/Ryan529616/aoi-orgware, the latest published release
+> at https://pypi.org/project/aoi-orgware/, and my current repository without
+> modifying my project. Resolve that AOI release to an exact version, tag, and
+> commit, then show me the proposed AOI revision, project files, user-scope files,
+> hooks, and trust boundary. Wait for my approval. Install that exact published
+> version in an isolated tool environment, use AOI's bootstrap flow when a
+> project-specific profile is justified, bind this repository to the current
+> coding-agent client, preserve unrelated settings, run AOI doctor and the
+> integration smoke checks, and use AOI for future material work. Do not claim
+> that hooks are trusted or that a model route was observed unless the runtime
+> provides evidence for it.
 
 That is the intended onboarding experience. The coding agent operates AOI's
 deterministic CLI internally; the user should not have to memorize lifecycle
-commands. The approval is deliberate because installing code from a URL and
-adding persistent project hooks is a supply-chain and trust decision.
+commands. The approval is deliberate because installing a package and adding
+persistent project hooks is a supply-chain and trust decision.
 
-### Manual source install
+### Direct install
 
-AOI is not published to PyPI yet. Until the next tagged release includes the
-current onboarding work, pin a reviewed commit instead of installing a moving
-branch:
+AOI publishes alpha releases on PyPI. Install the current release as an isolated
+tool, or install it in an activated virtual environment:
 
 ```bash
-# With uv:
-uv tool install "git+https://github.com/Ryan529616/aoi-orgware.git@<reviewed-commit-sha>"
+uv tool install aoi-orgware
+# or
+pipx install aoi-orgware
 
-# Or inside an activated virtual environment:
-python -m pip install "git+https://github.com/Ryan529616/aoi-orgware.git@<reviewed-commit-sha>"
+# Inside an activated virtual environment:
+python -m pip install aoi-orgware
 
 # Run one of these from the repository you want to govern.
 aoi codex-init --project-name "My Project" --json
 # or
 aoi claude-init --project-name "My Project" --json
 ```
+
+For a repeatable deployment, pin the reviewed release as
+`aoi-orgware==<reviewed-version>` instead of accepting a future update.
 
 The onboarding commands initialize AOI when needed, preserve unrelated client
 settings, install the generic AOI skill once at user scope, and wire the

@@ -12387,7 +12387,7 @@ class BytecodeHygieneTests(HarnessTestCase):
                 timeout=20,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertEqual(version.stdout.strip(), "AOI 0.2.2")
+            self.assertEqual(version.stdout.strip(), "AOI 0.2.3")
             help_result = subprocess.run(
                 [sys.executable, "-m", CLI_MODULE, "init-task", "--help"],
                 cwd=directory,

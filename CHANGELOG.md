@@ -7,6 +7,8 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-16 (alpha)
+
 ### Added
 - **One-command Codex onboarding** (`aoi codex-init`). It initializes AOI when
   needed, enables the explicit Codex-hook policy, non-destructively merges the
@@ -48,6 +50,8 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   recovery sequence.
 
 ### Notes
+- First public PyPI release. It rolls up the internal 0.2.1 and 0.2.2 alpha
+  milestones in addition to the onboarding and integrity changes above.
 - The hook adapter remains a cooperative, fail-open procedural guardrail, not a
   security sandbox. Workflow-orchestrated spawns bypass `PreToolUse`; the
   `SubagentStart` observation still accounts for them.
@@ -55,24 +59,27 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   or bypass hook trust. Existing AOI projects require the Chief credential and
   no active task before the configuration digest can change.
 
-## [0.2.2] - alpha
+## [0.2.2] - internal alpha (not published)
 
 - Single durable Chief lease per project with monotonic epochs, explicit
   takeover, and default fencing of lifecycle mutations.
 - Continued extraction of command bodies out of the monolithic CLI into
   `aoi_orgware/commands/` and integrity modules.
+- This internal milestone had no tag, GitHub Release, or PyPI distribution.
 
-## [0.2.1] - alpha
+## [0.2.1] - internal alpha (not published)
 
 - Task-global execution epochs, dispatch provenance, and resource-envelope
-  hardening. See the GitHub release for details.
+  hardening.
+- This internal milestone had no tag, GitHub Release, or PyPI distribution.
 
 ## [0.1.2] - alpha
 
 - First packaged alpha. Includes the Windows path-canonicalization fix for the
   symlink-traversal false positive. See the GitHub release for details.
 
-[Unreleased]: https://github.com/Ryan529616/aoi-orgware/compare/v0.2.2...HEAD
-[0.2.2]: https://github.com/Ryan529616/aoi-orgware/releases
-[0.2.1]: https://github.com/Ryan529616/aoi-orgware/releases
-[0.1.2]: https://github.com/Ryan529616/aoi-orgware/releases
+[Unreleased]: https://github.com/Ryan529616/aoi-orgware/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/Ryan529616/aoi-orgware/compare/v0.1.2-alpha...v0.2.3
+[0.2.2]: https://github.com/Ryan529616/aoi-orgware/commit/8ea308046f37e4cb73e7b0f0e56c1c80d71a8da4
+[0.2.1]: https://github.com/Ryan529616/aoi-orgware/commit/a56a20e5bdb9cf1fb6cba0483e4c82678d10d5cf
+[0.1.2]: https://github.com/Ryan529616/aoi-orgware/releases/tag/v0.1.2-alpha
