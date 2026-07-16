@@ -106,7 +106,16 @@ from .commands.coordination import (
     register_cross_lane_commands,
 )
 from .commands.execution_selection import register_execution_selection_commands
-from .commands.improvement import register_improvement_commands
+from .commands.improvement import (
+    ImprovementCmdServices,
+    cmd_improvement_arbitrate,
+    cmd_improvement_brief,
+    cmd_improvement_create,
+    cmd_improvement_link_project,
+    cmd_skill_adoption_record,
+    cmd_skill_release_record,
+    register_improvement_commands,
+)
 from .commands.jobs import register_job_commands
 from .commands.lanes import register_lane_commands
 from .commands.packets import register_packet_commands
@@ -2733,564 +2742,6 @@ def _records_fingerprint(records: list[dict[str, Any]]) -> str:
     ).hexdigest()
 
 
-def cmd_improvement_create(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    request_id = validate_id(args.request_id, "improvement request id")
-    task_type = validate_id(args.task_type, "improvement task type")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "submit improvement request for")
-        require_plan_ready(paths, state, "submit improvement request")
-        if any(
-            request.get("request_id") == request_id
-            for request in state.get("improvement_requests", [])
-        ):
-            raise HarnessError(f"improvement request already exists: {request_id}")
-        source_lane = lane_by_id(state, args.source_lane)
-        steward = _engaged_steward_lane(state)
-        occurrences = [_resolve_improvement_occurrence(state, item) for item in args.occurrence]
-        references = [item["reference"] for item in occurrences]
-        if len(references) != len(set(references)):
-            raise HarnessError("improvement occurrences must be distinct")
-        if args.trigger_class == "repeated_pain":
-            if len(occurrences) < 3 or len({item["kind"] for item in occurrences}) < 2:
-                raise HarnessError(
-                    "repeated pain requires at least three occurrences across two work-unit kinds"
-                )
-        elif len(occurrences) != 1:
-            raise HarnessError("critical single incident requires exactly one occurrence")
-        recorded = now_iso()
-        request = {
-            "integrity_version": 1,
-            "request_id": request_id,
-            "version": 1,
-            "status": "submitted",
-            "trigger_class": args.trigger_class,
-            "release_blocking": bool(args.release_blocking),
-            "source_lane_id": source_lane["lane_id"],
-            "source_lane_revision": source_lane["revision"],
-            "steward_lane_id": steward["lane_id"],
-            "task_type": task_type,
-            "pain_statement": require_evidence_detail(
-                args.pain_statement, "improvement pain statement"
-            ),
-            "desired_outcome": require_evidence_detail(
-                args.desired_outcome, "improvement desired outcome"
-            ),
-            "occurrences": occurrences,
-            "occurrence_fingerprint": _records_fingerprint(occurrences),
-            "brief": None,
-            "chief_decision": None,
-            "project": None,
-            "release_ids": [],
-            "events": [
-                {
-                    "event": "submitted",
-                    "actor_lane": source_lane["lane_id"],
-                    "recorded_at": recorded,
-                }
-            ],
-            "created_at": recorded,
-            "updated_at": recorded,
-        }
-        state["improvement_model_version"] = 1
-        state.setdefault("improvement_requests", []).append(request)
-        state.setdefault("skill_releases", [])
-        state.setdefault("skill_adoption_events", [])
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(request, args.json)
-    return 0
-
-
-def cmd_improvement_brief(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "brief improvement request for")
-        request = improvement_request_by_id(state, args.request_id)
-        if request.get("version") != args.expected_version or request.get("status") != "submitted":
-            raise HarnessError("improvement brief CAS/status gate failed")
-        steward = _engaged_steward_lane(state)
-        if steward.get("lane_id") != args.steward_lane_id:
-            raise HarnessError("improvement brief must be issued by the engaged steward")
-        capacity_reference = None
-        if args.capacity_review_id:
-            capacity = capacity_review_by_id(state, args.capacity_review_id)
-            if capacity.get("scope", {}).get("target_lane_id") != request.get("source_lane_id"):
-                raise HarnessError("capacity comparison targets a different department lane")
-            capacity_reference = {
-                "review_id": capacity["review_id"],
-                "version": capacity["version"],
-                "status": capacity["status"],
-                "dataset_sha256": capacity.get("dataset", {}).get("sha256"),
-            }
-        recorded = now_iso()
-        request["version"] = int(request["version"]) + 1
-        request["status"] = "awaiting_chief"
-        request["brief"] = {
-            "steward_lane_id": steward["lane_id"],
-            "options": _parse_improvement_options(args.option),
-            "capacity_reference": capacity_reference,
-            "recommendation": require_evidence_detail(
-                args.recommendation, "improvement recommendation"
-            ),
-            "evidence_boundary": require_evidence_detail(
-                args.evidence_boundary, "improvement evidence boundary"
-            ),
-            "recorded_at": recorded,
-        }
-        request["events"].append(
-            {"event": "awaiting_chief", "actor_lane": steward["lane_id"], "recorded_at": recorded}
-        )
-        request["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(request, args.json)
-    return 0
-
-
-def cmd_improvement_arbitrate(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "arbitrate improvement request for")
-        if any(
-            item.get("status") == "needs_user"
-            for item in state.get("needs_user_escalations", [])
-        ):
-            raise HarnessError(
-                "unresolved needs-user escalation blocks improvement arbitration"
-            )
-        request = improvement_request_by_id(state, args.request_id)
-        if (
-            request.get("version") != args.expected_version
-            or request.get("status") != "awaiting_chief"
-        ):
-            raise HarnessError("improvement arbitration CAS/status gate failed")
-        session_id = require_root_session(paths, state, args.session_id)
-        options = {
-            item.get("option_id") for item in request.get("brief", {}).get("options", [])
-        }
-        selected = args.selected_option or ""
-        if args.decision == "approved" and selected not in options:
-            raise HarnessError("approved improvement requires a valid selected option")
-        if args.decision == "rejected" and selected:
-            raise HarnessError("rejected improvement may not select an option")
-        recorded = now_iso()
-        request["version"] = int(request["version"]) + 1
-        request["status"] = "approved" if args.decision == "approved" else "rejected"
-        request["chief_decision"] = {
-            "decision_id": f"{request['request_id']}-chief-1",
-            "decision": args.decision,
-            "selected_option_id": selected,
-            "rationale": require_evidence_detail(
-                args.rationale, "improvement chief rationale"
-            ),
-            "root_owner": state.get("owner"),
-            "root_session_id": session_id,
-            "recorded_at": recorded,
-        }
-        request["events"].append(
-            {"event": request["status"], "actor_lane": "chief", "recorded_at": recorded}
-        )
-        request["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(request, args.json)
-    return 0
-
-
-def cmd_improvement_link_project(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    project_task_id = validate_id(args.project_task_id, "improvement project task id")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "link improvement project for")
-        request = improvement_request_by_id(state, args.request_id)
-        if request.get("version") != args.expected_version or request.get("status") != "approved":
-            raise HarnessError("improvement project link CAS/status gate failed")
-        if (request.get("chief_decision") or {}).get("selected_option_id") != "skill-automation":
-            raise HarnessError("only a chief-selected skill-automation option may create a project")
-        if project_task_id == state.get("task_id"):
-            raise HarnessError("improvement work must use an independent full harness task")
-        _engaged_steward_lane(state)
-        project = load_task(paths, project_task_id)
-        if project.get("profile", "full") != "full":
-            raise HarnessError("improvement project must use the full task profile")
-        require_open_task(project, "serve as improvement project")
-        require_plan_ready(paths, project, "link improvement project")
-        if not any(
-            claim.get("status") in RESERVING_CLAIM_STATUSES
-            for claim in claims_owned_by_task(paths, project_task_id)
-        ):
-            raise HarnessError("improvement project must own at least one reserving claim")
-        recorded = now_iso()
-        request["version"] = int(request["version"]) + 1
-        request["status"] = "delegated"
-        request["project"] = {
-            "task_id": project_task_id,
-            "plan_sha256": project.get("plan_sha256"),
-            "worktree": project.get("worktree"),
-            "branch": project.get("branch"),
-            "linked_at": recorded,
-        }
-        request["events"].append(
-            {"event": "delegated", "actor_lane": "steward", "recorded_at": recorded}
-        )
-        request["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(request, args.json)
-    return 0
-
-
-def cmd_skill_release_record(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    release_id = validate_id(args.release_id, "skill release id")
-    skill_id = validate_id(args.skill_id, "skill id")
-    expected_bundle_sha = require_text(args.bundle_sha256, "skill bundle SHA-256").lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_bundle_sha):
-        raise HarnessError("skill bundle SHA-256 must be full 64 hex")
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "record skill release for")
-        _engaged_steward_lane(state)
-        request = improvement_request_by_id(state, args.request_id)
-        if request.get("version") != args.expected_version or request.get("status") != "delegated":
-            raise HarnessError("skill release CAS/status gate failed")
-        if any(item.get("release_id") == release_id for item in state.get("skill_releases", [])):
-            raise HarnessError(f"skill release already exists: {release_id}")
-        project_task_id = request.get("project", {}).get("task_id")
-        project = load_task(paths, str(project_task_id))
-        if project.get("plan_sha256") != request.get("project", {}).get("plan_sha256"):
-            raise HarnessError("linked improvement project plan changed")
-        project_dir = task_dir(paths, str(project_task_id))
-        bundle_source, bundle_data = read_regular_artifact(
-            args.bundle, "skill bundle", max_bytes=32 * 1024 * 1024
-        )
-        manifest_source, manifest_data, manifest = _load_json_artifact(
-            args.manifest, "skill release manifest", args.manifest_sha256
-        )
-        validation_source, validation_data, validation = _load_json_artifact(
-            args.validation_receipt,
-            "skill validation receipt",
-            args.validation_receipt_sha256,
-        )
-        for source, label in (
-            (bundle_source, "skill bundle"),
-            (manifest_source, "skill release manifest"),
-            (validation_source, "skill validation receipt"),
-        ):
-            _require_project_result(project_dir, source, label)
-        bundle_sha = hashlib.sha256(bundle_data).hexdigest()
-        validation_sha = hashlib.sha256(validation_data).hexdigest()
-        bundle_members = _skill_bundle_member_hashes(bundle_data)
-        if bundle_sha != expected_bundle_sha:
-            raise HarnessError("skill bundle SHA-256 mismatch")
-        if (
-            manifest.get("skill_release_manifest_version") != 1
-            or manifest.get("skill_id") != skill_id
-            or manifest.get("skill_version") != args.skill_version
-            or manifest.get("maintenance_owner") != args.maintenance_owner
-            or manifest.get("rollback_plan") != args.rollback_plan
-            or manifest.get("bundle_sha256") != bundle_sha
-            or manifest.get("validation_receipt_sha256") != validation_sha
-            or not _valid_skill_manifest_files(manifest.get("files"))
-        ):
-            raise HarnessError("skill release manifest contract is incomplete or inconsistent")
-        manifest_members = {
-            str(item["path"]): str(item["sha256"])
-            for item in manifest["files"]
-        }
-        if manifest_members != bundle_members:
-            raise HarnessError("skill release manifest does not match archive members and SHA-256")
-        independent = validation.get("independent_review", {})
-        review_packet_id = str(independent.get("review_packet_id", ""))
-        if (
-            validation.get("validation_version") != 1
-            or validation.get("skill_creator_used") is not True
-            or validation.get("structural_pass") is not True
-            or validation.get("agents_metadata_consistent") is not True
-            or validation.get("bundled_scripts_tested") is not True
-            or not _valid_named_checks(validation.get("representative_project_fixtures"), 2)
-            or not _valid_named_checks(validation.get("adversarial_fixtures"), 3)
-            or not _valid_named_checks(validation.get("blind_forward_tests"), 2)
-            or independent.get("status") != "pass"
-            or not independent.get("evidence")
-            or not review_packet_id
-        ):
-            raise HarnessError("skill validation receipt does not meet the release quality gate")
-        required_artifact_shas = {
-            bundle_sha,
-            hashlib.sha256(manifest_data).hexdigest(),
-            validation_sha,
-        }
-        review_packet = _require_done_reviewer_packet(
-            paths,
-            project,
-            review_packet_id,
-            required_artifact_shas=required_artifact_shas,
-        )
-        project_records = [
-            item
-            for item in project.get("verification", [])
-            if item.get("status") == "pass"
-            and item.get("integrity_version") == 1
-            and item.get("category") in {"skill_validation", "independent_review"}
-            and required_artifact_shas.issubset(
-                {ref.get("sha256") for ref in item.get("artifact_refs", [])}
-            )
-        ]
-        if (
-            len(project_records) != 2
-            or {item.get("category") for item in project_records}
-            != {"skill_validation", "independent_review"}
-        ):
-            raise HarnessError(
-                "linked project requires candidate-bound skill_validation and independent_review records"
-            )
-        independent_record = next(
-            item
-            for item in project_records
-            if item.get("category") == "independent_review"
-        )
-        if (
-            independent_record.get("review_packet_id") != review_packet["packet_id"]
-            or independent_record.get("review_result_sha256")
-            != review_packet.get("result_sha256")
-            or independent_record.get("reviewer_agent_id")
-            != review_packet.get("agent_id")
-        ):
-            raise HarnessError(
-                "independent review verification is not bound to the reviewer result identity"
-            )
-        destination_root = task_dir(paths, args.task) / "results"
-        bundle_snapshot = destination_root / f"skill-release-{release_id}.bundle"
-        manifest_snapshot = destination_root / f"skill-release-{release_id}.manifest.json"
-        validation_snapshot = destination_root / f"skill-release-{release_id}.validation.json"
-        atomic_write_bytes(bundle_snapshot, bundle_data)
-        atomic_write_bytes(manifest_snapshot, manifest_data)
-        atomic_write_bytes(validation_snapshot, validation_data)
-        for destination in (bundle_snapshot, manifest_snapshot, validation_snapshot):
-            os.chmod(destination, 0o600)
-        recorded = now_iso()
-        release = {
-            "integrity_version": 1,
-            "release_id": release_id,
-            "request_id": request["request_id"],
-            "project_task_id": project_task_id,
-            "skill_id": skill_id,
-            "skill_version": require_text(args.skill_version, "skill version"),
-            "maintenance_owner": require_text(
-                args.maintenance_owner, "skill maintenance owner"
-            ),
-            "rollback_plan": require_evidence_detail(
-                args.rollback_plan, "skill rollback plan"
-            ),
-            "status": "release_candidate",
-            "bundle_path": str(bundle_snapshot),
-            "bundle_sha256": bundle_sha,
-            "bundle_size_bytes": len(bundle_data),
-            "manifest_path": str(manifest_snapshot),
-            "manifest_sha256": sha256_file(manifest_snapshot),
-            "validation_path": str(validation_snapshot),
-            "validation_sha256": sha256_file(validation_snapshot),
-            "independent_review": {
-                "review_packet_id": review_packet["packet_id"],
-                "review_result_sha256": review_packet["result_sha256"],
-                "reviewer_agent_id": review_packet["agent_id"],
-            },
-            "recorded_at": recorded,
-        }
-        state.setdefault("skill_releases", []).append(release)
-        request["release_ids"].append(release_id)
-        request["version"] = int(request["version"]) + 1
-        request["status"] = "release_candidate"
-        request["events"].append(
-            {"event": "release_candidate", "actor_lane": "steward", "recorded_at": recorded}
-        )
-        request["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(release, args.json)
-    return 0
-
-
-def cmd_skill_adoption_record(args: argparse.Namespace, paths: HarnessPaths) -> int:
-    with state_lock(paths):
-        state = load_task(paths, args.task)
-        require_open_task(state, "record skill adoption decision for")
-        request = improvement_request_by_id(state, args.request_id)
-        if request.get("version") != args.expected_version:
-            raise HarnessError("skill adoption CAS failed")
-        releases = [
-            item for item in state.get("skill_releases", []) if item.get("release_id") == args.release_id
-        ]
-        if len(releases) != 1 or args.release_id not in request.get("release_ids", []):
-            raise HarnessError("skill release does not belong to this improvement request")
-        release = releases[0]
-        for path_field, sha_field in (
-            ("bundle_path", "bundle_sha256"),
-            ("manifest_path", "manifest_sha256"),
-            ("validation_path", "validation_sha256"),
-        ):
-            release_path = Path(str(release.get(path_field, "")))
-            if (
-                not release_path.is_file()
-                or release_path.is_symlink()
-                or sha256_file(release_path) != release.get(sha_field)
-            ):
-                raise HarnessError("skill release artifact is missing or tampered")
-        release_errors = _skill_release_semantic_integrity_errors(state, release, paths)
-        if release_errors:
-            raise HarnessError("; ".join(release_errors))
-        allowed = {
-            "release_candidate": {"canary"},
-            "canary": {"adopt", "pause", "rollback"},
-            "paused": {"canary", "rollback", "deprecate"},
-            "adopted": {"pause", "rollback", "deprecate"},
-        }
-        if args.action not in allowed.get(str(request.get("status")), set()):
-            raise HarnessError(
-                f"invalid skill adoption transition {request.get('status')} -> {args.action}"
-            )
-        session_id = require_root_session(paths, state, args.session_id)
-        _, evidence_data, evidence_payload = _load_json_artifact(
-            args.evidence_artifact, "skill adoption evidence", args.evidence_sha256
-        )
-        if evidence_payload.get("adoption_receipt_version") != 1:
-            raise HarnessError("skill adoption evidence has an unsupported schema")
-        if (
-            evidence_payload.get("request_id") != request["request_id"]
-            or evidence_payload.get("release_id") != release["release_id"]
-            or evidence_payload.get("skill_version") != release["skill_version"]
-            or evidence_payload.get("action") != args.action
-        ):
-            raise HarnessError("skill adoption evidence is bound to a different release")
-        skill_work_unit_bindings: list[dict[str, Any]] = []
-        baseline_work_unit_bindings: list[dict[str, Any]] = []
-        bound_canary_event_id = ""
-        if args.action == "canary":
-            if (
-                _json_nonnegative_int(evidence_payload, "planned_skill_units") < 3
-                or not str(evidence_payload.get("rollback_plan", "")).strip()
-            ):
-                raise HarnessError("skill canary requires at least three units and a rollback plan")
-        if args.action == "adopt":
-            canary_events = [
-                item
-                for item in state.get("skill_adoption_events", [])
-                if item.get("release_id") == release["release_id"]
-                and item.get("action") == "canary"
-            ]
-            if (
-                not canary_events
-                or evidence_payload.get("canary_event_id")
-                != canary_events[-1].get("event_id")
-            ):
-                raise HarnessError("skill adoption evidence is not bound to the current canary")
-            canary_event = canary_events[-1]
-            bound_canary_event_id = str(canary_event["event_id"])
-            skill_work_unit_bindings = _resolve_adoption_work_units(
-                state,
-                evidence_payload.get("skill_work_units"),
-                label="skill canary",
-                minimum=3,
-                canary_recorded_at=str(canary_event.get("recorded_at", "")),
-                require_after_canary=True,
-                expected_skill_release_id=str(release.get("release_id", "")),
-                expected_skill_version=str(release.get("skill_version", "")),
-                expected_canary_event_id=bound_canary_event_id,
-            )
-            if _json_nonnegative_int(evidence_payload, "skill_units") != len(
-                skill_work_unit_bindings
-            ):
-                raise HarnessError(
-                    "skill_units must equal the number of bound skill_work_units"
-                )
-            if evidence_payload.get("efficiency_claim") is True:
-                baseline_work_unit_bindings = _resolve_adoption_work_units(
-                    state,
-                    evidence_payload.get("baseline_work_units"),
-                    label="skill baseline",
-                    minimum=3,
-                    canary_recorded_at=str(canary_event.get("recorded_at", "")),
-                    require_after_canary=False,
-                )
-                if _json_nonnegative_int(evidence_payload, "baseline_units") != len(
-                    baseline_work_unit_bindings
-                ):
-                    raise HarnessError(
-                        "baseline_units must equal the number of bound baseline_work_units"
-                    )
-                if {
-                    item["identity_sha256"] for item in skill_work_unit_bindings
-                } & {
-                    item["identity_sha256"] for item in baseline_work_unit_bindings
-                }:
-                    raise HarnessError(
-                        "skill and baseline work units must have disjoint durable identities"
-                    )
-            if (
-                evidence_payload.get("success_criteria_met") is not True
-                or _json_nonnegative_int(evidence_payload, "quality_regressions") != 0
-                or evidence_payload.get("rollback_path_verified") is not True
-            ):
-                raise HarnessError("skill adoption evidence does not meet the canary quality gate")
-        if args.action in {"pause", "rollback", "deprecate"}:
-            require_evidence_detail(
-                str(evidence_payload.get("reason", "")), "skill adoption action reason"
-            )
-        recorded = now_iso()
-        evidence_snapshot = (
-            task_dir(paths, args.task)
-            / "results"
-            / f"skill-adoption-{args.release_id}-{len(state.get('skill_adoption_events', [])) + 1}.json"
-        )
-        atomic_write_bytes(evidence_snapshot, evidence_data)
-        os.chmod(evidence_snapshot, 0o600)
-        status_map = {
-            "canary": "canary",
-            "adopt": "adopted",
-            "pause": "paused",
-            "rollback": "rolled_back",
-            "deprecate": "deprecated",
-        }
-        event = {
-            "integrity_version": 1,
-            "event_id": f"{args.release_id}-adoption-{len(state.get('skill_adoption_events', [])) + 1}",
-            "request_id": request["request_id"],
-            "release_id": args.release_id,
-            "action": args.action,
-            "resulting_status": status_map[args.action],
-            "evidence_path": str(evidence_snapshot),
-            "evidence_sha256": sha256_file(evidence_snapshot),
-            "rationale": require_evidence_detail(args.rationale, "skill adoption rationale"),
-            "root_owner": state.get("owner"),
-            "root_session_id": session_id,
-            "recorded_at": recorded,
-        }
-        if args.action == "adopt":
-            event["canary_event_id"] = bound_canary_event_id
-            event["skill_work_unit_bindings"] = skill_work_unit_bindings
-            event["baseline_work_unit_bindings"] = baseline_work_unit_bindings
-        state.setdefault("skill_adoption_events", []).append(event)
-        request["version"] = int(request["version"]) + 1
-        request["status"] = event["resulting_status"]
-        request["events"].append(
-            {"event": event["resulting_status"], "actor_lane": "chief", "recorded_at": recorded}
-        )
-        request["updated_at"] = recorded
-        release["status"] = event["resulting_status"]
-        release["updated_at"] = recorded
-        bump_task(state)
-        write_task(paths, state)
-        write_index(paths)
-    emit(event, args.json)
-    return 0
-
-
 def _selection_terminal_packet_bindings(
     state: dict[str, Any], selection_id: str
 ) -> list[dict[str, Any]]:
@@ -4253,6 +3704,17 @@ def _capacity_cmd_services() -> CapacityCmdServices:
         capability_catalog_version=CAPABILITY_CATALOG_VERSION,
         capability_tier_map=CAPABILITY_TIER_MAP,
         depth_two_roles=DEPTH_TWO_ROLES,
+    )
+
+
+def _improvement_cmd_services() -> ImprovementCmdServices:
+    return ImprovementCmdServices(
+        require_plan_ready=require_plan_ready,
+        require_root_session=require_root_session,
+        read_regular_artifact=read_regular_artifact,
+        records_fingerprint=_records_fingerprint,
+        require_done_reviewer_packet=_require_done_reviewer_packet,
+        skill_release_semantic_integrity_errors=_skill_release_semantic_integrity_errors,
     )
 
 
@@ -9228,15 +8690,26 @@ def build_parser(
         vocab=vocab,
     )
 
+    improvement_services = _improvement_cmd_services()
     register_improvement_commands(
         sub,
         handlers={
-            "improvement_create": cmd_improvement_create,
+            "improvement_create": functools.partial(
+                cmd_improvement_create, services=improvement_services
+            ),
             "improvement_brief": cmd_improvement_brief,
-            "improvement_arbitrate": cmd_improvement_arbitrate,
-            "improvement_link_project": cmd_improvement_link_project,
-            "skill_release_record": cmd_skill_release_record,
-            "skill_adoption_record": cmd_skill_adoption_record,
+            "improvement_arbitrate": functools.partial(
+                cmd_improvement_arbitrate, services=improvement_services
+            ),
+            "improvement_link_project": functools.partial(
+                cmd_improvement_link_project, services=improvement_services
+            ),
+            "skill_release_record": functools.partial(
+                cmd_skill_release_record, services=improvement_services
+            ),
+            "skill_adoption_record": functools.partial(
+                cmd_skill_adoption_record, services=improvement_services
+            ),
         },
         add_json_argument=add_json_argument,
         vocab=vocab,
