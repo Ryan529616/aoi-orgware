@@ -48,5 +48,6 @@ nav:
       - Method: evaluation.md
       - Pilot protocol: PILOT.md
   - History:
+      - v0.3 adoption plan: v0.3-adoption-plan.md
       - v0.3 plan: v0.3-plan.md
       - v0.2 migration: v0.2-migration.md
