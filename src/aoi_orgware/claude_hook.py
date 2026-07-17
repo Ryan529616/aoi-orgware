@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 from pathlib import Path
@@ -53,6 +54,19 @@ DEFAULT_GOVERNED_AGENT_TYPES = ("general-purpose",)
 AGENT_TOOL_NAME = "Agent"
 # A wildcard arm matches any observed transport agent_type for its parent slot.
 WILDCARD_AGENT_TYPE = "*"
+TIER_MODELS_ENV = "AOI_CLAUDE_TIER_MODELS"
+# Requested-model families each packet tier may name in a governed dispatch.
+# Matching is case-insensitive substring against the requested model value, so
+# "sonnet" covers both the alias and a fully qualified model id. The session's
+# own top-price model is deliberately in no tier: the Chief session is the only
+# place for it, and a packet that needs it is an escalation, not a dispatch.
+DEFAULT_TIER_MODEL_FAMILIES: dict[str, tuple[str, ...]] = {
+    "frontier": ("opus",),
+    "expert": ("opus", "sonnet"),
+    "advanced": ("sonnet",),
+    "standard": ("sonnet", "haiku"),
+    "economical": ("haiku",),
+}
 
 
 def governed_agent_types() -> frozenset[str]:
@@ -61,6 +75,81 @@ def governed_agent_types() -> frozenset[str]:
         return frozenset(DEFAULT_GOVERNED_AGENT_TYPES)
     return frozenset(
         item.strip() for item in raw.split(",") if item.strip()
+    )
+
+
+def tier_model_families() -> dict[str, tuple[str, ...]]:
+    """Tier -> allowed requested-model families, env-overridable as JSON."""
+
+    raw = os.environ.get(TIER_MODELS_ENV, "")
+    if not raw.strip():
+        return dict(DEFAULT_TIER_MODEL_FAMILIES)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return dict(DEFAULT_TIER_MODEL_FAMILIES)
+    if not isinstance(parsed, dict):
+        return dict(DEFAULT_TIER_MODEL_FAMILIES)
+    families: dict[str, tuple[str, ...]] = {}
+    for tier, models in parsed.items():
+        if not isinstance(models, list):
+            continue
+        values = tuple(
+            str(model).strip().lower() for model in models if str(model).strip()
+        )
+        if values:
+            families[str(tier)] = values
+    return families or dict(DEFAULT_TIER_MODEL_FAMILIES)
+
+
+def model_tier_violation(
+    model_tier: Any, tool_input: dict[str, Any]
+) -> str | None:
+    """Deny reason when the dispatch request's model breaks the tier policy.
+
+    This checks the *dispatch request* the runtime received, not the routing
+    the runtime later performs. A packet without a tier and a tier without a
+    table row both pass through: the tier ledger gate lives at create-packet,
+    and an unknown label has no policy to enforce.
+    """
+
+    tier = str(model_tier or "").strip()
+    if not tier:
+        return None
+    families = tier_model_families().get(tier)
+    if not families:
+        return None
+    model = str(tool_input.get("model", "") or "").strip()
+    if not model:
+        return (
+            f"AOI model-tier gate: packet tier {tier!r} requires an explicit "
+            f"model from families {', '.join(families)}; omitting `model` "
+            "inherits the Chief session's model, which this packet's tier "
+            "does not authorize."
+        )
+    lowered = model.lower()
+    if not any(family in lowered for family in families):
+        return (
+            f"AOI model-tier gate: requested model {model!r} is outside packet "
+            f"tier {tier!r} (allowed families: {', '.join(families)}). "
+            "Re-dispatch with a matching model, or re-scope the packet tier "
+            "through the normal packet path."
+        )
+    return None
+
+
+def model_tier_note(model_tier: Any, tool_input: dict[str, Any]) -> str:
+    """Allow-reason suffix naming the checked model, empty when unchecked."""
+
+    tier = str(model_tier or "").strip()
+    if not tier or not tier_model_families().get(tier):
+        return ""
+    model = str(tool_input.get("model", "") or "").strip()
+    if not model:
+        return ""
+    return (
+        f" Requested model {model!r} is within tier {tier!r} at "
+        "dispatch-request level."
     )
 
 
@@ -182,6 +271,15 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
         )
         if helper.get("status") == "authorized":
             parent_packet_id = str(helper.get("packet_id", ""))
+            violation = model_tier_violation(helper.get("model_tier"), tool_input)
+            if violation:
+                pretooluse_decision(
+                    "deny",
+                    f"{violation} Depth-two helpers are capped at the parent "
+                    f"packet's tier (parent packet {parent_packet_id}"
+                    f"{task_suffix}).",
+                )
+                return
             remaining = helper.get("remaining_helper_budget")
             budget = helper.get("helper_spawn_budget")
             pretooluse_decision(
@@ -203,11 +301,18 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
         return
     if status == "authorized":
         packet_id = str(outcome.get("packet_id", ""))
+        violation = model_tier_violation(outcome.get("model_tier"), tool_input)
+        if violation:
+            pretooluse_decision(
+                "deny", f"{violation} (packet {packet_id}{task_suffix})"
+            )
+            return
         pretooluse_decision(
             "allow",
             f"AOI pre-armed dispatch: packet {packet_id} has current full authority "
             "and is armed for this "
-            f"parent-session/agent-type slot ({subagent_type}){task_suffix}. The "
+            f"parent-session/agent-type slot ({subagent_type}){task_suffix}."
+            f"{model_tier_note(outcome.get('model_tier'), tool_input)} The "
             "following SubagentStart observation consumes the arm.",
         )
         return

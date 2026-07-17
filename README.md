@@ -245,7 +245,7 @@ AOI is strict about distinguishing control from observation:
 | State-file publication | Successful raw reads see complete old or new bytes; managed reads may transiently fail closed. Not seamless availability, not a multi-file transaction, not power-loss proof |
 | External tool jobs | Provenance is what the caller records and AOI cross-checks; AOI does not observe the remote process itself |
 | Codex sub-agent start | Observed after creation when the trusted hook runs; not a pre-spawn boundary |
-| Claude governed `Agent` dispatch | `PreToolUse` can reject a missing or stale arm before that tool runs |
+| Claude governed `Agent` dispatch | `PreToolUse` can reject a missing or stale arm before that tool runs, and rejects a dispatch whose requested model is absent or outside the armed packet's tier. This checks the dispatch request the runtime received, not the routing it later performs |
 | Claude paths that bypass `PreToolUse` | Observed and accounted for at `SubagentStart`; not hard-blocked |
 | Model and capability tier | Requested policy unless the runtime exposes qualifying observation |
 

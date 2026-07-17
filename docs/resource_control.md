@@ -215,6 +215,39 @@ when the old applied state is still authoritative, reapplies the exact receipt
 bytes. Ambiguous or doubly failed recovery retains the receipt and fails
 closed.
 
+## Claude model-tier dispatch gate
+
+On the Claude host the tier ledger has one enforcement point Codex lacks:
+`PreToolUse` receives the `Agent` tool's input — including the requested
+`model` — before the sub-agent exists. The hook denies a governed dispatch
+whose model is absent (omission inherits the Chief session's model, which is
+exactly the cost leak the tier exists to prevent) or outside the armed
+packet's tier. Depth-two helper spawns are capped at the parent packet's
+tier.
+
+The tier→family table matches case-insensitive substrings, so `sonnet`
+covers both the alias and a fully qualified model id:
+
+| Tier | Default allowed families |
+|---|---|
+| `frontier` | `opus` |
+| `expert` | `opus`, `sonnet` |
+| `advanced` | `sonnet` |
+| `standard` | `sonnet`, `haiku` |
+| `economical` | `haiku` |
+
+The session's own top-price model is deliberately in no tier: the Chief
+session is the only place for it, and a packet that needs it is an
+escalation, not a dispatch. Override the table with
+`AOI_CLAUDE_TIER_MODELS`, a JSON object mapping tier names to family lists,
+e.g. `{"standard": ["opus"]}`; tiers absent from the override fall outside
+the gate.
+
+Boundary: this checks the dispatch *request* the runtime received, not the
+routing it later performs, and Workflow-orchestrated spawns bypass
+`PreToolUse` entirely (`SubagentStart` still observes them). It is a
+cooperative guardrail on the one hook that fires before spawn.
+
 ## Current evidence boundary
 
 This controller is policy-based, not cost-optimizing. AOI can select a role,

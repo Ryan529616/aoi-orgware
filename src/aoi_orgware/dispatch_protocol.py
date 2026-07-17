@@ -534,6 +534,7 @@ def validate_pre_spawn_arm(
             "task_id": state["task_id"],
             "packet_id": packet.get("packet_id"),
             "packet_path": packet.get("path"),
+            "model_tier": packet.get("model_tier"),
         }
 
 
@@ -585,6 +586,7 @@ def helper_budget_slot(
                 "packet_id": parent_packet.get("packet_id"),
                 "helper_spawn_budget": budget,
                 "remaining_helper_budget": remaining,
+                "model_tier": parent_packet.get("model_tier"),
             }
         return {
             "status": "denied",

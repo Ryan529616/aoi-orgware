@@ -8,6 +8,18 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 ## [Unreleased]
 
 ### Added
+- **Claude model-tier dispatch gate.** The Claude `PreToolUse` pre-spawn gate
+  now enforces the armed packet's `model_tier` against the dispatch request's
+  `model`: a governed dispatch without an explicit model is denied (omission
+  would inherit the Chief session's model), and a model outside the tier's
+  allowed families is denied before the sub-agent exists. Depth-two helper
+  spawns are capped at the parent packet's tier. The tier→family table is
+  env-overridable (`AOI_CLAUDE_TIER_MODELS`, JSON); the shipped default maps
+  frontier→opus, expert→opus/sonnet, advanced→sonnet, standard→sonnet/haiku,
+  economical→haiku, and deliberately places the session's top-price model in
+  no tier. This converts the previously declarative tier ledger into a
+  dispatch-request gate on the Claude host; it does not observe actual model
+  routing, and Workflow-orchestrated spawns still bypass `PreToolUse`.
 - **Typed package.** The full `src/aoi_orgware` surface type-checks clean
   (mypy, 57 -> 0 errors, behavior-preserving) and ships a PEP 561
   `py.typed` marker with a `Typing :: Typed` classifier; CI gains a mypy

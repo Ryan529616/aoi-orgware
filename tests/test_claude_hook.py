@@ -160,6 +160,7 @@ class ClaudeHookTestCase(HarnessTestCase):
         subagent_type: str = "general-purpose",
         tool_name: str = "Agent",
         agent_id: str = "",
+        model: str = "",
     ) -> dict:
         payload = {
             "hook_event_name": "PreToolUse",
@@ -174,6 +175,8 @@ class ClaudeHookTestCase(HarnessTestCase):
             },
             "tool_use_id": "toolu_gate_000001",
         }
+        if model:
+            payload["tool_input"]["model"] = model
         if agent_id:
             payload["agent_id"] = agent_id
         return payload
@@ -217,13 +220,77 @@ class ClaudeHookTestCase(HarnessTestCase):
         self.init_task(task_id, session_id="harness-test-chief")
         self.create_hook_packet(task_id, packet_id)
         self.arm(task_id, packet_id)
-        decision = self.claude_hook(self.pretooluse_payload())
+        decision = self.claude_hook(self.pretooluse_payload(model="sonnet"))
         output = decision["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "allow")
         self.assertIn(packet_id, output["permissionDecisionReason"])
+        self.assertIn(
+            "within tier 'standard'", output["permissionDecisionReason"]
+        )
         # The gate is read-only: the packet must remain armed for SubagentStart.
         state = self.task_state(task_id)
         self.assertEqual(state["packets"][0]["status"], "armed")
+
+    def test_gate_denies_authorized_dispatch_without_model(self) -> None:
+        task_id = "claude-gate-no-model"
+        packet_id = "claude-no-model-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm(task_id, packet_id)
+        decision = self.claude_hook(self.pretooluse_payload())
+        output = decision["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("requires an explicit model", output["permissionDecisionReason"])
+        self.assertIn("Chief session's model", output["permissionDecisionReason"])
+        # The deny is read-only: the arm stays live for a corrected dispatch.
+        state = self.task_state(task_id)
+        self.assertEqual(state["packets"][0]["status"], "armed")
+
+    def test_gate_denies_authorized_dispatch_with_out_of_tier_model(self) -> None:
+        task_id = "claude-gate-tier-breach"
+        packet_id = "claude-tier-breach-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm(task_id, packet_id)
+        decision = self.claude_hook(self.pretooluse_payload(model="opus"))
+        output = decision["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("outside packet tier 'standard'", output["permissionDecisionReason"])
+        state = self.task_state(task_id)
+        self.assertEqual(state["packets"][0]["status"], "armed")
+
+    def test_gate_matches_fully_qualified_model_ids_by_family(self) -> None:
+        task_id = "claude-gate-full-id"
+        packet_id = "claude-full-id-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm(task_id, packet_id)
+        decision = self.claude_hook(
+            self.pretooluse_payload(model="claude-sonnet-5")
+        )
+        output = decision["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "allow")
+        self.assertIn("within tier 'standard'", output["permissionDecisionReason"])
+
+    def test_gate_tier_model_families_env_override(self) -> None:
+        task_id = "claude-gate-tier-env"
+        packet_id = "claude-tier-env-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm(task_id, packet_id)
+        env_extra = {"AOI_CLAUDE_TIER_MODELS": '{"standard": ["opus"]}'}
+        allowed = self.claude_hook(
+            self.pretooluse_payload(model="opus"), env_extra=env_extra
+        )
+        self.assertEqual(
+            allowed["hookSpecificOutput"]["permissionDecision"], "allow"
+        )
+        denied = self.claude_hook(
+            self.pretooluse_payload(model="sonnet"), env_extra=env_extra
+        )
+        denied_out = denied["hookSpecificOutput"]
+        self.assertEqual(denied_out["permissionDecision"], "deny")
+        self.assertIn("outside packet tier", denied_out["permissionDecisionReason"])
 
     def test_gate_denies_live_slots_with_stale_exact_authority(self) -> None:
         task_id = "claude-gate-drift"
@@ -857,11 +924,31 @@ class ClaudeHookTestCase(HarnessTestCase):
                 session_id="parent-agent-1",
                 subagent_type="general-purpose",
                 agent_id="parent-agent-1",
+                model="haiku",
             )
         )
         allowed_out = allowed["hookSpecificOutput"]
         self.assertEqual(allowed_out["permissionDecision"], "allow")
         self.assertIn("helper-budget dispatch", allowed_out["permissionDecisionReason"])
+
+    def test_pretooluse_depth_two_denies_model_over_parent_tier(self) -> None:
+        task_id = "claude-helper-tier-cap"
+        packet_id = "claude-helper-tier-cap-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_budget_packet(task_id, packet_id, 1)
+        self.dispatch_parent_agent(task_id, packet_id, "parent-agent-1")
+        denied = self.claude_hook(
+            self.pretooluse_payload(
+                session_id="parent-agent-1",
+                subagent_type="general-purpose",
+                agent_id="parent-agent-1",
+                model="opus",
+            )
+        )
+        denied_out = denied["hookSpecificOutput"]
+        self.assertEqual(denied_out["permissionDecision"], "deny")
+        self.assertIn("capped at the parent", denied_out["permissionDecisionReason"])
+        self.assertIn("outside packet tier 'standard'", denied_out["permissionDecisionReason"])
 
     def test_pretooluse_depth_two_denies_without_helper_budget(self) -> None:
         task_id = "claude-helper-gate-zero"
