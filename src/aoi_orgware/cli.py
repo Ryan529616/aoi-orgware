@@ -334,6 +334,7 @@ from .harnesslib import (
     host_path_to_wsl,
     import_legacy,
     is_expired,
+    is_semantic_v2_task,
     lock_covers,
     legacy_pending_path,
     load_all_claims,
@@ -360,6 +361,7 @@ from .harnesslib import (
     require_complete_layout,
     require_chief_authority,
     scan_atomic_temporaries,
+    semantic_task_projection_status,
     session_path,
     sha256_file,
     state_lock,
@@ -5658,6 +5660,18 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     benchmark_reports: list[dict[str, Any]] = []
     for task in tasks:
         task_id = task["task_id"]
+        if "_semantic" in task:
+            try:
+                projection_status = semantic_task_projection_status(paths, task_id)
+            except HarnessError as exc:
+                errors.append(f"task {task_id}: {exc}")
+            else:
+                if projection_status != "current":
+                    warnings.append(
+                        f"task {task_id}: semantic projection is {projection_status}; "
+                        "the validated ledger was replayed in memory and explicit repair "
+                        "is required before mutation"
+                    )
         referenced = set(task.get("claims", []))
         owned = structured_by_task.get(task_id, set())
         for token in sorted(referenced - owned):
@@ -6742,12 +6756,62 @@ def _reload_locked_paths(paths: HarnessPaths) -> HarnessPaths:
     return current
 
 
+_SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
+    "check-locks",
+    "doctor",
+    "inspect-legacy",
+    "resume",
+    "status",
+    "verify-backup",
+}
+
+
+def _semantic_v2_stage1_target(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> str | None:
+    """Resolve direct and legacy-indirect task references without mutation."""
+
+    command = str(args._aoi_command)
+    direct = getattr(args, "task", None) or getattr(args, "task_id", None)
+    if isinstance(direct, str) and direct:
+        return validate_id(direct, "task id")
+    if command == "unbind-session":
+        session_id = str(getattr(args, "session_id", "") or "")
+        mapping = load_json(session_path(paths, session_id))
+        return validate_id(str(mapping.get("task_id", "")), "session task id")
+    if command in {"set-claim-status", "release-claim"}:
+        token = validate_id(str(getattr(args, "token", "") or ""), "claim token")
+        claim = load_claim_file(claim_path(paths, token, active=True))
+        return validate_id(str(claim.get("task_id", "")), "claim task id")
+    return None
+
+
+def _enforce_semantic_v2_stage1_boundary(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> None:
+    """Block unported v1 handlers before they can publish cross-file effects."""
+
+    command = str(args._aoi_command)
+    target = _semantic_v2_stage1_target(args, paths)
+    if target is None or not is_semantic_v2_task(paths, target):
+        return
+    if command == "init-task" and bool(getattr(args, "semantic_v2", False)):
+        return
+    if command in _SEMANTIC_V2_STAGE1_TARGET_COMMANDS:
+        return
+    raise HarnessError(
+        f"semantic-v2 task {target} is read-only in Stage 1; command {command!r} "
+        "requires an explicit semantic transition and side-effect transaction port"
+    )
+
+
 def _execute_project_command(
     args: argparse.Namespace, paths: HarnessPaths, *, initialized: bool
 ) -> int:
     command = str(args._aoi_command)
     args._aoi_initialized_at_dispatch = initialized
     if not command_requires_chief(command, initialized=initialized):
+        _enforce_semantic_v2_stage1_boundary(args, paths)
         return int(args.handler(args, paths))
     with state_lock(paths, create_layout=False):
         paths = _reload_locked_paths(paths)
@@ -6758,6 +6822,8 @@ def _execute_project_command(
             epoch=epoch,
             token=token,
         )
+        args._aoi_authority_ref = f"chief:{session_id}@{epoch}"
+        _enforce_semantic_v2_stage1_boundary(args, paths)
         return int(args.handler(args, paths))
 
 

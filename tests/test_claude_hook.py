@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -334,6 +335,72 @@ class ClaudeHookTestCase(HarnessTestCase):
         self.assertEqual(denied_out["permissionDecision"], "deny")
         self.assertIn("outside packet tier", denied_out["permissionDecisionReason"])
 
+    def test_gate_armed_unknown_type_cannot_bypass_tier_policy(self) -> None:
+        task_id = "claude-gate-wild-tier"
+        packet_id = "claude-wild-tier-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm_wildcard(task_id, packet_id)
+
+        missing = self.claude_hook(
+            self.pretooluse_payload(subagent_type="default")
+        )["hookSpecificOutput"]
+        self.assertEqual(missing["permissionDecision"], "deny")
+        self.assertIn("requires an explicit model", missing["permissionDecisionReason"])
+
+        excessive = self.claude_hook(
+            self.pretooluse_payload(subagent_type="default", model="opus")
+        )["hookSpecificOutput"]
+        self.assertEqual(excessive["permissionDecision"], "deny")
+        self.assertIn("outside packet tier", excessive["permissionDecisionReason"])
+
+        allowed = self.claude_hook(
+            self.pretooluse_payload(
+                subagent_type="default", model="claude-sonnet-5"
+            )
+        )["hookSpecificOutput"]
+        self.assertEqual(allowed["permissionDecision"], "allow")
+        self.assertIn(packet_id, allowed["permissionDecisionReason"])
+
+    def test_gate_tier_policy_override_is_strict_and_normalized(self) -> None:
+        task_id = "claude-gate-strict-tier"
+        packet_id = "claude-strict-tier-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm(task_id, packet_id)
+
+        uppercase = self.claude_hook(
+            self.pretooluse_payload(model="sonnet"),
+            env_extra={"AOI_CLAUDE_TIER_MODELS": '{"STANDARD": ["sonnet"]}'},
+        )["hookSpecificOutput"]
+        self.assertEqual(uppercase["permissionDecision"], "allow")
+
+        cases = (
+            ("{broken", "not valid JSON"),
+            ('{"standard": "sonnet"}', "must be a JSON list"),
+            ('{"expert": ["opus"]}', "has no configured policy row"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                denied = self.claude_hook(
+                    self.pretooluse_payload(model="sonnet"),
+                    env_extra={"AOI_CLAUDE_TIER_MODELS": raw},
+                )["hookSpecificOutput"]
+                self.assertEqual(denied["permissionDecision"], "deny")
+                self.assertIn(expected, denied["permissionDecisionReason"])
+
+    def test_gate_model_family_match_requires_token_boundary(self) -> None:
+        task_id = "claude-gate-family-boundary"
+        packet_id = "claude-family-boundary-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm(task_id, packet_id)
+        denied = self.claude_hook(
+            self.pretooluse_payload(model="notsonnet")
+        )["hookSpecificOutput"]
+        self.assertEqual(denied["permissionDecision"], "deny")
+        self.assertIn("outside packet tier", denied["permissionDecisionReason"])
+
     # ------------------------------------------------------------------
     # PreToolUse claim-write gate (opt-in)
     # ------------------------------------------------------------------
@@ -382,6 +449,21 @@ class ClaudeHookTestCase(HarnessTestCase):
             self.write_payload(file_path=target), env_extra=self.DENY
         )
         self.assertTrue(decision.get("continue"))
+
+    def test_claim_write_gate_matches_filesystem_case_domain(self) -> None:
+        task_id = "claude-write-case-domain"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-case", "repo:file:src/Owned.py")
+        target = str(self.root / "src" / "owned.py")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.DENY
+        )
+        if os.name == "nt":
+            self.assertTrue(decision.get("continue"))
+        else:
+            out = decision["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("not covered", out["permissionDecisionReason"])
 
     def test_claim_write_gate_warn_allows_but_announces(self) -> None:
         task_id = "claude-write-warn"
@@ -1097,6 +1179,63 @@ class ClaudeHookTestCase(HarnessTestCase):
         denied_out = denied["hookSpecificOutput"]
         self.assertEqual(denied_out["permissionDecision"], "deny")
         self.assertIn("--helper-spawn-budget", denied_out["permissionDecisionReason"])
+
+    def test_unknown_depth_two_type_is_still_tier_and_budget_gated(self) -> None:
+        task_id = "claude-helper-unknown-type"
+        packet_id = "claude-helper-unknown-parent"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_budget_packet(task_id, packet_id, 1)
+        self.dispatch_parent_agent(task_id, packet_id, "parent-agent-unknown")
+
+        excessive = self.claude_hook(
+            self.pretooluse_payload(
+                session_id="parent-agent-unknown",
+                subagent_type="Explore",
+                agent_id="parent-agent-unknown",
+                model="opus",
+            )
+        )["hookSpecificOutput"]
+        self.assertEqual(excessive["permissionDecision"], "deny")
+        self.assertIn("capped at the parent", excessive["permissionDecisionReason"])
+
+        allowed = self.claude_hook(
+            self.pretooluse_payload(
+                session_id="parent-agent-unknown",
+                subagent_type="Explore",
+                agent_id="parent-agent-unknown",
+                model="haiku",
+            )
+        )["hookSpecificOutput"]
+        self.assertEqual(allowed["permissionDecision"], "allow")
+        self.assertIn("helper-budget dispatch", allowed["permissionDecisionReason"])
+
+        observed = self.claude_hook(
+            self.start_payload(
+                session_id="parent-agent-unknown",
+                agent_id="unknown-helper-1",
+                agent_type="Explore",
+                prompt_id="unknown-helper-1",
+            )
+        )
+        self.assertIn(
+            "budgeted depth-two helper",
+            observed["hookSpecificOutput"]["additionalContext"],
+        )
+        packet = self.task_state(task_id)["packets"][0]
+        self.assertEqual(len(packet["helper_spawns"]), 1)
+
+        denied_after_budget = self.claude_hook(
+            self.pretooluse_payload(
+                session_id="parent-agent-unknown",
+                subagent_type="Explore",
+                agent_id="parent-agent-unknown",
+                model="haiku",
+            )
+        )["hookSpecificOutput"]
+        self.assertEqual(denied_after_budget["permissionDecision"], "deny")
+        self.assertIn(
+            "--helper-spawn-budget", denied_after_budget["permissionDecisionReason"]
+        )
 
     def test_helper_spawn_budget_field_is_contract_sealed(self) -> None:
         task_id = "claude-helper-seal"

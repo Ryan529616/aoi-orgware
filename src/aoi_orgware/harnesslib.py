@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import base64
+import binascii
 import contextvars
 import datetime as dt
 import errno
@@ -113,8 +114,19 @@ CHIEF_CREDENTIAL_SCHEMA_VERSION = 1
 CHIEF_CREDENTIAL_MAX_BYTES = 8 * 1024
 WINDOWS_REPLACE_RETRY_SECONDS = 2.0
 TREE_IDENTITY_SCAN_MAX_ENTRIES = 100_000
-ATOMIC_TEMP_NAME_RE = re.compile(
+# v1 names are retained for recovery of already-published state. New writers
+# use v2: compact operation spelling and URL-safe encoding of the full target
+# digest save native-Windows path budget without weakening the target binding
+# or the 128-bit random allocation nonce.
+ATOMIC_TEMP_V1_NAME_RE = re.compile(
     r"^\.aoi-tmp-v1\.(write|create)\.([0-9a-f]{64})\.([0-9a-f]{32})\.tmp$"
+)
+ATOMIC_TEMP_V2_NAME_RE = re.compile(
+    r"^\.aoi-v2-([wc])\.([A-Za-z0-9_-]{43})\.([0-9a-f]{32})$"
+)
+ATOMIC_TEMP_NAME_RE = re.compile(
+    r"^(?:\.aoi-tmp-v1\.(?:write|create)\.[0-9a-f]{64}\.[0-9a-f]{32}\.tmp|"
+    r"\.aoi-v2-[wc]\.[A-Za-z0-9_-]{43}\.[0-9a-f]{32})$"
 )
 LEGACY_ATOMIC_TEMP_NAME_RE = re.compile(r"^\..+\.tmp-[A-Za-z0-9_-]+$")
 ATOMIC_TEMP_SCAN_MAX_ENTRIES = 100_000
@@ -1612,7 +1624,6 @@ def _validate_interrupted_initialization_prefix(
     if paths.project.legacy_enabled:
         allowed_directories.update((paths.legacy_pending, paths.legacy_decisions))
     allowed_files = {paths.platform, paths.lock}
-    expected_lock_hash = _atomic_target_name_sha256(paths.lock)
     inspected_entry_count = 0
     state_lock_temporary_count = 0
 
@@ -1661,12 +1672,13 @@ def _validate_interrupted_initialization_prefix(
                         # A pre-link current-writer temp has no authority by itself.
                         # Validate and leave it for the old writer or authenticated
                         # temporary recovery after the canonical lock is established.
-                        temporary_match = ATOMIC_TEMP_NAME_RE.fullmatch(entry.name)
+                        temporary = _parse_atomic_temporary_name(entry.name)
                         if (
                             directory == paths.harness
-                            and temporary_match is not None
-                            and temporary_match.group(1) == "create"
-                            and temporary_match.group(2) == expected_lock_hash
+                            and temporary is not None
+                            and temporary[1] == "create"
+                            and temporary[2]
+                            == _atomic_target_name_digest(paths.lock, temporary[0])
                         ):
                             state_lock_temporary_count += 1
                             if (
@@ -2532,13 +2544,65 @@ def _atomic_target_name_sha256(path: Path) -> str:
     return hashlib.sha256(path.name.encode("utf-8")).hexdigest()
 
 
+def _atomic_target_name_digest(path: Path, version: str) -> str:
+    digest = _atomic_target_name_sha256(path)
+    if version == "v1":
+        return digest
+    if version == "v2":
+        return base64.urlsafe_b64encode(bytes.fromhex(digest)).decode("ascii").rstrip("=")
+    raise ValueError(f"unsupported atomic temporary version: {version}")
+
+
+def _canonical_v2_target_name_sha256(target_name_digest: str) -> str | None:
+    """Decode only the canonical unpadded base64url spelling of a SHA-256."""
+
+    try:
+        raw = base64.b64decode(
+            target_name_digest + "=", altchars=b"-_", validate=True
+        )
+    except (binascii.Error, ValueError):
+        return None
+    if (
+        len(raw) != hashlib.sha256().digest_size
+        or base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        != target_name_digest
+    ):
+        return None
+    return raw.hex()
+
+
+def _parse_atomic_temporary_name(
+    name: str,
+) -> tuple[str, str, str, str, str] | None:
+    """Return version, operation, name digest, canonical SHA-256, and nonce."""
+
+    v1 = ATOMIC_TEMP_V1_NAME_RE.fullmatch(name)
+    if v1 is not None:
+        operation, target_name_sha256, nonce = v1.groups()
+        return "v1", operation, target_name_sha256, target_name_sha256, nonce
+    v2 = ATOMIC_TEMP_V2_NAME_RE.fullmatch(name)
+    if v2 is not None:
+        operation, target_digest, nonce = v2.groups()
+        target_name_sha256 = _canonical_v2_target_name_sha256(target_digest)
+        if target_name_sha256 is None:
+            return None
+        return (
+            "v2",
+            {"w": "write", "c": "create"}[operation],
+            target_digest,
+            target_name_sha256,
+            nonce,
+        )
+    return None
+
+
 def _atomic_temporary_basename(path: Path, operation: str) -> str:
     if operation not in {"write", "create"}:
         raise ValueError(f"unsupported atomic temporary operation: {operation}")
-    target_name_sha256 = _atomic_target_name_sha256(path)
+    operation_code = {"write": "w", "create": "c"}[operation]
     return (
-        f".aoi-tmp-v1.{operation}.{target_name_sha256}."
-        f"{secrets.token_hex(16)}.tmp"
+        f".aoi-v2-{operation_code}.{_atomic_target_name_digest(path, 'v2')}."
+        f"{secrets.token_hex(16)}"
     )
 
 
@@ -2736,11 +2800,12 @@ def _private_regular_atomic_file(path: Path, metadata: os.stat_result) -> bool:
 def _create_alias_target_for_temporary(
     temporary: Path,
     metadata: os.stat_result,
-    target_name_sha256: str,
-    candidate_index: dict[tuple[int, int, str], list[Path]],
+    version: str,
+    target_name_digest: str,
+    candidate_index: dict[tuple[int, int, str, str], list[Path]],
 ) -> Path | None:
     matches = candidate_index.get(
-        (*_lock_identity(metadata), target_name_sha256), []
+        (*_lock_identity(metadata), version, target_name_digest), []
     )
     if len(matches) != 1 or matches[0] == temporary:
         return None
@@ -2753,7 +2818,7 @@ def _create_alias_target_for_temporary(
         not _private_regular_atomic_file(candidate, candidate_metadata)
         or int(candidate_metadata.st_nlink) != 2
         or _lock_identity(candidate_metadata) != _lock_identity(metadata)
-        or _atomic_target_name_sha256(candidate) != target_name_sha256
+        or _atomic_target_name_digest(candidate, version) != target_name_digest
     ):
         return None
     return candidate
@@ -2768,7 +2833,6 @@ def _recoverable_create_alias_for_target(target: Path) -> Path | None:
         return None
     if not _private_regular_atomic_file(target, metadata) or metadata.st_nlink != 2:
         return None
-    expected_hash = _atomic_target_name_sha256(target)
     inspected = 0
     aliases: list[Path] = []
     try:
@@ -2784,11 +2848,12 @@ def _recoverable_create_alias_for_target(target: Path) -> Path | None:
                 except StopIteration:
                     break
                 inspected += 1
-                match = ATOMIC_TEMP_NAME_RE.fullmatch(raw_candidate.name)
+                temporary = _parse_atomic_temporary_name(raw_candidate.name)
                 if (
-                    not match
-                    or match.group(1) != "create"
-                    or match.group(2) != expected_hash
+                    temporary is None
+                    or temporary[1] != "create"
+                    or temporary[2]
+                    != _atomic_target_name_digest(target, temporary[0])
                 ):
                     continue
                 candidate = Path(raw_candidate.path)
@@ -2811,14 +2876,14 @@ def _recoverable_create_alias_for_target(target: Path) -> Path | None:
 
 def _atomic_temporary_record(
     path: Path,
-    candidate_index: dict[tuple[int, int, str], list[Path]] | None = None,
+    candidate_index: dict[tuple[int, int, str, str], list[Path]] | None = None,
 ) -> AtomicTemporaryRecord:
     try:
         metadata = path.lstat()
     except OSError as exc:
         raise HarnessError(f"cannot inspect AOI temporary file {path}: {exc}") from exc
-    match = ATOMIC_TEMP_NAME_RE.fullmatch(path.name)
-    if match is None:
+    temporary = _parse_atomic_temporary_name(path.name)
+    if temporary is None:
         operation = (
             "legacy" if LEGACY_ATOMIC_TEMP_NAME_RE.fullmatch(path.name) else "unknown"
         )
@@ -2842,7 +2907,7 @@ def _atomic_temporary_record(
             st_ino=int(metadata.st_ino),
             st_nlink=int(metadata.st_nlink),
         )
-    operation, target_name_sha256, _nonce = match.groups()
+    version, operation, target_name_digest, target_name_sha256, _nonce = temporary
     classification = "ambiguous"
     recoverable = False
     target: Path | None = None
@@ -2852,7 +2917,7 @@ def _atomic_temporary_record(
             recoverable = True
         elif operation == "create" and metadata.st_nlink == 2:
             target = _create_alias_target_for_temporary(
-                path, metadata, target_name_sha256, candidate_index or {}
+                path, metadata, version, target_name_digest, candidate_index or {}
             )
             if target is not None:
                 classification = "published_create_alias"
@@ -2883,7 +2948,7 @@ def scan_atomic_temporaries(paths: HarnessPaths) -> list[AtomicTemporaryRecord]:
     while pending:
         directory = pending.pop()
         reserved_entries: list[Path] = []
-        candidate_index: dict[tuple[int, int, str], list[Path]] = {}
+        candidate_index: dict[tuple[int, int, str, str], list[Path]] = {}
         try:
             with os.scandir(directory) as entries:
                 while True:
@@ -2900,6 +2965,7 @@ def scan_atomic_temporaries(paths: HarnessPaths) -> list[AtomicTemporaryRecord]:
                     entry = Path(raw_entry.path)
                     reserved = bool(
                         entry.name.startswith(".aoi-tmp-v1.")
+                        or entry.name.startswith(".aoi-v2-")
                         or LEGACY_ATOMIC_TEMP_NAME_RE.fullmatch(entry.name)
                     )
                     if _path_is_link_like(entry):
@@ -2925,13 +2991,15 @@ def scan_atomic_temporaries(paths: HarnessPaths) -> list[AtomicTemporaryRecord]:
                         int(metadata.st_nlink) == 2
                         and _private_regular_atomic_file(entry, metadata)
                     ):
-                        key = (
-                            *_lock_identity(metadata),
-                            _atomic_target_name_sha256(entry),
-                        )
-                        matches = candidate_index.setdefault(key, [])
-                        if len(matches) < 2:
-                            matches.append(entry)
+                        for version in ("v1", "v2"):
+                            key = (
+                                *_lock_identity(metadata),
+                                version,
+                                _atomic_target_name_digest(entry, version),
+                            )
+                            matches = candidate_index.setdefault(key, [])
+                            if len(matches) < 2:
+                                matches.append(entry)
         except OSError as exc:
             raise HarnessError(
                 f"cannot inspect AOI state directory for temporaries {directory}: {exc}"
@@ -2960,12 +3028,21 @@ def _validate_atomic_temporary_record(record: AtomicTemporaryRecord) -> None:
     if record.classification == "published_create_alias":
         if record.target is None:
             raise HarnessError(f"AOI create alias lacks a target: {record.path}")
+        temporary = _parse_atomic_temporary_name(record.path.name)
+        if temporary is None:
+            raise HarnessError(f"AOI create alias name changed: {record.path}")
         target_metadata = record.target.lstat()
         if (
             _lock_identity(target_metadata) != (record.st_dev, record.st_ino)
             or int(target_metadata.st_nlink) != 2
+            or _atomic_target_name_digest(
+                record.target,
+                temporary[0],
+            )
+            != temporary[2]
             or _atomic_target_name_sha256(record.target)
-            != record.target_name_sha256
+            != temporary[3]
+            or temporary[3] != record.target_name_sha256
         ):
             raise HarnessError(f"AOI create alias target changed: {record.target}")
 
@@ -3050,8 +3127,34 @@ def task_state_path(paths: HarnessPaths, task_id: str) -> Path:
     return task_dir(paths, task_id) / "state.json"
 
 
+def is_semantic_v2_task(paths: HarnessPaths, task_id: str) -> bool:
+    """Return whether the task has crossed the semantic-v2 ledger boundary."""
+
+    from .semantic_store import has_semantic_ledger
+
+    return has_semantic_ledger(paths, task_id)
+
+
+def semantic_task_projection_status(paths: HarnessPaths, task_id: str) -> str:
+    """Return the bounded stored-projection status for doctor/status surfaces."""
+
+    from .semantic_store import semantic_projection_status
+
+    return semantic_projection_status(paths, task_id)
+
+
 def load_task(paths: HarnessPaths, task_id: str) -> dict[str, Any]:
-    state = load_json(task_state_path(paths, task_id))
+    semantic_v2 = is_semantic_v2_task(paths, task_id)
+    if semantic_v2:
+        from .semantic_store import load_semantic_task
+
+        state = load_semantic_task(paths, task_id)
+    else:
+        state = load_json(task_state_path(paths, task_id))
+        if "_semantic" in state:
+            raise HarnessError(
+                f"task {task_id} has a semantic projection without its event ledger"
+            )
     validate_task_state(state, task_state_path(paths, task_id))
     if state.get("task_id") != task_id:
         raise HarnessError(f"task state identity does not match requested task {task_id}")
@@ -3215,8 +3318,16 @@ def bump_task(state: dict[str, Any], checkpoint_required: bool = True) -> None:
 
 
 def write_task(paths: HarnessPaths, state: dict[str, Any]) -> None:
+    task_id = str(state.get("task_id", ""))
+    if "_semantic" in state or (
+        task_id and ID_RE.fullmatch(task_id) and is_semantic_v2_task(paths, task_id)
+    ):
+        raise HarnessError(
+            "semantic-v2 task requires an explicit semantic transition writer; "
+            "legacy write_task is disabled"
+        )
     validate_task_state(state)
-    atomic_write_json(task_state_path(paths, state["task_id"]), state)
+    atomic_write_json(task_state_path(paths, task_id), state)
 
 
 def _normalize_repo_path(raw: str) -> str:
@@ -4029,11 +4140,32 @@ def load_all_tasks(paths: HarnessPaths) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     if not paths.tasks.is_dir():
         return tasks
-    for path in sorted(paths.tasks.glob("*/state.json")):
-        state = load_json(path)
-        validate_task_state(state, path)
-        if state.get("task_id") != path.parent.name:
-            raise HarnessError(f"task state identity does not match directory: {path}")
+    directories = sorted(paths.tasks.iterdir(), key=lambda entry: entry.name)
+    if len(directories) > TREE_IDENTITY_SCAN_MAX_ENTRIES:
+        raise HarnessError("task directory scan exceeds the configured entry bound")
+    for directory in directories:
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise HarnessError(f"could not inspect task directory {directory}: {exc}") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or _path_is_link_like(directory):
+            continue
+        state_path = directory / "state.json"
+        if is_semantic_v2_task(paths, directory.name):
+            state = load_task(paths, directory.name)
+        elif state_path.is_file():
+            state = load_json(state_path)
+            if "_semantic" in state:
+                raise HarnessError(
+                    f"task {directory.name} has a semantic projection without its event ledger"
+                )
+            validate_task_state(state, state_path)
+            if state.get("task_id") != directory.name:
+                raise HarnessError(
+                    f"task state identity does not match directory: {state_path}"
+                )
+        else:
+            continue
         tasks.append(state)
     return tasks
 

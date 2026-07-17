@@ -23,6 +23,8 @@ WORKER = HERE / "atomic_crash_worker.py"
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import harnesslib as h  # noqa: E402
+from aoi_orgware import semantic_events as semantic  # noqa: E402
+from aoi_orgware import semantic_store as semantic_store  # noqa: E402
 from tests.harness_case import HarnessTestCase  # noqa: E402
 
 
@@ -462,6 +464,144 @@ class CheckpointCrashTests(AtomicCrashController, HarnessTestCase):
         self.assertEqual(
             normalize_index_timestamp(paths.index.read_bytes()),
             normalize_index_timestamp(expected_index),
+        )
+
+
+class SemanticGenesisCrashTests(AtomicCrashController, HarnessTestCase):
+    TASK_ID = "semantic-genesis-crash"
+    COMMAND_ID = "init-semantic-genesis-crash-v1"
+
+    def semantic_command(self) -> list[str]:
+        return [
+            "init-task",
+            "--task-id",
+            self.TASK_ID,
+            "--title",
+            "Semantic genesis crash",
+            "--objective",
+            "Prove ordered event and projection publication",
+            "--owner",
+            "test-root",
+            "--completion-boundary",
+            "Every process-kill boundary recovers at most one semantic head",
+            "--semantic-v2",
+            "--semantic-command-id",
+            self.COMMAND_ID,
+            "--json",
+        ]
+
+    def event_path(self, paths: h.HarnessPaths) -> Path:
+        return semantic_store.semantic_event_directory(
+            paths, self.TASK_ID
+        ) / semantic.event_filename(1)
+
+    def test_kill_after_event_publish_replays_and_exact_retry_repairs_projection(self) -> None:
+        paths = h.get_paths(self.root)
+        event_path = self.event_path(paths)
+        state_path = h.task_state_path(paths, self.TASK_ID)
+        self.kill_at_boundary(
+            destination=event_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=self.semantic_command(),
+        )
+
+        self.assertTrue(event_path.is_file())
+        self.assertFalse(state_path.exists())
+        event_before = event_path.read_bytes()
+        replayed = h.load_task(paths, self.TASK_ID)
+        self.assertEqual(replayed["task_id"], self.TASK_ID)
+        self.assertEqual(
+            semantic_store.semantic_projection_status(paths, self.TASK_ID), "missing"
+        )
+
+        retried = json.loads(self.cli(*self.semantic_command()).stdout)
+        self.assertTrue(retried["idempotent_retry"])
+        self.assertTrue(retried["projection_repaired"])
+        self.assertEqual(event_path.read_bytes(), event_before)
+        self.assertEqual(
+            list(semantic_store.semantic_event_directory(paths, self.TASK_ID).glob("*.json")),
+            [event_path],
+        )
+        self.assertEqual(
+            semantic_store.semantic_projection_status(paths, self.TASK_ID), "current"
+        )
+
+    def test_kill_after_projection_publish_leaves_one_current_head_and_stale_index_only(self) -> None:
+        paths = h.get_paths(self.root)
+        state_path = h.task_state_path(paths, self.TASK_ID)
+        old_index = paths.index.read_bytes()
+        self.kill_at_boundary(
+            destination=state_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=self.semantic_command(),
+        )
+
+        event_path = self.event_path(paths)
+        self.assertTrue(event_path.is_file())
+        self.assertTrue(state_path.is_file())
+        self.assertEqual(paths.index.read_bytes(), old_index)
+        self.assertEqual(
+            semantic_store.semantic_projection_status(paths, self.TASK_ID), "current"
+        )
+        before = event_path.read_bytes()
+        retried = json.loads(self.cli(*self.semantic_command()).stdout)
+        self.assertTrue(retried["idempotent_retry"])
+        self.assertFalse(retried["projection_repaired"])
+        self.assertEqual(event_path.read_bytes(), before)
+        self.assertNotEqual(paths.index.read_bytes(), old_index)
+
+    def test_kill_after_event_temp_fsync_requires_residue_recovery_then_retries(self) -> None:
+        paths = h.get_paths(self.root)
+        event_path = self.event_path(paths)
+        self.kill_at_boundary(
+            destination=event_path,
+            stage="temp_fsynced",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=self.semantic_command(),
+        )
+
+        self.assertFalse(event_path.exists())
+        event_directory = semantic_store.semantic_event_directory(paths, self.TASK_ID)
+        self.assertEqual(len(atomic_temporaries(event_directory)), 1)
+        failed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "aoi_orgware.cli",
+                "doctor",
+                "--task",
+                self.TASK_ID,
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(failed.returncode, 1, failed)
+        self.assertTrue(
+            any("unexpected file" in error for error in json.loads(failed.stdout)["errors"]),
+            failed.stdout,
+        )
+
+        recovered = json.loads(self.cli("recover-temporaries", "--json").stdout)
+        self.assertGreaterEqual(len(recovered["recovered"]), 1)
+        self.assertEqual(atomic_temporaries(event_directory), [])
+        initialized = json.loads(self.cli(*self.semantic_command()).stdout)
+        self.assertFalse(initialized["idempotent_retry"])
+        self.assertTrue(event_path.is_file())
+        self.assertEqual(
+            semantic_store.semantic_projection_status(paths, self.TASK_ID), "current"
         )
 
 

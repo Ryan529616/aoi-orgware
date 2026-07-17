@@ -94,8 +94,28 @@ class AtomicTemporaryRecoveryTests(AtomicCrashController, HarnessTestCase):
             os.fsync(handle.fileno())
         return temporary
 
-    def leave_unpublished_temporary(self, target: Path, payload: bytes) -> Path:
-        descriptor, temporary = h._open_atomic_temporary(target, "write")
+    def leave_unpublished_temporary(
+        self, target: Path, payload: bytes, *, operation: str = "write"
+    ) -> Path:
+        descriptor, temporary = h._open_atomic_temporary(target, operation)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temporary
+
+    def leave_v1_unpublished_temporary(
+        self, target: Path, payload: bytes, *, operation: str = "write"
+    ) -> Path:
+        temporary = target.parent / (
+            f".aoi-tmp-v1.{operation}.{h._atomic_target_name_sha256(target)}."
+            f"{'0' * 32}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
@@ -553,6 +573,32 @@ class AtomicTemporaryRecoveryTests(AtomicCrashController, HarnessTestCase):
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
         h.require_complete_layout(h.get_paths(root))
 
+    def test_v1_ready_nul_interrupted_prefix_can_still_acquire_chief(self) -> None:
+        root, paths, environment = self.interrupted_prefix("ready-nul-v1")
+        h.atomic_create_bytes(paths.lock, b"\0")
+        temporary = self.leave_v1_unpublished_temporary(
+            paths.lock, b"\0", operation="create"
+        )
+
+        acquired = self.run_prefix_cli(
+            root,
+            environment,
+            "chief-acquire",
+            "--session-id",
+            "interrupted-ready-v1-chief",
+            "--json",
+        )
+
+        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        authority = json.loads(acquired.stdout)["authority"]
+        self.assertEqual(authority["session_id"], "interrupted-ready-v1-chief")
+        self.assertTrue(
+            temporary.exists(),
+            "Chief bootstrap must leave the historical pre-link residue inert",
+        )
+        self.assertEqual(temporary.read_bytes(), b"\0")
+        self.assertEqual(temporary.stat().st_nlink, 1)
+
     def checkpoint_command(self, task_id: str) -> list[str]:
         return [
             "checkpoint",
@@ -707,6 +753,162 @@ class AtomicTemporaryRecoveryTests(AtomicCrashController, HarnessTestCase):
             [],
         )
 
+    def test_v1_unpublished_temporary_remains_recoverable(self) -> None:
+        paths = h.get_paths(self.root)
+        temporary = self.leave_v1_unpublished_temporary(
+            paths.index, b"historical v1 residue\n"
+        )
+
+        recovered = json.loads(self.cli("recover-temporaries", "--json").stdout)
+
+        self.assertEqual([item["path"] for item in recovered["recovered"]], [temporary.name])
+        self.assertFalse(temporary.exists())
+
+    def test_v1_published_create_alias_remains_recoverable(self) -> None:
+        paths = h.get_paths(self.root)
+        target = paths.tasks / "historical-create.json"
+        temporary = self.leave_v1_unpublished_temporary(
+            target, b"historical v1 publication\n", operation="create"
+        )
+        os.link(temporary, target, follow_symlinks=False)
+
+        recovered = json.loads(self.cli("recover-temporaries", "--json").stdout)
+
+        self.assertEqual(
+            recovered["recovered"],
+            [
+                {
+                    "path": f"tasks/{temporary.name}",
+                    "operation": "create",
+                    "target_name_sha256": h._atomic_target_name_sha256(target),
+                    "classification": "published_create_alias",
+                    "recoverable": True,
+                    "target": "tasks/historical-create.json",
+                }
+            ],
+        )
+        self.assertFalse(temporary.exists())
+        self.assertEqual(target.read_bytes(), b"historical v1 publication\n")
+
+    def test_v2_published_create_alias_reports_canonical_hex_digest(self) -> None:
+        paths = h.get_paths(self.root)
+        target = paths.tasks / "current-create.json"
+        temporary = self.leave_unpublished_temporary(
+            target, b"current v2 publication\n", operation="create"
+        )
+        self.assertIsNotNone(h.ATOMIC_TEMP_V2_NAME_RE.fullmatch(temporary.name))
+        os.link(temporary, target, follow_symlinks=False)
+
+        recovered = json.loads(self.cli("recover-temporaries", "--json").stdout)
+
+        record = recovered["recovered"]
+        self.assertEqual(len(record), 1)
+        self.assertEqual(record[0]["target_name_sha256"], h._atomic_target_name_sha256(target))
+        self.assertRegex(record[0]["target_name_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(record[0]["classification"], "published_create_alias")
+        self.assertFalse(temporary.exists())
+        self.assertEqual(target.read_bytes(), b"current v2 publication\n")
+
+    def test_v2_parser_rejects_noncanonical_base64url_digest(self) -> None:
+        temporary = h._atomic_temporary_basename(self.root / "INDEX.md", "write")
+        parsed = h._parse_atomic_temporary_name(temporary)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        prefix, _operation, digest, _target_sha256, nonce = parsed
+        self.assertEqual(prefix, "v2")
+        for replacement in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_":
+            if replacement == digest[-1]:
+                continue
+            malformed = f".aoi-v2-w.{digest[:-1]}{replacement}.{nonce}"
+            if h._parse_atomic_temporary_name(malformed) is None:
+                break
+        else:
+            self.fail("could not construct a noncanonical v2 base64url digest")
+        self.assertIsNotNone(h.ATOMIC_TEMP_V2_NAME_RE.fullmatch(malformed))
+        self.assertIsNone(h._parse_atomic_temporary_name(malformed))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows path budget regression")
+    def test_v2_atomic_temporaries_fit_a_native_windows_deep_path(self) -> None:
+        parent = Path(self.backup_temp.name)
+        probe = h._atomic_temporary_basename(parent / "written.json", "write")
+        while len(str(parent / probe)) < 245:
+            candidate = parent / f"deep-{len(parent.parts):02d}-segment"
+            if len(str(candidate / probe)) > 250:
+                break
+            parent = candidate
+        parent.mkdir(parents=True)
+        create_target = parent / "created.json"
+        write_target = parent / "written.json"
+        write_target.write_bytes(b"old\n")
+        observed: list[h._AtomicIOEvent] = []
+
+        with h._observe_atomic_io(observed.append):
+            h.atomic_create_bytes(create_target, b"created\n")
+            h.atomic_write_bytes(write_target, b"written\n")
+
+        temporaries = [
+            event.temporary
+            for event in observed
+            if event.stage == "temp_fsynced" and event.temporary is not None
+        ]
+        self.assertEqual(len(temporaries), 2)
+        for temporary in temporaries:
+            assert temporary is not None
+            self.assertIsNotNone(h.ATOMIC_TEMP_V2_NAME_RE.fullmatch(temporary.name))
+            self.assertLessEqual(len(str(temporary)), 250)
+        self.assertGreater(
+            len(
+                str(
+                    parent
+                    / (
+                        f".aoi-tmp-v1.write."
+                        f"{h._atomic_target_name_sha256(write_target)}."
+                        f"{'0' * 32}.tmp"
+                    )
+                )
+            ),
+            259,
+        )
+        self.assertEqual(create_target.read_bytes(), b"created\n")
+        self.assertEqual(write_target.read_bytes(), b"written\n")
+
+    @unittest.skipUnless(os.name == "nt", "native Windows path budget regression")
+    def test_v2_deep_path_residues_scan_and_recover(self) -> None:
+        paths = h.get_paths(self.root)
+        parent = paths.tasks
+        probe = h._atomic_temporary_basename(parent / "pending.json", "write")
+        while len(str(parent / probe)) < 245:
+            candidate = parent / f"deep-recovery-{len(parent.parts):02d}"
+            if len(str(candidate / probe)) > 250:
+                break
+            parent = candidate
+        parent.mkdir(parents=True)
+        write_target = parent / "pending.json"
+        create_target = parent / "published.json"
+        unpublished = self.leave_unpublished_temporary(
+            write_target, b"unpublished\n"
+        )
+        published_alias = self.leave_unpublished_temporary(
+            create_target, b"published\n", operation="create"
+        )
+        os.link(published_alias, create_target, follow_symlinks=False)
+        for temporary in (unpublished, published_alias):
+            self.assertIsNotNone(h.ATOMIC_TEMP_V2_NAME_RE.fullmatch(temporary.name))
+            self.assertLessEqual(len(str(temporary)), 250)
+
+        recovered = json.loads(self.cli("recover-temporaries", "--json").stdout)
+
+        expected = {
+            unpublished.relative_to(paths.harness).as_posix(),
+            published_alias.relative_to(paths.harness).as_posix(),
+        }
+        self.assertEqual(
+            {item["path"] for item in recovered["recovered"]}, expected
+        )
+        self.assertFalse(unpublished.exists())
+        self.assertFalse(published_alias.exists())
+        self.assertEqual(create_target.read_bytes(), b"published\n")
+
     def test_ambiguous_reserved_entry_causes_zero_deletions(self) -> None:
         paths = h.get_paths(self.root)
         valid = self.leave_unpublished_temporary(paths.index, b"future index\n")
@@ -781,7 +983,7 @@ class AtomicTemporaryRecoveryTests(AtomicCrashController, HarnessTestCase):
 
     def test_hardlinked_write_temporary_is_ambiguous_and_not_removed(self) -> None:
         paths = h.get_paths(self.root)
-        temporary = self.leave_unpublished_temporary(paths.index, b"future index\n")
+        temporary = self.leave_v1_unpublished_temporary(paths.index, b"future index\n")
         alias = paths.harness / "untrusted-hardlink-copy"
         os.link(temporary, alias)
 

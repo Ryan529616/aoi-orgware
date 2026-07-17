@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .harnesslib import get_paths
+from .harnesslib import get_paths, is_semantic_v2_task
 
 
 SUPPORTED_HOOK_VERSION = "6"
@@ -64,6 +64,10 @@ def session_state(
         if not SAFE_TASK_ID.fullmatch(task_id):
             return "corrupt", None
         task_dir = paths.tasks / task_id
+        # Stage 1 semantic-v2 tasks cannot be session-bound.  The legacy hook
+        # reader must not treat state.json as authority or bypass ledger replay.
+        if is_semantic_v2_task(paths, task_id):
+            return "corrupt", None
         state_path = task_dir / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not isinstance(state, dict) or state.get("task_id") != task_id:

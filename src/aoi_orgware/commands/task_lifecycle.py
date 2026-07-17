@@ -136,6 +136,13 @@ from ..harnesslib import (
     write_task,
 )
 from ..pilot import initialize_kit, load_record, write_summary
+from ..semantic_store import (
+    has_semantic_ledger,
+    initialize_semantic_task,
+    repair_semantic_projection,
+    semantic_ledger_is_empty,
+    semantic_projection_status,
+)
 from ..state_lookup import require_open_task
 
 
@@ -442,6 +449,19 @@ def uncovered_dependencies_after_release(
     ]
 
 
+def _reject_stage1_semantic_legacy_side_effect(
+    state: dict[str, Any], command: str
+) -> None:
+    """Defense in depth before a legacy handler mutates a side artifact."""
+
+    if "_semantic" in state:
+        raise HarnessError(
+            f"semantic-v2 task {state.get('task_id')} is read-only in Stage 1; "
+            f"command {command!r} requires an explicit semantic transition and "
+            "side-effect transaction port"
+        )
+
+
 def cmd_unbind_session(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices) -> int:
     with state_lock(paths):
         session_id = services.check_session_id(args.session_id)
@@ -453,6 +473,7 @@ def cmd_unbind_session(args: argparse.Namespace, paths: HarnessPaths, *, service
                 f"session maps to {task_id}, not the requested task {args.task}"
             )
         state = load_task(paths, task_id)
+        _reject_stage1_semantic_legacy_side_effect(state, "unbind-session")
         destination.unlink()
         if state.get("status") in {"active", "blocked"}:
             mapping_kind = mapping.get("mapping_kind", services.root_session_mapping_kind)
@@ -749,9 +770,99 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
     objective = require_text(args.objective, "objective")
     owner = require_text(args.owner, "owner")
     completion = require_text(args.completion_boundary, "completion boundary")
+    semantic_v2 = bool(getattr(args, "semantic_v2", False))
+    semantic_command_id = str(
+        getattr(args, "semantic_command_id", "") or ""
+    ).strip()
+    if semantic_v2:
+        if args.session_id:
+            raise HarnessError(
+                "Stage 1 semantic-v2 initialization does not support --session-id"
+            )
+        validate_id(semantic_command_id, "semantic command id")
+    elif semantic_command_id:
+        raise HarnessError("--semantic-command-id requires --semantic-v2")
+    effective_next_action = (
+        args.next_action or "Complete the plan and acquire minimum claims."
+    )
     metadata = git_metadata(Path(args.worktree) if args.worktree else paths.root)
     with state_lock(paths):
         destination = task_state_path(paths, task_id)
+        semantic_exists = has_semantic_ledger(paths, task_id)
+        semantic_empty = semantic_exists and semantic_ledger_is_empty(paths, task_id)
+        if semantic_exists and not semantic_empty:
+            if not semantic_v2:
+                raise HarnessError(
+                    f"task {task_id} already has a semantic-v2 ledger; "
+                    "retry with --semantic-v2 and the original command id"
+                )
+            existing = load_task(paths, task_id)
+            expected_request = {
+                "title": title,
+                "objective": objective,
+                "owner": owner,
+                "completion_boundary": completion,
+                "next_action": effective_next_action,
+                "worktree": metadata["worktree"],
+            }
+            mismatches = [
+                field
+                for field, expected in expected_request.items()
+                if existing.get(field) != expected
+            ]
+            if mismatches:
+                raise HarnessError(
+                    "semantic initialization retry differs in request field(s): "
+                    + ", ".join(mismatches)
+                )
+            plan_path = task_dir(paths, task_id) / "plan.md"
+            try:
+                # Draft plan contents may legitimately change before approval,
+                # but an exact init retry must not report success after the
+                # required side artifact disappeared or became linked.
+                sha256_file(plan_path)
+            except HarnessError as exc:
+                raise HarnessError(
+                    f"semantic initialization retry requires an existing private plan: {exc}"
+                ) from exc
+            checkpoint_path, expected_checkpoint, _ = prepare_checkpoint(
+                paths, existing
+            )
+            expected_checkpoint_sha256 = hashlib.sha256(
+                expected_checkpoint.encode("utf-8")
+            ).hexdigest()
+            try:
+                checkpoint_sha256 = sha256_file(checkpoint_path)
+            except HarnessError as exc:
+                raise HarnessError(
+                    "semantic initialization retry requires an existing private "
+                    f"checkpoint: {exc}"
+                ) from exc
+            if checkpoint_sha256 != expected_checkpoint_sha256:
+                raise HarnessError(
+                    "semantic initialization retry found a divergent checkpoint"
+                )
+            prior_status = semantic_projection_status(paths, task_id)
+            repaired = repair_semantic_projection(
+                paths,
+                task_id,
+                expected_command_id=semantic_command_id,
+            )
+            write_index(paths)
+            emit(
+                {
+                    "task_id": task_id,
+                    "plan": str(task_dir(paths, task_id) / "plan.md"),
+                    "checkpoint": str(task_dir(paths, task_id) / "checkpoint.md"),
+                    "checkpoint_required": bool(repaired["checkpoint_required"]),
+                    "plan_ready": bool(repaired["plan_ready"]),
+                    "semantic_v2": True,
+                    "idempotent_retry": True,
+                    "projection_repaired": prior_status != "current",
+                },
+                args.json,
+            )
+            return 0
         if destination.exists():
             raise HarnessError(f"task already exists: {task_id}")
         created = now_iso()
@@ -774,7 +885,7 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
             "updated_at": created,
             "outcome": "in_progress",
             "completion_boundary": completion,
-            "next_action": args.next_action or "Complete the plan and acquire minimum claims.",
+            "next_action": effective_next_action,
             "claims": [],
             "session_ids": [],
             "subagent_parent_session_ids": [],
@@ -804,6 +915,8 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
             "scope_revisions": [],
             **metadata,
         }
+        if semantic_v2:
+            state["semantic_write_policy"] = "stage1_read_only"
         directory = task_dir(paths, task_id)
         (directory / "packets").mkdir(parents=True, exist_ok=True)
         (directory / "results").mkdir(parents=True, exist_ok=True)
@@ -820,7 +933,21 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
         atomic_write_text(directory / "plan.md", plan)
         checkpoint, checkpoint_text, _ = prepare_checkpoint(paths, state)
         atomic_write_text(checkpoint, checkpoint_text)
-        write_task(paths, state)
+        if semantic_v2:
+            authority_ref = str(getattr(args, "_aoi_authority_ref", "") or "")
+            if not authority_ref:
+                raise HarnessError(
+                    "semantic-v2 initialization requires validated Chief authority"
+                )
+            state = initialize_semantic_task(
+                paths,
+                state,
+                command_id=semantic_command_id,
+                recorded_at=created,
+                authority_ref=authority_ref,
+            )
+        else:
+            write_task(paths, state)
         if args.session_id:
             services.bind_session_unlocked(paths, state, args.session_id, bump=False)
             write_task(paths, state)
@@ -832,6 +959,9 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
             "checkpoint": str(directory / "checkpoint.md"),
             "checkpoint_required": True,
             "plan_ready": False,
+            "semantic_v2": semantic_v2,
+            "idempotent_retry": False,
+            "projection_repaired": False,
         },
         args.json,
     )
@@ -1287,6 +1417,7 @@ def cmd_set_claim_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
         claim = load_claim_file(source)
         validate_claim_lock_identities(paths, claim)
         state = load_task(paths, claim["task_id"])
+        _reject_stage1_semantic_legacy_side_effect(state, "set-claim-status")
         claim["status"] = args.status
         claim["status_reason"] = require_text(args.reason, "reason")
         claim["updated_at"] = now_iso()
@@ -1311,6 +1442,7 @@ def cmd_release_claim(
         source = claim_path(paths, args.token, active=True)
         claim = load_claim_file(source)
         state = load_task(paths, claim["task_id"])
+        _reject_stage1_semantic_legacy_side_effect(state, "release-claim")
         uncovered = uncovered_dependencies_after_release(
             paths, state, str(claim.get("token"))
         )
@@ -1913,6 +2045,15 @@ def register_task_lifecycle_commands(
     parser.add_argument("--next-action")
     parser.add_argument("--session-id")
     parser.add_argument("--worktree")
+    parser.add_argument(
+        "--semantic-v2",
+        action="store_true",
+        help="initialize an event-authoritative semantic-v2 task (Stage 1, no session)",
+    )
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required with --semantic-v2",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["init_task"])
 
