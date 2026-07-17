@@ -42,6 +42,7 @@ nav:
   - Resource control: resource_control.md
   - Codebase memory: codebase-memory.md
   - Runbooks:
+      - Recovery and interrupted bootstrap: recovery.md
       - Release (PyPI): RELEASE.md
       - Helper-budget live canary: helper-canary-runbook.md
   - Evaluation:

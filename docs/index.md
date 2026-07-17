@@ -31,8 +31,14 @@ ran.
 
 ## Install
 
+!!! warning "These docs describe the v0.3 alpha line"
+
+    The default install resolves to the latest *stable* release (0.2.x), which
+    does not have the governance-honesty gates documented here. Pass `--pre` for
+    the line these docs describe, and expect alpha breakage.
+
 ```bash
-uv tool install aoi-orgware        # or: pipx install aoi-orgware
+uv tool install --prerelease=allow aoi-orgware   # or: pipx install --pip-args=--pre aoi-orgware
 
 # from the repository you want to govern:
 aoi codex-init  --project-name "My Project" --json   # Codex

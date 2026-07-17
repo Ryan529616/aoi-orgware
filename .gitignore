@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 build/
 dist/
+# `mkdocs build` output; the docs workflow builds this in CI.
+site/
 .state.lock
 # Managed projects receive their configured AOI state entry during `aoi init`.
 /.aoi/
