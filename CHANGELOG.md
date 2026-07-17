@@ -7,6 +7,8 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+## [0.3.0a3] - 2026-07-17 (alpha)
+
 Observability / last-mile line. Every change traces to the 2026-07-17
 evidence audit of AOI 0.3.0a2 governing ARISE: `routing_verified` was
 settable from CLI free text; the SubagentStart observation discarded the
