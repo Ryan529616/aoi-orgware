@@ -387,6 +387,35 @@ def portfolio_integrity_errors(
             errors.append(f"capacity review {review_id} dataset identity is missing")
         elif sha256_file(dataset_path) != dataset_sha:
             errors.append(f"capacity review {review_id} dataset SHA-256 mismatch")
+        else:
+            # The on-disk dataset is sha-anchored, so its fields cannot be
+            # edited silently; use it to stop the in-state review from being
+            # stripped back to a pre-typed-outcome shape (sample-gate evasion
+            # by deleting keys rather than falsifying them).
+            try:
+                dataset_file = json.loads(dataset_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                dataset_file = None
+                errors.append(
+                    f"capacity review {review_id} dataset file is unreadable"
+                )
+            if isinstance(dataset_file, dict) and "eligible_record_count" in dataset_file:
+                if dataset.get("eligible_record_count") != dataset_file.get(
+                    "eligible_record_count"
+                ):
+                    errors.append(
+                        f"capacity review {review_id} eligible record count "
+                        "diverges from its sha-anchored dataset file"
+                    )
+                recommendation_view = review.get("recommendation")
+                if recommendation_view is not None and (
+                    "phase" not in recommendation_view
+                    or "sample_boundary" not in recommendation_view
+                ):
+                    errors.append(
+                        f"capacity review {review_id} recommendation lacks the "
+                        "phase/sample-boundary contract its dataset version requires"
+                    )
         if review.get("catalog_version") != policy.capability_catalog_version:
             errors.append(f"capacity review {review_id} catalog version is unsupported")
         recommendation = review.get("recommendation")
@@ -396,6 +425,25 @@ def portfolio_integrity_errors(
             != recommendation.get("requested_model_tier")
         ):
             errors.append(f"capacity review {review_id} recommendation is inconsistent")
+        if recommendation is not None and "sample_boundary" in recommendation:
+            sample_boundary = recommendation.get("sample_boundary")
+            if (
+                not isinstance(sample_boundary, dict)
+                or not isinstance(sample_boundary.get("min_eligible_records"), int)
+                or isinstance(sample_boundary.get("min_eligible_records"), bool)
+                or sample_boundary.get("min_eligible_records") < 1
+                or not isinstance(
+                    sample_boundary.get("eligible_record_count"), int
+                )
+                or isinstance(sample_boundary.get("eligible_record_count"), bool)
+                or sample_boundary.get("eligible_record_count")
+                < sample_boundary.get("min_eligible_records")
+                or recommendation.get("phase") != "recommendation_only"
+            ):
+                errors.append(
+                    f"capacity review {review_id} sample boundary is malformed "
+                    "or below its declared minimum"
+                )
         if review.get("status") in {"approved", "distributed", "acknowledged", "consumed"}:
             decision = review.get("chief_decision", {})
             if decision.get("decision") != "approved" or not decision.get("root_session_id"):

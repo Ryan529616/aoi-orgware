@@ -465,6 +465,7 @@ def _resource_plan(
         execution_selection_id=args.execution_selection_id,
         override_id=args.override_id,
         override_settings=override_settings,
+        invocation_cwd=Path.cwd(),
     )
 
 
@@ -517,6 +518,17 @@ def cmd_codex_config_apply(
             raise HarnessError(f"resource config event already exists: {event_id}")
         plan, files = _resource_plan(args, paths, state, services=services)
         require_override_target_contract(state, args.override_id, plan["plan_sha256"])
+        applicability = str(plan.get("config_applicability", "unknown"))
+        if applicability == "not_applicable" and not getattr(
+            args, "allow_inapplicable", False
+        ):
+            raise HarnessError(
+                "codex-config-apply refused: the target worktree is outside the "
+                "invoking session's config ancestry, so no session like this one "
+                f"will ever load the written config ({plan.get('applicability_basis')}). "
+                "Start the fresh Codex session inside the target root, or pass "
+                "--allow-inapplicable to record an explicit acknowledgement."
+            )
         if plan["plan_sha256"] != expected_plan:
             raise HarnessError("Codex resource plan changed after Chief review")
         _require_task_lock_coverage(paths, state, plan["required_locks"])
@@ -575,6 +587,11 @@ def cmd_codex_config_apply(
                 ),
                 "required_locks": plan["required_locks"],
                 "restart_required": True,
+                "config_applicability": plan.get("config_applicability", "unknown"),
+                "applicability_basis": plan.get("applicability_basis", ""),
+                "inapplicable_acknowledged": bool(
+                    getattr(args, "allow_inapplicable", False)
+                ),
                 "root_session_id": session_id,
                 "applied_at": recorded,
                 "rollback": None,
@@ -652,6 +669,8 @@ def cmd_codex_config_apply(
             "receipt_path": str(receipt_path),
             "receipt_sha256": receipt_sha,
             "restart_required": True,
+            "config_applicability": plan.get("config_applicability", "unknown"),
+            "applicability_basis": plan.get("applicability_basis", ""),
             "routing_verified": False,
         },
         args.json,
@@ -869,6 +888,15 @@ def register_resource_commands(
     add_plan_arguments(parser)
     parser.add_argument("--expected-plan-sha256", required=True)
     parser.add_argument("--session-id", required=True)
+    parser.add_argument(
+        "--allow-inapplicable",
+        action="store_true",
+        help=(
+            "acknowledge that the target worktree is outside the invoking "
+            "session's config ancestry and apply anyway; the acknowledgement "
+            "is recorded in the event and receipt"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["codex_config_apply"])
 

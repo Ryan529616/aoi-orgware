@@ -16,7 +16,7 @@ import argparse
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from ..harnesslib import PACKET_STATUSES
+from ..harnesslib import PACKET_STATUSES, PACKET_TYPED_OUTCOMES
 
 
 Handler = Callable[[argparse.Namespace, Any], int]
@@ -144,6 +144,14 @@ def register_packet_commands(
     parser.add_argument("--manual-unverified-reason")
     parser.add_argument("--summary")
     parser.add_argument("--evidence", action="append", default=[])
+    parser.add_argument(
+        "--typed-outcome",
+        choices=sorted(PACKET_TYPED_OUTCOMES),
+        help=(
+            "typed technical outcome of a terminal transition; transport "
+            "status alone never enters model-quality accounting"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["packet_update"])
 

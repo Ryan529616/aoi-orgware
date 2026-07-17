@@ -52,6 +52,35 @@ JOB_STATUSES = {"queued", "running", "pass", "fail", "stopped", "unknown"}
 ACTIVE_JOB_STATUSES = {"queued", "running", "unknown"}
 PACKET_STATUSES = {"ready", "armed", "dispatched", "done", "failed", "cancelled"}
 ACTIVE_PACKET_STATUSES = {"ready", "armed", "dispatched"}
+# Typed technical outcome of a terminal packet. Deliberately orthogonal to the
+# transport status: done/failed/cancelled say how the packet ENDED, the typed
+# outcome says what the ending MEANS for model-quality accounting. Absent or
+# "unclassified" outcomes are never model-quality eligible.
+PACKET_TYPED_OUTCOMES = {
+    "accepted",
+    "rejected",
+    "procedural_failure",
+    "transport_failure",
+    "cancelled",
+    "superseded",
+    "no_material_work",
+}
+MODEL_QUALITY_ELIGIBLE_OUTCOMES = {"accepted", "rejected"}
+PACKET_TYPED_OUTCOMES_BY_STATUS = {
+    "done": {"accepted", "rejected", "no_material_work", "superseded"},
+    "failed": {
+        "rejected",
+        "procedural_failure",
+        "transport_failure",
+        "no_material_work",
+    },
+    "cancelled": {
+        "cancelled",
+        "procedural_failure",
+        "superseded",
+        "no_material_work",
+    },
+}
 VERIFICATION_STATUSES = {"pending", "pass", "fail", "blocked", "skipped"}
 ACCOUNTED_VERIFICATION_STATUSES = VERIFICATION_STATUSES - {"pending"}
 DELIVERY_MODES = {"pending", "pushed", "local-only", "blocked", "none"}

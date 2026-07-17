@@ -94,6 +94,11 @@ from .commands.capacity import (
     cmd_capacity_snapshot,
     register_capacity_commands,
 )
+from .commands.canary import (
+    CanaryCmdServices,
+    cmd_codex_helper_canary,
+    register_canary_commands,
+)
 from .commands.context_memory import (
     ContextMemoryCmdServices,
     cmd_codebase_memory_benchmark_record,
@@ -293,6 +298,8 @@ from .harnesslib import (
     ACCOUNTED_VERIFICATION_STATUSES,
     ACTIVE_JOB_STATUSES,
     ACTIVE_PACKET_STATUSES,
+    MODEL_QUALITY_ELIGIBLE_OUTCOMES,
+    PACKET_TYPED_OUTCOMES_BY_STATUS,
     CHIEF_DEFAULT_TTL_SECONDS,
     CLAIM_STATUSES,
     DELIVERY_MODES,
@@ -1954,13 +1961,21 @@ def _capacity_records(
                 "status": packet.get("status"),
                 "requested_role": packet.get("agent_role"),
                 "requested_model_tier": packet.get("model_tier"),
+                # The stored flag is never trusted here: eligibility for the
+                # dataset is re-derived from the hook observation and the
+                # applied binding at export time, so a forged boolean in
+                # state.json cannot reach a capacity dataset.
                 "actual_role": packet.get("actual_role")
-                if packet.get("routing_verified")
+                if _derived_routing_verified(state, packet)
                 else "unavailable",
                 "actual_model_tier": packet.get("actual_model_tier")
-                if packet.get("routing_verified")
+                if _derived_routing_verified(state, packet)
                 else "unavailable",
-                "routing_verified": bool(packet.get("routing_verified")),
+                "routing_verified": _derived_routing_verified(state, packet),
+                "hook_observed_model": _hook_observed_routing_model(packet),
+                "routing_claim_provenance": str(
+                    (packet.get("routing_claim") or {}).get("provenance", "")
+                ),
                 "retry_of_packet_id": packet.get("retry_of_packet_id", ""),
                 "result_sha256": packet.get("result_sha256", ""),
                 "dispatch_provenance": dispatch_provenance,
@@ -1973,6 +1988,17 @@ def _capacity_records(
                 "token_usage": "unavailable",
                 "cost": "unavailable",
                 "engineering_acceptance": "not_inferred_from_packet_status",
+                "typed_outcome": str(packet.get("typed_outcome") or "unclassified"),
+                "typed_outcome_provenance": str(
+                    packet.get("typed_outcome_provenance") or "unclassified"
+                ),
+                # Model-quality denominators may only contain explicit
+                # accepted/rejected outcomes; transport status, cancellations,
+                # procedural and transport failures are excluded by design.
+                "model_quality_eligible": str(
+                    packet.get("typed_outcome") or "unclassified"
+                )
+                in MODEL_QUALITY_ELIGIBLE_OUTCOMES,
             }
         )
     records.sort(key=lambda item: str(item["packet_id"]))
@@ -4056,6 +4082,14 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or recommendation.get("requested_model_tier") != args.model_tier
             ):
                 raise HarnessError("capacity decision is stale, consumed, or outside packet scope")
+            if getattr(
+                paths.project, "capacity_recommendation_only", True
+            ) and recommendation.get("phase") != "recommendation_only":
+                raise HarnessError(
+                    "policy.capacity_recommendation_only is in force: a "
+                    "capacity decision may only be consumed when its "
+                    "recommendation records phase=recommendation_only"
+                )
         if args.retry_of_packet_id:
             retry_matches = [
                 packet
@@ -4235,6 +4269,14 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
             capacity_review["consumption"] = {
                 "packet_id": packet_id,
                 "decision_id": args.capacity_decision_id,
+                # Consumption stays a depth-two packet LABEL under the
+                # recommendation-only phase; it never selects a dispatch-time
+                # profile or provider model.
+                "phase": str(
+                    (capacity_review.get("recommendation") or {}).get(
+                        "phase", "recommendation_only"
+                    )
+                ),
                 "recorded_at": now_iso(),
             }
             capacity_review["updated_at"] = capacity_review["consumption"][
@@ -4245,6 +4287,77 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
         write_index(paths)
     emit({"packet_id": packet_id, "path": str(destination)}, args.json)
     return 0
+
+
+def _hook_observed_routing_model(packet: dict[str, Any]) -> str:
+    """Return the transport-observed model for this packet's consumed dispatch.
+
+    Empty when the dispatch was never hook-observed or the transport did not
+    expose a model field. This is the only routing-model source AOI trusts.
+    """
+
+    for attempt in packet.get("dispatch_attempts", []):
+        if not isinstance(attempt, dict) or attempt.get("status") != "consumed":
+            continue
+        observation = attempt.get("observation")
+        if isinstance(observation, dict):
+            return str(observation.get("model", "") or "")
+    return ""
+
+
+def _applied_model_binding(state: dict[str, Any], role: str) -> str:
+    """Return the newest applied, un-rolled-back resource-config model for role."""
+
+    for event in reversed(state.get("resource_config_events", [])):
+        if not isinstance(event, dict) or event.get("status") != "applied":
+            continue
+        if event.get("rollback"):
+            continue
+        agents = (event.get("resolved") or {}).get("agents") or {}
+        assignment = agents.get(role)
+        if isinstance(assignment, dict):
+            return str(assignment.get("model", "") or "")
+    return ""
+
+
+def routing_verification_integrity_errors(state: dict[str, Any]) -> list[str]:
+    """A stored routing_verified=true must be provable from hook + binding.
+
+    A true flag that the derivation cannot reproduce is either a forged state
+    edit or a legacy operator attestation — both are unproven routing claims
+    and must surface in doctor instead of silently feeding downstream
+    consumers. False/absent flags are always acceptable.
+    """
+
+    errors: list[str] = []
+    for packet in state.get("packets", []):
+        if not isinstance(packet, dict) or not packet.get("routing_verified"):
+            continue
+        if not _derived_routing_verified(state, packet):
+            errors.append(
+                f"packet {packet.get('packet_id')} claims routing_verified but "
+                "no hook-observed model matches a current applied "
+                "resource-config binding for its role"
+            )
+    return errors
+
+
+def _derived_routing_verified(state: dict[str, Any], packet: dict[str, Any]) -> bool:
+    """Routing is verified only by hook observation against an applied binding.
+
+    CLI free text (--routing-evidence and friends) records a claim but never
+    verification: the observed model must come from a consumed SubagentStart
+    observation and must equal the model an applied resource-config event bound
+    to this packet's role. Anything less stays routing_verified=false.
+    """
+
+    if packet.get("dispatch_provenance") not in HOOK_OBSERVED_DISPATCH_PROVENANCES:
+        return False
+    observed_model = _hook_observed_routing_model(packet)
+    if not observed_model:
+        return False
+    bound_model = _applied_model_binding(state, str(packet.get("agent_role", "")))
+    return bool(bound_model) and observed_model == bound_model
 
 
 def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
@@ -4338,6 +4451,21 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if args.actual_model_tier and args.actual_model_tier != packet.get("model_tier"):
             raise HarnessError(
                 "actual model tier differs from requested tier; do not claim routing verification"
+            )
+        typed_outcome = getattr(args, "typed_outcome", None)
+        if typed_outcome and args.status not in TERMINAL_PACKET_STATUSES:
+            raise HarnessError(
+                "typed outcome is only recordable on a terminal packet transition"
+            )
+        if typed_outcome and typed_outcome not in PACKET_TYPED_OUTCOMES_BY_STATUS.get(
+            args.status, set()
+        ):
+            allowed = ", ".join(
+                sorted(PACKET_TYPED_OUTCOMES_BY_STATUS.get(args.status, set()))
+            )
+            raise HarnessError(
+                f"typed outcome {typed_outcome!r} is not valid for status "
+                f"{args.status!r}; allowed: {allowed}"
             )
         if args.status == "done":
             authority_errors = packet_authority_integrity_errors(
@@ -4436,23 +4564,48 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             packet["routing_evidence"] = require_evidence_detail(
                 args.routing_evidence, "routing evidence"
             )
-        packet["routing_verified"] = bool(
-            packet.get("agent_id")
-            and packet.get("actual_role") == packet.get("agent_role")
-            and packet.get("actual_model_tier") == packet.get("model_tier")
-            and packet.get("routing_evidence")
-        )
+        if args.actual_role or args.actual_model_tier or args.routing_evidence:
+            # Operator statements stay recorded, but only as an explicit claim:
+            # they can never flip routing_verified on their own.
+            packet["routing_claim"] = {
+                "actual_role": str(args.actual_role or packet.get("actual_role") or ""),
+                "actual_model_tier": str(
+                    args.actual_model_tier or packet.get("actual_model_tier") or ""
+                ),
+                "evidence": str(packet.get("routing_evidence") or ""),
+                "provenance": "cli_claimed",
+                "recorded_at": packet["updated_at"],
+            }
+        packet["routing_verified"] = _derived_routing_verified(state, packet)
         if args.status in TERMINAL_PACKET_STATUSES:
+            # Typed technical outcome: explicit when supplied, "cancelled" as a
+            # safe default for cancellations, otherwise "unclassified" — which
+            # is never model-quality eligible. Transport status alone must not
+            # be readable as a model verdict.
+            if typed_outcome:
+                packet["typed_outcome"] = typed_outcome
+                packet["typed_outcome_provenance"] = "operator_declared"
+            elif args.status == "cancelled":
+                packet["typed_outcome"] = "cancelled"
+                packet["typed_outcome_provenance"] = "derived_from_status"
+            else:
+                packet["typed_outcome"] = "unclassified"
+                packet["typed_outcome_provenance"] = "unclassified"
             result = task_dir(paths, args.task) / "results" / f"{args.packet_id}.md"
             result_text = (
                 f"# Sub-agent result — {args.packet_id}\n\n"
                 f"- Status: `{args.status}`\n"
+                f"- Typed outcome: `{packet['typed_outcome']}` "
+                f"(`{packet['typed_outcome_provenance']}`)\n"
                 f"- Requested role/tier: `{packet.get('agent_role')}` / "
                 f"`{packet.get('model_tier')}`\n"
-                f"- Actual role/tier: `{packet.get('actual_role') or 'unverified'}` / "
+                f"- Actual role/tier (operator claim): `{packet.get('actual_role') or 'unverified'}` / "
                 f"`{packet.get('actual_model_tier') or 'unverified'}`\n"
-                f"- Routing verified: `{str(packet['routing_verified']).lower()}`\n\n"
-                f"- Routing evidence: {packet.get('routing_evidence') or 'Not exposed by platform.'}\n\n"
+                f"- Hook-observed model: `{_hook_observed_routing_model(packet) or 'not exposed by transport'}`\n"
+                f"- Routing verified (hook-observed vs applied binding): "
+                f"`{str(packet['routing_verified']).lower()}`\n\n"
+                f"- Routing evidence (operator claim, never verification): "
+                f"{packet.get('routing_evidence') or 'Not exposed by platform.'}\n\n"
                 f"- Dispatch provenance: `{packet.get('dispatch_provenance') or 'legacy_unverified'}`\n\n"
                 "## Summary\n\n"
                 f"{summary}\n\n"
@@ -5076,6 +5229,7 @@ def close_gate(
     )
     failures.extend(provider_errors)
     failures.extend(context_benchmark_integrity_errors(paths, state))
+    failures.extend(routing_verification_integrity_errors(state))
     failures.extend(portfolio_integrity_errors(state, paths))
     failures.extend(override_integrity_errors(state))
     failures.extend(resource_config_integrity_errors(paths, state))
@@ -6201,6 +6355,21 @@ def build_parser(
         },
         add_json_argument=add_json_argument,
         vocab=vocab,
+    )
+
+    register_canary_commands(
+        sub,
+        handlers={
+            "codex_helper_canary": functools.partial(
+                cmd_codex_helper_canary,
+                services=CanaryCmdServices(
+                    require_plan_ready=require_plan_ready,
+                    require_root_session=require_root_session,
+                    packet_by_id=_packet_by_id,
+                ),
+            ),
+        },
+        add_json_argument=add_json_argument,
     )
 
     improvement_services = _improvement_cmd_services()

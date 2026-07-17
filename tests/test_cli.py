@@ -9977,6 +9977,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 packet_id,
                 "--status",
                 "done",
+                "--typed-outcome",
+                "accepted",
                 "--summary",
                 f"Completed bounded {task_type} fixture",
                 "--evidence",
@@ -10036,6 +10038,12 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertTrue(capacity_record["dispatch_recorded_at"])
         self.assertEqual(capacity_record["subagent_start_observed_at"], "")
         self.assertEqual(capacity_record["orchestration_started_at"], "")
+        self.assertEqual(capacity_record["typed_outcome"], "accepted")
+        self.assertEqual(
+            capacity_record["typed_outcome_provenance"], "operator_declared"
+        )
+        self.assertTrue(capacity_record["model_quality_eligible"])
+        self.assertEqual(review["dataset"]["eligible_record_count"], 1)
         terminal_packet(
             "capacity-analysis",
             "capacity",
@@ -10066,8 +10074,21 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "Only one historical unit exists, so this approval is deliberately single-use",
                 "--confidence-boundary",
                 "Requested routing is auditable but actual model routing remains unobserved",
+                "--min-eligible-records",
+                "1",
                 "--json",
             ).stdout
+        )
+        self.assertEqual(
+            review["recommendation"]["phase"], "recommendation_only"
+        )
+        self.assertEqual(
+            review["recommendation"]["sample_boundary"],
+            {
+                "min_eligible_records": 1,
+                "eligible_record_count": 1,
+                "record_count": 1,
+            },
         )
         self.dispatch_packet("capacity-flow", "rtl-parent", "/root/rtl-parent")
         before = self.task_state("capacity-flow")
@@ -10312,6 +10333,10 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         leaf = next(item for item in state["packets"] if item["packet_id"] == "expert-leaf")
         self.assertFalse(leaf["routing_verified"] if "routing_verified" in leaf else False)
         self.assertEqual(state["capacity_reviews"][0]["status"], "consumed")
+        self.assertEqual(
+            state["capacity_reviews"][0]["consumption"]["phase"],
+            "recommendation_only",
+        )
         expires_at = (
             dt.datetime.now().astimezone() + dt.timedelta(minutes=5)
         ).isoformat()

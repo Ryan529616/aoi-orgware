@@ -800,7 +800,7 @@ class ClaudeHookTestCase(HarnessTestCase):
             exceeded["hookSpecificOutput"]["additionalContext"],
         )
         incident = self.task_state(task_id)["subagent_incidents"][-1]
-        self.assertEqual(incident["reason_code"], "no_matching_arm")
+        self.assertEqual(incident["reason_code"], "helper_budget_exhausted")
         self.assertEqual(len(self.task_state(task_id)["packets"][0]["helper_spawns"]), 2)
 
     def test_helper_spawn_replay_is_idempotent(self) -> None:
@@ -844,7 +844,7 @@ class ClaudeHookTestCase(HarnessTestCase):
             observed["hookSpecificOutput"]["additionalContext"],
         )
         incident = self.task_state(task_id)["subagent_incidents"][-1]
-        self.assertEqual(incident["reason_code"], "no_matching_arm")
+        self.assertEqual(incident["reason_code"], "no_helper_budget")
 
     def test_pretooluse_depth_two_allows_with_helper_budget(self) -> None:
         task_id = "claude-helper-gate"

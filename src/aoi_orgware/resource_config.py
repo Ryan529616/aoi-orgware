@@ -82,8 +82,26 @@ def _canonical_json(payload: Any) -> bytes:
     ).encode("utf-8")
 
 
+# Ambient provenance recorded on a plan but excluded from its digest: the
+# Chief-review anchor must be a pure function of the reviewed resource content,
+# not of the working directory the CLI happened to run from. The
+# not_applicable apply gate enforces ancestry independently of the digest.
+_PLAN_UNSIGNED_CONTEXT_KEYS = frozenset(
+    {
+        "plan_sha256",
+        "invocation_cwd",
+        "config_applicability",
+        "applicability_basis",
+    }
+)
+
+
 def _plan_sha256(payload: dict[str, Any]) -> str:
-    unsigned = {key: value for key, value in payload.items() if key != "plan_sha256"}
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key not in _PLAN_UNSIGNED_CONTEXT_KEYS
+    }
     return _sha256(_canonical_json(unsigned))
 
 
@@ -223,15 +241,18 @@ def _patch_agents_table(raw: bytes, *, max_threads: int, max_depth: int) -> byte
 
 
 def _patch_agent_file(
-    raw: bytes, *, role: str, model: str, reasoning_effort: str
+    raw: bytes, *, role: str, model: str, reasoning_effort: str,
+    profile: str | None = None,
 ) -> bytes:
+    expected_name = profile if profile is not None else role
     text, parsed = _decode_toml(raw, f"Codex agent {role}")
     for key in ("name", "description", "developer_instructions"):
         if not isinstance(parsed.get(key), str) or not parsed[key].strip():
             raise HarnessError(f"Codex agent {role} lacks required top-level {key}")
-    if parsed["name"] != role:
+    if parsed["name"] != expected_name:
         raise HarnessError(
-            f"Codex agent file name mismatch: expected {role!r}, got {parsed['name']!r}"
+            f"Codex agent file name mismatch: expected {expected_name!r}, "
+            f"got {parsed['name']!r}"
         )
     lines = text.splitlines()
     first_table = next(
@@ -417,6 +438,48 @@ def _dynamic_envelope(
     }
 
 
+def config_applicability_verdict(
+    *, target_root: Path, invocation_cwd: Path | None
+) -> tuple[str, str]:
+    """Classify whether a Codex session like the invoking one can load the
+    configuration AOI is about to write under ``target_root``.
+
+    Codex discovers project configuration from its session working directory
+    upward, so the written ``.codex`` tree is loadable only when the session
+    CWD is at or below ``target_root``. The invocation CWD is a cooperative
+    assertion (the caller is presumed to run AOI from inside the live session
+    workspace); when it is unavailable the verdict is ``unknown`` rather than a
+    silent restart_required=true.
+    """
+
+    if invocation_cwd is None:
+        return (
+            "unknown",
+            "no invocation working directory was available; AOI cannot relate "
+            "the target root to any live session config ancestry",
+        )
+    try:
+        cwd = invocation_cwd.resolve()
+        target = target_root.resolve()
+    except OSError as exc:
+        return (
+            "unknown",
+            f"invocation working directory could not be resolved: {exc}",
+        )
+    if cwd == target or target in cwd.parents:
+        return (
+            "applicable",
+            f"invocation cwd {cwd} is at or below target root {target}; a "
+            "fresh trusted session started here loads the written config",
+        )
+    return (
+        "not_applicable",
+        f"invocation cwd {cwd} is outside target root {target}; a session "
+        "like the invoking one never loads the written config — start the "
+        "fresh session inside the target root instead",
+    )
+
+
 def build_codex_resource_plan(
     *,
     event_id: str,
@@ -430,6 +493,7 @@ def build_codex_resource_plan(
     execution_selection_id: str = "",
     override_id: str = "",
     override_settings: dict[str, str | int] | None = None,
+    invocation_cwd: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     event_id = validate_id(event_id, "resource config event id")
     approved_task_plan_sha256 = str(state.get("plan_sha256", ""))
@@ -514,34 +578,49 @@ def build_codex_resource_plan(
     resolved_agents: dict[str, dict[str, str]] = {}
     role_sources: dict[str, bytes] = {}
     role_project_before: dict[str, bytes | None] = {}
+    role_profiles = getattr(config, "codex_role_profiles", {}) or {}
     for role in sorted(selected_roles):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", role):
             raise HarnessError(f"invalid managed Codex role: {role}")
-        project_source_path = root / ".codex" / "agents" / f"{role}.toml"
+        # Four-way separation: the AOI governance role names WHO owns the
+        # work; the Codex profile names WHICH agent file supplies runtime
+        # defaults. They coincide only when no mapping is configured.
+        profile = str(role_profiles.get(role, role))
+        profile_label = (
+            f"Codex profile {profile} (role {role})" if profile != role else f"Codex agent {role}"
+        )
+        project_source_path = root / ".codex" / "agents" / f"{profile}.toml"
         source = _safe_read(
             project_source_path,
-            f"project Codex agent {role}",
+            f"project {profile_label}",
             allow_missing=True,
         )
         source_kind = "project"
         if source is None:
-            source_path = codex_home / "agents" / f"{role}.toml"
-            source = _safe_read(source_path, f"user Codex agent {role}")
+            source_path = codex_home / "agents" / f"{profile}.toml"
+            source = _safe_read(source_path, f"user {profile_label}")
             source_kind = "user_template"
         assert source is not None
         role_sources[role] = source
         role_project_before[role] = source if source_kind == "project" else None
-        _source_text, source_profile = _decode_toml(source, f"user Codex agent {role}")
+        _source_text, source_profile = _decode_toml(source, f"user {profile_label}")
+        declared_name = source_profile.get("name")
+        if declared_name is not None and declared_name != profile:
+            raise HarnessError(
+                f"Codex profile name mismatch for role {role}: file resolves as "
+                f"{profile!r} but declares name {declared_name!r}"
+            )
         model = source_profile.get("model")
         reasoning = source_profile.get("model_reasoning_effort")
         if not isinstance(model, str) or not MODEL_RE.fullmatch(model):
-            raise HarnessError(f"user Codex agent {role} lacks a valid model")
+            raise HarnessError(f"user {profile_label} lacks a valid model")
         if reasoning not in CODEX_REASONING_EFFORTS:
             raise HarnessError(
-                f"user Codex agent {role} lacks a supported model_reasoning_effort"
+                f"user {profile_label} lacks a supported model_reasoning_effort"
             )
         resolved_agents[role] = {
             "capability_tier": config.roles.get(role, "project_external_role"),
+            "profile": profile,
             "model": model,
             "model_reasoning_effort": reasoning,
             "profile_source_kind": source_kind,
@@ -609,7 +688,8 @@ def build_codex_resource_plan(
         }
     )
     for role, assignment in resolved_agents.items():
-        relative = f".codex/agents/{role}.toml"
+        profile = assignment.get("profile", role)
+        relative = f".codex/agents/{profile}.toml"
         destination = root / Path(relative)
         before = role_project_before[role]
         if before is not None:
@@ -621,6 +701,7 @@ def build_codex_resource_plan(
         after = _patch_agent_file(
             source,
             role=role,
+            profile=profile,
             model=assignment["model"],
             reasoning_effort=assignment["model_reasoning_effort"],
         )
@@ -641,6 +722,9 @@ def build_codex_resource_plan(
     total = sum(len(item["after"]) + len(item["before"] or b"") for item in files)
     if total > RESOURCE_TOTAL_MAX_BYTES:
         raise HarnessError("Codex resource plan exceeds the aggregate byte limit")
+    _applicability_verdict, _applicability_basis = config_applicability_verdict(
+        target_root=root, invocation_cwd=invocation_cwd
+    )
     view: dict[str, Any] = {
         "schema_version": RESOURCE_PLAN_SCHEMA_VERSION,
         "event_id": event_id,
@@ -681,6 +765,10 @@ def build_codex_resource_plan(
             for item in files
         ],
         "restart_required": True,
+        "config_applicability": _applicability_verdict,
+        "applicability_basis": _applicability_basis,
+        "invocation_cwd": str(invocation_cwd) if invocation_cwd else "",
+        "codex_home": str(codex_home),
         "routing_evidence_boundary": (
             "Writes requested Codex configuration only; actual provider model routing, "
             "token usage, and price remain unavailable until independently observed."

@@ -40,6 +40,7 @@ from .execution_topology import _is_steward_synthesis_packet
 from .harnesslib import (
     ACTIVE_PACKET_STATUSES,
     PACKET_STATUSES,
+    PACKET_TYPED_OUTCOMES_BY_STATUS,
     HarnessError,
     HarnessPaths,
     parse_time,
@@ -113,6 +114,26 @@ class PacketIntegrityServices:
     active_dispatch_attempt: ActiveDispatchAttempt
     safe_hook_observation_text: SafeHookObservationText
     subagent_event_id: SubagentEventId
+
+
+def _canonical_observation_sha256(observation: dict[str, Any]) -> str:
+    """Recompute the routing observation's tamper-evidence digest.
+
+    Mirrors dispatch_protocol's canonical record hashing: the digest is taken
+    over every observation field except the digest itself.
+    """
+
+    import json
+
+    unsigned = {
+        key: value
+        for key, value in observation.items()
+        if key != "observation_sha256"
+    }
+    payload = json.dumps(
+        unsigned, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _is_exact_int(value: Any, expected: int) -> bool:
@@ -740,9 +761,23 @@ def packet_integrity_errors(
                         "permission_mode",
                         "observed_at",
                     }
+                    # Legacy consumed observations predate the hook-observed
+                    # routing record; new observations additionally carry the
+                    # transport-reported model AND its tamper-evidence digest.
+                    # A model without the digest is rejected outright so a
+                    # routing model can never be retrofitted onto a legacy
+                    # observation.
+                    routing_observation_fields = required_observation_fields | {
+                        "model",
+                        "observation_sha256",
+                    }
                     if (
                         not isinstance(observation, dict)
-                        or set(observation) != required_observation_fields
+                        or set(observation)
+                        not in (
+                            required_observation_fields,
+                            routing_observation_fields,
+                        )
                     ):
                         errors.append(
                             f"packet {packet_id} consumed dispatch attempt {attempt_index} has an invalid observation schema"
@@ -794,6 +829,18 @@ def packet_integrity_errors(
                                 observation.get("permission_mode", "")
                             )
                             != observation.get("permission_mode")
+                            or (
+                                "model" in observation
+                                and (
+                                    not isinstance(observation.get("model"), str)
+                                    or services.safe_hook_observation_text(
+                                        observation.get("model", "")
+                                    )
+                                    != observation.get("model")
+                                    or observation.get("observation_sha256")
+                                    != _canonical_observation_sha256(observation)
+                                )
+                            )
                         ):
                             errors.append(
                                 f"packet {packet_id} consumed dispatch attempt {attempt_index} observation lost identity integrity"
@@ -824,6 +871,19 @@ def packet_integrity_errors(
                 HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
             ):
                 errors.append(f"packet {packet_id} terminal work lacks dispatch provenance")
+            if "typed_outcome" in packet:
+                typed_outcome = packet.get("typed_outcome")
+                allowed_outcomes = PACKET_TYPED_OUTCOMES_BY_STATUS.get(
+                    str(status), set()
+                ) | {"unclassified"}
+                if (
+                    status not in {"done", "failed", "cancelled"}
+                    or typed_outcome not in allowed_outcomes
+                ):
+                    errors.append(
+                        f"packet {packet_id} typed outcome "
+                        f"{typed_outcome!r} is invalid for status {status!r}"
+                    )
             if provenance == "manual_unverified":
                 if not packet.get("manual_unverified_reason"):
                     errors.append(f"packet {packet_id} manual dispatch lacks a reason")

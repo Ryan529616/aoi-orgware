@@ -279,6 +279,160 @@ class ResourceConfigPrimitiveTests(unittest.TestCase):
             )
 
 
+class RoleProfileSeparationTests(HarnessTestCase):
+    """WS2 — AOI role, capability tier, Codex profile, and provider model are
+    four distinct identities; the role→profile mapping is project config and
+    profile files must declare the profile name they are resolved under."""
+
+    def _write_profile(self, stem: str, *, declared_name: str, model: str) -> Path:
+        agents = Path(self.env["CODEX_HOME"]) / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        path = agents / f"{stem}.toml"
+        path.write_text(
+            "\n".join(
+                [
+                    f'name = "{declared_name}"',
+                    'description = "Bounded fixture profile"',
+                    'developer_instructions = "Inspect only the bounded scope."',
+                    f'model = "{model}"',
+                    'model_reasoning_effort = "medium"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _map_profiles(self, mapping: dict[str, str]) -> None:
+        config = self.root / "aoi.toml"
+        lines = ["", "[codex.profiles]"]
+        lines.extend(f'{role} = "{profile}"' for role, profile in mapping.items())
+        config.write_text(
+            config.read_text(encoding="utf-8") + "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
+
+    def _plan_state(self) -> dict:
+        return {
+            "task_id": "profile-map",
+            "plan_sha256": "b" * 64,
+            "lanes": [{"status": "active", "role": "explorer"}],
+            "packets": [],
+            "execution_selections": [],
+        }
+
+    def test_mapping_resolves_profile_and_writes_profile_named_file(self) -> None:
+        self._write_profile("eda_probe", declared_name="eda_probe", model="gpt-x")
+        self._map_profiles({"explorer": "eda_probe"})
+        plan, files = rc.build_codex_resource_plan(
+            event_id="profile-map-event",
+            root=self.root,
+            config=load_config(self.root),
+            state=self._plan_state(),
+            codex_home=Path(self.env["CODEX_HOME"]),
+            managed_roles=["explorer"],
+        )
+        assignment = plan["resolved"]["agents"]["explorer"]
+        self.assertEqual(assignment["profile"], "eda_probe")
+        self.assertEqual(assignment["model"], "gpt-x")
+        self.assertEqual(assignment["capability_tier"], "standard")
+        agent_paths = [item["relative_path"] for item in files]
+        self.assertIn(".codex/agents/eda_probe.toml", agent_paths)
+        self.assertNotIn(".codex/agents/explorer.toml", agent_paths)
+
+    def test_profile_declaring_wrong_name_fails_closed(self) -> None:
+        self._write_profile("eda_probe", declared_name="explorer", model="gpt-x")
+        self._map_profiles({"explorer": "eda_probe"})
+        with self.assertRaisesRegex(HarnessError, "name mismatch"):
+            rc.build_codex_resource_plan(
+                event_id="profile-map-event",
+                root=self.root,
+                config=load_config(self.root),
+                state=self._plan_state(),
+                codex_home=Path(self.env["CODEX_HOME"]),
+                managed_roles=["explorer"],
+            )
+
+    def test_absent_mapping_preserves_identity_resolution(self) -> None:
+        self._write_profile("explorer", declared_name="explorer", model="gpt-x")
+        plan, files = rc.build_codex_resource_plan(
+            event_id="identity-event",
+            root=self.root,
+            config=load_config(self.root),
+            state=self._plan_state(),
+            codex_home=Path(self.env["CODEX_HOME"]),
+            managed_roles=["explorer"],
+        )
+        self.assertEqual(
+            plan["resolved"]["agents"]["explorer"]["profile"], "explorer"
+        )
+        self.assertIn(
+            ".codex/agents/explorer.toml",
+            [item["relative_path"] for item in files],
+        )
+
+    def test_config_rejects_undeclared_role_and_invalid_profile(self) -> None:
+        base = (self.root / "aoi.toml").read_text(encoding="utf-8")
+        candidate = self.root / "config-candidate.toml"
+        candidate.write_text(
+            base + '\n[codex.profiles]\nghost_role = "probe"\n', encoding="utf-8"
+        )
+        rejected = self.cli("config-check", "--file", str(candidate), ok=False)
+        self.assertIn("does not name a declared", rejected.stderr)
+        candidate.write_text(
+            base + '\n[codex.profiles]\nexplorer = "../evil"\n', encoding="utf-8"
+        )
+        rejected = self.cli("config-check", "--file", str(candidate), ok=False)
+        self.assertIn("valid Codex profile name", rejected.stderr)
+
+
+class ConfigApplicabilityTests(unittest.TestCase):
+    """WS3 — plan/apply must relate the target root to the invoking session's
+    config ancestry instead of hiding behind restart_required=true."""
+
+    def test_verdict_applicable_at_or_below_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            nested = target / "rtl" / "adfp"
+            nested.mkdir(parents=True)
+            verdict, basis = rc.config_applicability_verdict(
+                target_root=target, invocation_cwd=target
+            )
+            self.assertEqual(verdict, "applicable")
+            self.assertIn("at or below", basis)
+            verdict, _ = rc.config_applicability_verdict(
+                target_root=target, invocation_cwd=nested
+            )
+            self.assertEqual(verdict, "applicable")
+
+    def test_verdict_not_applicable_outside_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "worktree"
+            elsewhere = base / "elsewhere"
+            target.mkdir()
+            elsewhere.mkdir()
+            verdict, basis = rc.config_applicability_verdict(
+                target_root=target, invocation_cwd=elsewhere
+            )
+            self.assertEqual(verdict, "not_applicable")
+            self.assertIn("never loads the written config", basis)
+            # A target BELOW the cwd is still not applicable: config discovery
+            # walks upward from the session cwd, never downward.
+            verdict, _ = rc.config_applicability_verdict(
+                target_root=target, invocation_cwd=base
+            )
+            self.assertEqual(verdict, "not_applicable")
+
+    def test_verdict_unknown_without_cwd_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            verdict, basis = rc.config_applicability_verdict(
+                target_root=Path(directory), invocation_cwd=None
+            )
+            self.assertEqual(verdict, "unknown")
+            self.assertIn("cannot relate", basis)
+
+
 class ResourceControlTests(HarnessTestCase):
     def _state(self, task_id: str) -> dict:
         return json.loads(
@@ -910,6 +1064,46 @@ class ResourceControlTests(HarnessTestCase):
             plan["resolved"]["agents"]["explorer"]["model"], "gpt-5.6-sol"
         )
         self.assertEqual(plan["plan_sha256"], draft_plan["plan_sha256"])
+        # WS3: the subprocess CLI runs with cwd == the task root, so the plan
+        # relates the invoking session to the target root explicitly.
+        self.assertEqual(plan["config_applicability"], "applicable")
+        self.assertIn("at or below", plan["applicability_basis"])
+        # An invocation from OUTSIDE the target root (the in-process runner
+        # keeps pytest's repo cwd) must plan as not_applicable and fail the
+        # apply gate without an explicit acknowledgement.
+        outside_plan = json.loads(
+            self.cli_in_process(
+                "codex-config-plan",
+                "--task",
+                task_id,
+                "--event-id",
+                "resource-config-ancestry-probe",
+                "--role",
+                "explorer",
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(outside_plan["config_applicability"], "not_applicable")
+        self.assertIn(
+            "never loads the written config", outside_plan["applicability_basis"]
+        )
+        refused = self.cli_in_process(
+            "codex-config-apply",
+            "--task",
+            task_id,
+            "--event-id",
+            "resource-config-ancestry-probe",
+            "--role",
+            "explorer",
+            "--expected-plan-sha256",
+            outside_plan["plan_sha256"],
+            "--session-id",
+            root_session,
+            ok=False,
+        )
+        self.assertIn(
+            "outside the invoking session's config ancestry", refused.stderr
+        )
         self.cli(
             "codex-config-apply",
             "--task",
@@ -924,6 +1118,11 @@ class ResourceControlTests(HarnessTestCase):
             plan["plan_sha256"],
             "--session-id",
             root_session,
+        )
+        state = self._state(task_id)
+        self.assertEqual(
+            state["resource_config_events"][0]["config_applicability"],
+            "applicable",
         )
         state = self._state(task_id)
         self.assertEqual(state["override_requests"][0]["status"], "consumed")
@@ -948,6 +1147,98 @@ class ResourceControlTests(HarnessTestCase):
         project_agent = self.root / ".codex" / "agents" / "explorer.toml"
         self.assertIn(
             'model = "gpt-5.6-sol"', project_agent.read_text(encoding="utf-8")
+        )
+        # WS1 end-to-end positive path through the REAL CLI: with the applied
+        # binding live (explorer -> gpt-5.6-sol), a hook-observed dispatch
+        # whose transport reports that exact model derives routing_verified
+        # true; a mismatching observation stays false.
+        self.cli(
+            "create-packet",
+            "--task",
+            task_id,
+            "--packet-id",
+            "routing-e2e",
+            "--agent-role",
+            "explorer",
+            "--model-tier",
+            "standard",
+            "--objective",
+            "Verify hook-observed routing against the applied binding",
+            "--scope",
+            "read-only fixture",
+            "--deliverable",
+            "routing verification evidence",
+            "--validation",
+            "routing_verified derives true only from hook + binding",
+        )
+        self.arm_packet(task_id, "routing-e2e", expected_agent_type="explorer")
+        import hashlib as _hashlib
+
+        parent_session = (
+            "dispatch-parent-"
+            + _hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
+        )
+        observed = self.hook(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": parent_session,
+                "turn_id": "turn-routing-e2e",
+                "agent_id": "/root/routing-e2e",
+                "agent_type": "explorer",
+                "permission_mode": "default",
+                "model": "gpt-5.6-sol",
+            }
+        )
+        self.assertIn(
+            "valid pre-armed dispatch",
+            observed["hookSpecificOutput"]["additionalContext"],
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            "routing-e2e",
+            "--status",
+            "done",
+            "--typed-outcome",
+            "accepted",
+            "--summary",
+            "Routing verification fixture complete",
+            "--evidence",
+            "hook observation carries the applied binding model",
+        )
+        state = self._state(task_id)
+        e2e_packet = next(
+            item
+            for item in state["packets"]
+            if item["packet_id"] == "routing-e2e"
+        )
+        self.assertTrue(e2e_packet["routing_verified"])
+        self.assertEqual(
+            cli_impl._hook_observed_routing_model(e2e_packet), "gpt-5.6-sol"
+        )
+        self.assertEqual(
+            cli_impl.routing_verification_integrity_errors(state), []
+        )
+        # A stored true flag whose observation no longer proves the binding
+        # must surface in the doctor-level invariant.
+        forged = json.loads(json.dumps(state))
+        forged_packet = next(
+            item
+            for item in forged["packets"]
+            if item["packet_id"] == "routing-e2e"
+        )
+        forged_packet["dispatch_attempts"][0]["observation"][
+            "model"
+        ] = "gpt-forged"
+        self.assertTrue(
+            any(
+                "claims routing_verified" in error
+                for error in cli_impl.routing_verification_integrity_errors(
+                    forged
+                )
+            )
         )
         replay = self.cli(
             "codex-config-apply",
@@ -1023,6 +1314,67 @@ class ResourceControlTests(HarnessTestCase):
         )
         self.assertFalse((self.root / ".codex" / "config.toml").exists())
         self.assertFalse(project_agent.exists())
+        # WS3: an explicitly acknowledged inapplicable apply must proceed and
+        # record the acknowledgement in the event (in-process runner keeps
+        # pytest's cwd, which is outside the task root).
+        acknowledged_plan = json.loads(
+            self.cli_in_process(
+                "codex-config-plan",
+                "--task",
+                task_id,
+                "--event-id",
+                "resource-config-acknowledged",
+                "--role",
+                "explorer",
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(
+            acknowledged_plan["config_applicability"], "not_applicable"
+        )
+        # The cwd-independent digest means the same reviewed content hashes
+        # identically from inside and outside the target root.
+        inside_plan = json.loads(
+            self.cli(
+                "codex-config-plan",
+                "--task",
+                task_id,
+                "--event-id",
+                "resource-config-acknowledged",
+                "--role",
+                "explorer",
+                "--json",
+            ).stdout
+        )
+        self.assertEqual(
+            inside_plan["plan_sha256"], acknowledged_plan["plan_sha256"]
+        )
+        self.assertEqual(inside_plan["config_applicability"], "applicable")
+        self.cli_in_process(
+            "codex-config-apply",
+            "--task",
+            task_id,
+            "--event-id",
+            "resource-config-acknowledged",
+            "--role",
+            "explorer",
+            "--expected-plan-sha256",
+            acknowledged_plan["plan_sha256"],
+            "--session-id",
+            root_session,
+            "--allow-inapplicable",
+        )
+        state = self._state(task_id)
+        acknowledged_event = next(
+            item
+            for item in state["resource_config_events"]
+            if item["event_id"] == "resource-config-acknowledged"
+        )
+        self.assertEqual(acknowledged_event["status"], "applied")
+        self.assertEqual(
+            acknowledged_event["config_applicability"], "not_applicable"
+        )
+        self.assertTrue(acknowledged_event["inapplicable_acknowledged"])
 
 
 if __name__ == "__main__":

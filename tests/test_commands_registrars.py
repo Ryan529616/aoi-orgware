@@ -778,10 +778,13 @@ class CapacityCommandRegistryTests(unittest.TestCase):
                 "low",
                 "--confidence-boundary",
                 "b",
+                "--min-eligible-records",
+                "1",
             ]
         )
         self.assertIs(args.handler, handlers["capacity_recommend"])
         self.assertEqual(args.capability_tier, "c2_routine")
+        self.assertEqual(args.min_eligible_records, 1)
 
     def test_registry_rejects_out_of_vocab_leaf_role(self) -> None:
         parser, _ = self.parser()

@@ -298,6 +298,9 @@ def record_subagent_incident(
         "agent_type": safe_hook_observation_text(
             payload.get("agent_type", ""), policy=policy
         ),
+        "model": safe_hook_observation_text(
+            payload.get("model", ""), policy=policy
+        ),
         "observed_at": observed_at,
         "reason_code": reason_code,
         "candidate_packet_ids": sorted(set(candidate_packet_ids)),
@@ -704,6 +707,11 @@ def observe_subagent_start(
         current = dt.datetime.now().astimezone()
         transport_agent_type = str(payload.get("agent_type", ""))
         agent_id = str(payload.get("agent_id", ""))
+        # Transport-honest routing observation: record the model exactly as the
+        # hook payload provided it, empty when the transport did not expose one.
+        observed_model = safe_hook_observation_text(
+            payload.get("model", ""), policy=policy
+        )
         expired_arms = expire_dispatch_arms(state, current=current)
         valid_event = bool(
             policy.hook_id_re.fullmatch(transport_agent_type)
@@ -731,6 +739,7 @@ def observe_subagent_start(
             matched_expired_packet_ids=matched_expired_ids,
             policy=policy,
         )
+        helper_refusal_parent_id = ""
         if not reason_code:
             packet, attempt = candidates[0]
             try:
@@ -761,6 +770,7 @@ def observe_subagent_start(
                             payload.get("turn_id", ""), policy=policy
                         ),
                         "agent_type": transport_agent_type,
+                        "model": observed_model,
                         "observed_at": observed_at,
                     }
                 )
@@ -792,6 +802,22 @@ def observe_subagent_start(
             if parent_packet is not None:
                 budget = _helper_spawn_budget(parent_packet)
                 used = len(parent_packet.get("helper_spawns", []))
+                if parent_packet.get("status") in policy.executing_packet_statuses:
+                    # Direct-parent linkage worked; a refusal here is a budget
+                    # fact, not an arm-matching fact. Distinct reason codes let
+                    # the helper canary tell the taxonomy apart, and the
+                    # resolved direct parent is recorded so one parent's
+                    # refusal can never be attributed to another packet.
+                    if budget < 1:
+                        reason_code = "no_helper_budget"
+                        helper_refusal_parent_id = str(
+                            parent_packet.get("packet_id", "")
+                        )
+                    elif used >= budget:
+                        reason_code = "helper_budget_exhausted"
+                        helper_refusal_parent_id = str(
+                            parent_packet.get("packet_id", "")
+                        )
                 if (
                     parent_packet.get("status") in policy.executing_packet_statuses
                     and used < budget
@@ -804,6 +830,7 @@ def observe_subagent_start(
                             "turn_id": safe_hook_observation_text(
                                 payload.get("turn_id", ""), policy=policy
                             ),
+                            "model": observed_model,
                             "observed_at": observed_at,
                         }
                     )
@@ -835,6 +862,10 @@ def observe_subagent_start(
                 observed_at=observed_at,
                 policy=policy,
             )
+            if helper_refusal_parent_id:
+                incident.setdefault(
+                    "helper_parent_packet_id", helper_refusal_parent_id
+                )
             bump_task(state)
             write_task(paths, state)
             index_refreshed = services.refresh_index_after_commit(paths)
@@ -860,8 +891,14 @@ def observe_subagent_start(
             "permission_mode": safe_hook_observation_text(
                 payload.get("permission_mode", ""), policy=policy
             ),
+            "model": observed_model,
             "observed_at": observed_at,
         }
+        # Tamper evidence for the routing observation: the event identity hash
+        # deliberately excludes the model (replay identity must stay stable),
+        # so the model is bound here instead. Editing any observation field —
+        # including model — after consumption breaks this digest.
+        observation["observation_sha256"] = _canonical_record_sha256(observation)
         attempt["status"] = "consumed"
         attempt["observation"] = observation
         attempt["closed_at"] = observed_at

@@ -89,7 +89,9 @@ class ProjectConfig:
     required_receipt_components: tuple[str, ...]
     high_risk_paths: tuple[str, ...]
     external_lock_namespace: str
+    capacity_recommendation_only: bool
     codex_hooks_enabled: bool
+    codex_role_profiles: dict[str, str]
     legacy_enabled: bool
     sha256: str
 
@@ -234,7 +236,7 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
         raise ValueError(f"invalid {source}: {exc}") from exc
     allowed = {
         "schema_version", "profile_id", "state_dir", "project", "organization",
-        "roles", "evidence", "receipts", "policy", "hooks", "legacy",
+        "roles", "evidence", "receipts", "policy", "hooks", "codex", "legacy",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -297,7 +299,13 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
         raise ValueError("receipts.required must be a subset of components")
     policy = _table(payload, "policy")
     _reject_unknown(
-        policy, {"high_risk_paths", "external_lock_namespace"}, "policy"
+        policy,
+        {
+            "high_risk_paths",
+            "external_lock_namespace",
+            "capacity_recommendation_only",
+        },
+        "policy",
     )
     raw_high_risk = _strings(
         policy.get("high_risk_paths", []), "policy.high_risk_paths", allow_empty=True
@@ -316,10 +324,30 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
     namespace = policy.get("external_lock_namespace", "external")
     if not isinstance(namespace, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", namespace):
         raise ValueError("policy.external_lock_namespace is invalid")
+    # Absent means the restrictive phase: capacity output is advice only.
+    recommendation_only = policy.get("capacity_recommendation_only", True)
+    if not isinstance(recommendation_only, bool):
+        raise ValueError("policy.capacity_recommendation_only must be true or false")
     hooks_table = _table(payload, "hooks")
     _reject_unknown(hooks_table, {"codex"}, "hooks")
     hooks = _table(hooks_table, "codex")
     _reject_unknown(hooks, {"enabled"}, "hooks.codex")
+    codex_table = _table(payload, "codex")
+    _reject_unknown(codex_table, {"profiles"}, "codex")
+    profiles_table = _table(codex_table, "profiles")
+    codex_role_profiles: dict[str, str] = {}
+    for role, profile in profiles_table.items():
+        if role not in roles:
+            raise ValueError(
+                f"codex.profiles.{role} does not name a declared [roles] role"
+            )
+        if not isinstance(profile, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", profile
+        ):
+            raise ValueError(
+                f"codex.profiles.{role} must be a valid Codex profile name"
+            )
+        codex_role_profiles[role] = profile
     legacy = _table(payload, "legacy")
     _reject_unknown(legacy, {"enabled"}, "legacy")
     return ProjectConfig(
@@ -335,7 +363,9 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
         required_receipt_components=required,
         high_risk_paths=high_risk,
         external_lock_namespace=namespace,
+        capacity_recommendation_only=recommendation_only,
         codex_hooks_enabled=_boolean(hooks, "enabled", "hooks.codex.enabled"),
+        codex_role_profiles=codex_role_profiles,
         legacy_enabled=_boolean(legacy, "enabled", "legacy.enabled"),
         sha256=hashlib.sha256(raw).hexdigest(),
     )

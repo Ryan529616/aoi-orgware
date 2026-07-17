@@ -7,6 +7,82 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+Observability / last-mile line. Every change traces to the 2026-07-17
+evidence audit of AOI 0.3.0a2 governing ARISE: `routing_verified` was
+settable from CLI free text; the SubagentStart observation discarded the
+transport model; profile resolution hard-coupled AOI role names to Codex
+profile filenames (4 ARISE roles hard-failed on pure name drift);
+`codex-config-apply` hid inapplicable targets behind `restart_required=true`;
+helper budgets had never been exercised (81/81 packets budget 0) with the
+direct-parent transport question unverified; and 22% of terminal packets
+died of ceremony while `status` was the only outcome signal.
+
+### Added
+- **Hook-observed routing records (WS1).** SubagentStart observations,
+  helper spawns, resumptions, and incidents now persist the
+  transport-reported `model` (empty when not exposed). `routing_verified`
+  is DERIVED — true only when a consumed hook observation carries a model
+  that matches the packet-role binding of a current applied resource-config
+  event; `--actual-role/--actual-model-tier/--routing-evidence` are stored
+  as an explicit `routing_claim` (`provenance="cli_claimed"`) and can no
+  longer flip the flag.
+- **Role→profile mapping (WS2).** New optional `[codex.profiles]` aoi.toml
+  table maps AOI roles to Codex agent profile names; absent table preserves
+  the identity mapping byte-for-byte. Profile TOMLs declaring a `name` must
+  match the profile they resolve as (fail closed); resolved agents,
+  plans, and receipts now record the `profile` alongside role, tier, and
+  model.
+- **Config-ancestry applicability (WS3).** `codex-config-plan/apply`
+  relate the target worktree to the invoking session's working directory:
+  plans carry `config_applicability` (`applicable` / `not_applicable` /
+  `unknown`) with an explicit basis; apply fails closed on
+  `not_applicable` unless `--allow-inapplicable` records the
+  acknowledgement in the event and receipt.
+- **Helper transport canary (WS4).** Budget refusals now carry distinct
+  incident reason codes (`no_helper_budget`, `helper_budget_exhausted`)
+  instead of folding into `no_matching_arm`. New Chief-fenced
+  `codex-helper-canary` command classifies a live canary window into a
+  typed `transport_probes` verdict (`supported`,
+  `supported_budget_enforced`, `unsupported_root_parent_only`, `unknown`);
+  the live procedure is documented in `docs/helper-canary-runbook.md`.
+  Helper capability may only be claimed from a recorded probe.
+- **Typed technical outcomes (WS5).** Terminal `packet-update` accepts
+  `--typed-outcome` (accepted, rejected, procedural_failure,
+  transport_failure, cancelled, superseded, no_material_work) with
+  per-status validity; absent means `unclassified`. Capacity records and
+  the (now v2) capacity dataset export `typed_outcome` and
+  `model_quality_eligible`; only explicit accepted/rejected outcomes enter
+  a model-quality denominator — transport status never does.
+- **Recommendation-only phase gate (WS6).** `capacity-recommend` requires
+  `--min-eligible-records` and fails closed below it; recommendations
+  record `phase="recommendation_only"` and a typed `sample_boundary`,
+  enforced by portfolio-integrity invariants. New
+  `[policy] capacity_recommendation_only` (default true) pins the phase:
+  while true, a capacity decision may only be consumed when its
+  recommendation records that phase. No code path applies a capacity
+  recommendation to dispatch-time profile/model selection.
+
+### Hardened after independent adversarial review (12 confirmed findings)
+- Routing observations carry a tamper-evidence digest
+  (`observation_sha256`); editing the observed model after consumption —
+  or retrofitting a model onto a legacy observation — fails packet
+  integrity.
+- Capacity records re-derive routing verification at export time instead
+  of trusting the stored boolean, and doctor flags any stored
+  `routing_verified=true` that the hook+binding derivation cannot
+  reproduce (this includes legacy operator-attested flags and packets
+  whose binding was later rolled back: an unprovable claim is surfaced,
+  not grandfathered).
+- The resource plan digest excludes ambient invocation context
+  (`invocation_cwd`, applicability verdict/basis), so the Chief-review
+  anchor is a pure function of the reviewed content and a plan/apply pair
+  from different directories no longer misreports "plan changed".
+- Helper budget refusal incidents record `helper_parent_packet_id`; the
+  canary only counts refusals scoped to its own parent packet.
+- Typed outcomes are integrity-checked (value/status validity); the
+  sample-boundary contract is anchored to the sha-pinned dataset file so
+  deleting the fields is as detectable as falsifying them.
+
 ## [0.3.0a2] - 2026-07-17 (alpha)
 
 Governance-honesty pre-release on the v0.3 line. Every change traces to a

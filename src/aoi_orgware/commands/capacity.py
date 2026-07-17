@@ -182,8 +182,11 @@ def cmd_capacity_snapshot(
         if target.get("revision") != args.expected_lane_revision:
             raise HarnessError("capacity target lane revision CAS failed")
         records = services.capacity_records(state, target["lane_id"], task_type)
+        eligible_record_count = sum(
+            1 for record in records if record.get("model_quality_eligible") is True
+        )
         dataset_payload = {
-            "dataset_version": 1,
+            "dataset_version": 2,
             "task_id": state["task_id"],
             "review_id": review_id,
             "steward_lane_id": steward["lane_id"],
@@ -195,6 +198,7 @@ def cmd_capacity_snapshot(
             "task_type": task_type,
             "leaf_role": args.leaf_role,
             "records": records,
+            "eligible_record_count": eligible_record_count,
             "token_usage": "unavailable",
             "cost": "unavailable",
         }
@@ -228,6 +232,7 @@ def cmd_capacity_snapshot(
                 "path": str(dataset_path),
                 "sha256": dataset_sha,
                 "record_count": len(records),
+                "eligible_record_count": eligible_record_count,
                 "fingerprint": services.records_fingerprint(records),
                 "cutoff_at": recorded,
             },
@@ -265,6 +270,18 @@ def cmd_capacity_recommend(
             raise HarnessError("capacity dataset is missing or tampered")
         if int(dataset.get("record_count", 0)) < 1:
             raise HarnessError("capacity recommendation requires at least one verified task-type record")
+        min_eligible = int(args.min_eligible_records)
+        if min_eligible < 1:
+            raise HarnessError("capacity minimum eligible record count must be positive")
+        eligible_count = int(dataset.get("eligible_record_count", 0))
+        if eligible_count < min_eligible:
+            raise HarnessError(
+                "capacity recommendation sample gate failed: "
+                f"{eligible_count} model-quality-eligible record(s) "
+                f"(typed outcome accepted/rejected) < required {min_eligible}; "
+                "transport status and unclassified/procedural/cancelled outcomes "
+                "never count toward the model-quality sample"
+            )
         matches = [
             packet
             for packet in state.get("packets", [])
@@ -318,6 +335,14 @@ def cmd_capacity_recommend(
             ),
             "source_packet_id": source_packet["packet_id"],
             "source_result_sha256": source_packet["result_sha256"],
+            # Recommendation-only phase: this record advises; nothing may
+            # auto-apply it to dispatch-time profile or model selection.
+            "phase": "recommendation_only",
+            "sample_boundary": {
+                "min_eligible_records": min_eligible,
+                "eligible_record_count": eligible_count,
+                "record_count": int(dataset.get("record_count", 0)),
+            },
         }
         review["updated_at"] = now_iso()
         bump_task(state)
@@ -462,6 +487,16 @@ def register_capacity_commands(
     parser.add_argument("--rationale", required=True)
     parser.add_argument("--risk", required=True)
     parser.add_argument("--confidence-boundary", required=True)
+    parser.add_argument(
+        "--min-eligible-records",
+        type=int,
+        required=True,
+        help=(
+            "declared minimum count of model-quality-eligible records "
+            "(typed outcome accepted/rejected) this recommendation needs; "
+            "the recommendation fails closed below it"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["capacity_recommend"])
 
