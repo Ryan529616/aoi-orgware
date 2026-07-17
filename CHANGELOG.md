@@ -8,6 +8,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 ## [Unreleased]
 
 ### Added
+- **Claude claim-write gate (opt-in).** With `AOI_CLAUDE_CLAIM_WRITE_GATE=warn`
+  or `deny`, the Claude `PreToolUse` hook checks `Write`/`Edit`/`MultiEdit`/
+  `NotebookEdit` targets against the bound session's live `repo:file:`/
+  `repo:tree:` claims and warns or blocks a repo write outside them before it
+  lands — upgrading the claim ledger from a record to a pre-write gate on the
+  cooperative tool path. Default off is an exact pass-through. Writes under
+  `.aoi/`, outside the repo, from unbound sessions, and every `Bash` command
+  pass through; it gates only the cooperating tool path and is not an OS
+  sandbox.
 - **Claude model-tier dispatch gate.** The Claude `PreToolUse` pre-spawn gate
   now enforces the armed packet's `model_tier` against the dispatch request's
   `model`: a governed dispatch without an explicit model is denied (omission

@@ -248,6 +248,34 @@ routing it later performs, and Workflow-orchestrated spawns bypass
 `PreToolUse` entirely (`SubagentStart` still observes them). It is a
 cooperative guardrail on the one hook that fires before spawn.
 
+## Claude claim-write gate (opt-in)
+
+The claim ledger records who owns which files, but by default nothing stops a
+sub-agent from writing a file it never claimed — AOI is a cooperative
+guardrail, not an OS sandbox. On the Claude host, though, `PreToolUse` fires
+before `Write`/`Edit` too, so the ledger can be enforced on the tools a
+*cooperating* agent actually uses.
+
+Set `AOI_CLAUDE_CLAIM_WRITE_GATE`:
+
+| Value | Behavior on a `Write`/`Edit`/`MultiEdit`/`NotebookEdit` |
+|---|---|
+| unset / `off` | No gating (default; exact pass-through) |
+| `warn` | Allow, but announce a write outside the session's live claims |
+| `deny` | Block a write outside the session's live claims before it lands |
+
+The check applies only to a session bound to a task, compares the target
+against that task's reserving `repo:file:` and `repo:tree:` claims, and passes
+through writes outside the repo (temp/external output) and under `.aoi/` (Chief
+manages AOI state through the CLI, not file claims). `Bash` is never gated —
+its command cannot be resolved to a target, and a false deny there would break
+the session.
+
+Boundary: this gates the cooperative tool path only. A non-cooperating process
+under the same OS account, or a write routed through `Bash`, is not stopped.
+It upgrades the claim ledger from a record to a pre-write gate on Claude; it is
+not a sandbox.
+
 ## Current evidence boundary
 
 This controller is policy-based, not cost-optimizing. AOI can select a role,

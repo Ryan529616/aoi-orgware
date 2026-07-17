@@ -72,6 +72,48 @@ class ClaudeHookTestCase(HarnessTestCase):
             "The parent checks the conclusion against the named source paths",
         )
 
+    def claim_repo_locks(
+        self, task_id: str, token: str, *locks: str
+    ) -> None:
+        args = [
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            token,
+            "--owner",
+            "test-root",
+            "--kind",
+            "implementation",
+            "--intent",
+            "Reserve write scope for the claim-write gate test",
+            "--validation",
+            "The gate checks writes against these locks",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        ]
+        for lock in locks:
+            args.extend(["--lock", lock])
+        self.cli(*args)
+
+    def write_payload(
+        self,
+        *,
+        file_path: str,
+        session_id: str = "harness-test-chief",
+        tool_name: str = "Write",
+    ) -> dict:
+        return {
+            "hook_event_name": "PreToolUse",
+            "session_id": session_id,
+            "prompt_id": "prompt-write-1",
+            "permission_mode": "default",
+            "tool_name": tool_name,
+            "tool_input": {"file_path": file_path, "content": "x"},
+            "tool_use_id": "toolu_write_000001",
+        }
+
     def arm(
         self, task_id: str, packet_id: str, agent_type: str = "general-purpose"
     ) -> None:
@@ -291,6 +333,95 @@ class ClaudeHookTestCase(HarnessTestCase):
         denied_out = denied["hookSpecificOutput"]
         self.assertEqual(denied_out["permissionDecision"], "deny")
         self.assertIn("outside packet tier", denied_out["permissionDecisionReason"])
+
+    # ------------------------------------------------------------------
+    # PreToolUse claim-write gate (opt-in)
+    # ------------------------------------------------------------------
+
+    DENY = {"AOI_CLAUDE_CLAIM_WRITE_GATE": "deny"}
+    WARN = {"AOI_CLAUDE_CLAIM_WRITE_GATE": "warn"}
+
+    def test_claim_write_gate_off_by_default_allows_unclaimed(self) -> None:
+        task_id = "claude-write-off"
+        self.init_task(task_id, session_id="harness-test-chief")
+        target = str(self.root / "src" / "unclaimed.py")
+        decision = self.claude_hook(self.write_payload(file_path=target))
+        # Off = a silent pass-through (`allow()` -> {"continue": true}), no gate
+        # output at all.
+        self.assertTrue(decision.get("continue"))
+        self.assertNotIn("hookSpecificOutput", decision)
+
+    def test_claim_write_gate_deny_blocks_unclaimed_repo_write(self) -> None:
+        task_id = "claude-write-deny"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-a", "repo:file:src/owned.py")
+        target = str(self.root / "src" / "elsewhere.py")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.DENY
+        )
+        out = decision["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("not covered by any live claim", out["permissionDecisionReason"])
+
+    def test_claim_write_gate_deny_allows_exact_claimed_file(self) -> None:
+        task_id = "claude-write-exact"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-b", "repo:file:src/owned.py")
+        target = str(self.root / "src" / "owned.py")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.DENY
+        )
+        self.assertTrue(decision.get("continue"))
+
+    def test_claim_write_gate_deny_allows_file_under_claimed_tree(self) -> None:
+        task_id = "claude-write-tree"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-c", "repo:tree:src/pkg")
+        target = str(self.root / "src" / "pkg" / "deep" / "mod.py")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.DENY
+        )
+        self.assertTrue(decision.get("continue"))
+
+    def test_claim_write_gate_warn_allows_but_announces(self) -> None:
+        task_id = "claude-write-warn"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-d", "repo:file:src/owned.py")
+        target = str(self.root / "src" / "elsewhere.py")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.WARN
+        )
+        out = decision["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertIn("claim-write warning", out["permissionDecisionReason"])
+
+    def test_claim_write_gate_deny_passes_aoi_state_writes(self) -> None:
+        task_id = "claude-write-aoi"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-e", "repo:file:src/owned.py")
+        target = str(self.root / ".aoi" / "tasks" / task_id / "plan.md")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.DENY
+        )
+        self.assertTrue(decision.get("continue"))
+
+    def test_claim_write_gate_deny_passes_out_of_repo_writes(self) -> None:
+        task_id = "claude-write-external"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.claim_repo_locks(task_id, "wg-f", "repo:file:src/owned.py")
+        target = str(self.root.parent / "outside-the-repo.txt")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target), env_extra=self.DENY
+        )
+        self.assertTrue(decision.get("continue"))
+
+    def test_claim_write_gate_deny_passes_unbound_session(self) -> None:
+        target = str(self.root / "src" / "anything.py")
+        decision = self.claude_hook(
+            self.write_payload(file_path=target, session_id="never-bound"),
+            env_extra=self.DENY,
+        )
+        self.assertTrue(decision.get("continue"))
 
     def test_gate_denies_live_slots_with_stale_exact_authority(self) -> None:
         task_id = "claude-gate-drift"

@@ -54,6 +54,11 @@ DEFAULT_GOVERNED_AGENT_TYPES = ("general-purpose",)
 AGENT_TOOL_NAME = "Agent"
 # A wildcard arm matches any observed transport agent_type for its parent slot.
 WILDCARD_AGENT_TYPE = "*"
+# Tools whose target file is explicit enough to check against claims. Bash is
+# deliberately excluded: its command cannot be reliably resolved to a target,
+# and a false deny there would break the session.
+CLAIM_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+CLAIM_WRITE_GATE_ENV = "AOI_CLAUDE_CLAIM_WRITE_GATE"
 TIER_MODELS_ENV = "AOI_CLAUDE_TIER_MODELS"
 # Requested-model families each packet tier may name in a governed dispatch.
 # Matching is case-insensitive substring against the requested model value, so
@@ -153,6 +158,125 @@ def model_tier_note(model_tier: Any, tool_input: dict[str, Any]) -> str:
     )
 
 
+def claim_write_gate_mode() -> str:
+    """`off` (default), `warn`, or `deny` for the Write/Edit claim gate."""
+
+    raw = os.environ.get(CLAIM_WRITE_GATE_ENV, "").strip().lower()
+    return raw if raw in {"warn", "deny"} else "off"
+
+
+def _write_target(tool_input: dict[str, Any]) -> str:
+    for key in ("file_path", "notebook_path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _repo_relative(root: Path, target: str) -> str | None:
+    """Repo-root-relative POSIX path, or None when the target is outside root."""
+
+    try:
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    return relative.as_posix()
+
+
+def _claimed_repo_scopes(
+    root: Path, session_id: str
+) -> tuple[str, set[str], set[str]] | None:
+    """(task_id, exact-file locks, tree-prefix locks) for the bound session's
+    reserving claims, or None when the session is not bound to usable state."""
+
+    mapping_status, mapped = session_state(root, session_id)
+    if mapping_status not in {"valid", "subagent_parent"} or mapped is None:
+        return None
+    # Lazy import keeps ordinary hook startup (session start, prompt) small.
+    from .harnesslib import RESERVING_CLAIM_STATUSES, claims_for_task
+
+    state = mapped[0]
+    paths = get_paths(root)
+    exact: set[str] = set()
+    trees: set[str] = set()
+    for claim in claims_for_task(paths, state, validate_reserving=False):
+        if claim.get("status") not in RESERVING_CLAIM_STATUSES:
+            continue
+        for lock in claim.get("locks", []):
+            text = str(lock)
+            if text.startswith("repo:file:"):
+                exact.add(text[len("repo:file:") :].strip().lower())
+            elif text.startswith("repo:tree:"):
+                trees.add(text[len("repo:tree:") :].strip().strip("/").lower())
+    return str(state.get("task_id", "")), exact, trees
+
+
+def claim_write_gate(root: Path, payload: dict[str, Any]) -> None:
+    """Enforce file claims on the cooperative Write/Edit tool path.
+
+    Opt-in via ``AOI_CLAUDE_CLAIM_WRITE_GATE``; default off is an exact
+    pass-through. This upgrades the claim ledger to a pre-write gate on the
+    tools a cooperating agent actually uses; it is still cooperative, not an
+    OS sandbox, and it never touches Bash.
+    """
+
+    mode = claim_write_gate_mode()
+    if mode == "off":
+        allow()
+        return
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        allow()
+        return
+    target = _write_target(tool_input)
+    if not target:
+        allow()
+        return
+    session_id = str(payload.get("session_id", ""))
+    scopes = _claimed_repo_scopes(root, session_id)
+    if scopes is None:
+        # Unbound / ambient session: the write gate governs bound sessions only.
+        allow()
+        return
+    relative = _repo_relative(root, target)
+    if relative is None:
+        # Outside the repo (temp, external output) — not claim-governed.
+        allow()
+        return
+    if relative == ".aoi" or relative.startswith(".aoi/"):
+        # AOI state is Chief-managed through the CLI, not through file claims.
+        allow()
+        return
+    task_id, exact, trees = scopes
+    key = relative.lower()
+    covered = key in exact or any(
+        tree and (key == tree or key.startswith(tree + "/")) for tree in trees
+    )
+    if covered:
+        allow()
+        return
+    body = (
+        f"{relative!r} is not covered by any live claim on AOI task "
+        f"{task_id!r}. Claim the exact scope before writing "
+        f"(`aoi claim --task {task_id} ... --lock repo:file:{relative}`), or "
+        "write inside a claimed file or tree."
+    )
+    if mode == "deny":
+        pretooluse_decision(
+            "deny", f"AOI claim-write gate: {body}"
+        )
+    else:
+        pretooluse_decision(
+            "allow",
+            f"AOI claim-write warning: {body} (advisory: "
+            f"{CLAIM_WRITE_GATE_ENV}=warn)",
+        )
+
+
 def pretooluse_decision(decision: str, reason: str) -> None:
     write_output(
         {
@@ -212,7 +336,11 @@ def _armed_slot_exists(
 
 
 def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
-    if str(payload.get("tool_name", "")) != AGENT_TOOL_NAME:
+    tool_name = str(payload.get("tool_name", ""))
+    if tool_name in CLAIM_WRITE_TOOLS:
+        claim_write_gate(root, payload)
+        return
+    if tool_name != AGENT_TOOL_NAME:
         allow()
         return
     tool_input = payload.get("tool_input")

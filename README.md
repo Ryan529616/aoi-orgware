@@ -247,6 +247,7 @@ AOI is strict about distinguishing control from observation:
 | Codex sub-agent start | Observed after creation when the trusted hook runs; not a pre-spawn boundary |
 | Claude governed `Agent` dispatch | `PreToolUse` can reject a missing or stale arm before that tool runs, and rejects a dispatch whose requested model is absent or outside the armed packet's tier. This checks the dispatch request the runtime received, not the routing it later performs |
 | Claude paths that bypass `PreToolUse` | Observed and accounted for at `SubagentStart`; not hard-blocked |
+| Claude file writes vs claims | Opt-in (`AOI_CLAUDE_CLAIM_WRITE_GATE=warn\|deny`): `PreToolUse` can warn or block a `Write`/`Edit` to a repo path outside the bound session's live claims. Default off. Gates the cooperative tool path only — not `Bash`, not a non-cooperating process, not an OS sandbox |
 | Model and capability tier | Requested policy unless the runtime exposes qualifying observation |
 
 AOI does not launch a model, store provider API keys, or replace the client's

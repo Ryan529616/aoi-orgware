@@ -121,6 +121,16 @@ The sub-agent stays inside its packet, returns a bounded conclusion, and never
 mutates AOI state. **Ambient** agent types (Explore, workflow helpers) are not
 governed — their output is engineering inference for you, never packet evidence.
 
+## Optional: enforce claims on the write path
+
+By default the claim ledger is cooperative — it records ownership but does not
+stop a write to an unclaimed file. To harden it on this host, set
+`AOI_CLAUDE_CLAIM_WRITE_GATE=warn` (announce) or `deny` (block): `PreToolUse`
+then checks every `Write`/`Edit` against the bound session's live claims and
+warns or blocks a repo write outside them. Writes under `.aoi/`, outside the
+repo, and all `Bash` commands pass through. Claim the exact scope
+(`--lock repo:file:<path>` or `repo:tree:<dir>`) before writing under `deny`.
+
 ## Before you stop
 
 The Stop hook blocks if the task has a stale semantic checkpoint. Before ending a
