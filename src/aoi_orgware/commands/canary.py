@@ -29,7 +29,7 @@ import argparse
 import datetime as dt
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ..harnesslib import (
     HarnessError,
@@ -172,7 +172,7 @@ def cmd_codex_helper_canary(
             basis = (
                 "direct-parent linkage resolved and the budget gate refused "
                 "with explicit reason codes "
-                f"({sorted({i.get('reason_code') for i in budget_refusals})}); "
+                f"({sorted({cast(str, i.get('reason_code')) for i in budget_refusals})}); "
                 "the transport supports helper association but the budget "
                 "correctly blocked authorization"
             )

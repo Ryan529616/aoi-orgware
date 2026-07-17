@@ -1,0 +1,3 @@
+[run]
+source = aoi_orgware
+parallel = true

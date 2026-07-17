@@ -39,7 +39,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ..execution_topology import _require_execution_selection_snapshots_current
 from ..harnesslib import (
@@ -712,7 +712,7 @@ def cmd_codex_config_rollback(
             receipt.get("schema_version") != RESOURCE_RECEIPT_SCHEMA_VERSION
             or receipt.get("event_id") != event.get("event_id")
             or receipt.get("plan_sha256") != event.get("plan_sha256")
-            or receipt_plan.get("approved_task_plan_sha256")
+            or cast("dict[str, Any]", receipt_plan).get("approved_task_plan_sha256")
             != event.get("task_plan_sha256")
             or receipt.get("task_id") != state.get("task_id")
             or receipt.get("root_session_id") != event.get("root_session_id")

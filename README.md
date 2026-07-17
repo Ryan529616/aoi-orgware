@@ -7,6 +7,10 @@ checkpoints, and verification accountable when the work becomes parallel,
 long-running, or evidence-sensitive.
 
 [![CI](https://github.com/Ryan529616/aoi-orgware/actions/workflows/test.yml/badge.svg)](https://github.com/Ryan529616/aoi-orgware/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/aoi-orgware)](https://pypi.org/project/aoi-orgware/)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://ryan529616.github.io/aoi-orgware/)
+![Coverage floor](https://img.shields.io/badge/coverage-%E2%89%A580%25_enforced-brightgreen)
+![Typed](https://img.shields.io/badge/typing-py.typed-informational)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange)

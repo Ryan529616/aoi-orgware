@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Literal, cast, overload
 
 if os.name == "nt":
     import msvcrt
@@ -346,9 +346,14 @@ def discover_root(start: Path | None = None) -> Path:
         root = candidate
     else:
         search = (candidate, *candidate.parents)
-        root = next((item for item in search if (item / CONFIG_FILE).is_file()), None)
-        if root is None:
-            root = next((item for item in search if (item / ".git").exists()), candidate)
+        discovered = next(
+            (item for item in search if (item / CONFIG_FILE).is_file()), None
+        )
+        if discovered is None:
+            discovered = next(
+                (item for item in search if (item / ".git").exists()), candidate
+            )
+        root = discovered
     if root == Path(root.anchor) or root == Path.home().resolve():
         raise HarnessError(f"refusing dangerous AOI project root: {root}")
     if os.name == "nt" and str(root.anchor).startswith("\\\\"):
@@ -965,7 +970,7 @@ def state_lock(
 
 def _acquire_state_lock(handle: Any) -> None:
     if os.name != "nt":
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
         return
 
     # msvcrt locks a byte range rather than the whole file. Keep one durable
@@ -984,7 +989,7 @@ def _acquire_state_lock(handle: Any) -> None:
 
 def _release_state_lock(handle: Any) -> None:
     if os.name != "nt":
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
         return
     handle.seek(0)
     try:
@@ -1103,7 +1108,7 @@ def validate_chief_ttl(value: int) -> int:
     return value
 
 
-def _validate_chief_session_id(value: str) -> str:
+def _validate_chief_session_id(value: Any) -> str:
     if (
         not isinstance(value, str)
         or not value
@@ -1117,7 +1122,7 @@ def _validate_chief_session_id(value: str) -> str:
     return value
 
 
-def _validate_chief_reason(value: str, label: str) -> str:
+def _validate_chief_reason(value: Any, label: str) -> str:
     if (
         not isinstance(value, str)
         or not value
@@ -1202,7 +1207,7 @@ def validate_chief_authority_record(
         raise HarnessError("Chief authority status is invalid")
     renewal_count = payload.get("renewal_count")
     transition_seq = payload.get("transition_seq")
-    omitted_count = payload.get("omitted_transition_count")
+    omitted_count = cast(int, payload.get("omitted_transition_count"))
     if not _chief_exact_int(renewal_count) or not _chief_exact_int(transition_seq, 1):
         raise HarnessError("Chief authority counters are invalid")
     if not _chief_exact_int(omitted_count):
@@ -1233,7 +1238,7 @@ def validate_chief_authority_record(
         if previous_time is not None and event_time < previous_time:
             raise HarnessError("Chief authority audit event time moved backwards")
         previous_time = event_time
-        old_epoch = event.get("old_epoch")
+        old_epoch = cast(int, event.get("old_epoch"))
         new_epoch = event.get("new_epoch")
         if not _chief_exact_int(old_epoch) or not _chief_exact_int(new_epoch, 1):
             raise HarnessError("Chief authority audit event epoch is invalid")
@@ -1349,6 +1354,18 @@ def validate_chief_authority_record(
         if last_event["action"] != "release":
             raise HarnessError("inactive Chief authority lacks a release audit action")
     return payload
+
+
+@overload
+def load_chief_authority(
+    paths: HarnessPaths, *, allow_missing: Literal[False] = False
+) -> dict[str, Any]: ...
+
+
+@overload
+def load_chief_authority(
+    paths: HarnessPaths, *, allow_missing: Literal[True]
+) -> dict[str, Any] | None: ...
 
 
 def load_chief_authority(
@@ -1874,7 +1891,7 @@ def _validate_credential_ancestor_chain(path: Path) -> None:
                 raise HarnessError(
                     f"cannot inspect Chief credential ancestor {current}: {exc}"
                 ) from exc
-            if metadata.st_uid not in {0, os.geteuid()}:
+            if metadata.st_uid not in {0, os.geteuid()}:  # type: ignore[attr-defined]
                 raise HarnessError(
                     f"Chief credential ancestor has an untrusted owner: {current}"
                 )
@@ -1895,7 +1912,7 @@ def _validate_private_credential_directory(path: Path) -> None:
         raise HarnessError(f"Chief credential directory is missing: {path}")
     metadata = path.stat()
     if os.name != "nt":
-        if metadata.st_uid != os.geteuid():
+        if metadata.st_uid != os.geteuid():  # type: ignore[attr-defined]
             raise HarnessError(f"Chief credential directory has a different owner: {path}")
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise HarnessError(
@@ -1946,7 +1963,7 @@ def _validate_private_credential_file(path: Path) -> None:
     if metadata.st_size > CHIEF_CREDENTIAL_MAX_BYTES:
         raise HarnessError("Chief credential file exceeds the 8 KiB size bound")
     if os.name != "nt":
-        if metadata.st_uid != os.geteuid():
+        if metadata.st_uid != os.geteuid():  # type: ignore[attr-defined]
             raise HarnessError(f"Chief credential file has a different owner: {path}")
         if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise HarnessError(
@@ -2121,7 +2138,7 @@ def _remove_exact_chief_credential_candidate(path: Path, expected: bytes) -> boo
         before = target.lstat()
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             return False
-        if os.name != "nt" and before.st_uid != os.geteuid():
+        if os.name != "nt" and before.st_uid != os.geteuid():  # type: ignore[attr-defined]
             return False
         with target.open("rb") as handle:
             opened = os.fstat(handle.fileno())

@@ -16,7 +16,7 @@ import re
 import stat
 import subprocess
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from .harnesslib import (
     HarnessError,
@@ -901,24 +901,30 @@ def evaluate_live_receipt(
             branch = str(_git(canonical_root, ["branch", "--show-current"]))
             head = str(_git(canonical_root, ["rev-parse", "HEAD"])).lower()
             whole_status = bytes(
-                _git(
-                    canonical_root,
-                    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                    raw=True,
+                cast(
+                    bytes,
+                    _git(
+                        canonical_root,
+                        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                        raw=True,
+                    ),
                 )
             )
             scope_status = bytes(
-                _git(
-                    canonical_root,
-                    [
-                        "status",
-                        "--porcelain=v1",
-                        "-z",
-                        "--untracked-files=all",
-                        "--",
-                        project["indexed_scope"],
-                    ],
-                    raw=True,
+                cast(
+                    bytes,
+                    _git(
+                        canonical_root,
+                        [
+                            "status",
+                            "--porcelain=v1",
+                            "-z",
+                            "--untracked-files=all",
+                            "--",
+                            project["indexed_scope"],
+                        ],
+                        raw=True,
+                    ),
                 )
             )
         except HarnessError as exc:

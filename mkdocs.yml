@@ -1,0 +1,52 @@
+site_name: AOI — Agent Organization Infrastructure
+site_description: Git-native governance for coding-agent teams
+site_url: https://ryan529616.github.io/aoi-orgware/
+repo_url: https://github.com/Ryan529616/aoi-orgware
+repo_name: Ryan529616/aoi-orgware
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Overview: index.md
+  - Architecture: architecture.md
+  - Configuration: configuration.md
+  - Operating policy: POLICY.md
+  - Resource control: resource_control.md
+  - Codebase memory: codebase-memory.md
+  - Runbooks:
+      - Release (PyPI): RELEASE.md
+      - Helper-budget live canary: helper-canary-runbook.md
+  - Evaluation:
+      - Method: evaluation.md
+      - Pilot protocol: PILOT.md
+  - History:
+      - v0.3 plan: v0.3-plan.md
+      - v0.2 migration: v0.2-migration.md

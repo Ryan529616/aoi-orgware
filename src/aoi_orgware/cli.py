@@ -27,7 +27,7 @@ import tomllib
 import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 from . import __version__
 from . import dispatch_protocol as dispatch_protocol_impl
@@ -452,8 +452,8 @@ CLOSE_QUALIFYING_CATEGORIES = VERIFICATION_CATEGORIES - {
     "engineering_inference",
     "historical_terminal_readback",
 }
-RECEIPT_COMPONENTS = ("source", "runner", "config", "dependencies", "other")
-REQUIRED_RECEIPT_COMPONENTS = ("source", "runner")
+RECEIPT_COMPONENTS: tuple[str, ...] = ("source", "runner", "config", "dependencies", "other")
+REQUIRED_RECEIPT_COMPONENTS: tuple[str, ...] = ("source", "runner")
 HOOK_PROTOCOL_VERSION = "6"
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
 HELPER_SPAWN_BUDGET_MAX = 8
@@ -470,7 +470,7 @@ DISPATCH_PROVENANCES = {
     "manual_unverified",
 }
 MINI_MAX_LOCKS = 3
-MINI_FORBIDDEN_REPO_PREFIXES = (
+MINI_FORBIDDEN_REPO_PREFIXES: tuple[str, ...] = (
     ".aoi/",
     "infra/",
     "security/",
@@ -1945,7 +1945,7 @@ def _capacity_records(
             and isinstance(attempt.get("observation"), dict)
         ]
         subagent_start_observed_at = (
-            str(observed_starts[0].get("observed_at", ""))
+            str(cast("dict[str, Any]", observed_starts[0]).get("observed_at", ""))
             if dispatch_provenance in HOOK_OBSERVED_DISPATCH_PROVENANCES
             and len(observed_starts) == 1
             else ""
@@ -3854,6 +3854,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
         steward_input_bindings: list[dict[str, Any]] = []
         steward_selection_snapshot: dict[str, Any] = {}
         steward_execution_snapshot: dict[str, Any] = {}
+        selection: dict[str, Any] | None
         if synthesis_selection_id:
             packet_purpose = "steward_synthesis"
             if not args.lane_id:
@@ -4182,7 +4183,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if resource_envelope_sha256:
             text += (
                 "\n## AOI resource authority\n\n"
-                f"- Execution selection: `{selection.get('selection_id', '')}`\n"
+                f"- Execution selection: `{cast('dict[str, Any]', selection).get('selection_id', '')}`\n"
                 f"- Resource envelope SHA-256: `{resource_envelope_sha256}`\n"
                 "- Requested model routing remains unverified until observed.\n"
             )
@@ -4545,7 +4546,7 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if (
             args.status in TERMINAL_PACKET_STATUSES
             and _packet_schema_version(packet) is not None
-            and _packet_schema_version(packet) < 5
+            and cast(int, _packet_schema_version(packet)) < 5
             and not packet.get("dispatch_provenance")
         ):
             packet["dispatch_provenance"] = "legacy_unverified"
@@ -5583,7 +5584,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             tasks = [task]
         except HarnessError as exc:
             tasks = []
-            claims = []
+            claims: list[dict[str, Any]] = []
             errors.append(str(exc))
         else:
             try:

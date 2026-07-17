@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -96,3 +96,55 @@ jobs:
         run: |
           $expectedVersion = python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])"
           python scripts/verify_dist.py --dist-dir dist --expected-version $expectedVersion
+
+  typing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install mypy
+        run: python -m pip install mypy
+      - name: Type-check the published package surface
+        run: python -m mypy src/aoi_orgware --ignore-missing-imports
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install coverage tooling
+        run: python -m pip install pytest coverage
+      - name: Enable subprocess coverage
+        # Most of the suite drives the CLI through real subprocesses; without
+        # process_startup the measured number understates coverage by ~30
+        # points (54% naive vs 83% subprocess-aware at the 0.3.0a3 baseline).
+        run: |
+          SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+          printf 'import coverage\ncoverage.process_startup()\n' > "$SITE/sitecustomize.py"
+      - name: Run suite under coverage
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: src
+          COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
+          COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
+        run: |
+          mkdir -p covdata
+          python -m coverage run --parallel-mode -m pytest tests/ -q --tb=short
+      - name: Combine and enforce floor
+        env:
+          COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
+        run: |
+          python -m coverage combine
+          python -m coverage report --fail-under=80

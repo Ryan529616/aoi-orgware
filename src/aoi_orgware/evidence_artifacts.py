@@ -23,7 +23,7 @@ import tarfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 from .harnesslib import (
     HarnessError,
@@ -437,15 +437,15 @@ def read_recovery_tar_member(
                 raise HarnessError("recovery archive member must be a regular file")
             if match.size <= 0 or match.size > TERMINAL_ARTIFACT_MAX_BYTES:
                 raise HarnessError("recovery archive member size is outside the allowed bound")
-            stream = archive.extractfile(match)
-            if stream is None:
+            member_stream = archive.extractfile(match)
+            if member_stream is None:
                 raise HarnessError("recovery archive member cannot be read")
             remaining_extracted = (
                 policy.bound_artifact_total_max_bytes - budget["extracted_bytes"]
             )
             if remaining_extracted < match.size:
                 raise HarnessError("recovery archive aggregate extraction budget is exceeded")
-            data = stream.read(min(TERMINAL_ARTIFACT_MAX_BYTES, remaining_extracted) + 1)
+            data = member_stream.read(min(TERMINAL_ARTIFACT_MAX_BYTES, remaining_extracted) + 1)
             if len(data) != match.size:
                 raise HarnessError("recovery archive member size does not match its header")
             budget["extracted_bytes"] += len(data)
@@ -680,7 +680,7 @@ def packet_recovery_integrity_errors(
                 continue
             stored_member = recovery.get("archive_member")
             try:
-                canonical_member = canonical_recovery_archive_member(stored_member)
+                canonical_member = canonical_recovery_archive_member(cast(str, stored_member))
             except (AttributeError, HarnessError) as exc:
                 errors.append(f"{label} archive member is invalid: {exc}")
                 continue

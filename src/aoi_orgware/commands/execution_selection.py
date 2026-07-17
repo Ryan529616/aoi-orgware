@@ -56,7 +56,7 @@ import hashlib
 import json
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import AbstractSet, Any, Protocol
 
 from .. import resource_governance as resource_governance_impl
 from ..context_receipts import context_provider_brief_bindings
@@ -210,7 +210,7 @@ class ExecutionSelectionCmdServices:
     require_plan_ready: _RequirePlanReady
     require_root_session: _RequireRootSession
     role_tier_map: Callable[[], Mapping[str, str]]
-    terminal_coordination_statuses: Collection[str]
+    terminal_coordination_statuses: AbstractSet[str]
     approved_override_settings: _ApprovedOverrideSettings
     require_override_target_contract: _RequireOverrideTargetContract
     override_by_id: _OverrideById

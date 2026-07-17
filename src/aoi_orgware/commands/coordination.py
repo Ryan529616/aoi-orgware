@@ -50,7 +50,7 @@ import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import AbstractSet, Any, Protocol
 
 from ..harnesslib import (
     RESERVING_CLAIM_STATUSES,
@@ -153,9 +153,9 @@ class CoordinationCmdServices:
     require_root_session: _RequireRootSession
     portfolio_integrity_errors: _PortfolioIntegrityErrors
     snapshot_evidence_artifact: _SnapshotEvidenceArtifact
-    change_classes: Collection[str]
+    change_classes: AbstractSet[str]
     dependency_kinds: Collection[str]
-    terminal_coordination_statuses: Collection[str]
+    terminal_coordination_statuses: AbstractSet[str]
     cooperative_authority_boundary: str
 
 

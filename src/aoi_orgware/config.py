@@ -10,7 +10,7 @@ import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, TypeGuard
 
 
 CONFIG_FILE = "aoi.toml"
@@ -155,7 +155,7 @@ def _strings(value: Any, label: str, *, allow_empty: bool = False) -> tuple[str,
     return tuple(result)
 
 
-def _valid_project_name(value: Any) -> bool:
+def _valid_project_name(value: Any) -> TypeGuard[str]:
     return (
         isinstance(value, str)
         and 1 <= len(value) <= 128

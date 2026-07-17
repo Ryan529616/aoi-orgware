@@ -45,7 +45,7 @@ import argparse
 import json
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import AbstractSet, Any, Protocol
 
 from ..git_plumbing import git_is_ancestor, resolve_task_commit, state_worktree
 from ..harnesslib import (
@@ -123,7 +123,7 @@ class LanesCmdServices:
     max_engaged_lanes: int
     terminal_coordination_statuses: Collection[str]
     terminal_improvement_statuses: Collection[str]
-    change_classes: Collection[str]
+    change_classes: AbstractSet[str]
     dependency_kinds: Collection[str]
 
 

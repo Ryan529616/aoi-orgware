@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # The package has zero runtime dependencies; the only supply chain to watch
+  # is the SHA-pinned GitHub Actions in the CI and publish workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3

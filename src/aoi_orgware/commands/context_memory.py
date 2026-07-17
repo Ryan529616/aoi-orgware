@@ -333,12 +333,12 @@ def cmd_codebase_memory_benchmark_record(
             records, generated_at=now_iso()
         )
         snapshots: list[dict[str, Any]] = []
-        for index, (source, expected, _data, _payload) in enumerate(prepared, start=1):
+        for index, (record_source, expected, _data, _payload) in enumerate(prepared, start=1):
             snapshots.append(
                 snapshot_evidence_artifact(
                     paths,
                     state["task_id"],
-                    source,
+                    record_source,
                     expected,
                     label="codebase-memory benchmark record",
                     basename=(

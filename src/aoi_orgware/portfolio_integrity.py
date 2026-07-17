@@ -31,7 +31,7 @@ import re
 from collections.abc import Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from .execution_policy import _execution_policy_v2_enabled
 from .execution_topology import (
@@ -431,13 +431,13 @@ def portfolio_integrity_errors(
                 not isinstance(sample_boundary, dict)
                 or not isinstance(sample_boundary.get("min_eligible_records"), int)
                 or isinstance(sample_boundary.get("min_eligible_records"), bool)
-                or sample_boundary.get("min_eligible_records") < 1
+                or cast(int, sample_boundary.get("min_eligible_records")) < 1
                 or not isinstance(
                     sample_boundary.get("eligible_record_count"), int
                 )
                 or isinstance(sample_boundary.get("eligible_record_count"), bool)
-                or sample_boundary.get("eligible_record_count")
-                < sample_boundary.get("min_eligible_records")
+                or cast(int, sample_boundary.get("eligible_record_count"))
+                < cast(int, sample_boundary.get("min_eligible_records"))
                 or recommendation.get("phase") != "recommendation_only"
             ):
                 errors.append(

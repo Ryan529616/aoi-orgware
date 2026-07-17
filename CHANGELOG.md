@@ -7,6 +7,23 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+### Added
+- **Typed package.** The full `src/aoi_orgware` surface type-checks clean
+  (mypy, 57 -> 0 errors, behavior-preserving) and ships a PEP 561
+  `py.typed` marker with a `Typing :: Typed` classifier; CI gains a mypy
+  gate. One pre-existing latent defect found during the pass is documented
+  in the typing patches (receipt rollback `plan` access order) and left
+  behavior-identical for a separate fix.
+- **Python 3.14** added to the CI matrix and trove classifiers.
+- **Coverage gate.** Subprocess-aware coverage job (the suite drives the
+  CLI through real subprocesses; naive measurement understates by ~30
+  points) with an enforced 80% floor — measured 83% at this baseline.
+- **Documentation site.** mkdocs-material site built from `docs/` with a
+  strict-mode build, deployed to GitHub Pages.
+- **Community files.** CONTRIBUTING, bug-report and PR templates, and a
+  Dependabot config watching the SHA-pinned GitHub Actions.
+
+
 ## [0.3.0a3] - 2026-07-17 (alpha)
 
 Observability / last-mile line. Every change traces to the 2026-07-17
