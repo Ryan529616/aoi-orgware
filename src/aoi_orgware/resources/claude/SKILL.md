@@ -93,8 +93,29 @@ aoi create-packet --task <id> --packet-id <pid> --agent-role explorer \
   --validation "<how the root will check it>"
 aoi packet-arm --task <id> --packet-id <pid> --expected-agent-type general-purpose \
   --expires-at <timestamp within 15 minutes>
-# Now spawn exactly one matching general-purpose sub-agent.
+# Now spawn exactly one matching general-purpose sub-agent, and pass a model
+# inside the packet's tier — see below.
 ```
+
+**Pass a tier-matched `model` when you spawn.** `PreToolUse` reads the `Agent`
+tool's `model` and denies a governed dispatch whose model is absent (omitting it
+would inherit *your* model — the cost leak the tier exists to prevent) or outside
+the packet tier's families. The shipped default table:
+
+| `--model-tier` | Pass a model in family |
+|---|---|
+| `frontier` | `opus` |
+| `expert` | `opus` or `sonnet` |
+| `advanced` | `sonnet` |
+| `standard` | `sonnet` or `haiku` |
+| `economical` | `haiku` |
+
+So an `--model-tier standard` packet must be spawned with a `sonnet` or `haiku`
+model; spawning it on `opus`, or with no model, is denied before the sub-agent
+exists. Matching is by family substring, so both the alias and a fully qualified
+id (`claude-sonnet-5`) count. Override the table with `AOI_CLAUDE_TIER_MODELS`
+(JSON). The session's top-price model is in no tier by default: a packet that
+truly needs it is an escalation, not a routine dispatch.
 
 The sub-agent stays inside its packet, returns a bounded conclusion, and never
 mutates AOI state. **Ambient** agent types (Explore, workflow helpers) are not
