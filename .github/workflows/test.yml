@@ -110,8 +110,12 @@ jobs:
           cache: pip
       - name: Install mypy
         run: python -m pip install mypy
-      - name: Type-check the published package surface
-        run: python -m mypy src/aoi_orgware --ignore-missing-imports
+      - name: Type-check the published package surface (both platforms)
+        # The locking/credential code has os.name-guarded branches; check the
+        # native platform and an emulated win32 pass so neither side regresses.
+        run: |
+          python -m mypy src/aoi_orgware --ignore-missing-imports
+          python -m mypy src/aoi_orgware --ignore-missing-imports --platform win32
 
   coverage:
     runs-on: ubuntu-latest

@@ -979,7 +979,7 @@ def _acquire_state_lock(handle: Any) -> None:
     handle.seek(0)
     while True:
         try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
             return
         except OSError as exc:
             if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
@@ -993,7 +993,7 @@ def _release_state_lock(handle: Any) -> None:
         return
     handle.seek(0)
     try:
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
     except OSError as exc:
         raise HarnessError(f"could not release AOI state lock: {exc}") from exc
 
@@ -1991,7 +1991,7 @@ def _windows_dpapi_transform(data: bytes, *, protect: bool) -> bytes:
         outgoing = DataBlob()
         flags = 0x1  # CRYPTPROTECT_UI_FORBIDDEN
         if protect:
-            ok = ctypes.windll.crypt32.CryptProtectData(
+            ok = ctypes.windll.crypt32.CryptProtectData(  # type: ignore[attr-defined]
                 ctypes.byref(incoming),
                 "AOI Chief credential",
                 None,
@@ -2001,7 +2001,7 @@ def _windows_dpapi_transform(data: bytes, *, protect: bool) -> bytes:
                 ctypes.byref(outgoing),
             )
         else:
-            ok = ctypes.windll.crypt32.CryptUnprotectData(
+            ok = ctypes.windll.crypt32.CryptUnprotectData(  # type: ignore[attr-defined]
                 ctypes.byref(incoming),
                 None,
                 None,
@@ -2011,11 +2011,11 @@ def _windows_dpapi_transform(data: bytes, *, protect: bool) -> bytes:
                 ctypes.byref(outgoing),
             )
         if not ok:
-            raise ctypes.WinError()
+            raise ctypes.WinError()  # type: ignore[attr-defined]
         try:
             return ctypes.string_at(outgoing.pbData, outgoing.cbData)
         finally:
-            ctypes.windll.kernel32.LocalFree(outgoing.pbData)
+            ctypes.windll.kernel32.LocalFree(outgoing.pbData)  # type: ignore[attr-defined]
     except (OSError, ValueError) as exc:
         operation = "protect" if protect else "unprotect"
         raise HarnessError(f"Windows DPAPI could not {operation} Chief credential") from exc
