@@ -54,6 +54,13 @@ class SemanticPersistenceTests(unittest.TestCase):
             authority_ref=AUTHORITY,
         )
 
+    def append(self, *args, **kwargs):
+        # This low-level fixture intentionally builds only the task directory,
+        # not a complete AOI Chief layout. CLI/migration integration tests use
+        # the real state lock; these tests isolate append/recovery mechanics.
+        with mock.patch.object(h, "_require_chief_lock"):
+            return store.append_semantic_transition(*args, **kwargs)
+
     def event_path(self, sequence: int = 1) -> Path:
         return store.semantic_event_directory(self.paths, TASK_ID) / semantic.event_filename(sequence)
 
@@ -218,6 +225,159 @@ class SemanticPersistenceTests(unittest.TestCase):
         self.assertEqual(store.repair_semantic_projection(self.paths, TASK_ID), replayed)
         self.assertEqual(store.semantic_projection_status(self.paths, TASK_ID), "current")
 
+    def test_authoritative_append_uses_expected_head_and_exact_retry(self) -> None:
+        initial = self.initialize()
+        head = store.semantic_head(self.paths, TASK_ID)
+        result_state = dict(semantic.projection_domain(initial), revision=2)
+
+        appended = self.append(
+            self.paths,
+            TASK_ID,
+            result_state,
+            event_type="task_checkpointed",
+            command_id="checkpoint-semantic-persistence-r2",
+            recorded_at="2026-07-18T00:01:00+00:00",
+            authority_ref=AUTHORITY,
+            expected_head_sha256=head["event_sha256"],
+        )
+        self.assertFalse(appended.idempotent_replay)
+        self.assertEqual(appended.event["sequence"], 2)
+        self.assertEqual(
+            semantic.projection_domain(appended.projection), result_state
+        )
+        event_before = self.event_path(2).read_bytes()
+
+        retried = self.append(
+            self.paths,
+            TASK_ID,
+            result_state,
+            event_type="task_checkpointed",
+            command_id="checkpoint-semantic-persistence-r2",
+            recorded_at="2026-07-18T05:00:00+00:00",
+            authority_ref=AUTHORITY,
+            expected_head_sha256=head["event_sha256"],
+        )
+        self.assertTrue(retried.idempotent_replay)
+        self.assertEqual(self.event_path(2).read_bytes(), event_before)
+        self.assertEqual(store.semantic_head(self.paths, TASK_ID)["sequence"], 2)
+
+        with self.assertRaisesRegex(store.SemanticStoreError, "expected head"):
+            self.append(
+                self.paths,
+                TASK_ID,
+                dict(result_state, revision=3),
+                event_type="task_checkpointed",
+                command_id="checkpoint-semantic-persistence-r3",
+                recorded_at="2026-07-18T00:02:00+00:00",
+                authority_ref=AUTHORITY,
+                expected_head_sha256=head["event_sha256"],
+            )
+        with self.assertRaisesRegex(store.SemanticStoreError, "different semantics"):
+            self.append(
+                self.paths,
+                TASK_ID,
+                dict(result_state, revision=99),
+                event_type="task_checkpointed",
+                command_id="checkpoint-semantic-persistence-r2",
+                recorded_at="2026-07-18T00:02:00+00:00",
+                authority_ref=AUTHORITY,
+                expected_head_sha256=head["event_sha256"],
+            )
+
+    def test_authoritative_append_requires_the_project_state_lock(self) -> None:
+        initial = self.initialize()
+        head = store.semantic_head(self.paths, TASK_ID)
+        with self.assertRaisesRegex(h.HarnessError, "requires the project state lock"):
+            store.append_semantic_transition(
+                self.paths,
+                TASK_ID,
+                dict(semantic.projection_domain(initial), revision=2),
+                event_type="task_checkpointed",
+                command_id="checkpoint-without-lock-r2",
+                recorded_at="2026-07-18T00:01:00+00:00",
+                authority_ref=AUTHORITY,
+                expected_head_sha256=head["event_sha256"],
+            )
+
+    def test_event_first_append_retry_repairs_projection_without_duplicate(self) -> None:
+        initial = self.initialize()
+        head = store.semantic_head(self.paths, TASK_ID)
+        result_state = dict(semantic.projection_domain(initial), revision=2)
+        original_write = h.atomic_write_bytes
+        failed = False
+
+        def fail_projection_once(path: Path, payload: bytes) -> None:
+            nonlocal failed
+            if path == h.task_state_path(self.paths, TASK_ID) and not failed:
+                failed = True
+                raise h.HarnessError("injected projection publication failure")
+            original_write(path, payload)
+
+        with mock.patch.object(h, "atomic_write_bytes", side_effect=fail_projection_once):
+            with self.assertRaisesRegex(store.SemanticStoreError, "publish semantic projection"):
+                self.append(
+                    self.paths,
+                    TASK_ID,
+                    result_state,
+                    event_type="task_checkpointed",
+                    command_id="checkpoint-event-first-r2",
+                    recorded_at="2026-07-18T00:01:00+00:00",
+                    authority_ref=AUTHORITY,
+                    expected_head_sha256=head["event_sha256"],
+                )
+        self.assertTrue(self.event_path(2).is_file())
+        self.assertEqual(store.semantic_projection_status(self.paths, TASK_ID), "behind")
+
+        retried = self.append(
+            self.paths,
+            TASK_ID,
+            result_state,
+            event_type="task_checkpointed",
+            command_id="checkpoint-event-first-r2",
+            recorded_at="2026-07-18T00:02:00+00:00",
+            authority_ref=AUTHORITY,
+            expected_head_sha256=head["event_sha256"],
+        )
+        self.assertTrue(retried.idempotent_replay)
+        self.assertEqual(store.semantic_projection_status(self.paths, TASK_ID), "current")
+        self.assertFalse(self.event_path(3).exists())
+
+    def test_successor_chief_can_repair_exact_published_transition_without_rewriting_event(
+        self,
+    ) -> None:
+        initial = self.initialize()
+        head = store.semantic_head(self.paths, TASK_ID)
+        result_state = dict(semantic.projection_domain(initial), revision=2)
+        appended = self.append(
+            self.paths,
+            TASK_ID,
+            result_state,
+            event_type="task_checkpointed",
+            command_id="checkpoint-successor-recovery-r2",
+            recorded_at="2026-07-18T00:01:00+00:00",
+            authority_ref=AUTHORITY,
+            expected_head_sha256=head["event_sha256"],
+        )
+        event_before = self.event_path(2).read_bytes()
+        h.atomic_write_bytes(
+            h.task_state_path(self.paths, TASK_ID), store._projection_bytes(initial)
+        )
+        self.assertEqual(store.semantic_projection_status(self.paths, TASK_ID), "behind")
+
+        with mock.patch.object(h, "_require_chief_lock"):
+            recovered = store.recover_published_semantic_transition(
+                self.paths,
+                TASK_ID,
+                result_state,
+                event_type="task_checkpointed",
+                command_id="checkpoint-successor-recovery-r2",
+                expected_head_sha256=head["event_sha256"],
+            )
+        self.assertTrue(recovered.idempotent_replay)
+        self.assertEqual(recovered.event, appended.event)
+        self.assertEqual(self.event_path(2).read_bytes(), event_before)
+        self.assertEqual(store.semantic_projection_status(self.paths, TASK_ID), "current")
+
 
 class SemanticLifecycleIntegrationTests(HarnessTestCase):
     TASK = "semantic-lifecycle"
@@ -261,7 +421,7 @@ class SemanticLifecycleIntegrationTests(HarnessTestCase):
         paths = h.get_paths(self.root)
         state = h.load_task(paths, self.TASK)
         self.assertIn("_semantic", state)
-        self.assertEqual(state["semantic_write_policy"], "stage1_read_only")
+        self.assertEqual(state["semantic_write_policy"], "explicit_transition_only")
         event_path = store.semantic_event_directory(paths, self.TASK) / semantic.event_filename(1)
         event_before = event_path.read_bytes()
 
@@ -273,7 +433,7 @@ class SemanticLifecycleIntegrationTests(HarnessTestCase):
         blocked = self.cli(
             "set-phase", "--task", self.TASK, "--phase", "implementing", ok=False
         )
-        self.assertIn("read-only in Stage 1", blocked.stderr)
+        self.assertIn("requires explicit semantic transitions", blocked.stderr)
         self.assertEqual(event_path.read_bytes(), event_before)
 
         retried = json.loads(self.init_semantic().stdout)
@@ -378,7 +538,7 @@ class SemanticLifecycleIntegrationTests(HarnessTestCase):
         unbind = self.cli(
             "unbind-session", "--session-id", session_id, ok=False
         )
-        self.assertIn("read-only in Stage 1", unbind.stderr)
+        self.assertIn("requires explicit semantic transitions", unbind.stderr)
         self.assertEqual(mapping_path.read_bytes(), mapping_before)
 
         token = "forged-semantic-claim"
@@ -409,7 +569,7 @@ class SemanticLifecycleIntegrationTests(HarnessTestCase):
             "must not mutate",
             ok=False,
         )
-        self.assertIn("read-only in Stage 1", blocked_status.stderr)
+        self.assertIn("requires explicit semantic transitions", blocked_status.stderr)
         self.assertEqual(claim_path.read_bytes(), claim_before)
         blocked_release = self.cli(
             "release-claim",
@@ -421,7 +581,7 @@ class SemanticLifecycleIntegrationTests(HarnessTestCase):
             "must not mutate",
             ok=False,
         )
-        self.assertIn("read-only in Stage 1", blocked_release.stderr)
+        self.assertIn("requires explicit semantic transitions", blocked_release.stderr)
         self.assertEqual(claim_path.read_bytes(), claim_before)
 
         legacy = "legacy-still-mutable"

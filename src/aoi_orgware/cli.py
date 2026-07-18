@@ -37,6 +37,7 @@ from . import job_integrity as job_integrity_impl
 from . import packet_integrity as packet_integrity_impl
 from . import portfolio_integrity as portfolio_integrity_impl
 from . import resource_governance as resource_governance_impl
+from . import semantic_store as semantic_store_impl
 from . import skill_lifecycle as skill_lifecycle_impl
 from . import verification_integrity as verification_integrity_impl
 from .evidence_artifacts import (
@@ -173,6 +174,12 @@ from .commands.status import (
     critical_projection,
     register_status_commands,
     resolve_resume_task,
+)
+from .commands.semantic import (
+    cmd_semantic_head,
+    cmd_semantic_migrate,
+    cmd_semantic_migration_rollback,
+    register_semantic_commands,
 )
 from .commands.temporary_recovery import (
     TemporaryRecoveryServices,
@@ -628,6 +635,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "inspect-legacy",
     "reconcile",
     "resume",
+    "semantic-head",
     "status",
     "verify-backup",
     "doctor",
@@ -5241,6 +5249,14 @@ def close_gate(
     failures.extend(override_integrity_errors(state))
     failures.extend(resource_config_integrity_errors(paths, state))
     failures.extend(resource_envelope_integrity_errors(state))
+    failures.extend(
+        f"semantic authority: {error}"
+        for error in semantic_store_impl.semantic_integrity_errors(
+            paths,
+            str(state.get("task_id", "")),
+            require_current_projection=True,
+        )
+    )
     for selection in state.get("execution_selections", []):
         if selection.get("mode") not in {"centralized_parallel", "hybrid"}:
             continue
@@ -5376,8 +5392,98 @@ def cmd_close_task(
             "stating why the registered completion boundary was not met and "
             "where that scope now lives"
         )
+    semantic_result: semantic_store_impl.SemanticAppendResult | None = None
+    index_warning = ""
     with state_lock(paths):
         state = load_task(paths, args.task)
+        semantic_v2 = "_semantic" in state
+        semantic_command_id = str(
+            getattr(args, "semantic_command_id", "") or ""
+        ).strip()
+        semantic_expected_head = str(
+            getattr(args, "semantic_expected_head_sha256", "") or ""
+        ).strip()
+        if semantic_v2:
+            validate_id(semantic_command_id, "semantic command id")
+            if not re.fullmatch(r"[0-9a-f]{64}", semantic_expected_head):
+                raise HarnessError(
+                    "semantic-v2 close requires --semantic-expected-head-sha256"
+                )
+        elif semantic_command_id or semantic_expected_head:
+            raise HarnessError(
+                "semantic close options require a semantic-v2 task"
+            )
+        if semantic_v2 and state.get("status") == "done":
+            expected_next_action = args.next_action or "No further action; task closed."
+            retry_summary = require_text(args.summary, "summary")
+            published_summary = semantic_store_impl.published_semantic_close_summary(
+                paths,
+                str(state["task_id"]),
+                command_id=semantic_command_id,
+                expected_head_sha256=semantic_expected_head,
+            )
+            if (
+                state.get("outcome") != outcome
+                or retry_summary != published_summary
+                or state.get("next_action") != expected_next_action
+                or str(state.get("boundary_disposition", ""))
+                != str((args.boundary_disposition or "").strip())
+                or str(state.get("blockers_disposition", ""))
+                != str((args.blockers_disposition or "").strip())
+            ):
+                raise HarnessError(
+                    "semantic close retry differs from the published close semantics"
+                )
+            semantic_result = semantic_store_impl.recover_published_semantic_transition(
+                paths,
+                str(state["task_id"]),
+                state,
+                event_type="task_closed",
+                command_id=semantic_command_id,
+                expected_head_sha256=semantic_expected_head,
+            )
+            checkpoint = task_dir(paths, args.task) / "checkpoint.md"
+            checkpoint_sha256 = str(state.get("checkpoint_sha256", ""))
+            if not re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256):
+                raise HarnessError(
+                    "semantic close checkpoint digest is invalid"
+                )
+            checkpoint_current = False
+            try:
+                checkpoint_current = (
+                    checkpoint.is_file()
+                    and sha256_file(checkpoint) == checkpoint_sha256
+                )
+            except OSError:
+                checkpoint_current = False
+            if not checkpoint_current:
+                checkpoint, checkpoint_text, rendered_sha256 = prepare_checkpoint(
+                    paths, state
+                )
+                if rendered_sha256 != checkpoint_sha256:
+                    raise HarnessError(
+                        "semantic close checkpoint is missing or damaged and the "
+                        "installed renderer cannot reproduce its authoritative bytes"
+                    )
+                atomic_write_text(checkpoint, checkpoint_text)
+            unbind_all_sessions_unlocked(paths, state)
+            try:
+                write_index(paths)
+            except HarnessError as exc:
+                index_warning = str(exc)
+            if emit_result:
+                emit(
+                    {
+                        "task_id": args.task,
+                        "status": "done",
+                        "checkpoint": str(checkpoint),
+                        "semantic_head_sha256": semantic_result.event["event_sha256"],
+                        "idempotent_replay": True,
+                        "index_warning": index_warning,
+                    },
+                    args.json,
+                )
+            return 0
         require_open_task(state, "close")
         if outcome == "achieved" and state.get("blockers"):
             if not (args.blockers_disposition or "").strip():
@@ -5405,14 +5511,56 @@ def cmd_close_task(
         _, current = worktree_integrity_errors(paths, state)
         if current:
             state["closed_head_sha"] = current["head_sha"]
-        checkpoint = commit_checkpoint(paths, state)
+        if semantic_v2:
+            semantic_store_impl.preflight_semantic_append(
+                paths,
+                str(state["task_id"]),
+                command_id=semantic_command_id,
+                expected_head_sha256=semantic_expected_head,
+            )
+            checkpoint, checkpoint_text, checkpoint_sha256 = prepare_checkpoint(
+                paths, state
+            )
+            state["checkpoint_sha256"] = checkpoint_sha256
+            semantic_result = semantic_store_impl.append_semantic_transition(
+                paths,
+                str(state["task_id"]),
+                state,
+                event_type="task_closed",
+                command_id=semantic_command_id,
+                recorded_at=state["closed_at"],
+                authority_ref=str(getattr(args, "_aoi_authority_ref", "") or ""),
+                expected_head_sha256=semantic_expected_head,
+            )
+            # The event plus its replayed projection are authoritative; the
+            # checkpoint is a derived artifact.  Its bytes/digest are bound in
+            # the event state above, but publication must happen afterwards so
+            # an event-first interruption leaves the prior checkpoint intact.
+            atomic_write_text(checkpoint, checkpoint_text)
+        else:
+            checkpoint = commit_checkpoint(paths, state)
         unbind_all_sessions_unlocked(paths, state)
-        write_index(paths)
+        try:
+            write_index(paths)
+        except HarnessError as exc:
+            if not semantic_v2:
+                raise
+            index_warning = str(exc)
     if emit_result:
-        emit(
-            {"task_id": args.task, "status": "done", "checkpoint": str(checkpoint)},
-            args.json,
-        )
+        payload = {
+            "task_id": args.task,
+            "status": "done",
+            "checkpoint": str(checkpoint),
+        }
+        if semantic_result is not None:
+            payload.update(
+                {
+                    "semantic_head_sha256": semantic_result.event["event_sha256"],
+                    "idempotent_replay": semantic_result.idempotent_replay,
+                    "index_warning": index_warning,
+                }
+            )
+        emit(payload, args.json)
     return 0
 
 
@@ -5664,6 +5812,24 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     benchmark_reports: list[dict[str, Any]] = []
     for task in tasks:
         task_id = task["task_id"]
+        semantic_errors = semantic_store_impl.semantic_integrity_errors(
+            paths, task_id
+        )
+        errors.extend(
+            f"task {task_id}: semantic authority: {error}"
+            for error in semantic_errors
+        )
+        try:
+            migration_rolled_back = (
+                semantic_store_impl.semantic_migration_rolled_back(paths, task_id)
+            )
+        except HarnessError as exc:
+            migration_rolled_back = False
+            errors.append(f"task {task_id}: semantic rollback archive: {exc}")
+        if migration_rolled_back:
+            warnings.append(
+                f"task {task_id}: semantic migration is an inert preserved rollback archive"
+            )
         if "_semantic" in task:
             try:
                 projection_status = semantic_task_projection_status(paths, task_id)
@@ -6356,6 +6522,16 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    register_semantic_commands(
+        sub,
+        handlers={
+            "semantic_head": cmd_semantic_head,
+            "semantic_migrate": cmd_semantic_migrate,
+            "semantic_migration_rollback": cmd_semantic_migration_rollback,
+        },
+        add_json_argument=add_json_argument,
+    )
+
     capacity_services = _capacity_cmd_services()
     register_capacity_commands(
         sub,
@@ -6606,6 +6782,14 @@ def build_parser(
         help="required when closing achieved with recorded blockers",
     )
     p.add_argument("--next-action")
+    p.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required when closing a semantic-v2 task",
+    )
+    p.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required when closing a semantic-v2 task",
+    )
     add_json_argument(p)
     p.set_defaults(handler=cmd_close_task)
 
@@ -6766,9 +6950,13 @@ def _reload_locked_paths(paths: HarnessPaths) -> HarnessPaths:
 
 _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "check-locks",
+    "close-task",
     "doctor",
     "inspect-legacy",
     "resume",
+    "semantic-head",
+    "semantic-migrate",
+    "semantic-migration-rollback",
     "status",
     "verify-backup",
 }
@@ -6808,7 +6996,7 @@ def _enforce_semantic_v2_stage1_boundary(
     if command in _SEMANTIC_V2_STAGE1_TARGET_COMMANDS:
         return
     raise HarnessError(
-        f"semantic-v2 task {target} is read-only in Stage 1; command {command!r} "
+        f"semantic-v2 task {target} requires explicit semantic transitions; command {command!r} "
         "requires an explicit semantic transition and side-effect transaction port"
     )
 

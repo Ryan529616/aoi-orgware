@@ -74,7 +74,7 @@ def session_state(
         if not SAFE_TASK_ID.fullmatch(task_id):
             return "corrupt", None
         task_dir = paths.tasks / task_id
-        # Stage 1 semantic-v2 tasks cannot be session-bound.  The legacy hook
+        # Semantic-v2 task initialization cannot bind a session. The legacy hook
         # reader must not treat state.json as authority or bypass ledger replay.
         if is_semantic_v2_task(paths, task_id):
             return "corrupt", None

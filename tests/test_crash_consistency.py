@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -603,6 +604,298 @@ class SemanticGenesisCrashTests(AtomicCrashController, HarnessTestCase):
         self.assertEqual(
             semantic_store.semantic_projection_status(paths, self.TASK_ID), "current"
         )
+
+
+class SemanticMigrationCrashTests(AtomicCrashController, HarnessTestCase):
+    TASK_ID = "semantic-migration-crash"
+    COMMAND_ID = "semantic-migration-crash-r1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.init_task(self.TASK_ID)
+        self.paths = h.get_paths(self.root)
+        self.state_path = h.task_state_path(self.paths, self.TASK_ID)
+        self.legacy_bytes = self.state_path.read_bytes()
+        self.legacy_sha256 = hashlib.sha256(self.legacy_bytes).hexdigest()
+
+    def migration_command(self) -> list[str]:
+        return [
+            "semantic-migrate",
+            "--task",
+            self.TASK_ID,
+            "--command-id",
+            self.COMMAND_ID,
+            "--expected-legacy-state-sha256",
+            self.legacy_sha256,
+            "--json",
+        ]
+
+    def test_kill_after_legacy_snapshot_publish_resumes_without_byte_drift(self) -> None:
+        snapshot_path = semantic_store.legacy_snapshot_path(
+            self.paths, self.TASK_ID
+        )
+        event_path = semantic_store.semantic_event_directory(
+            self.paths, self.TASK_ID
+        ) / semantic.event_filename(1)
+        self.kill_at_boundary(
+            destination=snapshot_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=self.migration_command(),
+        )
+
+        self.assertEqual(snapshot_path.read_bytes(), self.legacy_bytes)
+        self.assertFalse(event_path.exists())
+        self.assertEqual(self.state_path.read_bytes(), self.legacy_bytes)
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        self.assertFalse(migrated["idempotent_replay"])
+        self.assertTrue(event_path.is_file())
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID),
+            "current",
+        )
+
+    def test_kill_after_migration_event_publish_exact_retry_finishes_cutover(self) -> None:
+        event_path = semantic_store.semantic_event_directory(
+            self.paths, self.TASK_ID
+        ) / semantic.event_filename(1)
+        receipt_path = semantic_store.migration_receipt_path(
+            self.paths, self.TASK_ID
+        )
+        self.kill_at_boundary(
+            destination=event_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=self.migration_command(),
+        )
+
+        self.assertTrue(event_path.is_file())
+        self.assertFalse(receipt_path.exists())
+        self.assertEqual(self.state_path.read_bytes(), self.legacy_bytes)
+        event_before = event_path.read_bytes()
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        self.assertTrue(migrated["idempotent_replay"])
+        self.assertEqual(event_path.read_bytes(), event_before)
+        self.assertTrue(receipt_path.is_file())
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID),
+            "current",
+        )
+
+    def test_kill_after_migration_receipt_publish_exact_retry_finishes_projection(
+        self,
+    ) -> None:
+        receipt_path = semantic_store.migration_receipt_path(
+            self.paths, self.TASK_ID
+        )
+        self.kill_at_boundary(
+            destination=receipt_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=self.migration_command(),
+        )
+
+        self.assertTrue(receipt_path.is_file())
+        self.assertEqual(self.state_path.read_bytes(), self.legacy_bytes)
+        receipt_before = receipt_path.read_bytes()
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        self.assertTrue(migrated["idempotent_replay"])
+        self.assertEqual(receipt_path.read_bytes(), receipt_before)
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID),
+            "current",
+        )
+
+    def test_kill_after_rollback_marker_publish_exact_retry_restores_legacy_bytes(
+        self,
+    ) -> None:
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        marker_path = (
+            h.task_dir(self.paths, self.TASK_ID)
+            / semantic_store.SEMANTIC_DIRECTORY_NAME
+            / semantic_store.MIGRATION_ROLLBACK_NAME
+        )
+        rollback_command = [
+            "semantic-migration-rollback",
+            "--task",
+            self.TASK_ID,
+            "--command-id",
+            "semantic-migration-crash-rollback-r1",
+            "--expected-head-sha256",
+            migrated["head_event_sha256"],
+            "--expected-migration-receipt-sha256",
+            migrated["migration_receipt_sha256"],
+            "--json",
+        ]
+        semantic_projection = self.state_path.read_bytes()
+        self.assertNotEqual(semantic_projection, self.legacy_bytes)
+        self.kill_at_boundary(
+            destination=marker_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=rollback_command,
+        )
+
+        self.assertTrue(marker_path.is_file())
+        self.assertEqual(self.state_path.read_bytes(), semantic_projection)
+        rolled_back = json.loads(self.cli(*rollback_command).stdout)
+        self.assertTrue(rolled_back["idempotent_replay"])
+        self.assertEqual(self.state_path.read_bytes(), self.legacy_bytes)
+        self.assertFalse(semantic_store.has_semantic_ledger(self.paths, self.TASK_ID))
+
+    def test_kill_after_rollback_state_publish_requires_completion_receipt(self) -> None:
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        semantic_root = (
+            h.task_dir(self.paths, self.TASK_ID)
+            / semantic_store.SEMANTIC_DIRECTORY_NAME
+        )
+        marker_path = semantic_root / semantic_store.MIGRATION_ROLLBACK_NAME
+        completion_path = (
+            semantic_root / semantic_store.MIGRATION_ROLLBACK_COMPLETION_NAME
+        )
+        rollback_command = [
+            "semantic-migration-rollback",
+            "--task",
+            self.TASK_ID,
+            "--command-id",
+            "semantic-migration-crash-rollback-state-r1",
+            "--expected-head-sha256",
+            migrated["head_event_sha256"],
+            "--expected-migration-receipt-sha256",
+            migrated["migration_receipt_sha256"],
+            "--json",
+        ]
+        self.kill_at_boundary(
+            destination=self.state_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=rollback_command,
+        )
+
+        self.assertTrue(marker_path.is_file())
+        self.assertFalse(completion_path.exists())
+        self.assertEqual(self.state_path.read_bytes(), self.legacy_bytes)
+        self.assertTrue(semantic_store.has_semantic_ledger(self.paths, self.TASK_ID))
+        rolled_back = json.loads(self.cli(*rollback_command).stdout)
+        self.assertTrue(rolled_back["idempotent_replay"])
+        self.assertTrue(completion_path.is_file())
+        self.assertFalse(semantic_store.has_semantic_ledger(self.paths, self.TASK_ID))
+
+    def test_kill_after_rollback_completion_publish_is_fully_idempotent(self) -> None:
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        completion_path = (
+            h.task_dir(self.paths, self.TASK_ID)
+            / semantic_store.SEMANTIC_DIRECTORY_NAME
+            / semantic_store.MIGRATION_ROLLBACK_COMPLETION_NAME
+        )
+        rollback_command = [
+            "semantic-migration-rollback",
+            "--task",
+            self.TASK_ID,
+            "--command-id",
+            "semantic-migration-crash-rollback-complete-r1",
+            "--expected-head-sha256",
+            migrated["head_event_sha256"],
+            "--expected-migration-receipt-sha256",
+            migrated["migration_receipt_sha256"],
+            "--json",
+        ]
+        self.kill_at_boundary(
+            destination=completion_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=rollback_command,
+        )
+
+        self.assertTrue(completion_path.is_file())
+        self.assertEqual(self.state_path.read_bytes(), self.legacy_bytes)
+        self.assertFalse(semantic_store.has_semantic_ledger(self.paths, self.TASK_ID))
+        completion_before = completion_path.read_bytes()
+        rolled_back = json.loads(self.cli(*rollback_command).stdout)
+        self.assertTrue(rolled_back["idempotent_replay"])
+        self.assertEqual(completion_path.read_bytes(), completion_before)
+
+    def test_kill_after_semantic_close_event_publish_exact_retry_finishes_close(
+        self,
+    ) -> None:
+        self.cli(
+            "set-delivery",
+            "--task",
+            self.TASK_ID,
+            "--mode",
+            "local-only",
+            "--detail",
+            "Semantic close crash remains local",
+        )
+        self.cli(
+            "checkpoint",
+            "--task",
+            self.TASK_ID,
+            "--next-action",
+            "Close through the semantic writer",
+        )
+        self.legacy_bytes = self.state_path.read_bytes()
+        self.legacy_sha256 = hashlib.sha256(self.legacy_bytes).hexdigest()
+        migrated = json.loads(self.cli(*self.migration_command()).stdout)
+        old_projection = self.state_path.read_bytes()
+        close_command = [
+            "close-task",
+            "--task",
+            self.TASK_ID,
+            "--summary",
+            "Semantic close crash recovery is event-authoritative",
+            "--outcome",
+            "partial",
+            "--boundary-disposition",
+            "This test validates only close crash mechanics",
+            "--semantic-command-id",
+            "semantic-close-crash-r2",
+            "--semantic-expected-head-sha256",
+            migrated["head_event_sha256"],
+            "--json",
+        ]
+        close_event_path = semantic_store.semantic_event_directory(
+            self.paths, self.TASK_ID
+        ) / semantic.event_filename(2)
+        self.kill_at_boundary(
+            destination=close_event_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=close_command,
+        )
+
+        self.assertTrue(close_event_path.is_file())
+        self.assertEqual(self.state_path.read_bytes(), old_projection)
+        checkpoint_path = h.task_dir(self.paths, self.TASK_ID) / "checkpoint.md"
+        checkpoint_before = checkpoint_path.read_bytes()
+        self.assertEqual(h.load_task(self.paths, self.TASK_ID)["status"], "done")
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID),
+            "behind",
+        )
+        event_before = close_event_path.read_bytes()
+        closed = json.loads(self.cli(*close_command).stdout)
+        self.assertTrue(closed["idempotent_replay"])
+        self.assertEqual(close_event_path.read_bytes(), event_before)
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID),
+            "current",
+        )
+        self.assertNotEqual(checkpoint_path.read_bytes(), checkpoint_before)
 
 
 if __name__ == "__main__":

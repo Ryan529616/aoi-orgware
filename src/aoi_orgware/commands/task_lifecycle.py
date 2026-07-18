@@ -456,7 +456,7 @@ def _reject_stage1_semantic_legacy_side_effect(
 
     if "_semantic" in state:
         raise HarnessError(
-            f"semantic-v2 task {state.get('task_id')} is read-only in Stage 1; "
+            f"semantic-v2 task {state.get('task_id')} requires explicit semantic transitions; "
             f"command {command!r} requires an explicit semantic transition and "
             "side-effect transaction port"
         )
@@ -777,7 +777,7 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
     if semantic_v2:
         if args.session_id:
             raise HarnessError(
-                "Stage 1 semantic-v2 initialization does not support --session-id"
+                "semantic-v2 initialization does not support --session-id"
             )
         validate_id(semantic_command_id, "semantic command id")
     elif semantic_command_id:
@@ -918,7 +918,7 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
             **metadata,
         }
         if semantic_v2:
-            state["semantic_write_policy"] = "stage1_read_only"
+            state["semantic_write_policy"] = "explicit_transition_only"
         directory = task_dir(paths, task_id)
         (directory / "packets").mkdir(parents=True, exist_ok=True)
         (directory / "results").mkdir(parents=True, exist_ok=True)
@@ -2052,7 +2052,7 @@ def register_task_lifecycle_commands(
     parser.add_argument(
         "--semantic-v2",
         action="store_true",
-        help="initialize an event-authoritative semantic-v2 task (Stage 1, no session)",
+        help="initialize an event-authoritative semantic-v2 task (explicit transitions only)",
     )
     parser.add_argument(
         "--semantic-command-id",
