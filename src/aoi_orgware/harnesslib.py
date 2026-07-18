@@ -174,6 +174,7 @@ TASK_OBJECT_LIST_FIELDS = {
     "override_requests",
     "packets",
     "resource_config_events",
+    "resource_session_registrations",
     "skill_adoption_events",
     "skill_releases",
     "subagent_incidents",
@@ -3307,6 +3308,21 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
             raise HarnessError(f"task field {field!r} must contain only {kind}{where}")
     if "delivery" in state and not isinstance(state["delivery"], dict):
         raise HarnessError(f"task field 'delivery' must be an object{where}")
+    registration_version_present = (
+        "resource_session_registration_schema_version" in state
+    )
+    registrations_present = "resource_session_registrations" in state
+    if registration_version_present != registrations_present:
+        raise HarnessError(
+            f"task resource session registration fields are incomplete{where}"
+        )
+    if registration_version_present and (
+        isinstance(state["resource_session_registration_schema_version"], bool)
+        or state["resource_session_registration_schema_version"] != 2
+    ):
+        raise HarnessError(
+            f"unsupported resource session registration schema{where}"
+        )
     _validate_mini_finish_record(state, source)
 
 

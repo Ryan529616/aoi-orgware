@@ -89,6 +89,7 @@ class RelocationContractTests(unittest.TestCase):
             "codex-config-plan": resource_cmds.cmd_codex_config_plan,
             "codex-config-apply": resource_cmds.cmd_codex_config_apply,
             "codex-config-rollback": resource_cmds.cmd_codex_config_rollback,
+            "codex-session-register": resource_cmds.cmd_codex_session_register,
         }
         for command, body in expected.items():
             handler = choices[command].get_default("handler")
@@ -97,6 +98,10 @@ class RelocationContractTests(unittest.TestCase):
             self.assertIsInstance(
                 handler.keywords["services"], resource_cmds.ResourceCmdServices
             )
+        self.assertIs(
+            choices["codex-startup-receipt-show"].get_default("handler"),
+            resource_cmds.cmd_codex_startup_receipt_show,
+        )
 
     def test_module_leaf_helpers_are_module_local(self) -> None:
         # emit/require_text/require_evidence_detail/_extend_unique are pure leaf
@@ -127,6 +132,10 @@ class ServicesFactoryWiringTests(unittest.TestCase):
         self.assertIs(
             services.validate_selection_resource_envelope,
             cli_impl._validate_selection_resource_envelope,
+        )
+        self.assertIs(
+            services.resource_config_integrity_errors,
+            cli_impl.resource_config_integrity_errors,
         )
 
 

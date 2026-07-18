@@ -194,6 +194,15 @@ private regular-file residues are manual-audit warnings, and structurally
 ambiguous legacy entries are errors. Non-cooperating same-account writers remain
 outside this guarantee.
 
+Codex startup resource observations use the same cooperative-lock boundary.
+Managed files are read twice and accepted only when the byte streams, descriptor
+identity, and final pathname identity agree. This detects ordinary concurrent
+mutation and replacement; it is not an OS-atomic filesystem snapshot against a
+hostile same-account writer that deliberately restores metadata or times writes
+around both reads. Registration therefore proves only managed-byte-state
+equivalence to the current reviewed plan, not exact resource-event chronology or
+that Codex loaded the observed bytes.
+
 `acknowledged` means a directive was received. Resolution additionally requires
 implementation evidence against the selected baseline and verification by a
 different lane against an explicit oracle.

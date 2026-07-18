@@ -21,6 +21,7 @@ from typing import Any, Iterable
 from .config import ProjectConfig
 from .harnesslib import (
     HarnessError,
+    _path_is_link_like,
     atomic_write_bytes,
     canonicalize_no_link_traversal,
     fsync_directory,
@@ -59,6 +60,9 @@ ENVELOPE_OVERRIDE_KEYS = {
     "envelope.max_delegation_depth",
 }
 OVERRIDE_TARGET_KINDS = {"resource_config", "execution_resource"}
+_MANAGED_PROFILE_FILE_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.toml"
+)
 
 
 class ResourceApplyRollbackError(HarnessError):
@@ -134,26 +138,43 @@ def _safe_read(path: Path, label: str, *, allow_missing: bool = False) -> bytes 
         raise HarnessError(f"cannot open {label} {canonical}: {exc}") from exc
     try:
         opened = os.fstat(descriptor)
-        chunks: list[bytes] = []
-        remaining = RESOURCE_FILE_MAX_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(64 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        payload = b"".join(chunks)
+        def read_bounded() -> bytes:
+            chunks: list[bytes] = []
+            remaining = RESOURCE_FILE_MAX_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        payload = read_bounded()
+        first_finished = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        confirmed_payload = read_bounded()
         finished = os.fstat(descriptor)
     finally:
         os.close(descriptor)
+    try:
+        after = canonical.lstat()
+    except OSError as exc:
+        raise HarnessError(f"{label} changed while being read: {canonical}") from exc
     identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
     if (
         len(payload) > RESOURCE_FILE_MAX_BYTES
+        or payload != confirmed_payload
         or opened.st_nlink != 1
+        or first_finished.st_nlink != 1
+        or finished.st_nlink != 1
+        or after.st_nlink != 1
         or not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(after.st_mode)
         or any(
             getattr(before, field, None) != getattr(opened, field, None)
-            or getattr(opened, field, None) != getattr(finished, field, None)
+            or getattr(opened, field, None) != getattr(first_finished, field, None)
+            or getattr(first_finished, field, None) != getattr(finished, field, None)
+            or getattr(finished, field, None) != getattr(after, field, None)
             for field in identity
         )
         or len(payload) != finished.st_size
@@ -161,6 +182,108 @@ def _safe_read(path: Path, label: str, *, allow_missing: bool = False) -> bytes 
     ):
         raise HarnessError(f"{label} changed while being read: {canonical}")
     return payload
+
+
+def snapshot_managed_resource_files(root: Path) -> list[dict[str, str]]:
+    """Record stable repeated-read identities for managed SessionStart files.
+
+    The caller owns the AOI state lock.  Each file is read twice and its open
+    descriptor plus final pathname identity are checked.  This detects normal
+    concurrent replacement or mutation; it is not an OS-level atomic snapshot
+    against a hostile same-account writer that deliberately evades metadata
+    and repeated-read checks.
+    """
+
+    root = canonicalize_no_link_traversal(root, "Codex project root")
+    candidates: list[tuple[str, Path]] = [
+        (".codex/config.toml", root / ".codex" / "config.toml")
+    ]
+    agents = root / ".codex" / "agents"
+    agents_identity: tuple[int, int, int] | None = None
+    try:
+        before = agents.lstat()
+    except FileNotFoundError:
+        before = None
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect managed Codex agents directory: {exc}") from exc
+    if before is not None:
+        if _path_is_link_like(agents) or not stat.S_ISDIR(before.st_mode):
+            raise HarnessError("managed Codex agents path must be a non-linked directory")
+        if canonicalize_no_link_traversal(agents, "managed Codex agents directory") != agents:
+            raise HarnessError("managed Codex agents directory path is not canonical")
+        try:
+            with os.scandir(agents) as entries:
+                names = sorted(
+                    entry.name
+                    for entry in entries
+                    if _MANAGED_PROFILE_FILE_RE.fullmatch(entry.name)
+                )
+            after = agents.lstat()
+        except OSError as exc:
+            raise HarnessError(f"cannot scan managed Codex agents directory: {exc}") from exc
+        identity = ("st_dev", "st_ino", "st_mtime_ns")
+        if (
+            _path_is_link_like(agents)
+            or not stat.S_ISDIR(after.st_mode)
+            or any(
+                getattr(before, field, None) != getattr(after, field, None)
+                for field in identity
+            )
+            or canonicalize_no_link_traversal(
+                agents, "managed Codex agents directory"
+            )
+            != agents
+        ):
+            raise HarnessError("managed Codex agents directory changed while being scanned")
+        if len(names) + 1 > RESOURCE_FILE_MAX_COUNT:
+            raise HarnessError("managed Codex resource snapshot exceeds the file-count bound")
+        agents_identity = (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_mtime_ns),
+        )
+        candidates.extend(
+            (f".codex/agents/{name}", agents / name) for name in names
+        )
+
+    records: list[dict[str, str]] = []
+    total = 0
+    for relative, path in candidates:
+        payload = _safe_read(
+            path,
+            f"startup resource observation {relative}",
+            allow_missing=True,
+        )
+        if payload is None:
+            continue
+        total += len(payload)
+        if total > RESOURCE_TOTAL_MAX_BYTES:
+            raise HarnessError("managed Codex resource snapshot exceeds the byte bound")
+        records.append(
+            {
+                "relative_path": relative,
+                "after_sha256": _sha256(payload),
+            }
+        )
+    if agents_identity is not None:
+        try:
+            final = agents.lstat()
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot recheck managed Codex agents directory: {exc}"
+            ) from exc
+        if (
+            _path_is_link_like(agents)
+            or not stat.S_ISDIR(final.st_mode)
+            or agents_identity
+            != (int(final.st_dev), int(final.st_ino), int(final.st_mtime_ns))
+            or canonicalize_no_link_traversal(
+                agents, "managed Codex agents directory"
+            )
+            != agents
+        ):
+            raise HarnessError("managed Codex agents directory changed while being read")
+    return sorted(records, key=lambda item: item["relative_path"])
 
 
 def _decode_toml(raw: bytes, label: str) -> tuple[str, dict[str, Any]]:
@@ -1080,6 +1203,26 @@ def _resource_files_from_receipt(
     files = validate_resource_receipt(receipt)
     for item in files:
         item["path"] = root / Path(item["relative_path"])
+    return files
+
+
+def assert_resource_files_applied(
+    *, root: Path, receipt: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Require every managed target to equal the receipt's exact after bytes.
+
+    This is the read-only live-state gate shared by fresh-session registration,
+    doctor, and later dispatch arm integration.  All targets are preflighted
+    before returning, and the validated decoded records are returned so callers
+    do not need to parse the receipt a second way.
+    """
+
+    files = _resource_files_from_receipt(root=root, receipt=receipt)
+    _assert_resource_state(
+        files,
+        state_key="after",
+        action="applied resource verification",
+    )
     return files
 
 

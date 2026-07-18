@@ -202,10 +202,10 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
                 + f"<task-id> --session-id {display_id}. "
             )
     # The Codex SessionStart command input has no trustworthy event timestamp.
-    # Persist only an exact startup input and create the timestamp locally.  This
-    # remains deliberately independent of task/session mapping state: receipt
-    # persistence is merely the fresh-session evidence later consumed by Chief
-    # registration, never a claim that any model or runtime profile was loaded.
+    # Create the timestamp locally, then let the receipt store snapshot managed
+    # project resource bytes under the AOI state lock.  This remains independent
+    # of task/session mapping state and never claims that Codex loaded a model,
+    # provider route, or runtime profile.
     if type(raw_source) is str and raw_source == "startup":
         try:
             raw_cwd = payload.get("cwd")
@@ -219,7 +219,7 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
             persist_startup_receipt(
                 paths,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "hook_protocol_version": 6,
                     "session_id": raw_session_id,
                     "source": raw_source,

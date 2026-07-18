@@ -48,6 +48,7 @@ from ..harnesslib import (
     RESERVING_CLAIM_STATUSES,
     atomic_create_bytes,
     bump_task,
+    canonicalize_no_link_traversal,
     claims_owned_by_task,
     is_expired,
     load_json,
@@ -55,6 +56,7 @@ from ..harnesslib import (
     lock_covers,
     now_iso,
     parse_time,
+    parse_tz_aware_time,
     sha256_file,
     task_dir,
     validate_id,
@@ -68,6 +70,7 @@ from ..resource_config import (
     RESOURCE_RECEIPT_SCHEMA_VERSION,
     ResourceApplyRollbackError,
     apply_resource_files,
+    assert_resource_files_applied,
     build_codex_resource_plan,
     make_resource_receipt,
     parse_override_settings,
@@ -75,7 +78,24 @@ from ..resource_config import (
     resource_plan_sha256,
     rollback_files_from_receipt,
 )
-from ..resource_governance import override_by_id, require_override_target_contract
+from ..resource_governance import (
+    MAX_RESOURCE_SESSION_REGISTRATIONS,
+    current_applied_resource_event,
+    latest_resource_transition_at,
+    load_bound_resource_receipt,
+    override_by_id,
+    require_override_target_contract,
+)
+from ..routing_authority import (
+    RoutingAuthorityError,
+    registration_identity_sha256,
+    resource_event_snapshot_sha256,
+    resource_files_manifest_sha256,
+    seal_session_registration,
+    startup_resource_files_match,
+    validate_session_registration,
+)
+from ..session_receipts import load_startup_receipt, load_startup_receipt_locked
 from ..state_lookup import require_open_task
 
 
@@ -90,8 +110,12 @@ _HANDLER_NAMES = frozenset(
         "codex_config_plan",
         "codex_config_apply",
         "codex_config_rollback",
+        "codex_startup_receipt_show",
+        "codex_session_register",
     }
 )
+
+_RESOURCE_CLOCK_SKEW_TOLERANCE_SECONDS = 5
 
 
 class _StateLock(Protocol):
@@ -139,6 +163,12 @@ class _ValidateSelectionResourceEnvelope(Protocol):
     ) -> dict[str, Any] | None: ...
 
 
+class _ResourceConfigIntegrityErrors(Protocol):
+    def __call__(
+        self, paths: HarnessPaths, state: dict[str, Any]
+    ) -> list[str]: ...
+
+
 @dataclass(frozen=True)
 class ResourceCmdServices:
     """CLI-resident, project-mutable, and fault-injected operations.
@@ -157,6 +187,7 @@ class ResourceCmdServices:
     require_root_session: _RequireRootSession
     approved_override_settings: _ApprovedOverrideSettings
     validate_selection_resource_envelope: _ValidateSelectionResourceEnvelope
+    resource_config_integrity_errors: _ResourceConfigIntegrityErrors
 
 
 def emit(payload: Any, as_json: bool = False) -> None:
@@ -390,6 +421,68 @@ def _task_resource_worktree(paths: HarnessPaths, state: dict[str, Any]) -> Path:
     return worktree
 
 
+def _bounded_strict_time_after(
+    references: Iterable[dt.datetime], *, label: str
+) -> str:
+    raw_current = now_iso()
+    current = parse_tz_aware_time(raw_current)
+    if current is None:
+        raise HarnessError(f"current {label} time is invalid")
+    bounded = list(references)
+    if not bounded:
+        return raw_current
+    latest = max(bounded)
+    if current > latest:
+        return raw_current
+    rollback_delta = latest - current
+    tolerance = dt.timedelta(seconds=_RESOURCE_CLOCK_SKEW_TOLERANCE_SECONDS)
+    if rollback_delta > tolerance:
+        raise HarnessError(
+            f"system clock precedes the latest {label} by "
+            f"{rollback_delta.total_seconds():.6f}s "
+            f"(tolerance {_RESOURCE_CLOCK_SKEW_TOLERANCE_SECONDS}s)"
+        )
+    return (latest + dt.timedelta(microseconds=1)).isoformat(
+        timespec="microseconds"
+    )
+
+
+def _latest_registration_times(state: dict[str, Any]) -> list[dt.datetime]:
+    times: list[dt.datetime] = []
+    records = state.get("resource_session_registrations", [])
+    if not isinstance(records, list):
+        raise HarnessError("resource session registrations must be a list")
+    for raw in records:
+        try:
+            registration = validate_session_registration(raw)
+        except (RoutingAuthorityError, TypeError, ValueError) as exc:
+            raise HarnessError(
+                f"resource session registration is invalid: {exc}"
+            ) from exc
+        recorded = parse_tz_aware_time(registration["registered_at"])
+        if recorded is None:
+            raise HarnessError("resource session registration time is invalid")
+        times.append(recorded)
+    return times
+
+
+def _next_resource_transition_time(state: dict[str, Any]) -> str:
+    """Return a strictly monotonic timestamp for a resource-state transition.
+
+    Resource commands commonly run in separate processes or host layers.  A
+    bounded wall-clock rollback is serialized one microsecond after the latest
+    validated resource/registration cause; a larger rollback fails closed.
+    """
+
+    latest = latest_resource_transition_at(state)
+    references = _latest_registration_times(state)
+    if latest is not None:
+        references.append(latest)
+    return _bounded_strict_time_after(
+        references, label="resource transition"
+    )
+
+
 def _require_task_lock_coverage(
     paths: HarnessPaths, state: dict[str, Any], locks: Iterable[str]
 ) -> list[str]:
@@ -532,7 +625,7 @@ def cmd_codex_config_apply(
         if plan["plan_sha256"] != expected_plan:
             raise HarnessError("Codex resource plan changed after Chief review")
         _require_task_lock_coverage(paths, state, plan["required_locks"])
-        recorded = now_iso()
+        recorded = _next_resource_transition_time(state)
         receipt = make_resource_receipt(
             event_id=event_id,
             plan=plan,
@@ -589,8 +682,9 @@ def cmd_codex_config_apply(
                 "restart_required": True,
                 "config_applicability": plan.get("config_applicability", "unknown"),
                 "applicability_basis": plan.get("applicability_basis", ""),
-                "inapplicable_acknowledged": bool(
-                    getattr(args, "allow_inapplicable", False)
+                "inapplicable_acknowledged": (
+                    applicability == "not_applicable"
+                    and bool(getattr(args, "allow_inapplicable", False))
                 ),
                 "root_session_id": session_id,
                 "applied_at": recorded,
@@ -678,6 +772,335 @@ def cmd_codex_config_apply(
     return 0
 
 
+def _expected_sha256(value: str, label: str) -> str:
+    normalized = value.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise HarnessError(f"{label} must be full lowercase SHA-256")
+    return normalized
+
+
+def cmd_codex_startup_receipt_show(
+    args: argparse.Namespace, paths: HarnessPaths
+) -> int:
+    """Expose one validated startup receipt for explicit registration CAS."""
+
+    receipt = load_startup_receipt(paths, args.session_id)
+    emit(
+        {
+            **receipt,
+            "freshness_evidence": "startup_receipt_only",
+            "config_loaded_verified": "unavailable",
+        },
+        args.json,
+    )
+    return 0
+
+
+def _registration_records_for_write(state: dict[str, Any]) -> list[dict[str, Any]]:
+    version_present = "resource_session_registration_schema_version" in state
+    records_present = "resource_session_registrations" in state
+    if version_present != records_present:
+        raise HarnessError("resource session registration state is partially initialized")
+    if not version_present:
+        has_v6_artifact = False
+        has_executing_v5_packet = False
+        for packet in state.get("packets", []):
+            if not isinstance(packet, dict):
+                raise HarnessError("task packet state is invalid")
+            packet_version = packet.get("packet_schema_version", 0)
+            if (
+                isinstance(packet_version, bool)
+                or not isinstance(packet_version, int)
+                or packet_version < 0
+            ):
+                raise HarnessError("task packet schema version is invalid")
+            if (
+                packet_version >= 6
+                or "routing_authority" in packet
+                or "session_registration" in packet
+            ):
+                has_v6_artifact = True
+                break
+            if packet_version == 5 and packet.get("status") in {
+                "armed",
+                "dispatched",
+            }:
+                has_executing_v5_packet = True
+        if has_v6_artifact:
+            raise HarnessError(
+                "legacy task registration fields cannot be adopted after v6 artifacts exist"
+            )
+        if has_executing_v5_packet:
+            raise HarnessError(
+                "legacy task registration fields require active v5 armed/dispatched "
+                "packets to drain first"
+            )
+        state["resource_session_registration_schema_version"] = 2
+        state["resource_session_registrations"] = []
+    if state.get("resource_session_registration_schema_version") != 2:
+        raise HarnessError("resource session registration schema is unsupported")
+    records = state.get("resource_session_registrations")
+    if not isinstance(records, list):
+        raise HarnessError("resource session registrations must be a list")
+    if len(records) >= MAX_RESOURCE_SESSION_REGISTRATIONS:
+        raise HarnessError("resource session registration count reached its bound")
+    return cast("list[dict[str, Any]]", records)
+
+
+def cmd_codex_session_register(
+    args: argparse.Namespace, paths: HarnessPaths, *, services: ResourceCmdServices
+) -> int:
+    """Bind one startup byte-state to the exact current Codex resource state."""
+
+    event_id = validate_id(args.event_id, "resource config event id")
+    expected_startup_sha = _expected_sha256(
+        args.expected_startup_receipt_sha256,
+        "--expected-startup-receipt-sha256",
+    )
+    expected_resource_sha = _expected_sha256(
+        args.expected_resource_receipt_sha256,
+        "--expected-resource-receipt-sha256",
+    )
+    idempotent_replay = False
+    with services.state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "register a fresh Codex session for")
+        services.require_plan_ready(paths, state, "register a fresh Codex session")
+        session_id = services.require_root_session(paths, state, args.session_id)
+
+        chief = getattr(args, "_aoi_chief_authority", None)
+        if not isinstance(chief, dict) or set(chief) != {
+            "session_id",
+            "epoch",
+            "authority_record_sha256",
+        }:
+            raise HarnessError("fresh-session registration requires active Chief authority")
+        authority_ref = str(getattr(args, "_aoi_authority_ref", "") or "")
+        expected_authority_ref = f"chief:{chief.get('session_id')}@{chief.get('epoch')}"
+        if authority_ref != expected_authority_ref:
+            raise HarnessError("fresh-session registration lacks validated Chief authority")
+        if chief.get("session_id") != session_id:
+            raise HarnessError(
+                "registrar Chief session must equal the fresh task root session"
+            )
+
+        worktree = validated_state_worktree(paths, state)
+        startup = load_startup_receipt_locked(paths, session_id)
+        if startup["startup_receipt_sha256"] != expected_startup_sha:
+            raise HarnessError("startup receipt changed after Chief selection")
+        try:
+            startup_cwd = canonicalize_no_link_traversal(
+                Path(startup["cwd"]), "startup registration cwd"
+            )
+            startup_cwd.relative_to(worktree)
+        except (HarnessError, TypeError, ValueError) as exc:
+            raise HarnessError(
+                "startup registration cwd is not canonical inside the task worktree"
+            ) from exc
+        if (
+            str(startup_cwd) != startup["cwd"]
+            or not startup_cwd.is_dir()
+            or startup["project_root"] != str(worktree)
+            or startup["aoi_config_sha256"] != paths.project.sha256
+        ):
+            raise HarnessError(
+                "startup receipt no longer matches the current task root/config binding"
+            )
+
+        current_event = current_applied_resource_event(state)
+        matches = [
+            event
+            for event in state.get("resource_config_events", [])
+            if event.get("event_id") == event_id
+        ]
+        if (
+            len(matches) != 1
+            or current_event is None
+            or current_event is not matches[0]
+        ):
+            raise HarnessError(
+                "resource event is not the unique effective-current applied event"
+            )
+        event = matches[0]
+        if (
+            event.get("status") != "applied"
+            or event.get("rollback") is not None
+            or event.get("restart_required") is not True
+            or event.get("config_applicability") != "applicable"
+            or event.get("inapplicable_acknowledged") is not False
+            or event.get("task_plan_sha256") != state.get("plan_sha256")
+        ):
+            raise HarnessError(
+                "effective resource event is not eligible for fresh-session registration"
+            )
+        receipt = load_bound_resource_receipt(paths, state, event)
+        if event.get("receipt_sha256") != expected_resource_sha:
+            raise HarnessError("resource receipt changed after Chief selection")
+        plan = receipt["plan"]
+        if plan.get("aoi_config_sha256") != paths.project.sha256:
+            raise HarnessError("resource plan does not bind the current aoi.toml")
+        try:
+            startup_match = startup_resource_files_match(startup, plan)
+        except RoutingAuthorityError as exc:
+            raise HarnessError(
+                f"startup resource observation is invalid: {exc}"
+            ) from exc
+        assert_resource_files_applied(root=worktree, receipt=receipt)
+        integrity_errors = services.resource_config_integrity_errors(paths, state)
+        if integrity_errors:
+            raise HarnessError(
+                "fresh-session registration integrity gate failed: "
+                + "; ".join(integrity_errors[:3])
+            )
+        project_configs = [
+            item
+            for item in plan.get("files", [])
+            if item.get("relative_path") == ".codex/config.toml"
+        ]
+        if len(project_configs) != 1:
+            raise HarnessError("resource receipt lacks one exact project config")
+
+        startup_at = parse_tz_aware_time(startup["observed_at"])
+        if startup_at is None:
+            raise HarnessError("startup receipt observation time is invalid")
+        registration_references = _latest_registration_times(state)
+        registration_references.append(startup_at)
+        latest_transition = latest_resource_transition_at(state)
+        if latest_transition is not None:
+            registration_references.append(latest_transition)
+        registered_at = _bounded_strict_time_after(
+            registration_references,
+            label="fresh-session registration cause",
+        )
+        try:
+            registration: dict[str, Any] = {
+                "registration_schema_version": 2,
+                "session_id": session_id,
+                "task_id": state["task_id"],
+                "task_plan_sha256": event["task_plan_sha256"],
+                "startup_receipt_snapshot": startup,
+                "startup_receipt_sha256": startup["startup_receipt_sha256"],
+                "resource_config_event_id": event_id,
+                "resource_event_applied_snapshot": copy.deepcopy(event),
+                "resource_event_applied_sha256": resource_event_snapshot_sha256(
+                    event
+                ),
+                "resource_receipt_relative_path": (
+                    f"results/resource-config-{event_id}.json"
+                ),
+                "resource_receipt_sha256": event["receipt_sha256"],
+                "resource_plan_sha256": event["plan_sha256"],
+                "aoi_config_sha256": plan["aoi_config_sha256"],
+                "project_config_sha256": project_configs[0]["after_sha256"],
+                "resource_files_manifest_sha256": resource_files_manifest_sha256(
+                    plan
+                ),
+                "startup_resource_files_match": startup_match,
+                "task_worktree": str(worktree),
+                "config_ancestry_verified": True,
+                "resource_files_verified": True,
+                "startup_resource_state_equivalent": True,
+                "freshness_verdict": "registered_byte_state_equivalent_only",
+                "config_loaded_verified": "unavailable",
+                "registrar_chief_authority": {
+                    "session_id": session_id,
+                    "epoch": chief["epoch"],
+                    "authority_record_sha256": chief[
+                        "authority_record_sha256"
+                    ],
+                },
+                "registration_identity_sha256": "0" * 64,
+                "registered_at": registered_at,
+            }
+            registration["registration_identity_sha256"] = (
+                registration_identity_sha256(registration)
+            )
+            registration = seal_session_registration(registration)
+        except RoutingAuthorityError as exc:
+            raise HarnessError(f"fresh-session registration is invalid: {exc}") from exc
+
+        existing_raw = state.get("resource_session_registrations", [])
+        if not isinstance(existing_raw, list):
+            raise HarnessError("resource session registrations must be a list")
+        existing = [
+            item for item in existing_raw if item.get("session_id") == session_id
+        ]
+        if len(existing) > 1:
+            raise HarnessError("fresh session has duplicate registration records")
+        if existing:
+            try:
+                prior = validate_session_registration(existing[0])
+            except RoutingAuthorityError as exc:
+                raise HarnessError(
+                    f"existing fresh-session registration is invalid: {exc}"
+                ) from exc
+            if (
+                prior["registration_identity_sha256"]
+                != registration["registration_identity_sha256"]
+            ):
+                raise HarnessError(
+                    "fresh session is already registered to different authority"
+                )
+            registration = prior
+            idempotent_replay = True
+        else:
+            records = _registration_records_for_write(state)
+            records.append(registration)
+            state.setdefault("facts", []).append(
+                f"Registered fresh Codex session {session_id} to resource event "
+                f"{event_id} as byte-state-equivalent-only; config loading remains "
+                "unavailable."
+            )
+            bump_task(state)
+            try:
+                services.write_task(paths, state)
+            except BaseException as exc:
+                try:
+                    published = load_task(paths, args.task)
+                except (HarnessError, OSError, ValueError) as probe_exc:
+                    raise HarnessError(
+                        "fresh-session registration publication is ambiguous"
+                    ) from probe_exc
+                published_matches = [
+                    item
+                    for item in published.get("resource_session_registrations", [])
+                    if item == registration
+                ]
+                if len(published_matches) == 1:
+                    raise HarnessError(
+                        "fresh-session registration was published but its durability "
+                        "step reported an error"
+                    ) from exc
+                if any(
+                    item.get("session_id") == session_id
+                    for item in published.get("resource_session_registrations", [])
+                ):
+                    raise HarnessError(
+                        "fresh-session registration publication is divergent"
+                    ) from exc
+                raise
+        try:
+            services.write_index(paths)
+        except BaseException as exc:
+            raise HarnessError(
+                "fresh-session registration is durable but index refresh failed"
+            ) from exc
+
+    emit(
+        {
+            "task_id": args.task,
+            "session_id": session_id,
+            "resource_config_event_id": event_id,
+            "registration": registration,
+            "idempotent_replay": idempotent_replay,
+            "freshness_verdict": "registered_byte_state_equivalent_only",
+            "config_loaded_verified": "unavailable",
+        },
+        args.json,
+    )
+    return 0
+
+
 def cmd_codex_config_rollback(
     args: argparse.Namespace, paths: HarnessPaths, *, services: ResourceCmdServices
 ) -> int:
@@ -690,8 +1113,15 @@ def cmd_codex_config_rollback(
             for event in state.get("resource_config_events", [])
             if event.get("event_id") == args.event_id
         ]
-        if len(matches) != 1 or matches[0].get("status") != "applied":
-            raise HarnessError("resource config event is not uniquely applied")
+        current_event = current_applied_resource_event(state)
+        if (
+            len(matches) != 1
+            or matches[0].get("status") != "applied"
+            or current_event is not matches[0]
+        ):
+            raise HarnessError(
+                "resource config event is not the unique effective-current apply"
+            )
         event = matches[0]
         receipt_path = Path(str(event.get("receipt_path", "")))
         expected_receipt_path = (
@@ -732,10 +1162,10 @@ def cmd_codex_config_rollback(
             args.reason, "resource config rollback reason"
         )
         prior_event = copy.deepcopy(event)
+        recorded = _next_resource_transition_time(state)
         rollback_files_from_receipt(
             root=_task_resource_worktree(paths, state), receipt=receipt
         )
-        recorded = now_iso()
         event["status"] = "rolled_back"
         event["rollback"] = {
             "reason": rollback_reason,
@@ -900,6 +1330,20 @@ def register_resource_commands(
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["codex_config_apply"])
 
+    parser = subparsers.add_parser("codex-session-register")
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument("--event-id", required=True)
+    parser.add_argument("--expected-startup-receipt-sha256", required=True)
+    parser.add_argument("--expected-resource-receipt-sha256", required=True)
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["codex_session_register"])
+
+    parser = subparsers.add_parser("codex-startup-receipt-show")
+    parser.add_argument("--session-id", required=True)
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["codex_startup_receipt_show"])
+
     parser = subparsers.add_parser("codex-config-rollback")
     parser.add_argument("--task", required=True)
     parser.add_argument("--event-id", required=True)
@@ -914,6 +1358,8 @@ __all__ = [
     "cmd_codex_config_apply",
     "cmd_codex_config_plan",
     "cmd_codex_config_rollback",
+    "cmd_codex_session_register",
+    "cmd_codex_startup_receipt_show",
     "cmd_override_arbitrate",
     "cmd_override_request",
     "cmd_override_revoke",

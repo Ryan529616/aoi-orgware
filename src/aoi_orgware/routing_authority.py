@@ -84,24 +84,43 @@ _STARTUP_RECEIPT_BASE = {
     "cwd",
     "project_root",
     "aoi_config_sha256",
+    "observed_resource_files",
+    "observed_resource_files_sha256",
+}
+_STARTUP_RECEIPT_V1_BASE = _STARTUP_RECEIPT_BASE - {
+    "observed_resource_files",
+    "observed_resource_files_sha256",
+}
+_REGISTRAR_CHIEF_AUTHORITY = {
+    "session_id",
+    "epoch",
+    "authority_record_sha256",
 }
 _REGISTRATION_BASE = {
     "registration_schema_version",
     "session_id",
+    "task_id",
+    "task_plan_sha256",
     "startup_receipt_snapshot",
     "startup_receipt_sha256",
     "resource_config_event_id",
-    "resource_event_sha256",
+    "resource_event_applied_snapshot",
+    "resource_event_applied_sha256",
+    "resource_receipt_relative_path",
     "resource_receipt_sha256",
+    "resource_plan_sha256",
     "aoi_config_sha256",
     "project_config_sha256",
     "resource_files_manifest_sha256",
+    "startup_resource_files_match",
     "task_worktree",
     "config_ancestry_verified",
     "resource_files_verified",
-    "observed_after_apply",
+    "startup_resource_state_equivalent",
     "freshness_verdict",
     "config_loaded_verified",
+    "registrar_chief_authority",
+    "registration_identity_sha256",
     "registered_at",
 }
 _TERMINAL_TYPED_OUTCOMES_BY_STATUS = {
@@ -340,6 +359,72 @@ def resource_files_manifest_sha256(plan: Mapping[str, Any]) -> str:
     return canonical_sha256(view, max_bytes=MAX_RECORD_BYTES)
 
 
+def _resource_file_identities(
+    value: Any, *, label: str, allow_empty: bool
+) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > 64 or (not allow_empty and not value):
+        _fail(f"{label} is invalid")
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in value:
+        item = _object(
+            candidate,
+            {"relative_path", "after_sha256"},
+            f"{label} file",
+        )
+        relative = item["relative_path"]
+        if not isinstance(relative, str) or not (
+            relative == ".codex/config.toml" or _PROFILE_PATH.fullmatch(relative)
+        ):
+            _fail(f"{label} path is invalid")
+        if relative in seen:
+            _fail(f"{label} repeats a path")
+        seen.add(relative)
+        _sha(item["after_sha256"], f"{label} file sha256")
+        records.append(
+            {
+                "relative_path": relative,
+                "after_sha256": item["after_sha256"],
+            }
+        )
+    if [item["relative_path"] for item in records] != sorted(seen):
+        _fail(f"{label} paths are not canonical")
+    return records
+
+
+def startup_resource_files_match(
+    startup_receipt: Mapping[str, Any], plan: Mapping[str, Any]
+) -> list[dict[str, str]]:
+    """Return the exact reviewed file identities observed at SessionStart.
+
+    The startup hook snapshots every managed project resource file.  A plan can
+    govern a subset of that tree, so registration extracts the reviewed subset
+    and fails closed if even one planned after-image was absent or different.
+    """
+
+    startup = _startup_receipt(_plain_copy(startup_receipt))
+    records = _plan_files(plan)
+    expected = [
+        {
+            "relative_path": relative,
+            "after_sha256": records[relative]["after_sha256"],
+        }
+        for relative in sorted(records)
+    ]
+    observed = {
+        item["relative_path"]: item["after_sha256"]
+        for item in startup["observed_resource_files"]
+    }
+    if any(
+        observed.get(item["relative_path"]) != item["after_sha256"]
+        for item in expected
+    ):
+        _fail(
+            "startup receipt did not observe the reviewed resource file after-images"
+        )
+    return expected
+
+
 def _validate_real_receipt_input(
     envelope: Any,
     event: Mapping[str, Any],
@@ -479,7 +564,7 @@ def _startup_receipt(value: Any) -> dict[str, Any]:
         _STARTUP_RECEIPT_BASE | {"startup_receipt_sha256"},
         "startup receipt",
     )
-    if item["schema_version"] != 1 or item["hook_protocol_version"] != 6:
+    if item["schema_version"] != 2 or item["hook_protocol_version"] != 6:
         _fail("startup receipt version is unsupported")
     _hook_id(item["session_id"], "startup session id")
     if item["source"] != "startup":
@@ -488,6 +573,20 @@ def _startup_receipt(value: Any) -> dict[str, Any]:
     _text(item["cwd"], "startup cwd", limit=4096, strip=False)
     _text(item["project_root"], "startup project root", limit=4096, strip=False)
     _sha(item["aoi_config_sha256"], "startup AOI config sha256")
+    observed = _resource_file_identities(
+        item["observed_resource_files"],
+        label="startup observed resource files",
+        allow_empty=True,
+    )
+    _sha(
+        item["observed_resource_files_sha256"],
+        "startup observed resource files sha256",
+    )
+    if (
+        canonical_sha256(observed, max_bytes=MAX_RECORD_BYTES)
+        != item["observed_resource_files_sha256"]
+    ):
+        _fail("startup observed resource files SHA-256 is invalid")
     _sha(item["startup_receipt_sha256"], "startup receipt sha256")
     base = {key: item[key] for key in _STARTUP_RECEIPT_BASE}
     if canonical_sha256(base, max_bytes=MAX_RECORD_BYTES) != item["startup_receipt_sha256"]:
@@ -495,8 +594,85 @@ def _startup_receipt(value: Any) -> dict[str, Any]:
     return item
 
 
+def validate_stored_startup_receipt(value: Any) -> dict[str, Any]:
+    """Validate a persisted receipt without inventing missing v2 evidence.
+
+    Schema v1 shipped before managed-file identities were observed.  Those
+    records remain readable, hash-verified historical data so one legacy store
+    member cannot block unrelated v2 startups.  Registration authority still
+    uses the v2-only validator above; no v1 receipt is upgraded in place.
+    """
+
+    candidate = _plain_copy(value)
+    if isinstance(candidate, dict) and candidate.get("schema_version") == 2:
+        return _startup_receipt(candidate)
+    item = _object(
+        candidate,
+        _STARTUP_RECEIPT_V1_BASE | {"startup_receipt_sha256"},
+        "legacy startup receipt",
+    )
+    if item["schema_version"] != 1 or item["hook_protocol_version"] != 6:
+        _fail("legacy startup receipt version is unsupported")
+    _hook_id(item["session_id"], "legacy startup session id")
+    if item["source"] != "startup":
+        _fail("only a fresh startup may produce a legacy startup receipt")
+    _dt(item["observed_at"], "legacy startup observed_at")
+    _text(item["cwd"], "legacy startup cwd", limit=4096, strip=False)
+    _text(item["project_root"], "legacy startup project root", limit=4096, strip=False)
+    _sha(item["aoi_config_sha256"], "legacy startup AOI config sha256")
+    _sha(item["startup_receipt_sha256"], "legacy startup receipt sha256")
+    base = {key: item[key] for key in _STARTUP_RECEIPT_V1_BASE}
+    if canonical_sha256(base, max_bytes=MAX_RECORD_BYTES) != item["startup_receipt_sha256"]:
+        _fail("legacy startup receipt SHA-256 is invalid")
+    return item
+
+
+def registration_identity_preimage(
+    registration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the replay identity that deliberately excludes time and renewals."""
+
+    try:
+        registrar = registration["registrar_chief_authority"]
+        if not isinstance(registrar, Mapping):
+            _fail("registration Chief authority is invalid")
+        return {
+            "session_id": registration["session_id"],
+            "task_id": registration["task_id"],
+            "task_plan_sha256": registration["task_plan_sha256"],
+            "startup_receipt_sha256": registration["startup_receipt_sha256"],
+            "resource_config_event_id": registration["resource_config_event_id"],
+            "resource_event_applied_sha256": registration[
+                "resource_event_applied_sha256"
+            ],
+            "resource_receipt_relative_path": registration[
+                "resource_receipt_relative_path"
+            ],
+            "resource_receipt_sha256": registration["resource_receipt_sha256"],
+            "resource_plan_sha256": registration["resource_plan_sha256"],
+            "aoi_config_sha256": registration["aoi_config_sha256"],
+            "project_config_sha256": registration["project_config_sha256"],
+            "resource_files_manifest_sha256": registration[
+                "resource_files_manifest_sha256"
+            ],
+            "task_worktree": registration["task_worktree"],
+            "registrar_chief_session_id": registrar["session_id"],
+            "registrar_chief_epoch": registrar["epoch"],
+        }
+    except KeyError as exc:
+        raise RoutingAuthorityError(
+            "registration identity preimage is incomplete"
+        ) from exc
+
+
+def registration_identity_sha256(registration: Mapping[str, Any]) -> str:
+    return canonical_sha256(
+        registration_identity_preimage(registration), max_bytes=MAX_RECORD_BYTES
+    )
+
+
 def seal_session_registration(registration: Mapping[str, Any]) -> dict[str, Any]:
-    """Seal a Chief registration that references an earlier startup receipt."""
+    """Seal a v2 Chief registration and its rollback-stable applied snapshot."""
     base = _object(
         _plain_copy(registration),
         _REGISTRATION_BASE,
@@ -515,9 +691,10 @@ def _registration(value: Any) -> dict[str, Any]:
         _REGISTRATION_BASE | {"registration_sha256"},
         "session registration",
     )
-    if item["registration_schema_version"] != 1:
+    if item["registration_schema_version"] != 2:
         _fail("session registration version is unsupported")
     _hook_id(item["session_id"], "registered session id")
+    _id(item["task_id"], "registration task id")
     startup = _startup_receipt(item["startup_receipt_snapshot"])
     if (
         item["startup_receipt_sha256"] != startup["startup_receipt_sha256"]
@@ -526,31 +703,107 @@ def _registration(value: Any) -> dict[str, Any]:
         or item["task_worktree"] != startup["project_root"]
     ):
         _fail("session registration is not bound to its startup receipt")
+    event = _resource_event(item["resource_event_applied_snapshot"])
     _id(item["resource_config_event_id"], "registration resource event id")
+    _text(
+        item["resource_receipt_relative_path"],
+        "registration resource receipt relative path",
+        limit=4096,
+        strip=False,
+    )
     for key in (
+        "task_plan_sha256",
         "startup_receipt_sha256",
-        "resource_event_sha256",
+        "resource_event_applied_sha256",
         "resource_receipt_sha256",
+        "resource_plan_sha256",
         "aoi_config_sha256",
         "project_config_sha256",
         "resource_files_manifest_sha256",
+        "registration_identity_sha256",
         "registration_sha256",
     ):
         _sha(item[key], key)
     base = {key: item[key] for key in _REGISTRATION_BASE}
     if canonical_sha256(base, max_bytes=MAX_RECORD_BYTES) != item["registration_sha256"]:
         _fail("session registration SHA-256 is invalid")
-    _dt(item["registered_at"], "registered_at")
+    startup_at = _dt(startup["observed_at"], "startup observed_at")
+    registered_at = _dt(item["registered_at"], "registered_at")
+    registrar = _object(
+        item["registrar_chief_authority"],
+        _REGISTRAR_CHIEF_AUTHORITY,
+        "registration Chief authority",
+    )
+    _hook_id(registrar["session_id"], "registration Chief session id")
     if (
-        item["config_ancestry_verified"] is not True
+        isinstance(registrar["epoch"], bool)
+        or not isinstance(registrar["epoch"], int)
+        or registrar["epoch"] < 1
+    ):
+        _fail("registration Chief epoch is invalid")
+    _sha(
+        registrar["authority_record_sha256"],
+        "registration Chief authority record sha256",
+    )
+    startup_match = _resource_file_identities(
+        item["startup_resource_files_match"],
+        label="registration startup resource file match",
+        allow_empty=False,
+    )
+    observed = {
+        record["relative_path"]: record["after_sha256"]
+        for record in startup["observed_resource_files"]
+    }
+    project_matches = [
+        record
+        for record in startup_match
+        if record["relative_path"] == ".codex/config.toml"
+    ]
+    if (
+        item["resource_config_event_id"] != event["event_id"]
+        or item["resource_event_applied_sha256"]
+        != canonical_sha256(event, max_bytes=MAX_RECORD_BYTES)
+        or item["resource_receipt_relative_path"]
+        != _relative_receipt_path(event["event_id"])
+        or item["resource_receipt_sha256"] != event["receipt_sha256"]
+        or item["resource_plan_sha256"] != event["plan_sha256"]
+        or item["task_plan_sha256"] != event["task_plan_sha256"]
+        or item["registration_identity_sha256"]
+        != registration_identity_sha256(item)
+        or registrar["session_id"] != item["session_id"]
+        or not startup_at < registered_at
+        or canonical_sha256(startup_match, max_bytes=MAX_RECORD_BYTES)
+        != item["resource_files_manifest_sha256"]
+        or any(
+            observed.get(record["relative_path"]) != record["after_sha256"]
+            for record in startup_match
+        )
+        or len(project_matches) != 1
+        or project_matches[0]["after_sha256"] != item["project_config_sha256"]
+        or item["config_ancestry_verified"] is not True
         or item["resource_files_verified"] is not True
-        or item["observed_after_apply"] is not True
-        or item["freshness_verdict"] != "registered_only"
+        or item["startup_resource_state_equivalent"] is not True
+        or item["freshness_verdict"]
+        != "registered_byte_state_equivalent_only"
         or item["config_loaded_verified"] != "unavailable"
     ):
         _fail("session registration startup authority is invalid")
     _text(item["task_worktree"], "registration task worktree", limit=4096, strip=False)
     return item
+
+
+def validate_session_registration(registration: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and detach one sealed registration without filesystem I/O."""
+
+    return _clone(_registration(_plain_copy(registration)))
+
+
+def resource_event_snapshot_sha256(event: Mapping[str, Any]) -> str:
+    """Hash one exact applicable, non-rollback applied resource event."""
+
+    return canonical_sha256(
+        _resource_event(_plain_copy(event)), max_bytes=MAX_RECORD_BYTES
+    )
 
 
 def _packet(value: Any) -> dict[str, Any]:
@@ -621,7 +874,11 @@ def _validate_authority(authority: Mapping[str, Any], *, nested: bool = False) -
     )
     _hook_id(chief["session_id"], "chief session id")
     _sha(chief["authority_sha256"], "chief authority sha256")
-    if isinstance(chief["epoch"], bool) or not isinstance(chief["epoch"], int) or chief["epoch"] < 0:
+    if (
+        isinstance(chief["epoch"], bool)
+        or not isinstance(chief["epoch"], int)
+        or chief["epoch"] < 1
+    ):
         _fail("chief epoch is invalid")
     transport = _object(
         value["transport_authority"],
@@ -672,25 +929,33 @@ def _validate_authority(authority: Mapping[str, Any], *, nested: bool = False) -
     _sha(resource["project_config_after_sha256"], "project config after sha256")
 
     registration = _registration(value["session_registration"])
-    startup = _dt(
-        registration["startup_receipt_snapshot"]["observed_at"],
-        "startup observed_at",
-    )
     registered = _dt(registration["registered_at"], "registered_at")
-    applied = _dt(event["applied_at"], "resource applied_at")
-    if not applied < startup <= registered <= armed:
-        _fail("apply/startup/register/arm timeline is invalid")
+    if registered >= armed:
+        _fail("registration postdates arm authority")
     plan = receipt_authority["plan_snapshot"]
+    registrar = registration["registrar_chief_authority"]
     if (
-        registration["resource_config_event_id"] != event["event_id"]
-        or registration["resource_event_sha256"] != resource["event_snapshot_sha256"]
+        chief["session_id"] != registrar["session_id"]
+        or chief["epoch"] != registrar["epoch"]
+        or registration["task_id"] != packet["task_id"]
+        or registration["task_plan_sha256"] != packet["task_plan_sha256"]
+        or registration["resource_config_event_id"] != event["event_id"]
+        or registration["resource_event_applied_snapshot"] != event
+        or registration["resource_event_applied_sha256"]
+        != resource["event_snapshot_sha256"]
+        or registration["resource_receipt_relative_path"]
+        != receipt_authority["receipt_relative_path"]
         or registration["resource_receipt_sha256"] != event["receipt_sha256"]
+        or registration["resource_plan_sha256"] != event["plan_sha256"]
         or registration["aoi_config_sha256"] != plan["aoi_config_sha256"]
         or registration["project_config_sha256"] != resource["project_config_after_sha256"]
         or registration["resource_files_manifest_sha256"]
         != resource_files_manifest_sha256(plan)
     ):
-        _fail("session registration does not bind exact resource/AOI/Codex startup hashes")
+        _fail(
+            "session registration does not bind the current Chief and exact "
+            "resource/AOI/Codex startup hashes"
+        )
 
     envelope = _snapshot(value["resource_envelope"], "resource envelope")
     if envelope["snapshot"] != event["dynamic_envelope"]:
@@ -1017,7 +1282,7 @@ def build_dispatch_outcome(
         "provider_route_verified": "unavailable",
         "runtime_profile_verified": "unavailable",
         "runtime_sandbox_profile_verified": "unavailable",
-        "fresh_session_evidence": "registered_only"
+        "fresh_session_evidence": "registered_byte_state_equivalent_only"
         if arm["packet_authority"]["delegation_depth"] == 1
         else "inherited_root_registration",
         "verdict": verdict,

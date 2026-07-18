@@ -17,8 +17,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import harnesslib as h
-from .routing_authority import seal_startup_receipt
-from .semantic_events import SemanticEventError, canonical_json_bytes
+from .resource_config import snapshot_managed_resource_files
+from .routing_authority import seal_startup_receipt, validate_stored_startup_receipt
+from .semantic_events import SemanticEventError, canonical_json_bytes, canonical_sha256
 
 
 STARTUP_RECEIPTS_DIRECTORY = "startup-receipts"
@@ -200,18 +201,9 @@ def _read_receipt(path: Path, expected_session_id: str | None) -> dict[str, Any]
         decoded = json.loads(canonical_payload.decode("utf-8"))
         if not isinstance(decoded, dict):
             raise SessionReceiptError("startup receipt must contain a JSON object")
-        # The routing authority intentionally exposes only the constructor, not
-        # a public unseal routine.  Reconstruct from exactly the unsealed
-        # fields and require the stored sealing field to round-trip byte-for-
-        # byte, which rejects both hash tampering and added credential-shaped
-        # fields.
         if "startup_receipt_sha256" not in decoded:
             raise SessionReceiptError("startup receipt sealing field is missing")
-        sealed = seal_startup_receipt(
-            {key: value for key, value in decoded.items() if key != "startup_receipt_sha256"}
-        )
-        if decoded != sealed:
-            raise SessionReceiptError("startup receipt sealing field is invalid")
+        sealed = validate_stored_startup_receipt(decoded)
         canonical = canonical_json_bytes(sealed, max_bytes=MAX_STARTUP_RECEIPT_BYTES)
     except SessionReceiptError:
         raise
@@ -335,12 +327,26 @@ def _load_startup_receipt_locked(paths: h.HarnessPaths, session_id: str) -> dict
     return _read_receipt(path, session_id)
 
 
+def load_startup_receipt_locked(
+    paths: h.HarnessPaths, session_id: str
+) -> dict[str, Any]:
+    """Load one receipt while the caller already owns the project state lock.
+
+    Chief registration needs the receipt, task state, resource receipt, and
+    live config files to share one serialization boundary.  This explicit API
+    avoids a nested lock while retaining the exact same path and content
+    validation as :func:`load_startup_receipt`.
+    """
+
+    return _load_startup_receipt_locked(paths, _session_id(session_id))
+
+
 def load_startup_receipt(paths: h.HarnessPaths, session_id: str) -> dict[str, Any]:
     """Load one exact startup receipt under the project lock, failing closed."""
 
     normalized = _session_id(session_id)
     with h.state_lock(paths, create_layout=False):
-        return _load_startup_receipt_locked(paths, normalized)
+        return load_startup_receipt_locked(paths, normalized)
 
 
 def scan_startup_receipts(paths: h.HarnessPaths) -> list[dict[str, Any]]:
@@ -351,7 +357,7 @@ def scan_startup_receipts(paths: h.HarnessPaths) -> list[dict[str, Any]]:
 
 
 def _same_startup_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return all(
+    return left.get("schema_version") == right.get("schema_version") == 2 and all(
         left.get(field) == right.get(field)
         for field in ("session_id", "aoi_config_sha256", "project_root", "cwd")
     )
@@ -405,49 +411,108 @@ def store_startup_receipt(
     """
 
     sealed = seal_startup_receipt(receipt)
-    session_id = sealed["session_id"]
     write_paths = _fresh_write_paths(paths, sealed)
-    try:
-        payload = _encode_storage_payload(sealed)
-    except (SemanticEventError, TypeError, ValueError) as exc:
-        raise SessionReceiptError(f"startup receipt cannot be canonicalized: {exc}") from exc
     with h.state_lock(write_paths, create_layout=False):
         # Reload once more under the selected state lock.  A config/root/path
         # drift cannot redirect the first receipt-directory creation.
         write_paths = _fresh_write_paths(paths, sealed)
-        _ensure_receipt_directory(write_paths)
-        path = _validate_receipt_path(
-            write_paths, startup_receipt_path(write_paths, session_id)
-        )
-        # Existing paths are only validated and loaded below; replay must not
-        # open an atomic-create attempt.  A new filename reserves its exact
-        # canonical bytes before publication, so a successful create can never
-        # push a valid store beyond either scan bound.
-        if path.exists():
-            stored = _load_startup_receipt_locked(write_paths, session_id)
-        else:
-            scanned, stored_bytes = _scan_startup_receipt_usage_locked(write_paths)
-            if len(scanned) >= MAX_STARTUP_RECEIPT_SCAN_ENTRIES:
-                raise SessionReceiptError("startup receipt store entry bound is exhausted")
-            if stored_bytes + len(payload) > MAX_STARTUP_RECEIPT_SCAN_BYTES:
-                raise SessionReceiptError("startup receipt store byte bound is exhausted")
-            try:
-                h.atomic_create_bytes(path, payload)
-            except h.HarnessError:
-                # A create may report after its destination became visible;
-                # only that exact collision/publication race may fall through
-                # to validation.  Other create failures remain observable.
-                if not path.exists():
-                    raise
-            stored = _load_startup_receipt_locked(write_paths, session_id)
-        if not _same_startup_identity(stored, sealed):
+        return _store_startup_receipt_locked(write_paths, sealed)
+
+
+def _store_startup_receipt_locked(
+    write_paths: h.HarnessPaths, sealed: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Publish one sealed receipt while the caller owns the project lock."""
+
+    session_id = sealed["session_id"]
+    _ensure_receipt_directory(write_paths)
+    path = _validate_receipt_path(
+        write_paths, startup_receipt_path(write_paths, session_id)
+    )
+    # Existing paths are only validated and loaded below; replay must not open
+    # an atomic-create attempt.  A new filename reserves its exact canonical
+    # bytes before publication, so a successful create can never push a valid
+    # store beyond either scan bound.
+    if path.exists():
+        stored = _load_startup_receipt_locked(write_paths, session_id)
+    else:
+        try:
+            payload = _encode_storage_payload(sealed)
+        except (SemanticEventError, TypeError, ValueError) as exc:
             raise SessionReceiptError(
-                "startup receipt conflict: session id is already bound to different "
-                "config/root/cwd identity"
+                f"startup receipt cannot be canonicalized: {exc}"
+            ) from exc
+        scanned, stored_bytes = _scan_startup_receipt_usage_locked(write_paths)
+        if len(scanned) >= MAX_STARTUP_RECEIPT_SCAN_ENTRIES:
+            raise SessionReceiptError("startup receipt store entry bound is exhausted")
+        if stored_bytes + len(payload) > MAX_STARTUP_RECEIPT_SCAN_BYTES:
+            raise SessionReceiptError("startup receipt store byte bound is exhausted")
+        try:
+            h.atomic_create_bytes(path, payload)
+        except h.HarnessError:
+            # A create may report after its destination became visible; only
+            # that exact collision/publication race may fall through.
+            if not path.exists():
+                raise
+        stored = _load_startup_receipt_locked(write_paths, session_id)
+    if not _same_startup_identity(stored, sealed):
+        raise SessionReceiptError(
+            "startup receipt conflict: session id is already bound to different "
+            "schema/config/root/cwd identity"
+        )
+    return stored
+
+
+def persist_startup_receipt(
+    paths: h.HarnessPaths, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Capture managed resource bytes and publish one schema-v2 receipt.
+
+    File observation and receipt publication share the project state lock, so
+    registration can prove that every reviewed after-image existed at the
+    SessionStart boundary without comparing independent host wall clocks.
+    """
+
+    base = dict(receipt)
+    expected_fields = {
+        "schema_version",
+        "hook_protocol_version",
+        "session_id",
+        "source",
+        "observed_at",
+        "cwd",
+        "project_root",
+        "aoi_config_sha256",
+    }
+    if set(base) != expected_fields or base.get("schema_version") != 2:
+        raise SessionReceiptError("unobserved startup receipt schema is invalid")
+    preflight = seal_startup_receipt(
+        {
+            **base,
+            "observed_resource_files": [],
+            "observed_resource_files_sha256": canonical_sha256([]),
+        }
+    )
+    write_paths = _fresh_write_paths(paths, preflight)
+    with h.state_lock(write_paths, create_layout=False):
+        write_paths = _fresh_write_paths(paths, preflight)
+        existing_path = startup_receipt_path(write_paths, preflight["session_id"])
+        if existing_path.exists() or h._path_is_link_like(existing_path):
+            stored = _load_startup_receipt_locked(
+                write_paths, preflight["session_id"]
             )
-        return stored
-
-
-# An explicit verb makes later hook integration read naturally without creating
-# a second persistence implementation.
-persist_startup_receipt = store_startup_receipt
+            if not _same_startup_identity(stored, preflight):
+                raise SessionReceiptError(
+                    "startup receipt conflict: session id is already bound to "
+                    "different schema/config/root/cwd identity"
+                )
+            return stored
+        observed = snapshot_managed_resource_files(write_paths.root)
+        sealed = seal_startup_receipt(
+            {
+                **base,
+                "observed_resource_files": observed,
+                "observed_resource_files_sha256": canonical_sha256(observed),
+            }
+        )
+        return _store_startup_receipt_locked(write_paths, sealed)

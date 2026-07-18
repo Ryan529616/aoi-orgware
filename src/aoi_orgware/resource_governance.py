@@ -8,6 +8,8 @@ stale module globals after a project-specific role map is loaded.
 
 from __future__ import annotations
 
+import copy
+import datetime as dt
 import hashlib
 import json
 import re
@@ -23,16 +25,29 @@ from .harnesslib import (
     is_expired,
     load_json,
     parse_time,
+    parse_tz_aware_time,
     sha256_file,
     task_dir,
     validate_id,
+    validated_state_worktree,
 )
 from .resource_config import (
     AOI_MAX_DELEGATION_DEPTH,
     ARISE_MAX_THREADS_CEILING,
+    assert_resource_files_applied,
     parse_override_settings,
     validate_resource_receipt,
 )
+from .routing_authority import (
+    RoutingAuthorityError,
+    resource_files_manifest_sha256,
+    startup_resource_files_match,
+    validate_session_registration,
+)
+from .session_receipts import load_startup_receipt
+
+
+MAX_RESOURCE_SESSION_REGISTRATIONS = 256
 
 
 @dataclass(frozen=True)
@@ -71,6 +86,212 @@ def _canonical_record_sha256(value: dict[str, Any]) -> str:
         value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class ResourceTransition:
+    """One validated resource lifecycle transition in absolute-time order."""
+
+    occurred_at: dt.datetime
+    event: dict[str, Any]
+    kind: str
+
+
+@dataclass(frozen=True)
+class ResourceTransitionReplay:
+    """Validated replay result shared by readers and resource command writers."""
+
+    transitions: tuple[ResourceTransition, ...]
+    current_event: dict[str, Any] | None
+
+    @property
+    def latest_transition_at(self) -> dt.datetime | None:
+        return self.transitions[-1].occurred_at if self.transitions else None
+
+
+def _resource_transition_time(value: Any, *, label: str) -> dt.datetime:
+    parsed = parse_tz_aware_time(value if isinstance(value, str) else None)
+    if parsed is None:
+        raise HarnessError(f"{label} must be a timezone-aware ISO-8601 timestamp")
+    return parsed
+
+
+def replay_resource_transitions(state: dict[str, Any]) -> ResourceTransitionReplay:
+    """Fail closed unless resource event lifecycle history replays exactly.
+
+    Event-list order is the append order of applies.  Rollbacks are represented
+    on their original events, so their absolute-time transitions are replayed
+    after building the complete transition set.  Every instant must be unique;
+    this makes both stack evolution and observations at boundaries unambiguous.
+    """
+
+    events = state.get("resource_config_events", [])
+    if not isinstance(events, list):
+        raise HarnessError("resource config events must be a list")
+
+    transitions: list[ResourceTransition] = []
+    seen_instants: dict[dt.datetime, str] = {}
+    previous_applied: dt.datetime | None = None
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise HarnessError(f"resource config event at index {index} must be an object")
+        event_id = str(event.get("event_id", f"index-{index}"))
+        applied_at = _resource_transition_time(
+            event.get("applied_at"),
+            label=f"resource config event {event_id} applied time",
+        )
+        if applied_at in seen_instants:
+            raise HarnessError(
+                f"resource transition instant is not unique: {event_id} applied"
+            )
+        if previous_applied is not None and applied_at <= previous_applied:
+            raise HarnessError(
+                "resource config apply transitions must follow event append order"
+            )
+        previous_applied = applied_at
+        seen_instants[applied_at] = f"{event_id} applied"
+        transitions.append(ResourceTransition(applied_at, event, "apply"))
+
+        status = event.get("status")
+        rollback = event.get("rollback")
+        if status == "applied":
+            if rollback is not None:
+                raise HarnessError(
+                    f"applied resource config event {event_id} carries rollback evidence"
+                )
+            continue
+        if status != "rolled_back" or not isinstance(rollback, dict):
+            raise HarnessError(f"resource config event {event_id} lifecycle is invalid")
+        rollback_at = _resource_transition_time(
+            rollback.get("recorded_at"),
+            label=f"resource config event {event_id} rollback time",
+        )
+        if rollback_at <= applied_at:
+            raise HarnessError(f"resource config event {event_id} rollback timeline is invalid")
+        if rollback_at in seen_instants:
+            raise HarnessError(
+                f"resource transition instant is not unique: {event_id} rollback"
+            )
+        seen_instants[rollback_at] = f"{event_id} rollback"
+        transitions.append(ResourceTransition(rollback_at, event, "rollback"))
+
+    ordered = tuple(sorted(transitions, key=lambda item: item.occurred_at))
+    stack: list[dict[str, Any]] = []
+    for transition in ordered:
+        event_id = str(transition.event.get("event_id", ""))
+        if transition.kind == "apply":
+            stack.append(transition.event)
+        elif not stack or stack[-1] is not transition.event:
+            raise HarnessError(
+                f"resource config rollback {event_id} does not pop the current stack top"
+            )
+        else:
+            stack.pop()
+    return ResourceTransitionReplay(
+        transitions=ordered,
+        current_event=stack[-1] if stack else None,
+    )
+
+
+def latest_resource_transition_at(state: dict[str, Any]) -> dt.datetime | None:
+    """Return the latest validated transition instant for a command writer."""
+
+    return replay_resource_transitions(state).latest_transition_at
+
+
+def current_applied_resource_event(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the effective current event from the apply/rollback stack."""
+
+    return replay_resource_transitions(state).current_event
+
+
+def applied_resource_event_at(
+    state: dict[str, Any], observed_at: str
+) -> dict[str, Any] | None:
+    """Return the resource event that was effective at one observed instant.
+
+    A current event can become effective again after a newer apply is rolled
+    back.  Fresh-session registration must bind the event that was effective at
+    startup, not merely the event that happens to be current at registration.
+    Equal timestamps are treated as ambiguous and therefore not ordered before
+    the observation.
+    """
+
+    observed = parse_tz_aware_time(observed_at)
+    if observed is None:
+        raise HarnessError("resource startup observation time is invalid")
+    replay = replay_resource_transitions(state)
+    stack: list[dict[str, Any]] = []
+    for transition in replay.transitions:
+        if transition.occurred_at == observed:
+            raise HarnessError(
+                "resource startup observation coincides with a resource transition"
+            )
+        if transition.occurred_at > observed:
+            break
+        if transition.kind == "apply":
+            stack.append(transition.event)
+        else:
+            # replay_resource_transitions already established this invariant.
+            stack.pop()
+    return stack[-1] if stack else None
+
+
+def load_bound_resource_receipt(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    """Load one exact managed receipt and cross-bind it to task and event."""
+
+    event_id = validate_id(str(event.get("event_id", "")), "resource config event id")
+    receipt_path = Path(str(event.get("receipt_path", "")))
+    expected_receipt_path = (
+        task_dir(paths, state["task_id"])
+        / "results"
+        / f"resource-config-{event_id}.json"
+    )
+    receipt_sha = str(event.get("receipt_sha256", ""))
+    if (
+        receipt_path != expected_receipt_path
+        or not receipt_path.is_file()
+        or receipt_path.is_symlink()
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha)
+        or sha256_file(receipt_path) != receipt_sha
+    ):
+        raise HarnessError(
+            f"resource config event {event_id} receipt identity is invalid"
+        )
+    receipt = load_json(receipt_path)
+    validate_resource_receipt(receipt)
+    receipt_plan = receipt["plan"]
+    if (
+        receipt.get("event_id") != event_id
+        or receipt.get("task_id") != state.get("task_id")
+        or receipt.get("plan_sha256") != event.get("plan_sha256")
+        or receipt_plan.get("approved_task_plan_sha256")
+        != event.get("task_plan_sha256")
+        or receipt.get("override_id", "") != event.get("override_id", "")
+        or receipt.get("root_session_id") != event.get("root_session_id")
+        or receipt.get("applied_at") != event.get("applied_at")
+        or receipt.get("restart_required") != event.get("restart_required")
+        or receipt_plan.get("restart_required") != event.get("restart_required")
+        or receipt_plan.get("config_applicability")
+        != event.get("config_applicability")
+        or receipt_plan.get("applicability_basis")
+        != event.get("applicability_basis")
+        or event.get("inapplicable_acknowledged")
+        is not (receipt_plan.get("config_applicability") == "not_applicable")
+        or receipt_plan.get("resolved") != event.get("resolved")
+        or receipt_plan.get("dynamic_envelope") != event.get("dynamic_envelope")
+        or event.get("execution_selection_id")
+        != receipt_plan.get("dynamic_envelope", {}).get("execution_selection_id", "")
+        or receipt_plan.get("required_locks") != event.get("required_locks")
+    ):
+        raise HarnessError(
+            f"resource config event {event_id} receipt binding is invalid"
+        )
+    return receipt
 
 
 def _lane_by_id(state: dict[str, Any], lane_id: str) -> dict[str, Any]:
@@ -744,7 +965,18 @@ def resource_config_integrity_errors(
 ) -> list[str]:
     errors: list[str] = []
     seen: set[str] = set()
-    for event in state.get("resource_config_events", []):
+    receipts: dict[str, dict[str, Any]] = {}
+    try:
+        replay = replay_resource_transitions(state)
+    except HarnessError as exc:
+        replay = None
+        errors.append(str(exc))
+    raw_events = state.get("resource_config_events", [])
+    events = raw_events if isinstance(raw_events, list) else []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            errors.append(f"resource config event at index {index} must be an object")
+            continue
         event_id = str(event.get("event_id", ""))
         try:
             validate_id(event_id, "resource config event id")
@@ -770,59 +1002,10 @@ def resource_config_integrity_errors(
             errors.append(
                 f"resource config event {event_id} task plan SHA-256 is invalid"
             )
-        receipt_path = Path(str(event.get("receipt_path", "")))
-        expected_receipt_path = (
-            task_dir(paths, state["task_id"])
-            / "results"
-            / f"resource-config-{event_id}.json"
-        )
-        receipt_sha = str(event.get("receipt_sha256", ""))
-        if (
-            receipt_path != expected_receipt_path
-            or not receipt_path.is_file()
-            or receipt_path.is_symlink()
-            or not re.fullmatch(r"[0-9a-f]{64}", receipt_sha)
-            or sha256_file(receipt_path) != receipt_sha
-        ):
-            errors.append(f"resource config event {event_id} receipt identity is invalid")
-        else:
-            try:
-                receipt = load_json(receipt_path)
-            except HarnessError as exc:
-                errors.append(
-                    f"resource config event {event_id} receipt is invalid: {exc}"
-                )
-            else:
-                try:
-                    validate_resource_receipt(receipt)
-                except HarnessError as exc:
-                    errors.append(
-                        f"resource config event {event_id} receipt is invalid: {exc}"
-                    )
-                else:
-                    receipt_plan = receipt["plan"]
-                    if (
-                        receipt.get("event_id") != event_id
-                        or receipt.get("task_id") != state.get("task_id")
-                        or receipt.get("plan_sha256") != event.get("plan_sha256")
-                        or receipt_plan.get("approved_task_plan_sha256")
-                        != event.get("task_plan_sha256")
-                        or receipt.get("override_id", "")
-                        != event.get("override_id", "")
-                        or receipt.get("root_session_id")
-                        != event.get("root_session_id")
-                        or receipt.get("applied_at") != event.get("applied_at")
-                        or receipt.get("restart_required")
-                        != event.get("restart_required")
-                        or receipt_plan.get("resolved") != event.get("resolved")
-                        or receipt_plan.get("dynamic_envelope")
-                        != event.get("dynamic_envelope")
-                        or receipt_plan.get("required_locks")
-                        != event.get("required_locks")
-                    ):
-                        errors.append(
-                            f"resource config event {event_id} receipt binding is invalid"
-                        )
+        try:
+            receipts[event_id] = load_bound_resource_receipt(paths, state, event)
+        except HarnessError as exc:
+            errors.append(str(exc))
         if event.get("override_id"):
             matches = [
                 item
@@ -848,12 +1031,20 @@ def resource_config_integrity_errors(
                 )
         rollback = event.get("rollback")
         if event.get("status") == "rolled_back":
+            applied_at = parse_time(str(event.get("applied_at", "")))
+            rollback_at = (
+                parse_time(str(rollback.get("recorded_at", "")))
+                if isinstance(rollback, dict)
+                else None
+            )
             if not isinstance(rollback, dict):
                 errors.append(f"resource config event {event_id} lacks rollback evidence")
             elif (
                 rollback.get("root_session_id") not in state.get("session_ids", [])
                 or not str(rollback.get("reason", "")).strip()
-                or parse_time(str(rollback.get("recorded_at", ""))) is None
+                or applied_at is None
+                or rollback_at is None
+                or rollback_at <= applied_at
             ):
                 errors.append(
                     f"resource config event {event_id} rollback evidence is invalid"
@@ -862,18 +1053,156 @@ def resource_config_integrity_errors(
             errors.append(
                 f"applied resource config event {event_id} carries rollback evidence"
             )
+
+    try:
+        worktree = validated_state_worktree(paths, state)
+    except HarnessError as exc:
+        worktree = None
+        errors.append(f"resource config task worktree is invalid: {exc}")
+
+    current = replay.current_event if replay is not None else None
+    if current is not None and worktree is not None:
+        current_id = str(current.get("event_id", ""))
+        current_receipt = receipts.get(current_id)
+        if current_receipt is not None:
+            try:
+                assert_resource_files_applied(root=worktree, receipt=current_receipt)
+            except HarnessError as exc:
+                errors.append(
+                    f"current applied resource event {current_id} files are invalid: {exc}"
+                )
+
+    registrations = state.get("resource_session_registrations", [])
+    if not isinstance(registrations, list):
+        errors.append("resource session registrations must be a list")
+        return errors
+    if len(registrations) > MAX_RESOURCE_SESSION_REGISTRATIONS:
+        errors.append("resource session registration count exceeds the bound")
+    registered_sessions: set[str] = set()
+    for raw_registration in registrations:
+        try:
+            registration = validate_session_registration(raw_registration)
+        except (RoutingAuthorityError, TypeError, ValueError) as exc:
+            errors.append(f"resource session registration is invalid: {exc}")
+            continue
+        session_id = registration["session_id"]
+        if session_id in registered_sessions:
+            errors.append(f"duplicate resource session registration for {session_id}")
+        registered_sessions.add(session_id)
+        try:
+            stored_startup = load_startup_receipt(paths, session_id)
+        except HarnessError as exc:
+            errors.append(
+                f"resource session registration {session_id} startup receipt store "
+                f"is invalid: {exc}"
+            )
+        else:
+            if stored_startup != registration["startup_receipt_snapshot"]:
+                errors.append(
+                    f"resource session registration {session_id} startup receipt "
+                    "store differs from its sealed snapshot"
+                )
+        if session_id not in state.get("session_ids", []):
+            errors.append(
+                f"resource session registration {session_id} lacks a task-bound root session"
+            )
+        event_id = registration["resource_config_event_id"]
+        matches = [
+            event
+            for event in events
+            if isinstance(event, dict) and event.get("event_id") == event_id
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"resource session registration {session_id} lacks one exact resource event"
+            )
+            continue
+        historical_applied = copy.deepcopy(matches[0])
+        if historical_applied.get("status") == "rolled_back":
+            rollback = historical_applied.get("rollback")
+            if not isinstance(rollback, dict):
+                errors.append(
+                    f"resource session registration {session_id} has malformed "
+                    "rollback history"
+                )
+                continue
+            rollback_at = parse_time(str(rollback.get("recorded_at", "")))
+            registered_at = parse_time(registration["registered_at"])
+            if (
+                rollback_at is None
+                or registered_at is None
+                or registered_at >= rollback_at
+            ):
+                errors.append(
+                    f"resource session registration {session_id} postdates rollback"
+                )
+            historical_applied["status"] = "applied"
+            historical_applied["rollback"] = None
+        if historical_applied != registration["resource_event_applied_snapshot"]:
+            errors.append(
+                f"resource session registration {session_id} event snapshot is invalid"
+            )
+        receipt = receipts.get(event_id)
+        if receipt is None:
+            continue
+        plan = receipt["plan"]
+        project_configs = [
+            item
+            for item in plan.get("files", [])
+            if item.get("relative_path") == ".codex/config.toml"
+        ]
+        try:
+            manifest_sha = resource_files_manifest_sha256(plan)
+            expected_startup_match = startup_resource_files_match(
+                registration["startup_receipt_snapshot"], plan
+            )
+        except RoutingAuthorityError as exc:
+            errors.append(
+                f"resource session registration {session_id} startup/file manifest "
+                f"binding is invalid: {exc}"
+            )
+            continue
+        if (
+            len(project_configs) != 1
+            or registration["task_id"] != state.get("task_id")
+            or registration["task_plan_sha256"]
+            != matches[0].get("task_plan_sha256")
+            or registration["resource_receipt_relative_path"]
+            != f"results/resource-config-{event_id}.json"
+            or registration["resource_receipt_sha256"]
+            != matches[0].get("receipt_sha256")
+            or registration["resource_plan_sha256"]
+            != matches[0].get("plan_sha256")
+            or registration["aoi_config_sha256"] != plan.get("aoi_config_sha256")
+            or registration["project_config_sha256"]
+            != project_configs[0].get("after_sha256")
+            or registration["resource_files_manifest_sha256"] != manifest_sha
+            or registration["startup_resource_files_match"]
+            != expected_startup_match
+            or worktree is None
+            or registration["task_worktree"] != str(worktree)
+        ):
+            errors.append(
+                f"resource session registration {session_id} resource binding is invalid"
+            )
     return errors
 
 
 
 __all__ = [
     "ResourceGovernancePolicy",
+    "ResourceTransition",
+    "ResourceTransitionReplay",
+    "applied_resource_event_at",
     "approved_override_settings",
     "build_execution_resource_envelope",
+    "current_applied_resource_event",
     "execution_selection_target_contract_from_record",
     "lane_authority_snapshot",
+    "latest_resource_transition_at",
     "override_by_id",
     "override_integrity_errors",
+    "replay_resource_transitions",
     "require_override_target_contract",
     "resource_config_integrity_errors",
     "resource_envelope_integrity_errors",

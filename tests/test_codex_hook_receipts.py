@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import sys
 from pathlib import Path
 
@@ -55,21 +56,60 @@ class CodexSessionStartReceiptTests(HarnessTestCase):
                 "cwd",
                 "project_root",
                 "aoi_config_sha256",
+                "observed_resource_files",
+                "observed_resource_files_sha256",
                 "startup_receipt_sha256",
             },
         )
-        self.assertEqual(stored["schema_version"], 1)
+        self.assertEqual(stored["schema_version"], 2)
         self.assertEqual(stored["hook_protocol_version"], 6)
         self.assertEqual(stored["session_id"], "codex-startup-receipt-1")
         self.assertEqual(stored["source"], "startup")
         self.assertEqual(stored["cwd"], str(self.root))
         self.assertEqual(stored["project_root"], str(self.root))
         self.assertEqual(stored["aoi_config_sha256"], h.get_paths(self.root).project.sha256)
+        self.assertEqual(stored["observed_resource_files"], [])
+        self.assertEqual(len(stored["observed_resource_files_sha256"]), 64)
         self.assertIsNotNone(dt.datetime.fromisoformat(stored["observed_at"]))
         for field in ("model", "permission_mode", "provider", "profile", "sandbox"):
             self.assertNotIn(field, stored)
         self.assertIn("No unambiguous task mapping", self.context(result))
         self.assertNotIn("Fresh-session registration is unavailable", self.context(result))
+
+    def test_startup_snapshots_exact_managed_resource_file_identities(self) -> None:
+        config = b"[agents]\nmax_threads = 4\nmax_depth = 2\n"
+        explorer = b'name = "explorer"\nmodel = "gpt-test"\n'
+        config_path = self.root / ".codex" / "config.toml"
+        agent_path = self.root / ".codex" / "agents" / "explorer.toml"
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_bytes(config)
+        agent_path.write_bytes(explorer)
+
+        self.hook(self.startup_payload())
+        stored = receipts.load_startup_receipt(
+            h.get_paths(self.root), "codex-startup-receipt-1"
+        )
+
+        self.assertEqual(
+            stored["observed_resource_files"],
+            [
+                {
+                    "relative_path": ".codex/agents/explorer.toml",
+                    "after_sha256": hashlib.sha256(explorer).hexdigest(),
+                },
+                {
+                    "relative_path": ".codex/config.toml",
+                    "after_sha256": hashlib.sha256(config).hexdigest(),
+                },
+            ],
+        )
+        config_path.write_bytes(config + b"# later drift\n")
+        self.assertEqual(
+            receipts.load_startup_receipt(
+                h.get_paths(self.root), "codex-startup-receipt-1"
+            ),
+            stored,
+        )
 
     def test_only_exact_startup_source_can_create_a_receipt_store(self) -> None:
         sources: list[object] = ["resume", "clear", "compact", None, 6, {"source": "startup"}]

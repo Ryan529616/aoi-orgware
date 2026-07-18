@@ -900,6 +900,8 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
             "context_provider_benchmarks": [],
             "override_requests": [],
             "resource_config_events": [],
+            "resource_session_registration_schema_version": 2,
+            "resource_session_registrations": [],
             "facts": [],
             "decisions": [],
             "rejected_paths": [],
@@ -1064,6 +1066,8 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths, *, services: T
             "context_provider_benchmarks": [],
             "override_requests": [],
             "resource_config_events": [],
+            "resource_session_registration_schema_version": 2,
+            "resource_session_registrations": [],
             "facts": [
                 "Mini lifecycle initialized, approved, bound, and claimed with "
                 "ordinary-exception rollback; process termination may require recovery."

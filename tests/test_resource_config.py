@@ -41,6 +41,53 @@ class ResourceConfigPrimitiveTests(unittest.TestCase):
             with mock.patch.object(rc.os, "read", side_effect=short_read):
                 self.assertEqual(rc._safe_read(path, "short-read fixture"), payload)
 
+    def test_safe_read_rejects_in_place_mutation_between_confirming_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.toml"
+            original = b"A" * (128 * 1024)
+            replacement = b"B" * len(original)
+            path.write_bytes(original)
+            metadata = path.stat()
+            real_lseek = os.lseek
+            mutated = False
+
+            def mutate_then_rewind(descriptor: int, offset: int, whence: int) -> int:
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    path.write_bytes(replacement)
+                    os.utime(
+                        path,
+                        ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+                    )
+                return real_lseek(descriptor, offset, whence)
+
+            with mock.patch.object(
+                rc.os, "lseek", side_effect=mutate_then_rewind
+            ), self.assertRaisesRegex(HarnessError, "changed while being read"):
+                rc._safe_read(path, "mutating fixture")
+
+    def test_safe_read_rejects_path_replacement_after_descriptor_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.toml"
+            replacement = Path(directory) / "replacement.toml"
+            path.write_bytes(b"old bytes\n")
+            replacement.write_bytes(b"new bytes\n")
+            real_close = os.close
+            replaced = False
+
+            def close_then_replace(descriptor: int) -> None:
+                nonlocal replaced
+                real_close(descriptor)
+                if not replaced:
+                    replaced = True
+                    os.replace(replacement, path)
+
+            with mock.patch.object(
+                rc.os, "close", side_effect=close_then_replace
+            ), self.assertRaisesRegex(HarnessError, "changed while being read"):
+                rc._safe_read(path, "replaced fixture")
+
     def test_apply_rollback_failure_has_a_distinct_recovery_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

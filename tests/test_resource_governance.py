@@ -17,7 +17,7 @@ sys.path.insert(0, str(SRC))
 
 from aoi_orgware import resource_governance as rg  # noqa: E402
 from aoi_orgware.commands.resource import register_resource_commands  # noqa: E402
-from aoi_orgware.harnesslib import HarnessError  # noqa: E402
+from aoi_orgware.harnesslib import HarnessError, get_paths  # noqa: E402
 from aoi_orgware.resource_config import (  # noqa: E402
     AOI_MAX_DELEGATION_DEPTH,
     ARISE_MAX_THREADS_CEILING,
@@ -106,6 +106,137 @@ class ResourceGovernancePolicyTests(unittest.TestCase):
             )
 
 
+def resource_event(
+    event_id: str,
+    applied_at: str,
+    *,
+    rollback_at: str | None = None,
+) -> dict[str, object]:
+    return {
+        "event_id": event_id,
+        "applied_at": applied_at,
+        "status": "rolled_back" if rollback_at is not None else "applied",
+        "rollback": (
+            {
+                "recorded_at": rollback_at,
+                "reason": "bounded regression rollback",
+                "root_session_id": "session",
+            }
+            if rollback_at is not None
+            else None
+        ),
+    }
+
+
+class ResourceTransitionReplayTests(unittest.TestCase):
+    def state(self, *events: dict[str, object]) -> dict[str, object]:
+        return {"resource_config_events": list(events)}
+
+    def test_replay_validates_nested_lifo_history_and_current_event(self) -> None:
+        state = self.state(
+            resource_event(
+                "a", "2026-07-18T00:00:01+00:00", rollback_at="2026-07-18T00:00:04+00:00"
+            ),
+            resource_event(
+                "b", "2026-07-18T00:00:02+00:00", rollback_at="2026-07-18T00:00:03+00:00"
+            ),
+        )
+
+        replay = rg.replay_resource_transitions(state)
+
+        self.assertIsNone(replay.current_event)
+        self.assertEqual(len(replay.transitions), 4)
+        self.assertEqual(
+            replay.latest_transition_at.isoformat(), "2026-07-18T00:00:04+00:00"
+        )
+        self.assertEqual(
+            rg.applied_resource_event_at(state, "2026-07-18T00:00:02.500000+00:00")["event_id"],
+            "b",
+        )
+        self.assertEqual(
+            rg.applied_resource_event_at(state, "2026-07-18T00:00:03.500000+00:00")["event_id"],
+            "a",
+        )
+        self.assertIsNone(
+            rg.applied_resource_event_at(state, "2026-07-18T00:00:04.500000+00:00")
+        )
+
+    def test_replay_rejects_reversed_apply_order(self) -> None:
+        state = self.state(
+            resource_event("a", "2026-07-18T00:00:02+00:00"),
+            resource_event("b", "2026-07-18T00:00:01+00:00"),
+        )
+
+        with self.assertRaisesRegex(HarnessError, "follow event append order"):
+            rg.replay_resource_transitions(state)
+
+    def test_replay_rejects_equal_absolute_transition_instants(self) -> None:
+        state = self.state(
+            resource_event("a", "2026-07-18T08:00:01+08:00"),
+            resource_event("b", "2026-07-18T00:00:01+00:00"),
+        )
+
+        with self.assertRaisesRegex(HarnessError, "not unique"):
+            rg.replay_resource_transitions(state)
+
+    def test_replay_rejects_naive_transition_time(self) -> None:
+        with self.assertRaisesRegex(HarnessError, "timezone-aware"):
+            rg.replay_resource_transitions(
+                self.state(resource_event("a", "2026-07-18T00:00:01"))
+            )
+
+    def test_replay_rejects_non_lifo_rollback(self) -> None:
+        state = self.state(
+            resource_event(
+                "a", "2026-07-18T00:00:01+00:00", rollback_at="2026-07-18T00:00:03+00:00"
+            ),
+            resource_event("b", "2026-07-18T00:00:02+00:00"),
+        )
+
+        with self.assertRaisesRegex(HarnessError, "current stack top"):
+            rg.replay_resource_transitions(state)
+
+    def test_observation_requires_a_strictly_between_transition_instant(self) -> None:
+        state = self.state(
+            resource_event(
+                "a", "2026-07-18T00:00:01+00:00", rollback_at="2026-07-18T00:00:03+00:00"
+            )
+        )
+
+        with self.assertRaisesRegex(HarnessError, "coincides with a resource transition"):
+            rg.applied_resource_event_at(state, "2026-07-18T00:00:01+00:00")
+        with self.assertRaisesRegex(HarnessError, "coincides with a resource transition"):
+            rg.applied_resource_event_at(state, "2026-07-18T00:00:03+00:00")
+        with self.assertRaisesRegex(HarnessError, "observation time is invalid"):
+            rg.applied_resource_event_at(state, "2026-07-18T00:00:02")
+
+    def test_integrity_errors_include_replay_failure(self) -> None:
+        state = self.state(resource_event("a", "2026-07-18T00:00:01"))
+        state.update({"task_id": "timeline-test", "session_ids": []})
+
+        errors = rg.resource_config_integrity_errors(
+            get_paths(REPO), state, policy=make_policy()
+        )
+
+        self.assertTrue(any("timezone-aware" in error for error in errors))
+
+    def test_integrity_errors_report_malformed_event_without_traceback(self) -> None:
+        state: dict[str, object] = {
+            "task_id": "timeline-test",
+            "session_ids": [],
+            "resource_config_events": [None],
+        }
+
+        errors = rg.resource_config_integrity_errors(
+            get_paths(REPO), state, policy=make_policy()
+        )
+
+        self.assertTrue(
+            any("event at index 0 must be an object" in error for error in errors),
+            errors,
+        )
+
+
 class ResourceCommandRegistryTests(unittest.TestCase):
     HANDLER_NAMES = {
         "override_request",
@@ -114,6 +245,8 @@ class ResourceCommandRegistryTests(unittest.TestCase):
         "codex_config_plan",
         "codex_config_apply",
         "codex_config_rollback",
+        "codex_session_register",
+        "codex_startup_receipt_show",
     }
 
     def parser(self) -> tuple[argparse.ArgumentParser, dict[str, object]]:

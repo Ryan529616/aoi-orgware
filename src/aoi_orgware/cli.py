@@ -157,6 +157,8 @@ from .commands.resource import (
     cmd_codex_config_apply,
     cmd_codex_config_plan,
     cmd_codex_config_rollback,
+    cmd_codex_session_register,
+    cmd_codex_startup_receipt_show,
     cmd_override_arbitrate,
     cmd_override_request,
     cmd_override_revoke,
@@ -622,6 +624,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "check-locks",
     "codebase-memory-benchmark-validate",
     "codex-config-plan",
+    "codex-startup-receipt-show",
     "inspect-legacy",
     "reconcile",
     "resume",
@@ -2193,6 +2196,7 @@ def _resource_cmd_services() -> ResourceCmdServices:
         require_root_session=require_root_session,
         approved_override_settings=approved_override_settings,
         validate_selection_resource_envelope=_validate_selection_resource_envelope,
+        resource_config_integrity_errors=resource_config_integrity_errors,
     )
 
 
@@ -6472,6 +6476,10 @@ def build_parser(
             "codex_config_rollback": functools.partial(
                 cmd_codex_config_rollback, services=resource_services
             ),
+            "codex_session_register": functools.partial(
+                cmd_codex_session_register, services=resource_services
+            ),
+            "codex_startup_receipt_show": cmd_codex_startup_receipt_show,
         },
         add_json_argument=add_json_argument,
     )
@@ -6816,13 +6824,18 @@ def _execute_project_command(
     with state_lock(paths, create_layout=False):
         paths = _reload_locked_paths(paths)
         session_id, epoch, token, _credential_path = _chief_credential(args, paths)
-        require_chief_authority(
+        chief_record = require_chief_authority(
             paths,
             session_id=session_id,
             epoch=epoch,
             token=token,
         )
         args._aoi_authority_ref = f"chief:{session_id}@{epoch}"
+        args._aoi_chief_authority = {
+            "session_id": chief_record["session_id"],
+            "epoch": chief_record["epoch"],
+            "authority_record_sha256": canonical_record_sha256(chief_record),
+        }
         _enforce_semantic_v2_stage1_boundary(args, paths)
         return int(args.handler(args, paths))
 

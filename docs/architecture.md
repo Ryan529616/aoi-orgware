@@ -132,6 +132,31 @@ Config apply requires claim coverage and the exact reviewed plan SHA. It writes
 a task-local receipt containing the full plan preimage before changing project
 files, applies each file with exact-state transition recovery, then publishes
 the event.
+A resource event is effective-current only when strict replay leaves it on top
+of the apply stack and its receipt/live after-bytes validate. Replay requires
+timezone-aware unique transition instants, apply transitions in event append
+order, and every rollback to pop the current stack top. Writers serialize up to
+five seconds of cross-process wall-clock jitter one microsecond after the latest
+causal resource/registration record; larger rollback fails before mutation.
+A startup-only Codex hook receipt is registered later by the same task-bound
+Chief session. Registration v2 seals the startup and applied-event snapshots,
+receipt/plan/config/profile-manifest hashes, task plan/worktree, and Chief
+session/epoch. Startup receipt schema v2 records managed project-file SHA-256
+identities under the state lock using two matching bounded reads plus stable
+descriptor/path metadata; registration requires every reviewed
+after-image in that observation and requires the event to remain
+effective-current at registration. Wall-clock comparison is not causal
+authority across Windows/WSL processes. Byte-identical events are deliberately
+indistinguishable at startup; current event/plan/Chief authority is selected at
+registration without claiming that startup followed that exact event. This
+establishes only `registered_byte_state_equivalent_only`; actual config loading,
+provider route, runtime profile, and sandbox remain unavailable without
+independent receipts. The stored Chief record hash is a command-time opaque
+attestation, not a reconstructable append-only history after lease renewal.
+These read checks are not an OS-atomic snapshot against a hostile same-account
+writer, which remains outside the cooperative state-lock guarantee. Historical
+schema-v1 receipts remain hash-validated but cannot satisfy v2 registration or
+be silently rewritten; they do not block unrelated v2 creation.
 A post-publication durability error retains the consistent event/files for
 doctor/reconcile instead of rolling back behind an already-published state.
 Explicit rollback preflights all unchanged applied bytes, restores the

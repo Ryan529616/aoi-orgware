@@ -189,14 +189,70 @@ approval, the ordinary plan/apply path recomputes and must exactly match it.
 Apply writes a task-local JSON receipt before changing project files. The
 receipt binds every before/after byte sequence, file hash, plan hash, root
 session, event, override, and the full reviewed plan preimage. After apply,
-start a fresh trusted Codex session
-and separately verify that its available agent types/configuration match the
-request. Do not report routing as verified merely because the files exist.
+start a fresh Codex session inside the task worktree. Do not report routing as
+verified merely because the files exist.
+
+## Fresh-session registration
+
+The startup hook stores a task-independent schema-v2 sealed receipt. Under the
+project state lock it records the SHA-256 identities of
+`.codex/config.toml` and managed `.codex/agents/*.toml` files. Inspect only its
+validated metadata and obtain the compare-and-register SHA without a Chief
+credential:
+
+```bash
+aoi codex-startup-receipt-show \
+  --session-id <fresh-session-id> \
+  --json
+```
+
+Bind that fresh session to the task and make the same session the active Chief
+before registering it. Use the startup SHA above and `receipt_sha256` returned
+by `codex-config-apply`:
+
+```bash
+aoi codex-session-register \
+  --task <task-id> \
+  --session-id <fresh-session-id> \
+  --event-id <event-id> \
+  --expected-startup-receipt-sha256 <startup-sha256> \
+  --expected-resource-receipt-sha256 <resource-receipt-sha256> \
+  --json
+```
+
+Each managed file is read twice and its descriptor and final pathname metadata
+must remain stable. This detects ordinary concurrent mutation/replacement, but
+is not an OS-atomic snapshot against a hostile same-account writer deliberately
+evading metadata and repeated-read checks. Such writers are outside the
+cooperative lock guarantee.
+
+Registration succeeds only when every reviewed plan after-image occurs in that
+sealed startup observation, the target event is still the unique
+effective-current apply, it matches the current approved task plan and exact
+receipt/applicability/selection authority, and all managed files still equal
+the receipt's after-bytes. Independent host/process timestamps are not used as
+causal proof. The complete existing registration ledger, strict apply/rollback
+replay, and persisted startup store must also validate. A same-epoch Chief
+renewal may replay the identical record; a different event, session, epoch,
+receipt, or historical authority is a conflict. Identical managed bytes from
+two different events are deliberately indistinguishable at startup; the
+selected event must be current at registration, but AOI does not claim startup
+occurred after that exact event. The result is only
+`registered_byte_state_equivalent_only`: the hook observed equivalent bytes,
+but it does not prove that Codex loaded them or that the provider honored the
+requested model/profile/sandbox.
+
+Schema-v1 startup receipts remain readable as hash-verified history so they do
+not poison the bounded store. They cannot satisfy v2 registration and are never
+silently upgraded; creating v2 for the same session id is an explicit conflict,
+while unrelated new v2 sessions continue normally.
 
 ## Rollback
 
-Rollback requires the same live task, Chief/root authority, claim coverage, and
-an unchanged receipt and unchanged applied file bytes:
+Rollback requires the same live task, Chief/root authority, claim coverage, an
+unchanged receipt and unchanged applied file bytes. The event must also be the
+unique effective-current apply; shadowed ancestors cannot be rolled back out of
+order even when their bytes happen to match:
 
 ```bash
 aoi codex-config-rollback \
@@ -213,7 +269,13 @@ mid-rollback write fails, AOI attempts to restore the exact applied state; if
 task-state publication fails after file rollback, AOI probes publication and,
 when the old applied state is still authoritative, reapplies the exact receipt
 bytes. Ambiguous or doubly failed recovery retains the receipt and fails
-closed.
+closed. After rolling back the latest apply, the newest remaining non-rollback
+apply becomes current and its exact after-bytes are revalidated. Apply and
+rollback writers share a strict timezone-aware replay: transition instants are
+unique, apply order follows the append ledger, and rollback is LIFO. Up to five
+seconds of cross-process clock jitter is serialized after the latest causal
+resource/registration record; a larger backward jump fails before any target
+file is changed.
 
 ## Claude model-tier dispatch gate
 

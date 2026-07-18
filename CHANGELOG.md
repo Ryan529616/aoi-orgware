@@ -8,6 +8,19 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 ## [Unreleased]
 
 ### Added
+- **Codex startup byte-state registration and strict resource timeline.**
+  Startup-only hook receipts now persist bounded managed project-file SHA-256
+  observations, with CurrentUser DPAPI storage on Windows and private-mode
+  validation on POSIX. A Chief-fenced registration binds that receipt to the
+  current reviewed resource plan, immutable applied-event snapshot, task plan,
+  worktree, and Chief epoch without claiming provider routing, config loading,
+  runtime profile, or sandbox facts. The resource lifecycle now replays a
+  strict timezone-aware LIFO apply/rollback timeline and serializes at most five
+  seconds of cross-process clock jitter. Registration explicitly proves only
+  `registered_byte_state_equivalent_only`: byte-identical events cannot be
+  ordered by filesystem evidence. Historical schema-v1 receipts remain
+  hash-validated but are never silently upgraded and do not block unrelated v2
+  startups.
 - **Claude claim-write gate (opt-in).** With `AOI_CLAUDE_CLAIM_WRITE_GATE=warn`
   or `deny`, the Claude `PreToolUse` hook checks `Write`/`Edit`/`MultiEdit`/
   `NotebookEdit` targets against the bound session's live `repo:file:`/

@@ -25,11 +25,13 @@ from aoi_orgware.routing_authority import (
     capacity_routing_view,
     codex_observation_event_id,
     outcome_sha256,
+    registration_identity_sha256,
     resource_files_manifest_sha256,
     seal_session_registration,
     seal_startup_receipt,
     validate_arm_authority,
     validate_dispatch_outcome,
+    validate_session_registration,
 )
 from aoi_orgware.semantic_events import canonical_json_bytes, canonical_sha256
 from tests.harness_case import HarnessTestCase
@@ -173,9 +175,19 @@ def registration_for(event: dict, plan: dict) -> dict:
         for item in plan["files"]
         if item["relative_path"] == ".codex/config.toml"
     )
+    startup_match = sorted(
+        [
+            {
+                "relative_path": item["relative_path"],
+                "after_sha256": item["after_sha256"],
+            }
+            for item in plan["files"]
+        ],
+        key=lambda item: item["relative_path"],
+    )
     startup = seal_startup_receipt(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "hook_protocol_version": 6,
             "session_id": "session-1",
             "source": "startup",
@@ -183,29 +195,47 @@ def registration_for(event: dict, plan: dict) -> dict:
             "cwd": "C:/work",
             "project_root": "C:/work",
             "aoi_config_sha256": plan["aoi_config_sha256"],
+            "observed_resource_files": startup_match,
+            "observed_resource_files_sha256": canonical_sha256(startup_match),
         }
     )
-    return seal_session_registration(
-        {
-            "registration_schema_version": 1,
+    registration = {
+        "registration_schema_version": 2,
+        "session_id": "session-1",
+        "task_id": "task-1",
+        "task_plan_sha256": event["task_plan_sha256"],
+        "startup_receipt_snapshot": startup,
+        "startup_receipt_sha256": startup["startup_receipt_sha256"],
+        "resource_config_event_id": event["event_id"],
+        "resource_event_applied_snapshot": event,
+        "resource_event_applied_sha256": canonical_sha256(event),
+        "resource_receipt_relative_path": (
+            f"results/resource-config-{event['event_id']}.json"
+        ),
+        "resource_receipt_sha256": event["receipt_sha256"],
+        "resource_plan_sha256": event["plan_sha256"],
+        "aoi_config_sha256": plan["aoi_config_sha256"],
+        "project_config_sha256": project_sha,
+        "resource_files_manifest_sha256": resource_files_manifest_sha256(plan),
+        "startup_resource_files_match": startup_match,
+        "task_worktree": "C:/work",
+        "config_ancestry_verified": True,
+        "resource_files_verified": True,
+        "startup_resource_state_equivalent": True,
+        "freshness_verdict": "registered_byte_state_equivalent_only",
+        "config_loaded_verified": "unavailable",
+        "registrar_chief_authority": {
             "session_id": "session-1",
-            "startup_receipt_snapshot": startup,
-            "startup_receipt_sha256": startup["startup_receipt_sha256"],
-            "resource_config_event_id": event["event_id"],
-            "resource_event_sha256": canonical_sha256(event),
-            "resource_receipt_sha256": event["receipt_sha256"],
-            "aoi_config_sha256": plan["aoi_config_sha256"],
-            "project_config_sha256": project_sha,
-            "resource_files_manifest_sha256": resource_files_manifest_sha256(plan),
-            "task_worktree": "C:/work",
-            "config_ancestry_verified": True,
-            "resource_files_verified": True,
-            "observed_after_apply": True,
-            "freshness_verdict": "registered_only",
-            "config_loaded_verified": "unavailable",
-            "registered_at": "2026-01-01T00:00:02Z",
-        }
+            "epoch": 1,
+            "authority_record_sha256": sha("9"),
+        },
+        "registration_identity_sha256": sha("0"),
+        "registered_at": "2026-01-01T00:00:02Z",
+    }
+    registration["registration_identity_sha256"] = registration_identity_sha256(
+        registration
     )
+    return seal_session_registration(registration)
 
 
 def root_arm(
@@ -250,7 +280,7 @@ def root_arm(
             "expires_at": "2026-01-01T00:10:03Z",
             "expected_agent_type": expected_agent_type,
         },
-        chief_authority={"session_id": "chief-1", "epoch": 1, "authority_sha256": sha("5")},
+        chief_authority={"session_id": "session-1", "epoch": 1, "authority_sha256": sha("5")},
         parent_authority=parent,
         resource_event_snapshot=event,
         resource_receipt=receipt,
@@ -333,7 +363,7 @@ def child_arm() -> dict:
             "expires_at": "2026-01-01T00:10:06Z",
             "expected_agent_type": "*",
         },
-        chief_authority={"session_id": "chief-1", "epoch": 1, "authority_sha256": sha("5")},
+        chief_authority={"session_id": "session-1", "epoch": 1, "authority_sha256": sha("5")},
         parent_authority=parent,
         resource_event_snapshot=event,
         resource_receipt=receipt,
@@ -364,6 +394,7 @@ def reseal_registration(arm: dict, key: str, value: str) -> dict:
         startup = seal_startup_receipt(startup_base)
         base["startup_receipt_snapshot"] = startup
         base["startup_receipt_sha256"] = startup["startup_receipt_sha256"]
+    base["registration_identity_sha256"] = registration_identity_sha256(base)
     registration = seal_session_registration(base)
     changed["session_registration"] = registration
     changed["parent_authority"]["root_registration_snapshot"] = registration
@@ -397,6 +428,45 @@ def test_real_receipt_profile_mapping_and_distinct_startup_hashes() -> None:
     assert registration["registration_sha256"] != registration["startup_receipt_sha256"]
     assert registration["aoi_config_sha256"] != registration["project_config_sha256"]
     assert "receipt" not in resource["receipt_authority"]
+
+
+def test_registration_v1_is_rejected_without_silent_upgrade() -> None:
+    event, _envelope, plan = real_resource()
+    legacy = registration_for(event, plan)
+    legacy = {
+        key: value for key, value in legacy.items() if key != "registration_sha256"
+    }
+    legacy["registration_schema_version"] = 1
+    with pytest.raises(RoutingAuthorityError, match="version is unsupported"):
+        seal_session_registration(legacy)
+    legacy["registration_sha256"] = canonical_sha256(legacy)
+    with pytest.raises(RoutingAuthorityError, match="version is unsupported"):
+        validate_session_registration(legacy)
+
+
+def test_arm_requires_current_registrar_chief_but_allows_same_epoch_renewal_hash() -> None:
+    arm = root_arm()
+    renewed = copy.deepcopy(arm)
+    renewed["chief_authority"]["authority_sha256"] = sha("f")
+    assert validate_arm_authority(renewed) == renewed
+    for field, value in (
+        ("session_id", "takeover-chief"),
+        ("epoch", 2),
+        ("epoch", 0),
+    ):
+        bad = copy.deepcopy(arm)
+        bad["chief_authority"][field] = value
+        with pytest.raises(RoutingAuthorityError, match="Chief|chief"):
+            validate_arm_authority(bad)
+
+
+def test_registration_must_strictly_predate_arm() -> None:
+    arm = root_arm()
+    arm["attempt_identity"]["armed_at"] = arm["session_registration"][
+        "registered_at"
+    ]
+    with pytest.raises(RoutingAuthorityError, match="postdates arm"):
+        validate_arm_authority(arm)
 
 
 def test_observation_event_id_matches_production_dispatch_policy() -> None:
@@ -510,7 +580,7 @@ def test_timeline_protocol_and_forged_authority_links_fail_closed() -> None:
             validate_arm_authority(bad)
     with pytest.raises(RoutingAuthorityError, match="AOI/Codex"):
         validate_arm_authority(reseal_registration(arm, "aoi_config_sha256", sha("8")))
-    with pytest.raises(RoutingAuthorityError, match="AOI/Codex"):
+    with pytest.raises(RoutingAuthorityError, match="startup authority"):
         validate_arm_authority(reseal_registration(arm, "project_config_sha256", sha("7")))
     for bad_observation in [
         observation(protocol="6"),
@@ -727,7 +797,7 @@ class RealPlannerRoutingIntegrationTests(HarnessTestCase):
         }
         startup = seal_startup_receipt(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "hook_protocol_version": 6,
                 "session_id": "fresh-session",
                 "source": "startup",
@@ -735,33 +805,63 @@ class RealPlannerRoutingIntegrationTests(HarnessTestCase):
                 "cwd": str(self.root),
                 "project_root": str(self.root),
                 "aoi_config_sha256": plan["aoi_config_sha256"],
-            }
-        )
-        registration = seal_session_registration(
-            {
-                "registration_schema_version": 1,
-                "session_id": "fresh-session",
-                "startup_receipt_snapshot": startup,
-                "startup_receipt_sha256": startup["startup_receipt_sha256"],
-                "resource_config_event_id": event["event_id"],
-                "resource_event_sha256": canonical_sha256(event),
-                "resource_receipt_sha256": receipt_sha,
-                "aoi_config_sha256": plan["aoi_config_sha256"],
-                "project_config_sha256": next(
-                    item["after_sha256"]
-                    for item in plan["files"]
-                    if item["relative_path"] == ".codex/config.toml"
+                "observed_resource_files": sorted(
+                    [
+                        {
+                            "relative_path": item["relative_path"],
+                            "after_sha256": item["after_sha256"],
+                        }
+                        for item in plan["files"]
+                    ],
+                    key=lambda item: item["relative_path"],
                 ),
-                "resource_files_manifest_sha256": resource_files_manifest_sha256(plan),
-                "task_worktree": str(self.root),
-                "config_ancestry_verified": True,
-                "resource_files_verified": True,
-                "observed_after_apply": True,
-                "freshness_verdict": "registered_only",
-                "config_loaded_verified": "unavailable",
-                "registered_at": "2026-01-01T00:00:02Z",
+                "observed_resource_files_sha256": resource_files_manifest_sha256(
+                    plan
+                ),
             }
         )
+        startup_match = startup["observed_resource_files"]
+        registration_base = {
+            "registration_schema_version": 2,
+            "session_id": "fresh-session",
+            "task_id": "real-planner-task",
+            "task_plan_sha256": event["task_plan_sha256"],
+            "startup_receipt_snapshot": startup,
+            "startup_receipt_sha256": startup["startup_receipt_sha256"],
+            "resource_config_event_id": event["event_id"],
+            "resource_event_applied_snapshot": event,
+            "resource_event_applied_sha256": canonical_sha256(event),
+            "resource_receipt_relative_path": (
+                "results/resource-config-real-planner-event.json"
+            ),
+            "resource_receipt_sha256": receipt_sha,
+            "resource_plan_sha256": event["plan_sha256"],
+            "aoi_config_sha256": plan["aoi_config_sha256"],
+            "project_config_sha256": next(
+                item["after_sha256"]
+                for item in plan["files"]
+                if item["relative_path"] == ".codex/config.toml"
+            ),
+            "resource_files_manifest_sha256": resource_files_manifest_sha256(plan),
+            "startup_resource_files_match": startup_match,
+            "task_worktree": str(self.root),
+            "config_ancestry_verified": True,
+            "resource_files_verified": True,
+            "startup_resource_state_equivalent": True,
+            "freshness_verdict": "registered_byte_state_equivalent_only",
+            "config_loaded_verified": "unavailable",
+            "registrar_chief_authority": {
+                "session_id": "fresh-session",
+                "epoch": 1,
+                "authority_record_sha256": sha("9"),
+            },
+            "registration_identity_sha256": sha("0"),
+            "registered_at": "2026-01-01T00:00:02Z",
+        }
+        registration_base["registration_identity_sha256"] = (
+            registration_identity_sha256(registration_base)
+        )
+        registration = seal_session_registration(registration_base)
         parent = {
             "session_id": "fresh-session",
             "mapping_kind": "root",

@@ -25,7 +25,7 @@ sys.path.insert(0, str(SRC))
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import session_receipts as receipts  # noqa: E402
 from aoi_orgware.routing_authority import RoutingAuthorityError, seal_startup_receipt  # noqa: E402
-from aoi_orgware.semantic_events import canonical_json_bytes  # noqa: E402
+from aoi_orgware.semantic_events import canonical_json_bytes, canonical_sha256  # noqa: E402
 from tests.harness_case import HarnessTestCase  # noqa: E402
 
 
@@ -36,7 +36,7 @@ class StartupReceiptStoreTests(HarnessTestCase):
 
     def receipt(self, **changes: object) -> dict[str, object]:
         value: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "hook_protocol_version": 6,
             "session_id": "session-receipt-1",
             "source": "startup",
@@ -44,8 +44,23 @@ class StartupReceiptStoreTests(HarnessTestCase):
             "cwd": str(self.root),
             "project_root": str(self.root),
             "aoi_config_sha256": self.paths.project.sha256,
+            "observed_resource_files": [],
+            "observed_resource_files_sha256": canonical_sha256([]),
         }
         value.update(changes)
+        return value
+
+    def legacy_receipt(self, **changes: object) -> dict[str, object]:
+        value = self.receipt(**changes)
+        value["schema_version"] = 1
+        value.pop("observed_resource_files")
+        value.pop("observed_resource_files_sha256")
+        return {**value, "startup_receipt_sha256": canonical_sha256(value)}
+
+    def unobserved_receipt(self, **changes: object) -> dict[str, object]:
+        value = self.receipt(**changes)
+        value.pop("observed_resource_files")
+        value.pop("observed_resource_files_sha256")
         return value
 
     def test_full_sha_path_and_canonical_storage_round_trip(self) -> None:
@@ -104,6 +119,56 @@ class StartupReceiptStoreTests(HarnessTestCase):
             with self.subTest(field=field), self.assertRaises(receipts.SessionReceiptError):
                 receipts.store_startup_receipt(self.paths, self.receipt(**{field: value}))
         self.assertEqual(receipts.load_startup_receipt(self.paths, "session-receipt-1"), original)
+
+    def test_legacy_v1_member_is_readable_without_poisoning_new_v2_creation(self) -> None:
+        legacy = self.legacy_receipt()
+        legacy_path = receipts.startup_receipt_path(self.paths, "session-receipt-1")
+        with h.state_lock(self.paths, create_layout=False):
+            receipts._ensure_receipt_directory(self.paths)
+            h.atomic_create_bytes(
+                legacy_path,
+                receipts._encode_storage_payload(legacy),
+            )
+
+        self.assertEqual(
+            receipts.load_startup_receipt(self.paths, "session-receipt-1"),
+            legacy,
+        )
+        legacy_raw = legacy_path.read_bytes()
+        current = receipts.store_startup_receipt(
+            self.paths,
+            self.receipt(session_id="session-receipt-2"),
+        )
+        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(
+            sorted(
+                item["schema_version"]
+                for item in receipts.scan_startup_receipts(self.paths)
+            ),
+            [1, 2],
+        )
+        with self.assertRaisesRegex(receipts.SessionReceiptError, "different schema"):
+            receipts.store_startup_receipt(self.paths, self.receipt())
+        self.assertEqual(legacy_path.read_bytes(), legacy_raw)
+
+    def test_persist_replay_loads_existing_before_snapshot_or_storage_encoding(self) -> None:
+        stored = receipts.store_startup_receipt(self.paths, self.receipt())
+        with mock.patch.object(
+            receipts,
+            "snapshot_managed_resource_files",
+            side_effect=AssertionError("snapshot must not run on replay"),
+        ) as snapshot, mock.patch.object(
+            receipts,
+            "_encode_storage_payload",
+            side_effect=AssertionError("storage encoding must not run on replay"),
+        ) as encode:
+            replay = receipts.persist_startup_receipt(
+                self.paths,
+                self.unobserved_receipt(observed_at="2026-07-18T00:05:00Z"),
+            )
+        self.assertEqual(replay, stored)
+        snapshot.assert_not_called()
+        encode.assert_not_called()
 
     def test_tamper_and_oversize_fail_closed(self) -> None:
         receipts.store_startup_receipt(self.paths, self.receipt())
