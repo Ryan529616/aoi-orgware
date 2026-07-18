@@ -94,6 +94,34 @@ class SemanticPersistenceTests(unittest.TestCase):
             )
         self.assertEqual(self.event_path().read_bytes(), before)
 
+    def test_public_event_chain_reader_is_complete_authenticated_and_detached(self) -> None:
+        self.initialize()
+        first = store.load_semantic_events(self.paths, TASK_ID)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(
+            first[0]["event_sha256"],
+            store.semantic_head(self.paths, TASK_ID)["event_sha256"],
+        )
+
+        first[0]["payload"]["snapshot"]["revision"] = 99
+        unchanged = store.load_semantic_events(self.paths, TASK_ID)
+        self.assertEqual(unchanged[0]["payload"]["snapshot"]["revision"], 1)
+
+        next_state = dict(self.state, revision=2)
+        appended = self.append(
+            self.paths,
+            TASK_ID,
+            next_state,
+            event_type="test_transition",
+            command_id="public-reader-transition",
+            recorded_at="2026-07-18T00:01:00+00:00",
+            authority_ref=AUTHORITY,
+            expected_head_sha256=unchanged[-1]["event_sha256"],
+        )
+        complete = store.load_semantic_events(self.paths, TASK_ID)
+        self.assertEqual([event["sequence"] for event in complete], [1, 2])
+        self.assertEqual(complete[-1]["event_sha256"], appended.event["event_sha256"])
+
     def test_empty_private_init_directory_is_recoverable_but_residue_is_not(self) -> None:
         event_directory = store.semantic_event_directory(self.paths, TASK_ID)
         event_directory.mkdir(parents=True)

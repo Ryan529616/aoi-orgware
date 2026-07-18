@@ -310,6 +310,18 @@ def semantic_head(paths: h.HarnessPaths, task_id: str) -> dict[str, Any]:
     }
 
 
+def load_semantic_events(paths: h.HarnessPaths, task_id: str) -> list[dict[str, Any]]:
+    """Return the complete authenticated ledger as detached in-memory records.
+
+    This is the public integration boundary for lifecycle writers that need to
+    prepare an exact content-binding transaction.  The records are decoded
+    afresh from canonical storage and fully replay-validated before return;
+    mutating the returned list cannot mutate the persisted ledger.
+    """
+
+    return _read_ledger(paths, task_id)
+
+
 def preflight_semantic_append(
     paths: h.HarnessPaths,
     task_id: str,
