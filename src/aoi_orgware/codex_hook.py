@@ -21,6 +21,9 @@ SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HOOK_INPUT_MAX_BYTES = 64 * 1024
 ROOT_SESSION_MAPPING_KIND = "root"
 SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
+STARTUP_RECEIPT_WARNING = (
+    "Fresh-session registration is unavailable until a valid startup. "
+)
 
 
 def root_path() -> Path:
@@ -42,6 +45,13 @@ def write_output(value: dict[str, Any]) -> None:
 
 def allow() -> None:
     write_output({"continue": True})
+
+
+def exact_payload_string(payload: dict[str, Any], key: str) -> str:
+    """Return an exact JSON string without coercing another type into authority."""
+
+    value = payload.get(key)
+    return value if type(value) is str else ""
 
 
 def session_state(
@@ -104,8 +114,10 @@ def session_state(
 
 
 def session_start(root: Path, payload: dict[str, Any]) -> None:
-    session_id = str(payload.get("session_id", ""))
-    source = str(payload.get("source", "startup"))
+    raw_session_id = payload.get("session_id")
+    session_id = exact_payload_string(payload, "session_id")
+    raw_source = payload.get("source")
+    source = exact_payload_string(payload, "source")
     mapping_status, mapped = session_state(root, session_id)
     paths = get_paths(root)
     base = (
@@ -189,6 +201,39 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
                 + "aoi bind-session --task "
                 + f"<task-id> --session-id {display_id}. "
             )
+    # The Codex SessionStart command input has no trustworthy event timestamp.
+    # Persist only an exact startup input and create the timestamp locally.  This
+    # remains deliberately independent of task/session mapping state: receipt
+    # persistence is merely the fresh-session evidence later consumed by Chief
+    # registration, never a claim that any model or runtime profile was loaded.
+    if type(raw_source) is str and raw_source == "startup":
+        try:
+            raw_cwd = payload.get("cwd")
+            if type(raw_session_id) is not str or type(raw_cwd) is not str:
+                raise ValueError("startup receipt input is incomplete")
+            # Keep the receipt store optional and startup-only.  A failure here
+            # must not change the established fail-open SessionStart context.
+            from .harnesslib import now_iso
+            from .session_receipts import persist_startup_receipt
+
+            persist_startup_receipt(
+                paths,
+                {
+                    "schema_version": 1,
+                    "hook_protocol_version": 6,
+                    "session_id": raw_session_id,
+                    "source": raw_source,
+                    "observed_at": now_iso(),
+                    "cwd": raw_cwd,
+                    "project_root": str(paths.root),
+                    "aoi_config_sha256": paths.project.sha256,
+                },
+            )
+        except Exception:
+            # Do not reveal filesystem/configuration details through a hook
+            # response.  The fixed warning is intentionally bounded and lets
+            # the normal SessionStart context remain useful.
+            context += STARTUP_RECEIPT_WARNING
     write_output(
         {
             "hookSpecificOutput": {
@@ -282,7 +327,7 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
 
 
 def user_prompt_submit(root: Path, payload: dict[str, Any]) -> None:
-    session_id = str(payload.get("session_id", ""))
+    session_id = exact_payload_string(payload, "session_id")
     mapping_status, mapped = session_state(root, session_id)
     base = (
         "AOI per-turn check: substantial implementation/document/evidence "
@@ -348,7 +393,7 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
     if payload.get("stop_hook_active") is True:
         allow()
         return
-    session_id = str(payload.get("session_id", ""))
+    session_id = exact_payload_string(payload, "session_id")
     mapping_status, mapped = session_state(root, session_id)
     if mapping_status == "subagent_parent":
         allow()
