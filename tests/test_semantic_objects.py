@@ -123,6 +123,21 @@ class SemanticObjectTests(unittest.TestCase):
         self.assertEqual(report["objects"][0]["payload"], {"rows": [1, 2]})
         self.assertEqual(report["orphan_object_sha256s"], [first["object_sha256"]])
 
+    def test_transition_permit_is_a_registered_bounded_small_object(self) -> None:
+        self.assertIn("transition_permit", objects.OBJECT_TYPES)
+        self.assertIn("transition_permit", objects.SMALL_OBJECT_TYPES)
+        candidate = self.object(
+            "a" * 64,
+            {"permit_sha256": "a" * 64},
+            "transition_permit",
+        )
+        stored = objects.publish_semantic_object(self.paths, candidate)
+        self.assertEqual(stored, candidate)
+
+        with mock.patch.object(objects, "MAX_SMALL_OBJECT_BYTES", 100):
+            with self.assertRaises(objects.SemanticObjectError):
+                self.object("b" * 64, "x" * 200, "transition_permit")
+
     def test_exact_binding_retry_and_divergent_same_key_fails(self) -> None:
         item = self.publish_object("route-1", {"answer": 7})
         first = objects.publish_semantic_binding(

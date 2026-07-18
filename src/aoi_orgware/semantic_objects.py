@@ -42,13 +42,14 @@ OBJECT_TYPES = frozenset(
         "routing_outcome",
         "routing_terminal",
         "transition_decision",
+        "transition_permit",
         "cohort_plan",
         "release_manifest",
         "promotion_receipt",
     }
 )
 SMALL_OBJECT_TYPES = frozenset(
-    {"routing_terminal", "transition_decision", "cohort_plan"}
+    {"routing_terminal", "transition_decision", "transition_permit", "cohort_plan"}
 )
 BINDING_KINDS = frozenset(
     {

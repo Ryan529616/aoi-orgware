@@ -6,10 +6,15 @@ from datetime import datetime, timezone
 import pytest
 
 from aoi_orgware.transition_permits import (
+    DECISION_SCHEMA_VERSION,
     TransitionPermitError,
     permit_consumption_identity,
     permit_replay_marker,
+    seal_transition_decision,
     seal_transition_permit,
+    transition_decision_sha256,
+    validate_decision_permit_pair,
+    validate_transition_decision,
     transition_permit_sha256,
     validate_transition_consumption,
     validate_transition_permit,
@@ -48,6 +53,27 @@ def sealed(**changes: object) -> dict[str, object]:
     return seal_transition_permit(permit_base(**changes))
 
 
+def decision_base(**changes: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema_version": DECISION_SCHEMA_VERSION,
+        "task_id": "task-1",
+        "action": "packet.arm",
+        "target_ids": ["packet-1"],
+        "parameters": {
+            "packet_id": "packet-1",
+            "packet_schema_version": 6,
+            "routing_authority_sha256": SHA_C,
+        },
+        "technical_payload_sha256": SHA_D,
+    }
+    value.update(changes)
+    return value
+
+
+def sealed_decision(**changes: object) -> dict[str, object]:
+    return seal_transition_decision(decision_base(**changes))
+
+
 def consume(permit: dict[str, object], **changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "task_id": "task-1",
@@ -74,6 +100,135 @@ def test_seal_is_deterministic_and_uses_canonical_hash() -> None:
     assert first == second
     assert first["permit_sha256"] == transition_permit_sha256(permit_base())
     assert validate_transition_permit(first) == first
+
+
+def test_decision_seal_is_deterministic_and_uses_canonical_hash() -> None:
+    first = sealed_decision(
+        parameters={
+            "routing_authority_sha256": SHA_C,
+            "packet_id": "packet-1",
+            "packet_schema_version": 6,
+        }
+    )
+    second = sealed_decision(
+        parameters={
+            "packet_schema_version": 6,
+            "packet_id": "packet-1",
+            "routing_authority_sha256": SHA_C,
+        }
+    )
+
+    assert first == second
+    assert first["decision_sha256"] == transition_decision_sha256(decision_base())
+    assert validate_transition_decision(first) == first
+
+
+@pytest.mark.parametrize(
+    ("builder", "validate", "field", "value"),
+    (
+        (
+            sealed_decision,
+            validate_transition_decision,
+            "schema_version",
+            1.0,
+        ),
+        (
+            sealed,
+            validate_transition_permit,
+            "schema_version",
+            1.0,
+        ),
+        (
+            sealed_decision,
+            validate_transition_decision,
+            "parameters",
+            {"packet_id": "packet-1", "packet_schema_version": 6.0, "routing_authority_sha256": SHA_C},
+        ),
+        (
+            sealed,
+            validate_transition_permit,
+            "parameters",
+            {"packet_id": "packet-1", "packet_schema_version": 6.0, "routing_authority_sha256": SHA_C},
+        ),
+    ),
+)
+def test_numeric_fields_reject_equal_floating_point_values_at_seal_and_validate(
+    builder: object,
+    validate: object,
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(TransitionPermitError, match="schema_version|packet_schema_version"):
+        builder(**{field: value})  # type: ignore[operator]
+
+    malformed = builder()  # type: ignore[operator]
+    malformed[field] = value  # type: ignore[index]
+    with pytest.raises(TransitionPermitError, match="schema_version|packet_schema_version"):
+        validate(malformed)  # type: ignore[operator]
+
+
+def test_decision_tamper_and_schema_widening_fail_closed() -> None:
+    decision = sealed_decision()
+    tampered = copy.deepcopy(decision)
+    tampered["technical_payload_sha256"] = SHA_A
+    with pytest.raises(TransitionPermitError, match="decision_sha256"):
+        validate_transition_decision(tampered)
+
+    for widened in (
+        {**decision_base(), "technical_payload": "Bearer reusable-token"},
+        {**decision_base(), "receipt_path": r"credentials\\chief.json"},
+        {**decision_base(), "technical_payload_sha256": "-----BEGIN PRIVATE KEY-----"},
+    ):
+        with pytest.raises(TransitionPermitError, match="schema|lowercase SHA-256"):
+            seal_transition_decision(widened)
+
+
+def test_decision_permit_pair_requires_exact_same_decision_boundary() -> None:
+    decision = sealed_decision()
+    permit = sealed(decision_sha256=decision["decision_sha256"])
+    paired = validate_decision_permit_pair(decision, permit)
+    assert paired == {"decision": decision, "permit": permit}
+
+    cohort_decision = sealed_decision(
+        action="cohort.advance",
+        target_ids=["cohort-1"],
+        parameters={
+            "cohort_id": "cohort-1",
+            "cohort_sha256": SHA_D,
+            "wave_index": 2,
+        },
+    )
+    cohort_permit = sealed(
+        decision_sha256=cohort_decision["decision_sha256"],
+        action="cohort.advance",
+        target_ids=["cohort-1"],
+        parameters={
+            "cohort_id": "cohort-1",
+            "cohort_sha256": SHA_D,
+            "wave_index": 2,
+        },
+    )
+    assert validate_decision_permit_pair(cohort_decision, cohort_permit) == {
+        "decision": cohort_decision,
+        "permit": cohort_permit,
+    }
+
+    with pytest.raises(TransitionPermitError, match="permit action"):
+        validate_decision_permit_pair(
+            decision,
+            sealed(
+                decision_sha256=decision["decision_sha256"],
+                action="cohort.advance",
+                target_ids=["cohort-1"],
+                parameters={
+                    "cohort_id": "cohort-1",
+                    "cohort_sha256": SHA_D,
+                    "wave_index": 2,
+                },
+            ),
+        )
+    with pytest.raises(TransitionPermitError, match="permit decision_sha256"):
+        validate_decision_permit_pair(decision, sealed())
 
 
 def test_sealed_tamper_and_malformed_schema_fail_closed() -> None:

@@ -17,6 +17,7 @@ from typing import Any
 from .semantic_events import SemanticEventError, canonical_sha256
 
 
+DECISION_SCHEMA_VERSION = 1
 PERMIT_SCHEMA_VERSION = 1
 MAX_PERMIT_BYTES = 64 * 1024
 
@@ -34,6 +35,15 @@ _PACKET_ARM_PARAMETER_FIELDS = {
 }
 _COHORT_ADVANCE_PARAMETER_FIELDS = {"cohort_id", "cohort_sha256", "wave_index"}
 _MAX_WAVE_INDEX = 1_000_000
+_DECISION_BASE_FIELDS = {
+    "schema_version",
+    "task_id",
+    "action",
+    "target_ids",
+    "parameters",
+    "technical_payload_sha256",
+}
+_SEALED_DECISION_FIELDS = _DECISION_BASE_FIELDS | {"decision_sha256"}
 _BASE_FIELDS = {
     "schema_version",
     "task_id",
@@ -117,6 +127,12 @@ def _bounded_int(value: Any, label: str, *, maximum: int) -> int:
     return value
 
 
+def _exact_int(value: Any, label: str, *, expected: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+        _fail(f"{label} is invalid")
+    return expected
+
+
 def _parameters(action: str, value: Any, target_ids: list[str]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         _fail("parameters must be an object")
@@ -151,9 +167,11 @@ def _parameters(action: str, value: Any, target_ids: list[str]) -> dict[str, Any
 
 
 def _exact_packet_schema_version(value: Any) -> int:
-    if value != 6 or isinstance(value, bool):
-        _fail("parameters.packet_schema_version is invalid")
-    return 6
+    return _exact_int(
+        value,
+        "parameters.packet_schema_version",
+        expected=6,
+    )
 
 
 def _chief_authority(value: Any) -> dict[str, Any]:
@@ -167,10 +185,66 @@ def _chief_authority(value: Any) -> dict[str, Any]:
     }
 
 
+def _decision_base(value: Any) -> dict[str, Any]:
+    item = _object(value, _DECISION_BASE_FIELDS, "decision")
+    _exact_int(
+        item["schema_version"],
+        "decision schema_version",
+        expected=DECISION_SCHEMA_VERSION,
+    )
+    action = _action(item["action"])
+    target_ids = _target_ids(item["target_ids"])
+    return {
+        "schema_version": DECISION_SCHEMA_VERSION,
+        "task_id": _lifecycle_id(item["task_id"], "task_id"),
+        "action": action,
+        "target_ids": target_ids,
+        "parameters": _parameters(action, item["parameters"], target_ids),
+        "technical_payload_sha256": _sha256(
+            item["technical_payload_sha256"], "technical_payload_sha256"
+        ),
+    }
+
+
+def transition_decision_sha256(decision: Mapping[str, Any]) -> str:
+    """Return the canonical hash of an unsealed, exact decision base record."""
+
+    base = _decision_base(decision)
+    try:
+        return canonical_sha256(base, max_bytes=MAX_PERMIT_BYTES)
+    except SemanticEventError as exc:
+        raise TransitionPermitError(str(exc)) from exc
+
+
+def seal_transition_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and append the deterministic decision SHA-256."""
+
+    base = _decision_base(decision)
+    try:
+        base["decision_sha256"] = canonical_sha256(base, max_bytes=MAX_PERMIT_BYTES)
+    except SemanticEventError as exc:
+        raise TransitionPermitError(str(exc)) from exc
+    return base
+
+
+def validate_transition_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a sealed decision and return a detached canonical copy."""
+
+    item = _object(decision, _SEALED_DECISION_FIELDS, "decision")
+    base = _decision_base({key: item[key] for key in _DECISION_BASE_FIELDS})
+    expected = transition_decision_sha256(base)
+    if item["decision_sha256"] != expected:
+        _fail("decision_sha256 does not match decision")
+    return {**base, "decision_sha256": expected}
+
+
 def _permit_base(value: Any) -> dict[str, Any]:
     item = _object(value, _BASE_FIELDS, "permit")
-    if item["schema_version"] != PERMIT_SCHEMA_VERSION or isinstance(item["schema_version"], bool):
-        _fail("permit schema_version is invalid")
+    _exact_int(
+        item["schema_version"],
+        "permit schema_version",
+        expected=PERMIT_SCHEMA_VERSION,
+    )
     action = _action(item["action"])
     target_ids = _target_ids(item["target_ids"])
     return {
@@ -219,6 +293,21 @@ def validate_transition_permit(permit: Mapping[str, Any]) -> dict[str, Any]:
     if item["permit_sha256"] != expected:
         _fail("permit_sha256 does not match permit")
     return {**base, "permit_sha256": expected}
+
+
+def validate_decision_permit_pair(
+    decision: Mapping[str, Any], permit: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Fail closed unless a sealed permit authorizes this exact decision."""
+
+    validated_decision = validate_transition_decision(decision)
+    validated_permit = validate_transition_permit(permit)
+    for field in ("task_id", "action", "target_ids", "parameters"):
+        if validated_permit[field] != validated_decision[field]:
+            _fail(f"permit {field} does not match decision")
+    if validated_permit["decision_sha256"] != validated_decision["decision_sha256"]:
+        _fail("permit decision_sha256 does not match decision")
+    return {"decision": validated_decision, "permit": validated_permit}
 
 
 def permit_replay_marker(permit: Mapping[str, Any]) -> str:
