@@ -21,6 +21,7 @@ from aoi_orgware import routing_persistence as routing  # noqa: E402
 from aoi_orgware import semantic_events as semantic  # noqa: E402
 from aoi_orgware import semantic_objects as objects  # noqa: E402
 from aoi_orgware import semantic_store as store  # noqa: E402
+from aoi_orgware import transition_permits as permits  # noqa: E402
 from aoi_orgware.config import default_config_text  # noqa: E402
 from tests.test_routing_authority import observation, root_arm  # noqa: E402
 
@@ -134,6 +135,125 @@ class RoutingPersistenceTests(unittest.TestCase):
         for wrapped in transaction["objects"]:
             objects.publish_semantic_object(self.paths, wrapped)
 
+    def permit_composite(
+        self,
+        *,
+        action: str = "packet.arm",
+        contract_task_id: str = TASK,
+        contract_packet_id: str = "packet-route",
+        event_type: str = "permitted_packet_arm",
+    ) -> dict[str, object]:
+        effect = routing.prepare_authority_effect(
+            task_id=TASK, event_chain=self.events, arm=self.arm
+        )
+        head = self.events[-1]["event_sha256"]
+        authority_sha = authority.authority_sha256(self.arm)
+        decision = permits.seal_transition_decision(
+            {
+                "schema_version": 1,
+                "task_id": contract_task_id,
+                "action": action,
+                "target_ids": [contract_packet_id] if action == "packet.arm" else ["cohort-1"],
+                "parameters": (
+                    {
+                        "packet_id": contract_packet_id,
+                        "packet_schema_version": 6,
+                        "routing_authority_sha256": authority_sha,
+                    }
+                    if action == "packet.arm"
+                    else {"cohort_id": "cohort-1", "cohort_sha256": "a" * 64, "wave_index": 0}
+                ),
+                "technical_payload_sha256": "b" * 64,
+            }
+        )
+        permit = permits.seal_transition_permit(
+            {
+                "schema_version": 1,
+                "task_id": contract_task_id,
+                "expected_semantic_head_sha256": head,
+                "decision_sha256": decision["decision_sha256"],
+                "action": decision["action"],
+                "target_ids": decision["target_ids"],
+                "parameters": decision["parameters"],
+                "expires_at": "2027-01-01T00:00:00Z",
+                "nonce": "permit-nonce-0001",
+                "chief_authority": {"session_id": "chief-1", "epoch": 1},
+            }
+        )
+        wrapped_decision = objects.create_semantic_object(
+            object_type="transition_decision",
+            task_id=TASK,
+            object_identity=decision["decision_sha256"],
+            payload=decision,
+        )
+        wrapped_permit = objects.create_semantic_object(
+            object_type="transition_permit",
+            task_id=TASK,
+            object_identity=permit["permit_sha256"],
+            payload=permit,
+        )
+        planned = semantic.create_transition_event(
+            self.events[-1],
+            semantic.replay_events(self.events),
+            effect["result_state"],
+            event_type=event_type,
+            **self.next_metadata("permit"),
+        )
+        binding = objects.create_semantic_binding(
+            binding_kind="permit_consumption",
+            task_id=TASK,
+            binding_key=permits.permit_consumption_identity(permit),
+            expected_semantic_head_sha256=head,
+            planned_event_sha256=planned["event_sha256"],
+            result_projection_sha256=planned["result_projection_sha256"],
+            object_sha256s=sorted(
+                row["object_sha256"]
+                for row in (wrapped_decision, wrapped_permit, effect["routing_authority"])
+            ),
+        )
+        return {
+            "effect": effect,
+            "decision": wrapped_decision,
+            "permit": wrapped_permit,
+            "event": planned,
+            "binding": binding,
+        }
+
+    def publish_permit_composite(self, composite: dict[str, object]) -> None:
+        for key in ("decision", "permit"):
+            objects.publish_semantic_object(self.paths, composite[key])
+        objects.publish_semantic_object(self.paths, composite["effect"]["routing_authority"])
+        objects.publish_semantic_binding(self.paths, composite["binding"], self.events)
+
+    def composite_report(self, composite: dict[str, object]) -> dict[str, object]:
+        return {
+            "task_id": TASK,
+            "objects": [
+                {**composite["decision"], "classification": "referenced", "binding_sha256s": []},
+                {**composite["permit"], "classification": "referenced", "binding_sha256s": []},
+                {
+                    **composite["effect"]["routing_authority"],
+                    "classification": "referenced",
+                    "binding_sha256s": [],
+                },
+            ],
+            "bindings": [{**composite["binding"], "classification": "pending"}],
+        }
+
+    def append_permit_composite(self, composite: dict[str, object]) -> None:
+        event = composite["event"]
+        appended = store.append_semantic_transition(
+            self.paths,
+            TASK,
+            composite["effect"]["result_state"],
+            event_type=semantic.command_semantics(event)["event_type"],
+            command_id=event["command_id"],
+            recorded_at=event["recorded_at"],
+            authority_ref=event["authority_ref"],
+            expected_head_sha256=self.events[-1]["event_sha256"],
+        )
+        self.events.append(appended.event)
+
     def test_slot_formula_and_projection_are_compact_digest_only(self) -> None:
         transaction = self.prepare_authority()
         expected_slot = semantic.canonical_sha256(
@@ -157,6 +277,203 @@ class RoutingPersistenceTests(unittest.TestCase):
         self.assertNotIn("attempt_identity", projection_text)
         self.assertNotIn("dispatch_provenance", projection_text)
         self.assertNotIn("binding_sha256", projection_text)
+
+    def test_prepare_authority_effect_is_pure_and_matches_direct_authority(self) -> None:
+        effect = routing.prepare_authority_effect(
+            task_id=TASK, event_chain=self.events, arm=self.arm
+        )
+        direct = self.prepare_authority()
+        self.assertEqual(effect["routing_authority_object"], effect["routing_authority"])
+        self.assertEqual(effect["routing_entry"], effect["authority_entry"])
+        self.assertEqual(effect["routing_authority"], direct["objects"][0])
+        self.assertEqual(effect["result_state"], direct["result_state"])
+        slot = routing.routing_outcome_slot_sha256(self.arm)
+        self.assertEqual(
+            effect["authority_entry"],
+            routing.routing_namespace_from_projection(effect["result_state"])["entries"][slot],
+        )
+
+    def test_permit_composite_pending_committed_and_exact_retry(self) -> None:
+        composite = self.permit_composite()
+        self.publish_permit_composite(composite)
+        pending = routing.inspect_routing_persistence(self.paths, TASK, self.events)
+        self.assertEqual(
+            [(row["stage"], row["classification"]) for row in pending["groups"]],
+            [("authority", "pending")],
+        )
+        self.assertEqual(
+            pending["routing_binding_sha256s"], [composite["binding"]["binding_sha256"]]
+        )
+        self.assertEqual(
+            objects.publish_semantic_binding(self.paths, composite["binding"], self.events),
+            composite["binding"],
+        )
+        appended = store.append_semantic_transition(
+            self.paths,
+            TASK,
+            composite["effect"]["result_state"],
+            event_type="permitted_packet_arm",
+            command_id=composite["event"]["command_id"],
+            recorded_at=composite["event"]["recorded_at"],
+            authority_ref=composite["event"]["authority_ref"],
+            expected_head_sha256=self.events[-1]["event_sha256"],
+        )
+        self.events.append(appended.event)
+        committed = routing.inspect_routing_persistence(self.paths, TASK, self.events)
+        self.assertEqual(
+            [(row["stage"], row["classification"]) for row in committed["groups"]],
+            [("authority", "committed")],
+        )
+
+    def test_permit_composite_rejects_wrong_refs_key_pair_action_and_nonrouting_reference(self) -> None:
+        composite = self.permit_composite()
+        self.publish_permit_composite(composite)
+        def replacement_binding(rows: list[dict[str, object]], key: str) -> dict[str, object]:
+            return objects.create_semantic_binding(
+                binding_kind="permit_consumption",
+                task_id=TASK,
+                binding_key=key,
+                expected_semantic_head_sha256=composite["binding"]["expected_semantic_head_sha256"],
+                planned_event_sha256=composite["binding"]["planned_event_sha256"],
+                result_projection_sha256=composite["binding"]["result_projection_sha256"],
+                object_sha256s=sorted(row["object_sha256"] for row in rows),
+            )
+
+        bad_key = copy.deepcopy(composite)
+        bad_key["binding"] = replacement_binding(
+            [bad_key["decision"], bad_key["permit"], bad_key["effect"]["routing_authority"]],
+            "f" * 64,
+        )
+        with mock.patch.object(objects, "inspect_semantic_objects", return_value=self.composite_report(bad_key)):
+            with self.assertRaisesRegex(h.HarnessError, "binding key"):
+                routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+        bad_refs = copy.deepcopy(composite)
+        bad_refs["binding"] = replacement_binding(
+            [bad_refs["decision"], bad_refs["permit"]],
+            permits.permit_consumption_identity(bad_refs["permit"]["payload"]),
+        )
+        report = self.composite_report(bad_refs)
+        report["objects"] = report["objects"][:2]
+        with mock.patch.object(objects, "inspect_semantic_objects", return_value=report):
+            with self.assertRaisesRegex(h.HarnessError, "types or cardinality"):
+                routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+        bad_pair = copy.deepcopy(composite)
+        decision_payload = copy.deepcopy(bad_pair["decision"]["payload"])
+        decision_payload["technical_payload_sha256"] = "c" * 64
+        decision_payload.pop("decision_sha256")
+        decision_payload = permits.seal_transition_decision(decision_payload)
+        bad_pair["decision"] = objects.create_semantic_object(
+            object_type="transition_decision",
+            task_id=TASK,
+            object_identity=decision_payload["decision_sha256"],
+            payload=decision_payload,
+        )
+        bad_pair["binding"] = replacement_binding(
+            [bad_pair["decision"], bad_pair["permit"], bad_pair["effect"]["routing_authority"]],
+            permits.permit_consumption_identity(bad_pair["permit"]["payload"]),
+        )
+        with mock.patch.object(objects, "inspect_semantic_objects", return_value=self.composite_report(bad_pair)):
+            with self.assertRaisesRegex(h.HarnessError, "decision or permit"):
+                routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+        cohort = self.permit_composite(action="cohort.advance")
+        with mock.patch.object(objects, "inspect_semantic_objects", return_value=self.composite_report(cohort)):
+            with self.assertRaisesRegex(h.HarnessError, "does not authorize"):
+                routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+        nonrouting = copy.deepcopy(composite["binding"])
+        nonrouting = objects.create_semantic_binding(
+            binding_kind="cohort_advance",
+            task_id=TASK,
+            binding_key=nonrouting["binding_key"],
+            expected_semantic_head_sha256=nonrouting["expected_semantic_head_sha256"],
+            planned_event_sha256=nonrouting["planned_event_sha256"],
+            result_projection_sha256=nonrouting["result_projection_sha256"],
+            object_sha256s=[composite["effect"]["routing_authority"]["object_sha256"]],
+        )
+        report = self.composite_report(composite)
+        report["objects"] = [report["objects"][2]]
+        report["bindings"] = [{**nonrouting, "classification": "pending"}]
+        with mock.patch.object(objects, "inspect_semantic_objects", return_value=report):
+            with self.assertRaisesRegex(h.HarnessError, "non-routing"):
+                routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+    def test_permit_composite_rejects_double_ownership_of_authority_slot(self) -> None:
+        composite = self.permit_composite()
+        direct = self.prepare_authority()
+        report = self.composite_report(composite)
+        report["bindings"].append({**direct["binding"], "classification": "pending"})
+        with mock.patch.object(objects, "inspect_semantic_objects", return_value=report):
+            with self.assertRaisesRegex(h.HarnessError, "multiple owning"):
+                routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+    def test_permit_composite_rejects_foreign_contract_task(self) -> None:
+        composite = self.permit_composite(contract_task_id="task-other")
+        self.publish_permit_composite(composite)
+        with self.assertRaisesRegex(h.HarnessError, "contract task"):
+            routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+    def test_permit_composite_rejects_foreign_authority_task(self) -> None:
+        composite = self.permit_composite()
+        foreign_arm = copy.deepcopy(self.arm)
+        foreign_arm["task_id"] = "task-other"
+        with mock.patch.object(
+            objects, "inspect_semantic_objects", return_value=self.composite_report(composite)
+        ):
+            with mock.patch.object(authority, "validate_arm_authority", return_value=foreign_arm):
+                with mock.patch.object(
+                    authority,
+                    "authority_sha256",
+                    return_value=composite["effect"]["routing_authority"]["object_identity"],
+                ):
+                    with self.assertRaisesRegex(h.HarnessError, "authority task"):
+                        routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+    def test_permit_composite_rejects_foreign_contract_packet(self) -> None:
+        composite = self.permit_composite(contract_packet_id="packet-other")
+        self.publish_permit_composite(composite)
+        with self.assertRaisesRegex(h.HarnessError, "does not authorize"):
+            routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+    def test_permit_composite_rejects_committed_projection_entry_drift(self) -> None:
+        composite = self.permit_composite()
+        result_state = copy.deepcopy(composite["effect"]["result_state"])
+        slot = routing.routing_outcome_slot_sha256(self.arm)
+        result_state[routing.ROUTING_NAMESPACE_KEY]["entries"][slot]["packet_id"] = "packet-other"
+        event = semantic.create_transition_event(
+            self.events[-1],
+            semantic.replay_events(self.events),
+            result_state,
+            event_type="permitted_packet_arm",
+            command_id=composite["event"]["command_id"],
+            recorded_at=composite["event"]["recorded_at"],
+            authority_ref=composite["event"]["authority_ref"],
+        )
+        binding = objects.create_semantic_binding(
+            binding_kind="permit_consumption",
+            task_id=TASK,
+            binding_key=composite["binding"]["binding_key"],
+            expected_semantic_head_sha256=event["prev_event_sha256"],
+            planned_event_sha256=event["event_sha256"],
+            result_projection_sha256=event["result_projection_sha256"],
+            object_sha256s=composite["binding"]["object_sha256s"],
+        )
+        composite["effect"]["result_state"] = result_state
+        composite["event"] = event
+        composite["binding"] = binding
+        self.publish_permit_composite(composite)
+        self.append_permit_composite(composite)
+        with self.assertRaisesRegex(h.HarnessError, "projection entry"):
+            routing.inspect_routing_persistence(self.paths, TASK, self.events)
+
+    def test_permit_composite_rejects_wrong_committed_event_type(self) -> None:
+        composite = self.permit_composite(event_type="wrong_permitted_packet_arm")
+        self.publish_permit_composite(composite)
+        self.append_permit_composite(composite)
+        with self.assertRaisesRegex(h.HarnessError, "event type"):
+            routing.inspect_routing_persistence(self.paths, TASK, self.events)
 
     def test_authority_outcome_terminal_commit_and_capacity_gate(self) -> None:
         self.assertEqual(

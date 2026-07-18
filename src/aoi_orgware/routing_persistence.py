@@ -20,6 +20,7 @@ from . import routing_bundle as bundle
 from . import semantic_events as semantic
 from . import semantic_objects as objects
 from . import semantic_store as store
+from . import transition_permits as permits
 
 
 ROUTING_PERSISTENCE_SCHEMA_VERSION = 1
@@ -44,6 +45,8 @@ _BINDING_KIND = {
     "outcome": "outcome_slot",
     "terminal": "terminal_slot",
 }
+_DIRECT_ROUTING_BINDING_KINDS = frozenset(_BINDING_KIND.values())
+_PERMIT_ROUTING_BINDING_KIND = "permit_consumption"
 _OBJECT_TYPES = {
     "authority": ("routing_authority",),
     "outcome": ("routing_authority", "routing_outcome"),
@@ -575,6 +578,39 @@ def _transaction_base(
     return validate_routing_transaction(base)
 
 
+def prepare_authority_effect(
+    *,
+    task_id: str,
+    event_chain: Iterable[Mapping[str, Any]],
+    arm: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the pure routing effect of one packet-schema-v6 arm.
+
+    A permit/cohort runtime owns the event and its single composite binding.
+    It needs this exact object and projection delta without manufacturing a
+    second routing binding or lifecycle event.
+    """
+
+    task_id = h.validate_id(task_id, "task id")
+    _records, replayed = _freeze_event_chain(event_chain, task_id)
+    checked_arm = authority.validate_arm_authority(arm)
+    if checked_arm["task_id"] != task_id:
+        raise RoutingPersistenceError("routing authority belongs to another task")
+    routing_authority = _authority_object(task_id, checked_arm)
+    entry = _entry_for("authority", checked_arm, {"routing_authority": routing_authority})
+    result_state = _advance_projection(semantic.projection_domain(replayed), entry)
+    # The long names are the public composite-runtime contract.  The concise
+    # aliases keep this first public extraction source-compatible with callers
+    # that adopted the packet wording before the runtime module landed.
+    return {
+        "routing_authority_object": routing_authority,
+        "routing_entry": entry,
+        "result_state": result_state,
+        "routing_authority": routing_authority,
+        "authority_entry": entry,
+    }
+
+
 def prepare_authority_transaction(
     *,
     task_id: str,
@@ -702,14 +738,88 @@ def validate_routing_transaction(value: Mapping[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _permit_composite_group(
+    binding: Mapping[str, Any],
+    by_digest: Mapping[str, Mapping[str, Any]],
+    task_id: str,
+) -> dict[str, Any]:
+    """Validate the one binding that owns a permitted ``packet.arm`` effect."""
+
+    try:
+        wrapped_rows = [by_digest[digest] for digest in binding["object_sha256s"]]
+    except KeyError as exc:
+        raise _fail("permit routing binding references a missing object", exc) from exc
+    by_type: dict[str, dict[str, Any]] = {}
+    for row in wrapped_rows:
+        wrapped = objects.validate_semantic_object(row)
+        if wrapped["task_id"] != task_id or wrapped["object_type"] in by_type:
+            raise RoutingPersistenceError("permit routing binding object group is invalid")
+        by_type[wrapped["object_type"]] = wrapped
+    if set(by_type) != {"transition_decision", "transition_permit", "routing_authority"}:
+        raise RoutingPersistenceError("permit routing binding object types or cardinality are invalid")
+    try:
+        decision = permits.validate_transition_decision(by_type["transition_decision"]["payload"])
+        permit = permits.validate_transition_permit(by_type["transition_permit"]["payload"])
+        pair = permits.validate_decision_permit_pair(decision, permit)
+        consumption_identity = permits.permit_consumption_identity(permit)
+    except permits.TransitionPermitError as exc:
+        raise _fail("permit routing decision or permit is invalid", exc) from exc
+    if by_type["transition_decision"]["object_identity"] != decision["decision_sha256"]:
+        raise RoutingPersistenceError("transition decision object identity differs from its payload")
+    if by_type["transition_permit"]["object_identity"] != permit["permit_sha256"]:
+        raise RoutingPersistenceError("transition permit object identity differs from its payload")
+    if decision["task_id"] != task_id or permit["task_id"] != task_id:
+        raise RoutingPersistenceError("permit routing contract task differs from binding task")
+    routing_authority = _individual_object(by_type["routing_authority"], task_id)
+    arm = authority.validate_arm_authority(routing_authority["payload"])
+    if arm["task_id"] != task_id:
+        raise RoutingPersistenceError("permit routing authority task differs from binding task")
+    routing_authority_sha256 = authority.authority_sha256(arm)
+    if (
+        pair["decision"]["action"] != "packet.arm"
+        or pair["decision"]["parameters"]["packet_id"]
+        != arm["packet_authority"]["packet_id"]
+        or pair["decision"]["parameters"]["routing_authority_sha256"]
+        != routing_authority_sha256
+    ):
+        raise RoutingPersistenceError("permit routing decision does not authorize this authority")
+    if binding["binding_key"] != consumption_identity:
+        raise RoutingPersistenceError("permit routing binding key differs from consumption identity")
+    if binding["expected_semantic_head_sha256"] != permit["expected_semantic_head_sha256"]:
+        raise RoutingPersistenceError("permit routing binding head differs from permit")
+    return {
+        "stage": "authority",
+        "slot": routing_outcome_slot_sha256(arm),
+        "objects": {"routing_authority": routing_authority},
+        "authority": arm,
+        "outcome": None,
+        "terminal": None,
+        "decision": decision,
+        "permit": permit,
+        "binding": binding,
+        "composite": True,
+    }
+
+
 def _routing_report_from_generic(
-    report: Mapping[str, Any], projection: Mapping[str, Any]
+    report: Mapping[str, Any],
+    projection: Mapping[str, Any],
+    event_chain: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     task_id = h.validate_id(report.get("task_id"), "task id")
     object_rows = report.get("objects")
     binding_rows = report.get("bindings")
     if not isinstance(object_rows, list) or not isinstance(binding_rows, list):
         raise RoutingPersistenceError("generic semantic object report is invalid")
+    event_by_sha: dict[str, Mapping[str, Any]] = {}
+    for event in _bounded_records(event_chain, semantic.MAX_LEDGER_EVENTS, "routing event chain"):
+        if not isinstance(event, Mapping):
+            raise RoutingPersistenceError("routing event chain row is invalid")
+        digest = event.get("event_sha256")
+        _sha(digest, "routing event SHA-256")
+        if digest in event_by_sha:
+            raise RoutingPersistenceError("routing event chain repeats an event SHA-256")
+        event_by_sha[digest] = event
     by_digest: dict[str, dict[str, Any]] = {}
     routing_digests: set[str] = set()
     authority_by_identity: dict[str, dict[str, Any]] = {}
@@ -771,11 +881,15 @@ def _routing_report_from_generic(
             raise _fail("semantic binding report row is incomplete", exc) from exc
         binding = objects.validate_semantic_binding(binding)
         references = set(binding["object_sha256s"])
-        if references & routing_digests and binding["binding_kind"] not in set(
-            _BINDING_KIND.values()
+        if references & routing_digests and binding["binding_kind"] not in (
+            _DIRECT_ROUTING_BINDING_KINDS | {_PERMIT_ROUTING_BINDING_KIND}
         ):
             raise RoutingPersistenceError("routing object is referenced by a non-routing binding")
-        if binding["binding_kind"] not in set(_BINDING_KIND.values()):
+        if binding["binding_kind"] == _PERMIT_ROUTING_BINDING_KIND:
+            group = _permit_composite_group(binding, by_digest, task_id)
+            groups.append({**group, "classification": row.get("classification")})
+            continue
+        if binding["binding_kind"] not in _DIRECT_ROUTING_BINDING_KINDS:
             continue
         stage = next(key for key, kind in _BINDING_KIND.items() if kind == binding["binding_kind"])
         try:
@@ -797,17 +911,44 @@ def _routing_report_from_generic(
         )
     namespace = routing_namespace_from_projection(projection)
     entries = namespace["entries"]
-    committed = {
-        (group["slot"], group["stage"]): group
-        for group in groups
-        if group["classification"] == "committed"
-    }
+    owned_stages: set[tuple[str, str]] = set()
+    binding_sha256s: set[str] = set()
+    committed: dict[tuple[str, str], dict[str, Any]] = {}
+    for group in groups:
+        key = (group["slot"], group["stage"])
+        if key in owned_stages:
+            raise RoutingPersistenceError("routing slot stage has multiple owning bindings")
+        owned_stages.add(key)
+        binding_sha = group["binding"]["binding_sha256"]
+        if binding_sha in binding_sha256s:
+            raise RoutingPersistenceError("routing binding digest is not unique")
+        binding_sha256s.add(binding_sha)
+        if group["classification"] == "committed":
+            committed[key] = group
     for group in groups:
         entry = entries.get(group["slot"])
         rank = _PHASE_RANK[group["stage"]]
         if group["classification"] == "committed":
+            event = event_by_sha.get(group["binding"]["planned_event_sha256"])
+            if event is None:
+                raise RoutingPersistenceError("committed routing binding has no ledger event")
+            try:
+                event_type = semantic.command_semantics(event)["event_type"]
+            except semantic.SemanticEventError as exc:
+                raise _fail("routing binding ledger event is invalid", exc) from exc
+            expected_event_type = (
+                "permitted_packet_arm"
+                if group.get("composite")
+                else _EVENT_TYPE[group["stage"]]
+            )
+            if event_type != expected_event_type:
+                raise RoutingPersistenceError("routing binding ledger event type is invalid")
             if entry is None or _PHASE_RANK[entry["phase"]] < rank:
                 raise RoutingPersistenceError("committed routing binding is absent from projection")
+            if group.get("composite") and entry != _entry_for(
+                "authority", group["authority"], group["objects"]
+            ):
+                raise RoutingPersistenceError("committed permit routing projection entry is invalid")
         elif group["classification"] == "pending":
             current_rank = 0 if entry is None else _PHASE_RANK[entry["phase"]]
             if current_rank != rank - 1:
@@ -847,9 +988,7 @@ def _routing_report_from_generic(
         "namespace": namespace,
         "groups": sorted(groups, key=lambda row: (row["slot"], _PHASE_RANK[row["stage"]])),
         "routing_object_sha256s": sorted(routing_digests),
-        "routing_binding_sha256s": sorted(
-            group["binding"]["binding_sha256"] for group in groups
-        ),
+        "routing_binding_sha256s": sorted(binding_sha256s),
     }
 
 
@@ -861,7 +1000,7 @@ def inspect_routing_persistence(
     task_id = h.validate_id(task_id, "task id")
     records, replayed = _freeze_event_chain(event_chain, task_id)
     report = objects.inspect_semantic_objects(paths, task_id, records)
-    return _routing_report_from_generic(report, replayed)
+    return _routing_report_from_generic(report, replayed, records)
 
 
 def commit_routing_transaction(
@@ -879,7 +1018,7 @@ def commit_routing_transaction(
         records,
         expected_binding_sha256=tx["binding"]["binding_sha256"],
     )
-    specialized = _routing_report_from_generic(generic, replayed)
+    specialized = _routing_report_from_generic(generic, replayed, records)
     existing = next(
         (
             row
@@ -1076,6 +1215,7 @@ __all__ = [
     "classify_legacy_cutover",
     "commit_routing_transaction",
     "inspect_routing_persistence",
+    "prepare_authority_effect",
     "prepare_authority_transaction",
     "prepare_outcome_transaction",
     "prepare_terminal_transaction",
