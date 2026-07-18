@@ -668,6 +668,7 @@ class ChiefAuthorityTests(HarnessTestCase):
         explicit = (
             cli_impl.CHIEF_AUTHORITY_CONTROL_COMMANDS
             | cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS
+            | cli_impl.CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS
             | cli_impl.CHIEF_STANDALONE_COMMANDS
             | {"init"}
         )
@@ -680,6 +681,15 @@ class ChiefAuthorityTests(HarnessTestCase):
         self.assertTrue(cli_impl.command_requires_chief("init", initialized=True))
         self.assertTrue(
             cli_impl.command_requires_chief("future-mutator", initialized=True)
+        )
+        self.assertFalse(
+            cli_impl.command_requires_chief("permit-consume", initialized=True)
+        )
+        self.assertTrue(
+            cli_impl.command_requires_chief("permit-issue", initialized=True)
+        )
+        self.assertNotIn(
+            "permit-consume", cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS
         )
         for command in cli_impl.CHIEF_STANDALONE_WRITER_COMMANDS:
             self.assertTrue(

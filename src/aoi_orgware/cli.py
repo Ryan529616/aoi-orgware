@@ -176,6 +176,8 @@ from .commands.status import (
     resolve_resume_task,
 )
 from .commands.semantic import (
+    cmd_permit_consume,
+    cmd_permit_issue,
     cmd_semantic_head,
     cmd_semantic_migrate,
     cmd_semantic_migration_rollback,
@@ -640,6 +642,10 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "verify-backup",
     "doctor",
 }
+# Permit consumption is an explicit no-Chief project mutation.  It is not
+# read-only: the command may publish one already Chief-issued exact semantic
+# transition, and its handler therefore owns the normal project state lock.
+CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS = {"permit-consume"}
 CHIEF_STANDALONE_READ_ONLY_COMMANDS = {
     "config-check",
     "pilot-validate",
@@ -675,6 +681,7 @@ def command_requires_chief(command: str, *, initialized: bool) -> bool:
     return command not in (
         CHIEF_AUTHORITY_CONTROL_COMMANDS
         | CHIEF_PROJECT_READ_ONLY_COMMANDS
+        | CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS
         | CHIEF_STANDALONE_READ_ONLY_COMMANDS
     )
 
@@ -6525,6 +6532,8 @@ def build_parser(
     register_semantic_commands(
         sub,
         handlers={
+            "permit_consume": cmd_permit_consume,
+            "permit_issue": cmd_permit_issue,
             "semantic_head": cmd_semantic_head,
             "semantic_migrate": cmd_semantic_migrate,
             "semantic_migration_rollback": cmd_semantic_migration_rollback,
@@ -6953,6 +6962,8 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "close-task",
     "doctor",
     "inspect-legacy",
+    "permit-consume",
+    "permit-issue",
     "resume",
     "semantic-head",
     "semantic-migrate",
