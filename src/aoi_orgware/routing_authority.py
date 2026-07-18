@@ -141,6 +141,7 @@ _TERMINAL_TYPED_OUTCOMES_BY_STATUS = {
     },
 }
 _TECHNICAL_OUTCOMES = {"accepted", "rejected"}
+_UNATTEMPTED_V6_ATTEMPT_FIELDS = {"status", "observation"}
 
 
 class RoutingAuthorityError(ValueError):
@@ -1185,6 +1186,8 @@ def outcome_sha256(outcome: Mapping[str, Any]) -> str:
         _fail("routing outcome must be an object")
     if "legacy_packet_snapshot" in outcome:
         _validate_legacy_outcome(outcome)
+    elif "unattempted_v6_packet_snapshot" in outcome:
+        _validate_unattempted_v6_cancellation_outcome(outcome)
     elif outcome.get("routing_outcome_sha256") != _outcome_hash(outcome):
         _fail("routing outcome hash mismatch")
     return _outcome_hash(outcome)
@@ -1360,8 +1363,16 @@ def _validate_legacy_outcome(item: Mapping[str, Any]) -> dict[str, Any]:
     }
     value = _object(item, fields, "legacy routing outcome")
     snapshot = value["legacy_packet_snapshot"]
-    if not isinstance(snapshot, dict) or snapshot.get("packet_schema_version") != 5:
-        _fail("legacy packet snapshot is not schema v5")
+    if not isinstance(snapshot, dict):
+        _fail("legacy packet snapshot is invalid")
+    version = snapshot.get("packet_schema_version", 0)
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or not 0 <= version <= 5
+    ):
+        _fail("legacy packet snapshot version is invalid")
+    _id(snapshot.get("packet_id"), "legacy packet_id")
     typed = snapshot.get("typed_outcome") or "unclassified"
     status, typed = _terminal_classification(snapshot.get("status"), typed)
     digest = canonical_sha256(snapshot, max_bytes=MAX_RECORD_BYTES)
@@ -1389,7 +1400,7 @@ def _validate_legacy_outcome(item: Mapping[str, Any]) -> dict[str, Any]:
 def build_legacy_outcome(
     packet_snapshot: Mapping[str, Any], *, recorded_at: str
 ) -> dict[str, Any]:
-    """Seal one terminal v5 snapshot without upgrading its routing evidence."""
+    """Seal one terminal v0-v5 snapshot without upgrading routing evidence."""
     snapshot = _clone(packet_snapshot)
     typed = snapshot.get("typed_outcome") or "unclassified"
     status, typed = _terminal_classification(snapshot.get("status"), typed)
@@ -1413,6 +1424,141 @@ def build_legacy_outcome(
     return _validate_legacy_outcome(outcome)
 
 
+def _validate_unattempted_v6_cancellation_outcome(
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a terminal v6 packet that never consumed a dispatch slot."""
+    fields = {
+        "schema_version",
+        "unattempted_v6_packet_snapshot",
+        "unattempted_v6_packet_snapshot_sha256",
+        "unattempted_v6_snapshot_identity_sha256",
+        "dispatch_provenance",
+        "terminal_status",
+        "typed_outcome",
+        *_REQUEST,
+        "active_model_slug_observed",
+        "observed_model_slug_match",
+        "config_loaded_verified",
+        "provider_route_verified",
+        "runtime_profile_verified",
+        "runtime_sandbox_profile_verified",
+        "fresh_session_evidence",
+        "verdict",
+        "recorded_at",
+        "routing_outcome_sha256",
+    }
+    value = _object(item, fields, "unattempted v6 cancellation outcome")
+    snapshot = value["unattempted_v6_packet_snapshot"]
+    if not isinstance(snapshot, dict):
+        _fail("unattempted v6 packet snapshot is invalid")
+    if (
+        not isinstance(snapshot.get("packet_schema_version"), int)
+        or isinstance(snapshot.get("packet_schema_version"), bool)
+        or snapshot.get("packet_schema_version") != 6
+    ):
+        _fail("unattempted v6 packet snapshot is not schema v6")
+    _id(snapshot.get("packet_id"), "unattempted v6 packet_id")
+    if snapshot.get("status") != "cancelled":
+        _fail("unattempted v6 packet is not cancelled")
+    _status, typed = _terminal_classification(
+        "cancelled", snapshot.get("typed_outcome") or "unclassified"
+    )
+    if snapshot.get("dispatch_provenance", "none") != "none":
+        _fail("unattempted v6 packet has dispatch provenance")
+    forbidden = {
+        "routing_authority",
+        "routing_outcome",
+        "routing_outcome_sha256",
+        "outcome_slot_sha256",
+        "observation",
+        "observation_binding",
+    }
+    if forbidden.intersection(snapshot):
+        _fail("unattempted v6 packet has a consumed routing binding")
+    attempts = snapshot.get("dispatch_attempts", [])
+    if not isinstance(attempts, list):
+        _fail("unattempted v6 packet dispatch attempts are invalid")
+    for attempt in attempts:
+        if (
+            not isinstance(attempt, dict)
+            or set(attempt) != _UNATTEMPTED_V6_ATTEMPT_FIELDS
+            or attempt["status"] not in {
+            "disarmed",
+            "expired",
+            }
+            or attempt["observation"] is not None
+        ):
+            _fail("unattempted v6 packet has a live or unknown dispatch attempt")
+    digest = canonical_sha256(snapshot, max_bytes=MAX_RECORD_BYTES)
+    if any(
+        value[key] != digest
+        for key in (
+            "unattempted_v6_packet_snapshot_sha256",
+            "unattempted_v6_snapshot_identity_sha256",
+        )
+    ):
+        _fail("unattempted v6 packet snapshot identity is invalid")
+    if (
+        value["schema_version"] != SCHEMA_VERSION
+        or value["dispatch_provenance"] != "not_dispatched"
+        or value["terminal_status"] != "cancelled"
+        or value["typed_outcome"] != typed
+        or any(value[key] != "unavailable" for key in _REQUEST)
+        or value["active_model_slug_observed"] is not None
+        or value["observed_model_slug_match"] != "unavailable"
+        or value["config_loaded_verified"] != "unavailable"
+        or value["provider_route_verified"] != "unavailable"
+        or value["runtime_profile_verified"] != "unavailable"
+        or value["runtime_sandbox_profile_verified"] != "unavailable"
+        or value["fresh_session_evidence"] != "unavailable"
+        or value["verdict"] != "not_dispatched"
+    ):
+        _fail("unattempted v6 cancellation outcome is invalid")
+    _dt(value["recorded_at"], "recorded_at")
+    if _outcome_hash(value) != value["routing_outcome_sha256"]:
+        _fail("unattempted v6 cancellation outcome hash mismatch")
+    return _clone(value)
+
+
+def build_unattempted_v6_cancellation_outcome(
+    packet_snapshot: Mapping[str, Any], *, recorded_at: str
+) -> dict[str, Any]:
+    """Seal a v6 ready-to-cancel terminal row without inventing routing data."""
+    snapshot = _clone(packet_snapshot)
+    digest = canonical_sha256(snapshot, max_bytes=MAX_RECORD_BYTES)
+    typed = packet_snapshot.get("typed_outcome") or "unclassified"
+    _terminal_classification("cancelled", typed)
+    outcome = {
+        "schema_version": SCHEMA_VERSION,
+        "unattempted_v6_packet_snapshot": snapshot,
+        "unattempted_v6_packet_snapshot_sha256": digest,
+        "unattempted_v6_snapshot_identity_sha256": digest,
+        "dispatch_provenance": "not_dispatched",
+        "terminal_status": "cancelled",
+        "typed_outcome": typed,
+        **{key: "unavailable" for key in _REQUEST},
+        "active_model_slug_observed": None,
+        "observed_model_slug_match": "unavailable",
+        "config_loaded_verified": "unavailable",
+        "provider_route_verified": "unavailable",
+        "runtime_profile_verified": "unavailable",
+        "runtime_sandbox_profile_verified": "unavailable",
+        "fresh_session_evidence": "unavailable",
+        "verdict": "not_dispatched",
+        "recorded_at": recorded_at,
+        "routing_outcome_sha256": "0" * 64,
+    }
+    outcome["routing_outcome_sha256"] = _outcome_hash(outcome)
+    return _validate_unattempted_v6_cancellation_outcome(outcome)
+
+
+def validate_unattempted_v6_cancellation_outcome(
+    outcome: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _validate_unattempted_v6_cancellation_outcome(outcome)
+
+
 def capacity_routing_view(outcomes: Any) -> dict[str, Any]:
     """Return every terminal row; eligibility is explicit and never re-derived."""
     if not isinstance(outcomes, list) or len(outcomes) > MAX_CAPACITY_ROWS:
@@ -1420,7 +1566,9 @@ def capacity_routing_view(outcomes: Any) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     seen_v6: set[str] = set()
     seen_legacy: set[str] = set()
+    seen_unattempted_v6: set[str] = set()
     observed_authorities: dict[str, str] = {}
+    seen_packet_ids: set[str] = set()
     for stored in outcomes:
         if not isinstance(stored, dict):
             _fail("capacity stored outcome is invalid")
@@ -1434,6 +1582,27 @@ def capacity_routing_view(outcomes: Any) -> dict[str, Any]:
             authority = None
             terminal_status = outcome["terminal_status"]
             typed = outcome["typed_outcome"]
+            packet_id = outcome["legacy_packet_snapshot"]["packet_id"]
+            role = tier = profile = requested_model = "unavailable"
+            observed_model = None
+            observation_identity = None
+        elif "unattempted_v6_outcome" in stored:
+            _object(
+                stored,
+                {"unattempted_v6_outcome"},
+                "unattempted v6 capacity row",
+            )
+            outcome = _validate_unattempted_v6_cancellation_outcome(
+                stored["unattempted_v6_outcome"]
+            )
+            identity = outcome["unattempted_v6_snapshot_identity_sha256"]
+            if identity in seen_unattempted_v6:
+                _fail("duplicate unattempted v6 packet snapshot identity")
+            seen_unattempted_v6.add(identity)
+            authority = None
+            terminal_status = outcome["terminal_status"]
+            typed = outcome["typed_outcome"]
+            packet_id = outcome["unattempted_v6_packet_snapshot"]["packet_id"]
             role = tier = profile = requested_model = "unavailable"
             observed_model = None
             observation_identity = None
@@ -1454,20 +1623,25 @@ def capacity_routing_view(outcomes: Any) -> dict[str, Any]:
             seen_v6.add(identity)
             observation_identity = outcome["observation_identity_sha256"]
             authority_hash = authority_sha256(authority)
-            if observation_identity is not None:
-                previous = observed_authorities.setdefault(observation_identity, authority_hash)
-                if previous != authority_hash:
-                    _fail("one observation cannot bind two packet authorities")
             role = outcome["requested_role"]
             tier = outcome["requested_capability_tier"]
             profile = outcome["requested_profile"]
             requested_model = outcome["requested_model"]
             observed_model = outcome["active_model_slug_observed"]
+            packet_id = authority["packet_authority"]["packet_id"]
+            if observation_identity is not None and observation_identity in observed_authorities:
+                _fail("one observation cannot bind two packet authorities (duplicate dispatch observation identity)")
+            if observation_identity is not None:
+                observed_authorities[observation_identity] = authority_hash
+        if packet_id in seen_packet_ids:
+            _fail("duplicate packet_id across capacity routing rows")
+        seen_packet_ids.add(packet_id)
         technical = typed in _TECHNICAL_OUTCOMES
         slug_attribution = outcome["verdict"] == "observed_model_slug_match"
         row = {
             "routing_outcome_sha256": outcome["routing_outcome_sha256"],
             "authority_sha256": None if authority is None else authority_sha256(authority),
+            "packet_id": packet_id,
             "sample_identity_sha256": identity,
             "observation_identity_sha256": observation_identity,
             "dispatch_provenance": outcome["dispatch_provenance"],

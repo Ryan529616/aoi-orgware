@@ -20,15 +20,31 @@ EXPECTED_PACKET_SCHEMA_VERSION = 6
 MAX_COHORT_BYTES = 64 * 1024
 MAX_COHORT_PACKETS = 1_024
 MAX_COHORT_WAVES = MAX_COHORT_PACKETS
-MAX_CONCURRENCY = 1_024
+MAX_CONCURRENCY = 12
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_SLOT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_PARENT_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}")
+_CANONICAL_AGENT_TYPES = frozenset(
+    {
+        "architect",
+        "batch",
+        "default",
+        "eda_expert",
+        "eda_operator",
+        "explorer",
+        "numeric_debugger",
+        "reviewer",
+        "rtl_engineer",
+        "worker",
+    }
+)
 _BASE_FIELDS = {
     "schema_version",
     "cohort_id",
     "packet_schema_version",
+    "resource_envelope_sha256",
+    "execution_selection_sha256",
     "packet_refs",
     "dependencies",
     "waves",
@@ -39,7 +55,8 @@ _BASE_FIELDS = {
 }
 _SEALED_FIELDS = _BASE_FIELDS | {"cohort_sha256"}
 _PACKET_REF_FIELDS = {"packet_id", "routing_authority_sha256"}
-_SLOT_FIELDS = {"packet_id", "slot_id"}
+_SLOT_FIELDS = {"packet_id", "transport", "parent_session_id", "expected_agent_type"}
+_SEALED_SLOT_FIELDS = _SLOT_FIELDS | {"slot_sha256"}
 _STATE_FIELDS = {"status", "terminal_outcome"}
 _STATUSES = {"planned", "armed", "start_observed", "terminal", "cancelled"}
 _TERMINAL_OUTCOMES = {"accepted", "rejected", "failed", "cancelled"}
@@ -183,33 +200,67 @@ def _max_concurrency(value: Any) -> int:
     return value
 
 
-def _transport_slots(value: Any, packet_ids: list[str], waves: list[list[str]]) -> list[dict[str, str]]:
+def _parent_session_id(value: Any) -> str:
+    if not isinstance(value, str) or not _PARENT_SESSION_ID.fullmatch(value):
+        _fail("transport_slot.parent_session_id is invalid")
+    return value
+
+
+def _expected_agent_type(value: Any) -> str:
+    if not isinstance(value, str) or (value != "*" and value not in _CANONICAL_AGENT_TYPES):
+        _fail("transport_slot.expected_agent_type is invalid")
+    return value
+
+
+def _slot_identity(slot: Mapping[str, str]) -> dict[str, str]:
+    return {
+        "transport": slot["transport"],
+        "parent_session_id": slot["parent_session_id"],
+        "expected_agent_type": slot["expected_agent_type"],
+    }
+
+
+def _slots_collide(left: Mapping[str, str], right: Mapping[str, str]) -> bool:
+    return left["parent_session_id"] == right["parent_session_id"] and (
+        left["expected_agent_type"] == "*"
+        or right["expected_agent_type"] == "*"
+        or left["expected_agent_type"] == right["expected_agent_type"]
+    )
+
+
+def _transport_slots(value: Any, packet_ids: list[str], *, sealed: bool) -> list[dict[str, str]]:
     if not isinstance(value, list) or len(value) != len(packet_ids):
         _fail("transport_slots is invalid")
     seen_packets: set[str] = set()
-    slot_by_packet: dict[str, str] = {}
+    slot_by_packet: dict[str, dict[str, str]] = {}
     for entry in value:
-        item = _object(entry, _SLOT_FIELDS, "transport_slot")
+        item = _object(entry, _SEALED_SLOT_FIELDS if sealed else _SLOT_FIELDS, "transport_slot")
         packet_id = _id(item["packet_id"], "transport_slot.packet_id")
-        slot_id = item["slot_id"]
         if packet_id not in packet_ids:
             _fail("transport_slots names an unknown packet")
         if packet_id in seen_packets:
             _fail("transport_slots contains duplicate packet references")
-        if not isinstance(slot_id, str) or not _SLOT.fullmatch(slot_id):
-            _fail("transport_slot.slot_id is invalid")
+        if item["transport"] != "codex":
+            _fail("transport_slot.transport is invalid")
+        slot = {
+            "packet_id": packet_id,
+            "transport": "codex",
+            "parent_session_id": _parent_session_id(item["parent_session_id"]),
+            "expected_agent_type": _expected_agent_type(item["expected_agent_type"]),
+        }
+        slot_sha256 = canonical_sha256(_slot_identity(slot), max_bytes=MAX_COHORT_BYTES)
+        if sealed:
+            if item["slot_sha256"] != slot_sha256:
+                _fail("transport_slot.slot_sha256 does not match slot")
+        slot["slot_sha256"] = slot_sha256
         seen_packets.add(packet_id)
-        slot_by_packet[packet_id] = slot_id
-    for wave in waves:
-        wave_slots = [slot_by_packet[packet_id] for packet_id in wave]
-        if len(set(wave_slots)) != len(wave_slots):
-            _fail("transport slot conflict within a wave")
+        slot_by_packet[packet_id] = slot
     # The packet list is the schedule's canonical identity.  Input order of a
     # mapping-like slot list must not create a distinct sealed cohort.
-    return [{"packet_id": packet_id, "slot_id": slot_by_packet[packet_id]} for packet_id in packet_ids]
+    return [slot_by_packet[packet_id] for packet_id in packet_ids]
 
 
-def _base(value: Any) -> dict[str, Any]:
+def _base(value: Any, *, sealed_slots: bool = False) -> dict[str, Any]:
     item = _object(value, _BASE_FIELDS, "cohort")
     if item["schema_version"] != COHORT_SCHEMA_VERSION or isinstance(item["schema_version"], bool):
         _fail("cohort schema_version is invalid")
@@ -224,11 +275,15 @@ def _base(value: Any) -> dict[str, Any]:
         "schema_version": COHORT_SCHEMA_VERSION,
         "cohort_id": _id(item["cohort_id"], "cohort_id"),
         "packet_schema_version": EXPECTED_PACKET_SCHEMA_VERSION,
+        # These are sealed references only.  Validating their referenced
+        # objects, lane caps, or live totals belongs to the integration layer.
+        "resource_envelope_sha256": _sha(item["resource_envelope_sha256"], "resource_envelope_sha256"),
+        "execution_selection_sha256": _sha(item["execution_selection_sha256"], "execution_selection_sha256"),
         "packet_refs": packet_refs,
         "dependencies": dependencies,
         "waves": waves,
         "max_concurrency": max_concurrency,
-        "transport_slots": _transport_slots(item["transport_slots"], packet_ids, waves),
+        "transport_slots": _transport_slots(item["transport_slots"], packet_ids, sealed=sealed_slots),
         "failure_policy": _policy(item["failure_policy"], "failure_policy"),
         "cancel_policy": _policy(item["cancel_policy"], "cancel_policy"),
     }
@@ -258,8 +313,11 @@ def validate_cohort(cohort: Mapping[str, Any]) -> dict[str, Any]:
     """Validate a sealed cohort and return a detached canonical copy."""
 
     item = _object(cohort, _SEALED_FIELDS, "cohort")
-    base = _base({key: item[key] for key in _BASE_FIELDS})
-    expected = cohort_sha256(base)
+    base = _base({key: item[key] for key in _BASE_FIELDS}, sealed_slots=True)
+    try:
+        expected = canonical_sha256(base, max_bytes=MAX_COHORT_BYTES)
+    except SemanticEventError as exc:
+        raise CohortError(str(exc)) from exc
     if item["cohort_sha256"] != expected:
         _fail("cohort_sha256 does not match cohort")
     return {**base, "cohort_sha256": expected}
@@ -315,6 +373,16 @@ def project_cohort(cohort: Mapping[str, Any], packet_states: Mapping[str, Any] |
     item = validate_cohort(cohort)
     packet_ids = [ref["packet_id"] for ref in item["packet_refs"]]
     states = _packet_states({} if packet_states is None else packet_states, packet_ids)
+    slot_by_packet = {entry["packet_id"]: entry for entry in item["transport_slots"]}
+    armed_packet_ids = [
+        packet_id for packet_id in packet_ids if states[packet_id]["status"] == "armed"
+    ]
+    for index, packet_id in enumerate(armed_packet_ids):
+        if any(
+            _slots_collide(slot_by_packet[packet_id], slot_by_packet[other_packet_id])
+            for other_packet_id in armed_packet_ids[index + 1 :]
+        ):
+            _fail("simultaneously armed packets collide in a transport slot")
     failure_triggered = any(
         state["status"] == "terminal" and state["terminal_outcome"] == "failed"
         for state in states.values()
@@ -377,11 +445,6 @@ def project_cohort(cohort: Mapping[str, Any], packet_states: Mapping[str, Any] |
     ]
     if len(active_packet_ids) > item["max_concurrency"]:
         _fail("observed active starts exceed max_concurrency")
-    slot_by_packet = {entry["packet_id"]: entry["slot_id"] for entry in item["transport_slots"]}
-    active_slots = [slot_by_packet[packet_id] for packet_id in active_packet_ids]
-    if len(set(active_slots)) != len(active_slots):
-        _fail("observed active starts reuse a transport slot")
-
     prior_waves_resolved = True
     waves: list[dict[str, Any]] = []
     packet_rows: list[dict[str, Any]] = []
@@ -397,6 +460,19 @@ def project_cohort(cohort: Mapping[str, Any], packet_states: Mapping[str, Any] |
             )
             for packet_id in wave
         }
+        # A slot is only a deterministic pre-arm ordering constraint.  Once a
+        # start has been observed, a following packet may be pre-armed even if
+        # the earlier execution is still live; integration owns live capacity.
+        for index, packet_id in enumerate(wave):
+            if not packet_eligible[packet_id]:
+                continue
+            if any(
+                packet_eligible[prior_packet_id]
+                and states[prior_packet_id]["status"] in {"planned", "armed"}
+                and _slots_collide(slot_by_packet[prior_packet_id], slot_by_packet[packet_id])
+                for prior_packet_id in wave[:index]
+            ):
+                packet_eligible[packet_id] = False
         wave_eligible = any(packet_eligible.values())
         all_resolved = all(
             _is_terminal_or_cancelled(states[packet_id]) or packet_id in blocked_packet_ids

@@ -22,6 +22,7 @@ from aoi_orgware.routing_authority import (
     build_arm_authority,
     build_dispatch_outcome,
     build_legacy_outcome,
+    build_unattempted_v6_cancellation_outcome,
     capacity_routing_view,
     codex_observation_event_id,
     outcome_sha256,
@@ -31,6 +32,7 @@ from aoi_orgware.routing_authority import (
     seal_startup_receipt,
     validate_arm_authority,
     validate_dispatch_outcome,
+    validate_unattempted_v6_cancellation_outcome,
     validate_session_registration,
 )
 from aoi_orgware.semantic_events import canonical_json_bytes, canonical_sha256
@@ -721,6 +723,100 @@ def test_capacity_order_is_deterministic_and_duplicate_identities_reject() -> No
     with pytest.raises(RoutingAuthorityError, match="snapshot identity"):
         capacity_routing_view(
             [{"legacy_outcome": legacy}, {"legacy_outcome": same_snapshot}]
+        )
+
+
+def test_legacy_terminal_history_accepts_v0_through_v5_but_no_live_snapshot() -> None:
+    for version in range(6):
+        outcome = build_legacy_outcome(
+            {"packet_schema_version": version, "status": "cancelled", "packet_id": f"old-{version}"},
+            recorded_at="2026-01-01T00:02:00Z",
+        )
+        assert outcome["dispatch_provenance"] == "legacy_unverified"
+        assert capacity_routing_view([{"legacy_outcome": outcome}])["rows"][0]["packet_id"] == f"old-{version}"
+    with pytest.raises(RoutingAuthorityError, match="terminal status"):
+        build_legacy_outcome(
+            {"packet_schema_version": 5, "status": "dispatched", "packet_id": "live"},
+            recorded_at="2026-01-01T00:02:00Z",
+        )
+
+
+def test_unattempted_v6_cancellation_is_tamper_evident_and_keeps_routing_unavailable() -> None:
+    snapshot = {
+        "packet_schema_version": 6,
+        "packet_id": "cancel-before-dispatch",
+        "status": "cancelled",
+        "typed_outcome": "superseded",
+        "dispatch_provenance": "none",
+        "dispatch_attempts": [{"status": "disarmed", "observation": None}],
+    }
+    outcome = build_unattempted_v6_cancellation_outcome(
+        snapshot, recorded_at="2026-01-01T00:02:00Z"
+    )
+    assert outcome["typed_outcome"] == "superseded"
+    assert outcome["verdict"] == "not_dispatched"
+    assert outcome["requested_model"] == "unavailable"
+    row = capacity_routing_view([{"unattempted_v6_outcome": outcome}])["rows"][0]
+    assert row["packet_id"] == "cancel-before-dispatch"
+    assert not row["model_quality_eligible"]
+    tampered = copy.deepcopy(outcome)
+    tampered["verdict"] = "observed_model_slug_match"
+    with pytest.raises(RoutingAuthorityError):
+        validate_unattempted_v6_cancellation_outcome(tampered)
+    for attempts in (
+        [{"status": "armed", "observation": None}],
+        [{"status": "disarmed", "observation": {"event_id": "forged"}}],
+        [{"status": "expired", "observation": None, "agent_id": "forged"}],
+        [{"status": "expired", "observation": None, "consumed": False}],
+        [{"status": "expired", "observation": None, "consumed": 0}],
+    ):
+        bad = copy.deepcopy(snapshot)
+        bad["dispatch_attempts"] = attempts
+        with pytest.raises(RoutingAuthorityError):
+            build_unattempted_v6_cancellation_outcome(
+                bad, recorded_at="2026-01-01T00:02:00Z"
+            )
+    for version in (True, 6.0):
+        bad = copy.deepcopy(snapshot)
+        bad["packet_schema_version"] = version
+        with pytest.raises(RoutingAuthorityError, match="schema v6"):
+            build_unattempted_v6_cancellation_outcome(
+                bad, recorded_at="2026-01-01T00:02:00Z"
+            )
+
+
+def test_capacity_rejects_packet_id_reused_across_record_wrappers() -> None:
+    packet_id = "shared-packet"
+    legacy = build_legacy_outcome(
+        {"packet_schema_version": 5, "status": "cancelled", "packet_id": packet_id},
+        recorded_at="2026-01-01T00:02:00Z",
+    )
+    unattempted = build_unattempted_v6_cancellation_outcome(
+        {
+            "packet_schema_version": 6,
+            "status": "cancelled",
+            "packet_id": packet_id,
+            "dispatch_provenance": "none",
+            "dispatch_attempts": [],
+        },
+        recorded_at="2026-01-01T00:02:00Z",
+    )
+    with pytest.raises(RoutingAuthorityError, match="duplicate packet_id"):
+        capacity_routing_view(
+            [{"legacy_outcome": legacy}, {"unattempted_v6_outcome": unattempted}]
+        )
+    arm = root_arm(packet_id)
+    observed = build_dispatch_outcome(
+        arm,
+        dispatch_provenance="codex_subagent_start_observed",
+        observation=observation(agent_id="shared-agent"),
+        recorded_at="2026-01-01T00:02:00Z",
+    )
+    with pytest.raises(RoutingAuthorityError, match="duplicate packet_id"):
+        capacity_routing_view([terminal_row(arm, observed), {"legacy_outcome": legacy}])
+    with pytest.raises(RoutingAuthorityError, match="duplicate packet_id"):
+        capacity_routing_view(
+            [terminal_row(arm, observed), {"unattempted_v6_outcome": unattempted}]
         )
 
 

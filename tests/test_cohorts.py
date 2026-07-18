@@ -19,11 +19,22 @@ SHA_B = "b" * 64
 SHA_C = "c" * 64
 
 
+def slot(packet_id: str, *, parent_session_id: str = "parent-session", expected_agent_type: str = "default") -> dict[str, str]:
+    return {
+        "packet_id": packet_id,
+        "transport": "codex",
+        "parent_session_id": parent_session_id,
+        "expected_agent_type": expected_agent_type,
+    }
+
+
 def cohort_base(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": 1,
         "cohort_id": "cohort-1",
         "packet_schema_version": 6,
+        "resource_envelope_sha256": SHA_A,
+        "execution_selection_sha256": SHA_B,
         "packet_refs": [
             {"packet_id": "packet-a", "routing_authority_sha256": SHA_A},
             {"packet_id": "packet-b", "routing_authority_sha256": SHA_B},
@@ -33,9 +44,9 @@ def cohort_base(**changes: object) -> dict[str, object]:
         "waves": [["packet-a"], ["packet-b"], ["packet-c"]],
         "max_concurrency": 2,
         "transport_slots": [
-            {"packet_id": "packet-a", "slot_id": "slot-1"},
-            {"packet_id": "packet-b", "slot_id": "slot-1"},
-            {"packet_id": "packet-c", "slot_id": "slot-1"},
+            slot("packet-a"),
+            slot("packet-b"),
+            slot("packet-c"),
         ],
         "failure_policy": "cancel_remaining",
         "cancel_policy": "cancel_remaining",
@@ -73,10 +84,10 @@ def test_dependency_edge_order_is_canonicalized_before_hashing() -> None:
         "packet_refs": packet_refs,
         "waves": [["packet-a", "packet-b"], ["packet-c"], ["packet-d"]],
         "transport_slots": [
-            {"packet_id": "packet-a", "slot_id": "slot-a"},
-            {"packet_id": "packet-b", "slot_id": "slot-b"},
-            {"packet_id": "packet-c", "slot_id": "slot-a"},
-            {"packet_id": "packet-d", "slot_id": "slot-a"},
+            slot("packet-a", expected_agent_type="explorer"),
+            slot("packet-b", expected_agent_type="worker"),
+            slot("packet-c", expected_agent_type="explorer"),
+            slot("packet-d", expected_agent_type="explorer"),
         ],
     }
     first = sealed(**common, dependencies={"packet-a": [], "packet-b": [], "packet-c": ["packet-a", "packet-b"], "packet-d": ["packet-c"]})
@@ -89,18 +100,41 @@ def test_transport_slot_mapping_is_canonicalized_by_packet_identity() -> None:
     first = sealed()
     second = sealed(
         transport_slots=[
-            {"packet_id": "packet-c", "slot_id": "slot-1"},
-            {"packet_id": "packet-a", "slot_id": "slot-1"},
-            {"packet_id": "packet-b", "slot_id": "slot-1"},
+            slot("packet-c"),
+            slot("packet-a"),
+            slot("packet-b"),
         ]
     )
 
     assert first == second
-    assert [slot["packet_id"] for slot in second["transport_slots"]] == [
+    assert [entry["packet_id"] for entry in second["transport_slots"]] == [
         "packet-a",
         "packet-b",
         "packet-c",
     ]
+
+
+def test_codex_slots_are_derived_sealed_and_bound_to_external_hashes() -> None:
+    cohort = sealed()
+    transport_slot = cohort["transport_slots"][0]
+    assert transport_slot == {
+        **slot("packet-a"),
+        "slot_sha256": transport_slot["slot_sha256"],
+    }
+    assert transport_slot["slot_sha256"] != SHA_A
+    assert cohort["resource_envelope_sha256"] == SHA_A
+    assert cohort["execution_selection_sha256"] == SHA_B
+
+    tampered_slot = copy.deepcopy(cohort)
+    tampered_slot["transport_slots"][0]["slot_sha256"] = SHA_A
+    with pytest.raises(CohortError, match="slot_sha256"):
+        validate_cohort(tampered_slot)
+    with pytest.raises(CohortError, match="transport_slot schema"):
+        sealed(transport_slots=[{**slot("packet-a"), "slot_sha256": SHA_A}, slot("packet-b"), slot("packet-c")])
+    with pytest.raises(CohortError, match="resource_envelope_sha256"):
+        sealed(resource_envelope_sha256="A" * 64)
+    with pytest.raises(CohortError, match="execution_selection_sha256"):
+        sealed(execution_selection_sha256="short")
 
 
 def test_schema_dag_capacity_slots_and_tampering_fail_closed() -> None:
@@ -114,12 +148,8 @@ def test_schema_dag_capacity_slots_and_tampering_fail_closed() -> None:
         sealed(packet_schema_version=5)
     with pytest.raises(CohortError, match="max_concurrency"):
         sealed(max_concurrency=1, waves=[["packet-a", "packet-b"], ["packet-c"]])
-    with pytest.raises(CohortError, match="slot conflict"):
-        sealed(
-            waves=[["packet-a", "packet-b"], ["packet-c"]],
-            max_concurrency=2,
-            dependencies={"packet-a": [], "packet-b": [], "packet-c": ["packet-b"]},
-        )
+    with pytest.raises(CohortError, match="max_concurrency"):
+        sealed(max_concurrency=13)
 
     tampered = copy.deepcopy(sealed())
     tampered["failure_policy"] = "continue"
@@ -140,12 +170,21 @@ def test_cohort_lifecycle_identifiers_are_canonical_and_bounded() -> None:
         sealed(packet_refs=[{"packet_id": "packet/path", "routing_authority_sha256": SHA_A}])
     with pytest.raises(CohortError, match="wave packet_id is invalid"):
         sealed(waves=[["packet/path"], ["packet-b"], ["packet-c"]])
-    with pytest.raises(CohortError, match="transport_slot.slot_id is invalid"):
+    for parent_session_id in ("parent\ninvalid", "p" * 513):
+        with pytest.raises(CohortError, match="transport_slot.parent_session_id is invalid"):
+            sealed(
+                transport_slots=[
+                    slot("packet-a", parent_session_id=parent_session_id),
+                    slot("packet-b"),
+                    slot("packet-c"),
+                ]
+            )
+    with pytest.raises(CohortError, match="transport_slot.expected_agent_type is invalid"):
         sealed(
             transport_slots=[
-                {"packet_id": "packet-a", "slot_id": "slot/path"},
-                {"packet_id": "packet-b", "slot_id": "slot-1"},
-                {"packet_id": "packet-c", "slot_id": "slot-1"},
+                slot("packet-a", expected_agent_type="general-purpose"),
+                slot("packet-b"),
+                slot("packet-c"),
             ]
         )
 
@@ -161,7 +200,7 @@ def test_iterative_cycle_validation_handles_the_1024_packet_boundary(monkeypatch
         },
         waves=[[packet_id] for packet_id in packet_ids],
         max_concurrency=1,
-        transport_slots=[{"packet_id": packet_id, "slot_id": f"slot-{index}"} for index, packet_id in enumerate(packet_ids)],
+        transport_slots=[slot(packet_id, parent_session_id=f"parent-{index}") for index, packet_id in enumerate(packet_ids)],
     )
     monkeypatch.setattr(cohorts_module, "MAX_COHORT_BYTES", 1024 * 1024)
     assert seal_cohort(chain)["cohort_id"] == "chain-1024"
@@ -185,6 +224,105 @@ def test_observed_start_is_the_only_running_projection_state() -> None:
         project_cohort(cohort, {"packet-a": {"status": "running", "terminal_outcome": None}})
 
 
+def test_codex_slot_collision_serializes_prearm_but_not_observed_execution() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="default"),
+            slot("packet-b", expected_agent_type="default"),
+            slot("packet-c", expected_agent_type="worker"),
+        ],
+    )
+    initial = project_cohort(cohort)
+    assert [packet["eligible"] for packet in initial["packets"]] == [True, False, True]
+
+    armed = project_cohort(
+        cohort, {"packet-a": {"status": "armed", "terminal_outcome": None}}
+    )
+    assert armed["packets"][0]["eligible"] is True
+    assert armed["packets"][0]["running"] is False
+    assert armed["packets"][1]["eligible"] is False
+    with pytest.raises(CohortError, match="simultaneously armed packets collide"):
+        project_cohort(
+            cohort,
+            {
+                "packet-a": {"status": "armed", "terminal_outcome": None},
+                "packet-b": {"status": "armed", "terminal_outcome": None},
+            },
+        )
+
+    first_started = project_cohort(
+        cohort, {"packet-a": {"status": "start_observed", "terminal_outcome": None}}
+    )
+    assert [packet["eligible"] for packet in first_started["packets"]] == [False, True, True]
+    assert first_started["packets"][0]["running"] is True
+
+    next_armed = project_cohort(
+        cohort,
+        {
+            "packet-a": {"status": "start_observed", "terminal_outcome": None},
+            "packet-b": {"status": "armed", "terminal_outcome": None},
+        },
+    )
+    assert [packet["eligible"] for packet in next_armed["packets"]] == [False, True, True]
+
+    overlapping_observations = project_cohort(
+        cohort,
+        {
+            "packet-b": {"status": "start_observed", "terminal_outcome": None},
+            "packet-a": {"status": "start_observed", "terminal_outcome": None},
+        },
+    )
+    assert [packet["running"] for packet in overlapping_observations["packets"]] == [True, True, False]
+
+
+def test_wildcard_slot_conflicts_only_within_the_same_parent_session() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="explorer"),
+            slot("packet-b", expected_agent_type="*"),
+            slot("packet-c", parent_session_id="other-parent", expected_agent_type="*"),
+        ],
+    )
+    projection = project_cohort(cohort)
+    assert [packet["eligible"] for packet in projection["packets"]] == [True, False, True]
+    with pytest.raises(CohortError, match="simultaneously armed packets collide"):
+        project_cohort(
+            cohort,
+            {
+                "packet-a": {"status": "armed", "terminal_outcome": None},
+                "packet-b": {"status": "armed", "terminal_outcome": None},
+            },
+        )
+
+
+def test_simultaneously_armed_noncolliding_slots_are_accepted() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="default"),
+            slot("packet-b", parent_session_id="other-parent", expected_agent_type="default"),
+            slot("packet-c", expected_agent_type="worker"),
+        ],
+    )
+
+    projection = project_cohort(
+        cohort,
+        {
+            "packet-a": {"status": "armed", "terminal_outcome": None},
+            "packet-b": {"status": "armed", "terminal_outcome": None},
+        },
+    )
+    assert [packet["eligible"] for packet in projection["packets"]] == [True, True, True]
+
+
 def test_terminal_arrival_order_does_not_change_next_wave_projection() -> None:
     cohort = sealed()
     first = project_cohort(
@@ -204,6 +342,29 @@ def test_terminal_arrival_order_does_not_change_next_wave_projection() -> None:
     assert first == second
     assert first["waves"][2]["status"] == "ready"
     assert first["packets"][2]["eligible"] is True
+
+
+def test_packet_state_mapping_order_does_not_change_slot_projection() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+    )
+    first = project_cohort(
+        cohort,
+        {
+            "packet-a": {"status": "start_observed", "terminal_outcome": None},
+            "packet-b": {"status": "planned", "terminal_outcome": None},
+        },
+    )
+    second = project_cohort(
+        cohort,
+        {
+            "packet-b": {"status": "planned", "terminal_outcome": None},
+            "packet-a": {"status": "start_observed", "terminal_outcome": None},
+        },
+    )
+    assert first == second
 
 
 def test_failure_and_cancel_policies_apply_only_to_their_matching_outcome() -> None:
@@ -251,10 +412,10 @@ def test_blocked_dependency_closure_allows_a_later_independent_wave() -> None:
         dependencies={"packet-a": [], "packet-b": ["packet-a"], "packet-c": ["packet-b"], "packet-d": []},
         waves=[["packet-a"], ["packet-b"], ["packet-c"], ["packet-d"]],
         transport_slots=[
-            {"packet_id": "packet-a", "slot_id": "slot-1"},
-            {"packet_id": "packet-b", "slot_id": "slot-1"},
-            {"packet_id": "packet-c", "slot_id": "slot-1"},
-            {"packet_id": "packet-d", "slot_id": "slot-1"},
+            slot("packet-a"),
+            slot("packet-b"),
+            slot("packet-c"),
+            slot("packet-d"),
         ],
     )
     projection = project_cohort(
@@ -309,9 +470,9 @@ def test_observed_start_remains_active_after_later_cancellation_request() -> Non
             waves=[["packet-a", "packet-c"], ["packet-b"]],
             max_concurrency=2,
             transport_slots=[
-                {"packet_id": "packet-a", "slot_id": "slot-1"},
-                {"packet_id": "packet-b", "slot_id": "slot-1"},
-                {"packet_id": "packet-c", "slot_id": "slot-2"},
+                slot("packet-a"),
+                slot("packet-b"),
+                slot("packet-c", expected_agent_type="worker"),
             ],
         ),
         {
@@ -335,9 +496,9 @@ def test_unknown_status_unknown_packet_and_oversize_inputs_are_rejected() -> Non
     oversized = cohort_base(
         packet_refs=[{"packet_id": packet_id, "routing_authority_sha256": SHA_A} for packet_id in packet_ids],
         dependencies={packet_id: [] for packet_id in packet_ids},
-        waves=[packet_ids],
-        max_concurrency=512,
-        transport_slots=[{"packet_id": packet_id, "slot_id": f"slot-{index}"} for index, packet_id in enumerate(packet_ids)],
+        waves=[packet_ids[index : index + 12] for index in range(0, len(packet_ids), 12)],
+        max_concurrency=12,
+        transport_slots=[slot(packet_id, parent_session_id=f"parent-{index}") for index, packet_id in enumerate(packet_ids)],
     )
     with pytest.raises(CohortError, match="byte bound"):
         seal_cohort(oversized)

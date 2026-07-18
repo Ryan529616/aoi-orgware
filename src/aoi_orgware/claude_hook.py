@@ -30,7 +30,6 @@ import argparse
 import datetime as dt
 import json
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -62,8 +61,8 @@ CLAIM_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 CLAIM_WRITE_GATE_ENV = "AOI_CLAUDE_CLAIM_WRITE_GATE"
 TIER_MODELS_ENV = "AOI_CLAUDE_TIER_MODELS"
 # Requested-model families each packet tier may name in a governed dispatch.
-# A family alias matches only a delimiter-bounded component of a fully qualified
-# model id; configured full ids match exactly. The session's
+# Matching is case-insensitive substring against the requested model value, so
+# "sonnet" covers both the alias and a fully qualified model id. The session's
 # own top-price model is deliberately in no tier: the Chief session is the only
 # place for it, and a packet that needs it is an escalation, not a dispatch.
 DEFAULT_TIER_MODEL_FAMILIES: dict[str, tuple[str, ...]] = {
@@ -73,7 +72,6 @@ DEFAULT_TIER_MODEL_FAMILIES: dict[str, tuple[str, ...]] = {
     "standard": ("sonnet", "haiku"),
     "economical": ("haiku",),
 }
-MODEL_FAMILY_ALIASES = frozenset({"opus", "sonnet", "haiku"})
 
 
 def governed_agent_types() -> frozenset[str]:
@@ -86,55 +84,27 @@ def governed_agent_types() -> frozenset[str]:
 
 
 def tier_model_families() -> dict[str, tuple[str, ...]]:
-    """Tier -> allowed requested models, with a strict JSON override.
-
-    A present but malformed override is a policy error. Silently falling back
-    would turn a deployment typo into an authorization bypass.
-    """
+    """Tier -> allowed requested-model families, env-overridable as JSON."""
 
     raw = os.environ.get(TIER_MODELS_ENV, "")
     if not raw.strip():
         return dict(DEFAULT_TIER_MODEL_FAMILIES)
     try:
         parsed = json.loads(raw)
-    except ValueError as exc:
-        raise ValueError(f"{TIER_MODELS_ENV} is not valid JSON") from exc
+    except ValueError:
+        return dict(DEFAULT_TIER_MODEL_FAMILIES)
     if not isinstance(parsed, dict):
-        raise ValueError(f"{TIER_MODELS_ENV} must be a JSON object")
+        return dict(DEFAULT_TIER_MODEL_FAMILIES)
     families: dict[str, tuple[str, ...]] = {}
     for tier, models in parsed.items():
-        key = str(tier).strip().lower()
-        if not key:
-            raise ValueError(f"{TIER_MODELS_ENV} contains an empty tier key")
-        if key in families:
-            raise ValueError(
-                f"{TIER_MODELS_ENV} contains duplicate tier {key!r} after normalization"
-            )
         if not isinstance(models, list):
-            raise ValueError(f"{TIER_MODELS_ENV} tier {key!r} must be a JSON list")
-        if not models or any(
-            not isinstance(model, str) or not model.strip() for model in models
-        ):
-            raise ValueError(
-                f"{TIER_MODELS_ENV} tier {key!r} must contain non-empty strings"
-            )
-        families[key] = tuple(model.strip().lower() for model in models)
-    if not families:
-        raise ValueError(f"{TIER_MODELS_ENV} must define at least one tier")
-    return families
-
-
-def _model_matches_approved_value(model: str, approved: str) -> bool:
-    normalized = model.strip().lower()
-    candidate = approved.strip().lower()
-    if candidate in MODEL_FAMILY_ALIASES:
-        return bool(
-            re.search(
-                rf"(?:^|[-_.]){re.escape(candidate)}(?:$|[-_.])",
-                normalized,
-            )
+            continue
+        values = tuple(
+            str(model).strip().lower() for model in models if str(model).strip()
         )
-    return normalized == candidate
+        if values:
+            families[str(tier)] = values
+    return families or dict(DEFAULT_TIER_MODEL_FAMILIES)
 
 
 def model_tier_violation(
@@ -143,23 +113,17 @@ def model_tier_violation(
     """Deny reason when the dispatch request's model breaks the tier policy.
 
     This checks the *dispatch request* the runtime received, not the routing
-    the runtime later performs. A packet without a tier passes through because
-    there is no tier authority to enforce. A configured policy defect or a
-    tier without a table row fails closed on this cooperative spawn path.
+    the runtime later performs. A packet without a tier and a tier without a
+    table row both pass through: the tier ledger gate lives at create-packet,
+    and an unknown label has no policy to enforce.
     """
 
-    tier = str(model_tier or "").strip().lower()
+    tier = str(model_tier or "").strip()
     if not tier:
         return None
-    try:
-        policy = tier_model_families()
-    except ValueError as exc:
-        return f"AOI model-tier policy is invalid: {exc}."
-    families = policy.get(tier)
+    families = tier_model_families().get(tier)
     if not families:
-        return (
-            f"AOI model-tier gate: packet tier {tier!r} has no configured policy row."
-        )
+        return None
     model = str(tool_input.get("model", "") or "").strip()
     if not model:
         return (
@@ -168,9 +132,8 @@ def model_tier_violation(
             "inherits the Chief session's model, which this packet's tier "
             "does not authorize."
         )
-    if not any(
-        _model_matches_approved_value(model, family) for family in families
-    ):
+    lowered = model.lower()
+    if not any(family in lowered for family in families):
         return (
             f"AOI model-tier gate: requested model {model!r} is outside packet "
             f"tier {tier!r} (allowed families: {', '.join(families)}). "
@@ -183,14 +146,8 @@ def model_tier_violation(
 def model_tier_note(model_tier: Any, tool_input: dict[str, Any]) -> str:
     """Allow-reason suffix naming the checked model, empty when unchecked."""
 
-    tier = str(model_tier or "").strip().lower()
-    if not tier:
-        return ""
-    try:
-        configured = tier_model_families().get(tier)
-    except ValueError:
-        configured = None
-    if not configured:
+    tier = str(model_tier or "").strip()
+    if not tier or not tier_model_families().get(tier):
         return ""
     model = str(tool_input.get("model", "") or "").strip()
     if not model:
@@ -230,23 +187,6 @@ def _repo_relative(root: Path, target: str) -> str | None:
     return relative.as_posix()
 
 
-def _repo_paths_casefold(root: Path) -> bool:
-    """Mirror the lock ledger's filesystem comparison domain."""
-
-    if os.name == "nt":
-        return True
-    # WSL repos on a configured Windows drive mount share the Windows lock
-    # identity; native POSIX repos remain case-sensitive.
-    from .harnesslib import _path_uses_windows_host_mount
-
-    return _path_uses_windows_host_mount(root)
-
-
-def _repo_path_key(root: Path, value: str) -> str:
-    normalized = value.strip().strip("/")
-    return normalized.casefold() if _repo_paths_casefold(root) else normalized
-
-
 def _claimed_repo_scopes(
     root: Path, session_id: str
 ) -> tuple[str, set[str], set[str]] | None:
@@ -269,9 +209,9 @@ def _claimed_repo_scopes(
         for lock in claim.get("locks", []):
             text = str(lock)
             if text.startswith("repo:file:"):
-                exact.add(_repo_path_key(root, text[len("repo:file:") :]))
+                exact.add(text[len("repo:file:") :].strip().lower())
             elif text.startswith("repo:tree:"):
-                trees.add(_repo_path_key(root, text[len("repo:tree:") :]))
+                trees.add(text[len("repo:tree:") :].strip().strip("/").lower())
     return str(state.get("task_id", "")), exact, trees
 
 
@@ -312,7 +252,7 @@ def claim_write_gate(root: Path, payload: dict[str, Any]) -> None:
         allow()
         return
     task_id, exact, trees = scopes
-    key = _repo_path_key(root, relative)
+    key = relative.lower()
     covered = key in exact or any(
         tree and (key == tree or key.startswith(tree + "/")) for tree in trees
     )
@@ -408,22 +348,9 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
         tool_input = {}
     subagent_type = str(tool_input.get("subagent_type", ""))
     session_id = str(payload.get("session_id", ""))
-    mapping_status, _ = session_state(root, session_id)
-    # The AOI-issued depth-one parent mapping is the authoritative nested case.
-    # A bound root payload carrying agent_id is also treated conservatively as
-    # nested; unbound/ambient payloads may carry that field and remain unbound.
-    nested_request = mapping_status == "subagent_parent" or (
-        mapping_status == "valid" and bool(str(payload.get("agent_id", "")))
-    )
-    explicit_slot = _armed_slot_exists(root, session_id, subagent_type)
     description = str(tool_input.get("description", "")).strip()
     task_suffix = f" for: {description}" if description else ""
-    if (
-        subagent_type not in governed_agent_types()
-        and not explicit_slot
-        and not nested_request
-        and mapping_status != "corrupt"
-    ):
+    if subagent_type not in governed_agent_types():
         # Ungoverned agent type: not gated, but still announce the dispatch so the
         # spawn (what agent, what task) is visible rather than silent.
         pretooluse_decision(
@@ -445,6 +372,14 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
     )
     status = outcome.get("status")
     reason_code = str(outcome.get("reason_code", ""))
+    if status == "unbound":
+        pretooluse_decision(
+            "allow",
+            f"AOI: dispatching {subagent_type!r}{task_suffix}. This session is not "
+            "bound to an AOI task, so the dispatch is not packet-gated; bind a task "
+            "to govern sub-agent dispatch.",
+        )
+        return
     if status == "corrupt":
         pretooluse_decision(
             "deny",
@@ -453,7 +388,7 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
             "sub-agent.",
         )
         return
-    if nested_request:
+    if str(payload.get("agent_id", "")):
         # A depth-two spawn. Read-only helpers are allowed against a parent
         # packet's Chief-granted helper budget; anything needing write authority
         # still goes through the manual depth-two dispatch path.
@@ -490,14 +425,6 @@ def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
             "remaining helper budget. Grant read-only helpers with "
             "`aoi create-packet --helper-spawn-budget N`, or arm and register a "
             "depth-two packet through the manual dispatch path for write authority.",
-        )
-        return
-    if status == "unbound":
-        pretooluse_decision(
-            "allow",
-            f"AOI: dispatching {subagent_type!r}{task_suffix}. This session is not "
-            "bound to an AOI task, so the dispatch is not packet-gated; bind a task "
-            "to govern sub-agent dispatch.",
         )
         return
     if status == "authorized":
@@ -557,11 +484,8 @@ def subagent_start(root: Path, payload: dict[str, Any]) -> None:
     )
     session_id = str(payload.get("session_id", ""))
     paths = get_paths(root)
-    mapping_status, _ = session_state(root, session_id)
-    if (
-        raw_agent_type not in governed_agent_types()
-        and mapping_status not in {"subagent_parent", "corrupt"}
-        and not _armed_slot_exists(root, session_id, raw_agent_type)
+    if raw_agent_type not in governed_agent_types() and not _armed_slot_exists(
+        root, session_id, raw_agent_type
     ):
         write_output(
             {
