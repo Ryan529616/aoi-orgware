@@ -7,16 +7,26 @@ import pytest
 import aoi_orgware.cohorts as cohorts_module
 from aoi_orgware.cohorts import (
     CohortError,
+    cohort_advance_selection_sha256,
     cohort_sha256,
+    eligible_cohort_wave_packet_ids,
+    execution_selection_identity_sha256,
     project_cohort,
     seal_cohort,
+    seal_cohort_advance_selection,
     validate_cohort,
+    validate_cohort_advance_selection,
 )
 
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
+SHA_D = "d" * 64
+SHA_E = "e" * 64
+SHA_F = "f" * 64
+SELECTION_IDENTITY_SHA = execution_selection_identity_sha256("selection-1")
+SELECTION_TARGET_SHA = SHA_F
 
 
 def slot(packet_id: str, *, parent_session_id: str = "parent-session", expected_agent_type: str = "default") -> dict[str, str]:
@@ -34,7 +44,8 @@ def cohort_base(**changes: object) -> dict[str, object]:
         "cohort_id": "cohort-1",
         "packet_schema_version": 6,
         "resource_envelope_sha256": SHA_A,
-        "execution_selection_sha256": SHA_B,
+        "execution_selection_identity_sha256": SELECTION_IDENTITY_SHA,
+        "execution_selection_target_contract_sha256": SELECTION_TARGET_SHA,
         "packet_refs": [
             {"packet_id": "packet-a", "routing_authority_sha256": SHA_A},
             {"packet_id": "packet-b", "routing_authority_sha256": SHA_B},
@@ -123,7 +134,11 @@ def test_codex_slots_are_derived_sealed_and_bound_to_external_hashes() -> None:
     }
     assert transport_slot["slot_sha256"] != SHA_A
     assert cohort["resource_envelope_sha256"] == SHA_A
-    assert cohort["execution_selection_sha256"] == SHA_B
+    assert (
+        cohort["execution_selection_identity_sha256"]
+        == execution_selection_identity_sha256("selection-1")
+    )
+    assert cohort["execution_selection_target_contract_sha256"] == SELECTION_TARGET_SHA
 
     tampered_slot = copy.deepcopy(cohort)
     tampered_slot["transport_slots"][0]["slot_sha256"] = SHA_A
@@ -133,8 +148,12 @@ def test_codex_slots_are_derived_sealed_and_bound_to_external_hashes() -> None:
         sealed(transport_slots=[{**slot("packet-a"), "slot_sha256": SHA_A}, slot("packet-b"), slot("packet-c")])
     with pytest.raises(CohortError, match="resource_envelope_sha256"):
         sealed(resource_envelope_sha256="A" * 64)
-    with pytest.raises(CohortError, match="execution_selection_sha256"):
-        sealed(execution_selection_sha256="short")
+    with pytest.raises(CohortError, match="execution_selection_identity_sha256"):
+        sealed(execution_selection_identity_sha256="short")
+    with pytest.raises(CohortError, match="execution_selection_target_contract_sha256"):
+        sealed(execution_selection_target_contract_sha256="short")
+    with pytest.raises(CohortError, match="execution_selection_id"):
+        execution_selection_identity_sha256("")
 
 
 def test_schema_dag_capacity_slots_and_tampering_fail_closed() -> None:
@@ -484,6 +503,223 @@ def test_observed_start_remains_active_after_later_cancellation_request() -> Non
     assert projection["cancel_requested"] is True
     assert projection["packets"][1]["running"] is True
     assert projection["waves"][0]["status"] == "active"
+
+
+def test_exact_advance_selection_is_sealed_in_wave_order() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="default"),
+            slot("packet-b", expected_agent_type="default"),
+            slot("packet-c", expected_agent_type="worker"),
+        ],
+    )
+    base = {
+        "schema_version": 1,
+        "cohort_sha256": cohort["cohort_sha256"],
+        "wave_index": 0,
+        "routes": [
+            {
+                "packet_id": "packet-a",
+                "routing_authority_sha256": SHA_A,
+                "outcome_slot_sha256": SHA_D,
+            },
+            {
+                "packet_id": "packet-c",
+                "routing_authority_sha256": SHA_C,
+                "outcome_slot_sha256": SHA_F,
+            },
+        ],
+    }
+
+    selection = seal_cohort_advance_selection(cohort, base, None)
+
+    assert selection["selection_sha256"] == cohort_advance_selection_sha256(
+        cohort, base, None
+    )
+    assert validate_cohort_advance_selection(cohort, selection, None) == selection
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(routes=[]), "routes"),
+        (
+            lambda value: value.update(routes=list(reversed(value["routes"]))),
+            "wave order",
+        ),
+        (
+            lambda value: value["routes"][0].update(
+                routing_authority_sha256=SHA_B
+            ),
+            "sealed packet authority",
+        ),
+        (
+            lambda value: value["routes"][1].update(outcome_slot_sha256=SHA_D),
+            "duplicate outcome slot",
+        ),
+        (
+            lambda value: value["routes"][1].update(packet_id="packet-b"),
+            "sealed packet authority",
+        ),
+        (lambda value: value.update(wave_index=True), "wave_index"),
+        (lambda value: value.update(extra="widened"), "schema"),
+    ],
+)
+def test_advance_selection_rejects_widening_reordering_and_route_substitution(
+    mutate, message: str
+) -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="default"),
+            slot("packet-b", expected_agent_type="default"),
+            slot("packet-c", expected_agent_type="worker"),
+        ],
+    )
+    base = {
+        "schema_version": 1,
+        "cohort_sha256": cohort["cohort_sha256"],
+        "wave_index": 0,
+        "routes": [
+            {
+                "packet_id": "packet-a",
+                "routing_authority_sha256": SHA_A,
+                "outcome_slot_sha256": SHA_D,
+            },
+            {
+                "packet_id": "packet-c",
+                "routing_authority_sha256": SHA_C,
+                "outcome_slot_sha256": SHA_F,
+            },
+        ],
+    }
+    mutate(base)
+
+    with pytest.raises(CohortError, match=message):
+        seal_cohort_advance_selection(cohort, base, None)
+
+
+def test_advance_selection_rejects_packet_from_another_wave_and_hash_tamper() -> None:
+    cohort = sealed()
+    base = {
+        "schema_version": 1,
+        "cohort_sha256": cohort["cohort_sha256"],
+        "wave_index": 0,
+        "routes": [
+            {
+                "packet_id": "packet-b",
+                "routing_authority_sha256": SHA_B,
+                "outcome_slot_sha256": SHA_E,
+            }
+        ],
+    }
+    with pytest.raises(CohortError, match="outside its wave"):
+        seal_cohort_advance_selection(cohort, base, None)
+
+    valid = seal_cohort_advance_selection(
+        cohort,
+        {
+            **base,
+            "routes": [
+                {
+                    "packet_id": "packet-a",
+                    "routing_authority_sha256": SHA_A,
+                    "outcome_slot_sha256": SHA_D,
+                }
+            ],
+        },
+        None,
+    )
+    valid["selection_sha256"] = SHA_F
+    with pytest.raises(CohortError, match="does not match"):
+        validate_cohort_advance_selection(cohort, valid, None)
+
+
+def test_manual_round_selection_uses_only_planned_eligible_packets() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="default"),
+            slot("packet-b", expected_agent_type="default"),
+            slot("packet-c", expected_agent_type="worker"),
+        ],
+    )
+
+    assert eligible_cohort_wave_packet_ids(
+        cohort, None, wave_index=0
+    ) == ["packet-a", "packet-c"]
+    assert eligible_cohort_wave_packet_ids(
+        cohort,
+        {"packet-a": {"status": "armed", "terminal_outcome": None}},
+        wave_index=0,
+    ) == ["packet-c"]
+    assert eligible_cohort_wave_packet_ids(
+        cohort,
+        {"packet-a": {"status": "start_observed", "terminal_outcome": None}},
+        wave_index=0,
+    ) == ["packet-b", "packet-c"]
+    assert eligible_cohort_wave_packet_ids(
+        cohort,
+        {"packet-b": {"status": "armed", "terminal_outcome": None}},
+        wave_index=0,
+    ) == ["packet-c"]
+
+
+def test_selection_seal_rejects_ineligible_or_colliding_packet_set() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []},
+        waves=[["packet-a", "packet-b", "packet-c"]],
+        max_concurrency=3,
+        transport_slots=[
+            slot("packet-a", expected_agent_type="default"),
+            slot("packet-b", expected_agent_type="default"),
+            slot("packet-c", expected_agent_type="worker"),
+        ],
+    )
+
+    def selection(packet_ids: list[str]) -> dict[str, object]:
+        route_by_packet = {
+            "packet-a": (SHA_A, SHA_D),
+            "packet-b": (SHA_B, SHA_E),
+            "packet-c": (SHA_C, SHA_F),
+        }
+        return {
+            "schema_version": 1,
+            "cohort_sha256": cohort["cohort_sha256"],
+            "wave_index": 0,
+            "routes": [
+                {
+                    "packet_id": packet_id,
+                    "routing_authority_sha256": route_by_packet[packet_id][0],
+                    "outcome_slot_sha256": route_by_packet[packet_id][1],
+                }
+                for packet_id in packet_ids
+            ],
+        }
+
+    for packet_ids in (["packet-b"], ["packet-a", "packet-b"]):
+        with pytest.raises(CohortError, match="exact eligible"):
+            seal_cohort_advance_selection(cohort, selection(packet_ids), None)
+
+    limited = seal_cohort_advance_selection(
+        cohort, selection(["packet-a"]), None, available_capacity=1
+    )
+    assert [route["packet_id"] for route in limited["routes"]] == ["packet-a"]
+
+
+def test_manual_round_selection_does_not_skip_unresolved_prior_wave() -> None:
+    cohort = sealed(
+        dependencies={"packet-a": [], "packet-b": [], "packet-c": []}
+    )
+
+    assert eligible_cohort_wave_packet_ids(cohort, None, wave_index=1) == []
 
 
 def test_unknown_status_unknown_packet_and_oversize_inputs_are_rejected() -> None:

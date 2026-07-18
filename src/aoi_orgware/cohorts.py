@@ -1,7 +1,10 @@
 """Pure deterministic cohort planning and projection (no transport launch).
 
 The schema binds a v6 packet authority reference to a fixed dependency graph
-and wave plan.  It intentionally does *not* dispatch a packet, reserve a real
+and wave plan.  Its execution-selection references seal both the selection
+identity and the immutable v2 target contract; the integration layer still
+has to prove that exact contract is active at the authorized semantic head.
+It intentionally does *not* dispatch a packet, reserve a real
 transport, or create a transport receipt.  A caller that later implements a
 transport must make and persist that claim separately.
 """
@@ -16,6 +19,7 @@ from .semantic_events import SemanticEventError, canonical_json_bytes, canonical
 
 
 COHORT_SCHEMA_VERSION = 1
+COHORT_ADVANCE_SELECTION_SCHEMA_VERSION = 1
 EXPECTED_PACKET_SCHEMA_VERSION = 6
 MAX_COHORT_BYTES = 64 * 1024
 MAX_COHORT_PACKETS = 1_024
@@ -44,7 +48,8 @@ _BASE_FIELDS = {
     "cohort_id",
     "packet_schema_version",
     "resource_envelope_sha256",
-    "execution_selection_sha256",
+    "execution_selection_identity_sha256",
+    "execution_selection_target_contract_sha256",
     "packet_refs",
     "dependencies",
     "waves",
@@ -57,6 +62,20 @@ _SEALED_FIELDS = _BASE_FIELDS | {"cohort_sha256"}
 _PACKET_REF_FIELDS = {"packet_id", "routing_authority_sha256"}
 _SLOT_FIELDS = {"packet_id", "transport", "parent_session_id", "expected_agent_type"}
 _SEALED_SLOT_FIELDS = _SLOT_FIELDS | {"slot_sha256"}
+_ADVANCE_ROUTE_FIELDS = {
+    "packet_id",
+    "routing_authority_sha256",
+    "outcome_slot_sha256",
+}
+_ADVANCE_SELECTION_FIELDS = {
+    "schema_version",
+    "cohort_sha256",
+    "wave_index",
+    "routes",
+}
+_SEALED_ADVANCE_SELECTION_FIELDS = _ADVANCE_SELECTION_FIELDS | {
+    "selection_sha256"
+}
 _STATE_FIELDS = {"status", "terminal_outcome"}
 _STATUSES = {"planned", "armed", "start_observed", "terminal", "cancelled"}
 _TERMINAL_OUTCOMES = {"accepted", "rejected", "failed", "cancelled"}
@@ -275,10 +294,19 @@ def _base(value: Any, *, sealed_slots: bool = False) -> dict[str, Any]:
         "schema_version": COHORT_SCHEMA_VERSION,
         "cohort_id": _id(item["cohort_id"], "cohort_id"),
         "packet_schema_version": EXPECTED_PACKET_SCHEMA_VERSION,
-        # These are sealed references only.  Validating their referenced
-        # objects, lane caps, or live totals belongs to the integration layer.
+        # These are sealed references only.  The integration layer must prove
+        # the exact target contract is the one active at the authorized head,
+        # bind it to every arm's applied resource event/dynamic envelope, and
+        # then re-derive live caps.
         "resource_envelope_sha256": _sha(item["resource_envelope_sha256"], "resource_envelope_sha256"),
-        "execution_selection_sha256": _sha(item["execution_selection_sha256"], "execution_selection_sha256"),
+        "execution_selection_identity_sha256": _sha(
+            item["execution_selection_identity_sha256"],
+            "execution_selection_identity_sha256",
+        ),
+        "execution_selection_target_contract_sha256": _sha(
+            item["execution_selection_target_contract_sha256"],
+            "execution_selection_target_contract_sha256",
+        ),
         "packet_refs": packet_refs,
         "dependencies": dependencies,
         "waves": waves,
@@ -294,6 +322,25 @@ def cohort_sha256(cohort: Mapping[str, Any]) -> str:
 
     try:
         return canonical_sha256(_base(cohort), max_bytes=MAX_COHORT_BYTES)
+    except SemanticEventError as exc:
+        raise CohortError(str(exc)) from exc
+
+
+def execution_selection_identity_sha256(execution_selection_id: str) -> str:
+    """Hash the exact non-empty execution-selection identity used by an arm.
+
+    This digest binds identity only.  It is not a digest of the mutable task
+    selection record or a substitute for integration-time active-state checks.
+    """
+
+    identity = {
+        "schema_version": 1,
+        "execution_selection_id": _id(
+            execution_selection_id, "execution_selection_id"
+        ),
+    }
+    try:
+        return canonical_sha256(identity, max_bytes=MAX_COHORT_BYTES)
     except SemanticEventError as exc:
         raise CohortError(str(exc)) from exc
 
@@ -321,6 +368,162 @@ def validate_cohort(cohort: Mapping[str, Any]) -> dict[str, Any]:
     if item["cohort_sha256"] != expected:
         _fail("cohort_sha256 does not match cohort")
     return {**base, "cohort_sha256": expected}
+
+
+def _wave_index(value: Any, cohort: Mapping[str, Any]) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value < len(cohort["waves"])
+    ):
+        _fail("cohort advance wave_index is invalid")
+    return value
+
+
+def _advance_selection_base(
+    cohort: Mapping[str, Any], value: Any
+) -> dict[str, Any]:
+    item = _object(value, _ADVANCE_SELECTION_FIELDS, "cohort advance selection")
+    if (
+        item["schema_version"] != COHORT_ADVANCE_SELECTION_SCHEMA_VERSION
+        or isinstance(item["schema_version"], bool)
+    ):
+        _fail("cohort advance selection schema_version is invalid")
+    checked_cohort = validate_cohort(cohort)
+    if item["cohort_sha256"] != checked_cohort["cohort_sha256"]:
+        _fail("cohort advance selection names another cohort")
+    wave_index = _wave_index(item["wave_index"], checked_cohort)
+    routes = item["routes"]
+    if (
+        not isinstance(routes, list)
+        or not routes
+        or len(routes) > checked_cohort["max_concurrency"]
+    ):
+        _fail("cohort advance routes are invalid or over capacity")
+    refs = {
+        ref["packet_id"]: ref["routing_authority_sha256"]
+        for ref in checked_cohort["packet_refs"]
+    }
+    wave = checked_cohort["waves"][wave_index]
+    wave_position = {packet_id: index for index, packet_id in enumerate(wave)}
+    checked_routes: list[dict[str, str]] = []
+    seen_packets: set[str] = set()
+    seen_slots: set[str] = set()
+    prior_position = -1
+    for raw in routes:
+        route = _object(raw, _ADVANCE_ROUTE_FIELDS, "cohort advance route")
+        packet_id = _id(route["packet_id"], "cohort advance route packet_id")
+        if packet_id not in wave_position:
+            _fail("cohort advance route names a packet outside its wave")
+        position = wave_position[packet_id]
+        if packet_id in seen_packets or position <= prior_position:
+            _fail("cohort advance routes are duplicate or out of wave order")
+        routing_authority_sha256 = _sha(
+            route["routing_authority_sha256"],
+            "cohort advance routing authority SHA-256",
+        )
+        if refs[packet_id] != routing_authority_sha256:
+            _fail("cohort advance route differs from sealed packet authority")
+        outcome_slot_sha256 = _sha(
+            route["outcome_slot_sha256"], "cohort advance outcome slot SHA-256"
+        )
+        if outcome_slot_sha256 in seen_slots:
+            _fail("cohort advance routes contain a duplicate outcome slot")
+        checked_routes.append(
+            {
+                "packet_id": packet_id,
+                "routing_authority_sha256": routing_authority_sha256,
+                "outcome_slot_sha256": outcome_slot_sha256,
+            }
+        )
+        seen_packets.add(packet_id)
+        seen_slots.add(outcome_slot_sha256)
+        prior_position = position
+    return {
+        "schema_version": COHORT_ADVANCE_SELECTION_SCHEMA_VERSION,
+        "cohort_sha256": checked_cohort["cohort_sha256"],
+        "wave_index": wave_index,
+        "routes": checked_routes,
+    }
+
+
+def cohort_advance_selection_sha256(
+    cohort: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    packet_states: Mapping[str, Any] | None,
+    *,
+    available_capacity: int | None = None,
+) -> str:
+    """Hash one exact eligible ordered subset of a sealed cohort wave."""
+
+    try:
+        base = _advance_selection_base(cohort, selection)
+        _require_eligible_selection(
+            cohort,
+            packet_states,
+            base,
+            available_capacity=available_capacity,
+        )
+        return canonical_sha256(base, max_bytes=MAX_COHORT_BYTES)
+    except SemanticEventError as exc:
+        raise CohortError(str(exc)) from exc
+
+
+def seal_cohort_advance_selection(
+    cohort: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    packet_states: Mapping[str, Any] | None,
+    *,
+    available_capacity: int | None = None,
+) -> dict[str, Any]:
+    """Seal packet, authority, and routing-slot identities for one advance."""
+
+    base = _advance_selection_base(cohort, selection)
+    _require_eligible_selection(
+        cohort,
+        packet_states,
+        base,
+        available_capacity=available_capacity,
+    )
+    try:
+        base["selection_sha256"] = canonical_sha256(
+            base, max_bytes=MAX_COHORT_BYTES
+        )
+    except SemanticEventError as exc:
+        raise CohortError(str(exc)) from exc
+    return base
+
+
+def validate_cohort_advance_selection(
+    cohort: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    packet_states: Mapping[str, Any] | None,
+    *,
+    available_capacity: int | None = None,
+) -> dict[str, Any]:
+    """Validate a sealed exact cohort advance selection."""
+
+    item = _object(
+        selection,
+        _SEALED_ADVANCE_SELECTION_FIELDS,
+        "sealed cohort advance selection",
+    )
+    base = _advance_selection_base(
+        cohort, {key: item[key] for key in _ADVANCE_SELECTION_FIELDS}
+    )
+    _require_eligible_selection(
+        cohort,
+        packet_states,
+        base,
+        available_capacity=available_capacity,
+    )
+    try:
+        expected = canonical_sha256(base, max_bytes=MAX_COHORT_BYTES)
+    except SemanticEventError as exc:
+        raise CohortError(str(exc)) from exc
+    if item["selection_sha256"] != expected:
+        _fail("cohort advance selection SHA-256 does not match selection")
+    return {**base, "selection_sha256": expected}
 
 
 def _packet_states(value: Any, packet_ids: list[str]) -> dict[str, dict[str, str | None]]:
@@ -460,6 +663,22 @@ def project_cohort(cohort: Mapping[str, Any], packet_states: Mapping[str, Any] |
             )
             for packet_id in wave
         }
+        # An already-armed slot wins over any still-planned colliding packet,
+        # regardless of plan order.  Otherwise an adversarial state with a
+        # later packet armed could make an earlier colliding packet appear
+        # eligible and permit two simultaneous arms for one transport slot.
+        for packet_id in wave:
+            if states[packet_id]["status"] != "planned":
+                continue
+            if any(
+                states[other_packet_id]["status"] == "armed"
+                and _slots_collide(
+                    slot_by_packet[packet_id], slot_by_packet[other_packet_id]
+                )
+                for other_packet_id in packet_ids
+                if other_packet_id != packet_id
+            ):
+                packet_eligible[packet_id] = False
         # A slot is only a deterministic pre-arm ordering constraint.  Once a
         # start has been observed, a following packet may be pre-armed even if
         # the earlier execution is still live; integration owns live capacity.
@@ -530,3 +749,88 @@ def project_cohort(cohort: Mapping[str, Any], packet_states: Mapping[str, Any] |
     }
     projection["projection_sha256"] = cohort_projection_sha256(projection)
     return projection
+
+
+def eligible_cohort_wave_packet_ids(
+    cohort: Mapping[str, Any],
+    packet_states: Mapping[str, Any] | None,
+    *,
+    wave_index: int,
+    available_capacity: int | None = None,
+) -> list[str]:
+    """Return the deterministic, not-yet-armed selection for one manual round.
+
+    This function only chooses identities from a supplied current-state view.
+    It neither creates routing authority nor claims a transport launch.
+    """
+
+    checked = validate_cohort(cohort)
+    wave_index = _wave_index(wave_index, checked)
+    states = _packet_states({} if packet_states is None else packet_states, [
+        ref["packet_id"] for ref in checked["packet_refs"]
+    ])
+    inflight = sum(
+        state["status"] in {"armed", "start_observed"}
+        for state in states.values()
+    )
+    local_available = max(0, checked["max_concurrency"] - inflight)
+    if available_capacity is None:
+        external_available = checked["max_concurrency"]
+    elif (
+        not isinstance(available_capacity, int)
+        or isinstance(available_capacity, bool)
+        or not 0 <= available_capacity <= MAX_CONCURRENCY
+    ):
+        _fail("cohort advance available capacity is invalid")
+    else:
+        external_available = available_capacity
+    budget = min(local_available, external_available)
+    projection = project_cohort(checked, packet_states)
+    by_packet = {row["packet_id"]: row for row in projection["packets"]}
+    candidates = [
+        packet_id
+        for packet_id in checked["waves"][wave_index]
+        if by_packet[packet_id]["status"] == "planned"
+        and by_packet[packet_id]["eligible"]
+    ]
+    return candidates[:budget]
+
+
+def _require_eligible_selection(
+    cohort: Mapping[str, Any],
+    packet_states: Mapping[str, Any] | None,
+    selection: Mapping[str, Any],
+    *,
+    available_capacity: int | None,
+) -> None:
+    expected = eligible_cohort_wave_packet_ids(
+        cohort,
+        packet_states,
+        wave_index=selection["wave_index"],
+        available_capacity=available_capacity,
+    )
+    selected = [route["packet_id"] for route in selection["routes"]]
+    if not expected or selected != expected:
+        _fail("cohort advance routes are not the exact eligible round selection")
+
+
+__all__ = [
+    "COHORT_ADVANCE_SELECTION_SCHEMA_VERSION",
+    "COHORT_SCHEMA_VERSION",
+    "EXPECTED_PACKET_SCHEMA_VERSION",
+    "MAX_COHORT_BYTES",
+    "MAX_COHORT_PACKETS",
+    "MAX_COHORT_WAVES",
+    "MAX_CONCURRENCY",
+    "CohortError",
+    "cohort_advance_selection_sha256",
+    "cohort_projection_sha256",
+    "cohort_sha256",
+    "eligible_cohort_wave_packet_ids",
+    "execution_selection_identity_sha256",
+    "project_cohort",
+    "seal_cohort",
+    "seal_cohort_advance_selection",
+    "validate_cohort",
+    "validate_cohort_advance_selection",
+]

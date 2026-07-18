@@ -59,10 +59,28 @@ def assignment(
     }
 
 
+def execution_resource_envelope(
+    *,
+    max_active_first_level_agents: int = 2,
+    max_active_total_agents: int = 2,
+    max_delegation_depth: int = 2,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "max_active_first_level_agents": max_active_first_level_agents,
+        "max_active_total_agents": max_active_total_agents,
+        "max_delegation_depth": max_delegation_depth,
+    }
+
+
 def real_resource(
     event_id: str = "event-1",
     *,
     config_after: bytes = b"max_threads = 2\n",
+    execution_selection_id: str = "",
+    max_active_first_level_agents: int = 2,
+    max_active_total_agents: int = 2,
+    max_delegation_depth: int = 2,
 ) -> tuple[dict, dict, dict]:
     review_source = b"name = 'review'\nmodel = 'gpt-old'\n"
     build_source = b"name = 'build'\nmodel = 'gpt-old'\n"
@@ -104,6 +122,22 @@ def real_resource(
         }
         for item in files
     ]
+    dynamic_envelope = {
+        "max_active_total_agents": max_active_total_agents,
+        "max_delegation_depth": max_delegation_depth,
+        "execution_selection_id": execution_selection_id,
+    }
+    if execution_selection_id:
+        selection_envelope = execution_resource_envelope(
+            max_active_first_level_agents=max_active_first_level_agents,
+            max_active_total_agents=max_active_total_agents,
+            max_delegation_depth=max_delegation_depth,
+        )
+        dynamic_envelope = {
+            **selection_envelope,
+            "execution_selection_id": execution_selection_id,
+            "resource_envelope_sha256": canonical_sha256(selection_envelope),
+        }
     plan = {
         "schema_version": 1,
         "event_id": event_id,
@@ -113,11 +147,7 @@ def real_resource(
         "aoi_config_sha256": sha("9"),
         "demand": {"engaged_lanes": [], "active_packets": [], "requested_depth": 2},
         "resolved": {"max_threads": 2, "max_depth": 2, "agents": agents},
-        "dynamic_envelope": {
-            "max_active_total_agents": 2,
-            "max_delegation_depth": 2,
-            "execution_selection_id": "",
-        },
+        "dynamic_envelope": dynamic_envelope,
         "policy_ceiling": {"max_threads": 12, "max_depth": 2},
         "override_id": "",
         "selection_role_settings": {},
@@ -153,7 +183,7 @@ def real_resource(
         "receipt_sha256": receipt_file_sha,
         "resolved": plan["resolved"],
         "dynamic_envelope": plan["dynamic_envelope"],
-        "execution_selection_id": "",
+        "execution_selection_id": execution_selection_id,
         "required_locks": plan["required_locks"],
         "restart_required": True,
         "config_applicability": "applicable",
@@ -245,8 +275,18 @@ def root_arm(
     expected_agent_type: str = "explorer",
     *,
     config_after: bytes = b"max_threads = 2\n",
+    execution_selection_id: str = "",
+    max_active_first_level_agents: int = 2,
+    max_active_total_agents: int = 2,
+    max_delegation_depth: int = 2,
 ) -> dict:
-    event, receipt, plan = real_resource(config_after=config_after)
+    event, receipt, plan = real_resource(
+        config_after=config_after,
+        execution_selection_id=execution_selection_id,
+        max_active_first_level_agents=max_active_first_level_agents,
+        max_active_total_agents=max_active_total_agents,
+        max_delegation_depth=max_delegation_depth,
+    )
     registration = registration_for(event, plan)
     parent = {
         "session_id": "session-1",
