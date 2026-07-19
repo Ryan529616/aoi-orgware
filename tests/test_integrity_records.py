@@ -127,6 +127,120 @@ def complete_contract(*, with_finding: bool = False, sealed: bool = False) -> di
 
 
 class IntegrityRecordTests(unittest.TestCase):
+    def test_codex_canonical_agent_ids_are_bound_without_relaxing_tokens(self) -> None:
+        snapshot = ir.build_snapshot_record(
+            task_id=TASK_ID,
+            worktree=WORKTREE,
+            baseline_head=H["base"],
+            current_head=H["candidate_head"],
+            artifact=artifact("canonical-agent.json", H["candidate"]),
+            snapshot_sha256=H["candidate"],
+            claim_scope_sha256=H["claim"],
+            covered_claim_tokens=["claim-1"],
+            purpose="candidate",
+            producer_agent_ids=["/root/implementer"],
+        )
+        review = ir.build_review_result_record(
+            snapshot_sha256=H["candidate"],
+            reviewer_agent_id="/root/independent/reviewer",
+            producer_agent_ids=snapshot["producer_agent_ids"],
+            result_artifact=artifact("canonical-agent-review.md", H["review_artifact"]),
+            outcome="clean",
+            finding_ids=[],
+        )
+        self.assertEqual(snapshot["producer_agent_ids"], ["/root/implementer"])
+        self.assertEqual(review["reviewer_agent_id"], "/root/independent/reviewer")
+        self.assertEqual(
+            ir.validate_agent_id("operator@example.invalid"),
+            "operator@example.invalid",
+        )
+
+        for invalid in ("", "agent identity", "agent\nidentity", "a" * 513):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ir.IntegrityRecordError, "1-512 ASCII"
+            ):
+                ir.validate_agent_id(invalid)
+        with self.assertRaisesRegex(ir.IntegrityRecordError, "task_id"):
+            ir.build_snapshot_record(
+                task_id="/root/not-a-task-id",
+                worktree=WORKTREE,
+                baseline_head=H["base"],
+                current_head=H["candidate_head"],
+                artifact=artifact("invalid-task.json", H["candidate"]),
+                snapshot_sha256=H["candidate"],
+                claim_scope_sha256=H["claim"],
+                covered_claim_tokens=[],
+                purpose="candidate",
+                producer_agent_ids=["/root/implementer"],
+            )
+
+    def test_canonical_agent_ids_cover_full_finding_fix_verification_chain(self) -> None:
+        boundary = "/" + "a" * 511
+        self.assertEqual(ir.validate_agent_id(boundary), boundary)
+        with self.assertRaisesRegex(ir.IntegrityRecordError, "1-512"):
+            ir.validate_agent_id("/" + "a" * 512)
+
+        contract = ir.build_integrity_contract(
+            baseline_head=H["base"], adopted_at=ADOPTED_AT
+        )
+        source = ir.build_snapshot_record(
+            task_id=TASK_ID, worktree=WORKTREE, baseline_head=H["base"],
+            current_head=H["candidate_head"],
+            artifact=artifact("canonical-chain.json", H["candidate"]),
+            snapshot_sha256=H["candidate"], claim_scope_sha256=H["claim"],
+            covered_claim_tokens=["claim-1"], purpose="candidate",
+            producer_agent_ids=[boundary],
+        )
+        contract = append(contract, "snapshots", source)
+        review = ir.build_review_result_record(
+            snapshot_sha256=H["candidate"],
+            reviewer_agent_id="/root/reviewer",
+            producer_agent_ids=[boundary],
+            result_artifact=artifact("canonical-review.md", H["review_artifact"]),
+            outcome="findings", finding_ids=["finding-1"],
+        )
+        contract = append(contract, "review_results", review)
+        finding = ir.build_finding_record(
+            finding_id="finding-1", review_result_record_sha256=review["record_sha256"],
+            snapshot_sha256=H["candidate"], reviewer_agent_id="/root/reviewer",
+            finding_artifact_sha256=H["review_artifact"],
+        )
+        contract = append(contract, "findings", finding)
+        fixed = ir.build_snapshot_record(
+            task_id=TASK_ID, worktree=WORKTREE, baseline_head=H["base"],
+            current_head=H["post_fix_head"],
+            artifact=artifact("canonical-post-fix.json", H["post_fix"]),
+            snapshot_sha256=H["post_fix"], claim_scope_sha256=H["post_fix_claim"],
+            covered_claim_tokens=["claim-1"], purpose="post_fix",
+            producer_agent_ids=["/root/fixer"],
+        )
+        contract = append(contract, "snapshots", fixed)
+        fix = ir.build_fix_record(
+            finding_id="finding-1", finding_record_sha256=finding["record_sha256"],
+            post_fix_snapshot_sha256=H["post_fix"],
+            fix_artifact=artifact("canonical-fix.md", H["fix_artifact"]),
+            producer_agent_ids=["/root/fixer"],
+        )
+        contract = append(contract, "fixes", fix)
+        verification = ir.build_review_verification_record(
+            finding_id="finding-1", fix_record_sha256=fix["record_sha256"],
+            snapshot_sha256=H["post_fix"], reviewer_agent_id="/root/verifier",
+            verification_artifact=artifact(
+                "canonical-verification.md", H["verification_artifact"]
+            ), outcome="pass",
+        )
+        contract = append(contract, "review_verifications", verification)
+        sealed = ir.seal_integrity_contract(
+            contract,
+            ir.build_integrity_seal(
+                latest_candidate_snapshot_sha256=H["candidate"],
+                latest_review_result_record_sha256=review["record_sha256"],
+                claim_scope_sha256=H["claim"],
+                sealed_at="2026-07-19T11:00:00+00:00",
+            ),
+        )
+        self.assertEqual(ir.integrity_contract_errors(sealed, require_complete=True), [])
+
     def test_zero_finding_review_is_required_and_sealable(self) -> None:
         contract = ir.build_integrity_contract(baseline_head=H["base"], adopted_at=ADOPTED_AT)
         contract = append(contract, "snapshots", candidate())

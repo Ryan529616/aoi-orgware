@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import sys
 import unittest
@@ -214,17 +215,64 @@ class IntegritySemanticRetryIntentTests(unittest.TestCase):
 class IntegrityCompositionTests(unittest.TestCase):
     def test_producers_include_owner_live_claim_and_done_mutator(self) -> None:
         state = {
-            "task_id": "task-1", "owner": "owner",
+            "task_id": "task-1", "owner": "/root/chief",
             "packets": [
-                {"status": "done", "packet_mode": "bounded_mutation", "agent_id": "worker"},
+                {
+                    "status": "done",
+                    "packet_mode": "bounded_mutation",
+                    "agent_id": "/root/implementer",
+                },
                 {"status": "done", "packet_mode": "read_only", "agent_id": "reader"},
             ],
         }
         with mock.patch.object(h, "claims_owned_by_task", return_value=[
-            {"status": "active", "owner": "claimer"},
+            {"status": "active", "owner": "/root/claimer"},
             {"status": "done", "owner": "old-claimer"},
         ]):
-            self.assertEqual(integrity._producer_ids(mock.sentinel.paths, state), ["claimer", "owner", "worker"])
+            self.assertEqual(
+                integrity._producer_ids(mock.sentinel.paths, state),
+                ["/root/chief", "/root/claimer", "/root/implementer"],
+            )
+
+    def test_producers_reject_agent_identity_outside_hook_bounds(self) -> None:
+        state = {
+            "task_id": "task-1",
+            "owner": "owner",
+            "packets": [
+                {
+                    "status": "done",
+                    "packet_mode": "bounded_mutation",
+                    "agent_id": "a" * 513,
+                }
+            ],
+        }
+        with (
+            mock.patch.object(h, "claims_owned_by_task", return_value=[]),
+            self.assertRaisesRegex(h.HarnessError, "1-512 ASCII"),
+        ):
+            integrity._producer_ids(mock.sentinel.paths, state)
+
+    def test_snapshot_rejects_bad_producer_before_cas_publication(self) -> None:
+        state = {
+            "task_id": "task-1",
+            "owner": "owner with spaces",
+            "worktree": "/repo",
+            "packets": [],
+            "integrity_contract": {"baseline_head": "a" * 40},
+        }
+        with (
+            mock.patch.object(integrity.git, "task_mutation_snapshot", return_value={}),
+            mock.patch.object(integrity.h, "claims_owned_by_task", return_value=[]),
+            mock.patch.object(
+                integrity.git,
+                "task_mutation_snapshot_claim_coverage",
+                return_value={"covered": True},
+            ),
+            mock.patch.object(integrity.artifacts, "preserve_generated_artifact_blob") as cas,
+        ):
+            with self.assertRaisesRegex(h.HarnessError, "task owner agent id"):
+                integrity._snapshot(mock.sentinel.paths, state, "candidate")
+        cas.assert_not_called()
 
     def test_snapshot_rejects_uncovered_mutations_before_cas_publication(self) -> None:
         state = {"task_id": "task-1", "worktree": "/repo", "integrity_contract": {"baseline_head": "a" * 40}}
@@ -237,6 +285,81 @@ class IntegrityCompositionTests(unittest.TestCase):
             with self.assertRaisesRegex(h.HarnessError, "uncovered"):
                 integrity._snapshot(mock.sentinel.paths, state, "candidate")
         cas.assert_not_called()
+
+    def test_review_fix_and_verify_reject_bad_principals_before_cas(self) -> None:
+        sha = "a" * 64
+        artifact_arg = f"{Path(self._tmp.name) / 'preflight.txt'}={sha}"
+        cases = [
+            (
+                integrity.cmd_integrity_review,
+                {
+                    "snapshots": [{
+                        "snapshot_sha256": sha, "purpose": "candidate",
+                        "producer_agent_ids": ["producer"],
+                    }],
+                },
+                self._args_for_preflight(
+                    snapshot_sha256=sha, reviewer_agent_id="producer",
+                    result_artifact=artifact_arg, outcome="clean", finding_id=[],
+                ),
+                "self-review",
+            ),
+            (
+                integrity.cmd_integrity_fix,
+                {
+                    "findings": [{"finding_id": "finding-1", "record_sha256": sha}],
+                    "snapshots": [{"snapshot_sha256": sha, "purpose": "post_fix"}],
+                },
+                self._args_for_preflight(
+                    finding_id="finding-1", post_fix_snapshot_sha256=sha,
+                    fix_artifact=artifact_arg,
+                ),
+                "task owner agent id",
+            ),
+            (
+                integrity.cmd_integrity_verify,
+                {
+                    "findings": [{"finding_id": "finding-1"}],
+                    "fixes": [{
+                        "record_sha256": sha, "finding_id": "finding-1",
+                        "post_fix_snapshot_sha256": sha,
+                    }],
+                },
+                self._args_for_preflight(
+                    finding_id="finding-1", fix_record_sha256=sha,
+                    snapshot_sha256=sha, reviewer_agent_id="reviewer with spaces",
+                    verification_artifact=artifact_arg, outcome="pass",
+                ),
+                "1-512 ASCII",
+            ),
+        ]
+        for command, contract, command_args, message in cases:
+            state = {
+                "task_id": "task-1", "owner": "owner with spaces",
+                "packets": [], "integrity_contract": contract,
+            }
+
+            def execute(*call_args: object, **_kwargs: object) -> object:
+                mutate = call_args[4]
+                return mutate(state)[1]  # type: ignore[operator]
+
+            with (
+                self.subTest(command=command.__name__),
+                mock.patch.object(h, "state_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(integrity, "_persist", side_effect=execute),
+                mock.patch.object(integrity, "_bound_artifact") as cas,
+                mock.patch.object(h, "claims_owned_by_task", return_value=[]),
+                self.assertRaisesRegex(h.HarnessError, message),
+            ):
+                command(command_args, mock.sentinel.paths)
+            cas.assert_not_called()
+
+    @staticmethod
+    def _args_for_preflight(**values: object) -> argparse.Namespace:
+        return argparse.Namespace(
+            task="task-1", json=True, command_id=None, recorded_at=None,
+            expected_head_sha256=None, **values,
+        )
 
     def test_registrar_exposes_all_contract_commands(self) -> None:
         parser = argparse.ArgumentParser()
@@ -286,6 +409,40 @@ class IntegrityLegacyEndToEndTests(HarnessTestCase):
     def _args(self, **values: object) -> argparse.Namespace:
         return argparse.Namespace(json=True, command_id=None, recorded_at=None,
                                   expected_head_sha256=None, **values)
+
+    def test_adopt_rejects_ineligible_owner_before_one_way_transition(self) -> None:
+        task_id = "integrity-ineligible-owner"
+        self.cli(
+            "init-task",
+            "--task-id", task_id,
+            "--title", "Integrity owner preflight",
+            "--objective", "Prove one-way adoption validates producer principals",
+            "--owner", "owner with spaces",
+            "--completion-boundary", "Adoption rejects before persistence",
+        )
+        result = self.cli("integrity-adopt", "--task", task_id, ok=False)
+        self.assertIn("task owner agent id", result.stderr)
+        self.assertNotIn("integrity_contract", h.load_task(h.get_paths(self.root), task_id))
+
+    def test_post_adopt_claim_rejects_bad_owner_without_any_mutation(self) -> None:
+        task_id = "integrity-claim-owner-gate"
+        self.init_task(task_id)
+        self.cli("integrity-adopt", "--task", task_id)
+        paths = h.get_paths(self.root)
+        state_path = h.task_dir(paths, task_id) / "state.json"
+        before = state_path.read_bytes()
+        result = self.cli(
+            "claim", "--task", task_id, "--token", "invalid-owner-claim",
+            "--owner", "owner with spaces", "--kind", "implementation",
+            "--lock", "repo:file:invalid-owner.txt", "--allow-nonexistent",
+            "--intent", "must fail before claim publication",
+            "--validation", "claim and task bytes remain unchanged",
+            "--expires-at", "2099-01-01T00:00:00+00:00", ok=False,
+        )
+        self.assertIn("claim owner agent id", result.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertFalse(h.claim_path(paths, "invalid-owner-claim", active=True).exists())
+        self.assertFalse(h.claim_path(paths, "invalid-owner-claim", active=False).exists())
 
     def test_adopt_candidate_clean_review_and_seal_with_real_cas(self) -> None:
         self.init_task(self.TASK)

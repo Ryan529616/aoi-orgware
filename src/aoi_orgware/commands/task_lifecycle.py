@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..agent_identity import AgentIdentityError, validate_agent_id
 from ..config import ProjectConfig, default_config_text, load_config_path
 from ..execution_policy import EXECUTION_POLICY_VERSION, TASK_EXECUTION_SCHEMA_VERSION
 from ..git_plumbing import (
@@ -1315,6 +1316,12 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLi
         if state.get("profile") == "mini":
             raise HarnessError("mini task may not acquire additional claims")
         services.require_plan_ready(paths, state, "acquire claim")
+        owner = require_text(args.owner, "owner")
+        if isinstance(state.get("integrity_contract"), Mapping):
+            try:
+                owner = validate_agent_id(owner, "claim owner agent id")
+            except AgentIdentityError as exc:
+                raise HarnessError(str(exc)) from exc
         claim_worktree = state_worktree(paths, state)
         locks = list(
             dict.fromkeys(
@@ -1400,7 +1407,7 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLi
             "source": "structured",
             "token": token,
             "task_id": state["task_id"],
-            "owner": require_text(args.owner, "owner"),
+            "owner": owner,
             "kind": require_text(args.kind, "kind"),
             "locks": locks,
             "intent": require_text(args.intent, "intent"),

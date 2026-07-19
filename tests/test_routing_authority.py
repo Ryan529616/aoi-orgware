@@ -524,6 +524,16 @@ def test_observation_event_id_matches_production_dispatch_policy() -> None:
     assert observed["event_id"] == dispatch_protocol.subagent_event_id(payload, policy=policy)
 
 
+def test_v6_observation_accepts_canonical_codex_agent_identity() -> None:
+    outcome = build_dispatch_outcome(
+        root_arm(),
+        dispatch_provenance="codex_subagent_start_observed",
+        observation=observation(agent_id="/root/observed-explorer"),
+        recorded_at="2026-01-01T00:02:00Z",
+    )
+    assert outcome["observation"]["agent_id"] == "/root/observed-explorer"
+
+
 def test_large_real_receipt_is_validated_then_compacted() -> None:
     large = b"#" * (450 * 1024)
     _event, envelope, _plan = real_resource(config_after=large)

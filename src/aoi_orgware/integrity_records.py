@@ -17,6 +17,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from typing import Any, TypeGuard
 
+from .agent_identity import (
+    AGENT_ID_RE,
+    AgentIdentityError,
+    validate_agent_id as validate_shared_agent_id,
+)
+
 
 INTEGRITY_CONTRACT_SCHEMA_VERSION = 1
 INTEGRITY_CONTRACT_MODE = "required_v1"
@@ -192,6 +198,15 @@ def _time(value: Any, label: str) -> str:
     return text
 
 
+def validate_agent_id(value: Any, label: str = "agent id") -> str:
+    """Validate one bounded dispatch/hook agent identity."""
+
+    try:
+        return validate_shared_agent_id(value, label)
+    except AgentIdentityError as exc:
+        raise IntegrityRecordError(str(exc)) from exc
+
+
 def _worktree(value: Any, label: str) -> str:
     text = _text(value, label)
     if not (PurePosixPath(text).is_absolute() or PureWindowsPath(text).is_absolute()):
@@ -256,7 +271,7 @@ def build_snapshot_record(
         ),
         "purpose": _one_of(purpose, "snapshot.purpose", {"candidate", "post_fix", "close"}),
         "producer_agent_ids": _normalized_iterable(
-            producer_agent_ids, "snapshot.producer_agent_ids", _TOKEN_RE, nonempty=True
+            producer_agent_ids, "snapshot.producer_agent_ids", AGENT_ID_RE, nonempty=True
         ),
     }
     return _seal_record(record)
@@ -294,9 +309,9 @@ def build_review_result_record(
     """Build the mandatory review result, including a zero-finding clean review."""
 
     producers = _normalized_iterable(
-        producer_agent_ids, "review_result.producer_agent_ids", _TOKEN_RE, nonempty=True
+        producer_agent_ids, "review_result.producer_agent_ids", AGENT_ID_RE, nonempty=True
     )
-    reviewer = _text(reviewer_agent_id, "review_result.reviewer_agent_id", pattern=_TOKEN_RE)
+    reviewer = validate_agent_id(reviewer_agent_id, "review_result.reviewer_agent_id")
     if reviewer in producers:
         raise IntegrityRecordError("review_result is self-review")
     findings = _normalized_iterable(finding_ids, "review_result.finding_ids", _FINDING_RE, nonempty=False)
@@ -326,7 +341,9 @@ def build_finding_record(
             "finding_id": _text(finding_id, "finding.finding_id", pattern=_FINDING_RE),
             "review_result_record_sha256": _sha256(review_result_record_sha256, "finding.review_result_record_sha256"),
             "snapshot_sha256": _sha256(snapshot_sha256, "finding.snapshot_sha256"),
-            "reviewer_agent_id": _text(reviewer_agent_id, "finding.reviewer_agent_id", pattern=_TOKEN_RE),
+            "reviewer_agent_id": validate_agent_id(
+                reviewer_agent_id, "finding.reviewer_agent_id"
+            ),
             "finding_artifact_sha256": _sha256(finding_artifact_sha256, "finding.finding_artifact_sha256"),
         }
     )
@@ -344,7 +361,7 @@ def build_fix_record(
             "post_fix_snapshot_sha256": _sha256(post_fix_snapshot_sha256, "fix.post_fix_snapshot_sha256"),
             "fix_artifact": _artifact(fix_artifact, "fix.fix_artifact"),
             "producer_agent_ids": _normalized_iterable(
-                producer_agent_ids, "fix.producer_agent_ids", _TOKEN_RE, nonempty=True
+                producer_agent_ids, "fix.producer_agent_ids", AGENT_ID_RE, nonempty=True
             ),
         }
     )
@@ -360,7 +377,9 @@ def build_review_verification_record(
             "finding_id": _text(finding_id, "review_verification.finding_id", pattern=_FINDING_RE),
             "fix_record_sha256": _sha256(fix_record_sha256, "review_verification.fix_record_sha256"),
             "snapshot_sha256": _sha256(snapshot_sha256, "review_verification.snapshot_sha256"),
-            "reviewer_agent_id": _text(reviewer_agent_id, "review_verification.reviewer_agent_id", pattern=_TOKEN_RE),
+            "reviewer_agent_id": validate_agent_id(
+                reviewer_agent_id, "review_verification.reviewer_agent_id"
+            ),
             "verification_artifact": _artifact(verification_artifact, "review_verification.verification_artifact"),
             "outcome": _one_of(outcome, "review_verification.outcome", {"pass", "fail"}),
         }

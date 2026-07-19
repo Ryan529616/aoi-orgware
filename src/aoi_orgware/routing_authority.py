@@ -16,6 +16,7 @@ import json
 import re
 from typing import Any, Mapping, NoReturn
 
+from .agent_identity import AGENT_ID_RE
 from .resource_config import resource_plan_sha256, validate_resource_receipt
 from .semantic_events import SemanticEventError, canonical_json_bytes, canonical_sha256
 
@@ -26,7 +27,7 @@ MAX_CAPACITY_ROWS = 100_000
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}")
-_HOOK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}")
+_HOOK_ID = AGENT_ID_RE
 _PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _PROFILE_PATH = re.compile(r"\.codex/agents/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.toml")
 

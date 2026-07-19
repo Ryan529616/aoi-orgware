@@ -34,6 +34,7 @@ from . import codex_install_provenance as codex_install_provenance_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import evidence_artifacts as evidence_artifacts_impl
+from .agent_identity import AGENT_ID_RE
 from . import execution_topology as execution_topology_impl
 from . import integrity_records as integrity_records_impl
 from . import job_integrity as job_integrity_impl
@@ -499,7 +500,7 @@ REQUIRED_RECEIPT_COMPONENTS: tuple[str, ...] = ("source", "runner")
 HOOK_PROTOCOL_VERSION = "6"
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
 HELPER_SPAWN_BUDGET_MAX = 8
-HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
+HOOK_ID_RE = AGENT_ID_RE
 ROOT_SESSION_MAPPING_KIND = "root"
 SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
 HOOK_OBSERVED_DISPATCH_PROVENANCES = {

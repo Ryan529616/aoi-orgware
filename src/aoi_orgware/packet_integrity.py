@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .agent_identity import AGENT_ID_RE
 from .evidence_artifacts import (
     COMMAND_ARTIFACT_MAX_BYTES,
     _is_legacy_snapshot_version,
@@ -58,7 +59,7 @@ HELPER_SPAWN_BUDGET_CONTRACT_PREFIX = "- AOI helper spawn budget:"
 HELPER_SPAWN_BUDGET_MAX = 8
 DISPATCH_WILDCARD_AGENT_TYPE = "*"
 HOOK_PROTOCOL_VERSION = "6"
-HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,512}$")
+HOOK_ID_RE = AGENT_ID_RE
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
 HOOK_OBSERVED_DISPATCH_PROVENANCES = {
     "codex_subagent_start_observed",

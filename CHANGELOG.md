@@ -16,7 +16,9 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   focused migration tests.
 - **O3 — dispatch v6.** Immutable arm-time routing authority, startup receipt
   registration, and explicit `unavailable` runtime-routing fields are covered
-  by focused packet and hook-receipt tests.
+  by focused packet and hook-receipt tests. Dispatch, routing, and integrity
+  now share one bounded agent-identity grammar, including canonical Codex
+  identities such as `/root/reviewer`.
 - **O4 — permits.** One-shot, Chief-authorized transition permits and exact
   consumption/replay checks are covered by focused semantic-object tests.
 - **O5 — cohorts.** Deterministic manual waves and no-launch-overclaim receipts
@@ -47,9 +49,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   implemented. The complete WSL pytest collection passed `1,312` tests with
   `28` platform skips; Windows `unittest discover` passed `1,102` tests with
   `28` skips, supplemented by final pytest coverage for free-function
-  provenance/workflow and host-native onboarding paths. `required_v1` is not a
-  mandatory semantic-v2 genesis field. Push and live canary are still open; no
-  GitHub Actions, PyPI, tag, or live-client result is claimed. Manual
+  provenance/workflow and host-native onboarding paths. A later shared-agent-ID
+  follow-up passed its focused integrity/dispatch/routing suites on Windows and
+  WSL; the pushed GitHub matrix remains its full-suite acceptance gate.
+  `required_v1` is not a mandatory semantic-v2 genesis field. Push and live
+  canary are still open; no GitHub Actions, PyPI, tag, or live-client result is claimed. Manual
   reviewer identity remains a cooperative assertion, and unavailable MCP
   registry paths are reported as uncovered.
 

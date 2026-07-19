@@ -48,6 +48,15 @@ def _validated_id(value: object, label: str) -> str:
     return h.validate_id(value, label)
 
 
+def _validated_agent_id(value: object, label: str) -> str:
+    """Validate an agent identity using the dispatch/hook identity grammar."""
+
+    try:
+        return records.validate_agent_id(value, label)
+    except records.IntegrityRecordError as exc:
+        raise h.HarnessError(str(exc)) from exc
+
+
 def _semantic_context(args: argparse.Namespace) -> tuple[str, str, str, str]:
     command_id = _validated_id(getattr(args, "command_id", None), "integrity command id")
     recorded_at = getattr(args, "recorded_at", None)
@@ -92,10 +101,12 @@ def _validate_draft(state: Mapping[str, Any]) -> None:
 
 
 def _producer_ids(paths: h.HarnessPaths, state: Mapping[str, Any]) -> list[str]:
-    values = {_validated_id(state.get("owner"), "task owner")}
+    values = {_validated_agent_id(state.get("owner"), "task owner agent id")}
     for claim in h.claims_owned_by_task(paths, str(state["task_id"])):
         if claim.get("status") in h.RESERVING_CLAIM_STATUSES:
-            values.add(_validated_id(claim.get("owner"), "live claim owner"))
+            values.add(
+                _validated_agent_id(claim.get("owner"), "live claim owner agent id")
+            )
     packets = state.get("packets", [])
     if not isinstance(packets, list):
         raise h.HarnessError("task packets are malformed")
@@ -103,7 +114,11 @@ def _producer_ids(paths: h.HarnessPaths, state: Mapping[str, Any]) -> list[str]:
         if not isinstance(packet, Mapping):
             raise h.HarnessError("task packet is malformed")
         if packet.get("status") == "done" and packet.get("packet_mode", "read_only") != "read_only":
-            values.add(_validated_id(packet.get("agent_id"), "done mutation packet agent id"))
+            values.add(
+                _validated_agent_id(
+                    packet.get("agent_id"), "done mutation packet agent id"
+                )
+            )
     return sorted(values)
 
 
@@ -147,6 +162,16 @@ def _retry_artifact_sha(value: Any, label: str) -> str:
     if not Path(source_text).is_absolute():
         raise h.HarnessError(f"{label} path must be absolute")
     return digest
+
+
+def _preflight_artifact(value: Any, label: str) -> dict[str, Any]:
+    """Build a non-persisted stand-in for record validation before CAS I/O."""
+
+    return records.build_artifact_ref(
+        path="preflight/artifact",
+        sha256=_retry_artifact_sha(value, label),
+        size_bytes=0,
+    )
 
 
 def _last_record(contract: Mapping[str, Any], collection: str, label: str) -> dict[str, Any]:
@@ -258,6 +283,9 @@ def _snapshot(
     )
     if not coverage["covered"]:
         raise h.HarnessError("integrity snapshot has uncovered task-local mutations")
+    # Validate every identity before publishing immutable CAS bytes.  A bad
+    # producer must not leave an unreferenced snapshot artifact behind.
+    producer_agent_ids = _producer_ids(paths, state)
     raw = semantic.canonical_json_bytes(snapshot, max_bytes=records.MAX_INTEGRITY_ARTIFACT_BYTES)
     artifact = artifacts.preserve_generated_artifact_blob(
         paths, task_id, raw, label="integrity mutation snapshot",
@@ -274,7 +302,7 @@ def _snapshot(
             claim_scope_sha256=coverage["claim_scope_sha256"],
             covered_claim_tokens=coverage["covered_claim_tokens"],
             purpose=purpose,
-            producer_agent_ids=_producer_ids(paths, state),
+            producer_agent_ids=producer_agent_ids,
         )
     except records.IntegrityRecordError as exc:
         raise h.HarnessError(str(exc)) from exc
@@ -344,6 +372,10 @@ def cmd_integrity_adopt(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
     task_id = h.validate_id(args.task, "task id")
     with h.state_lock(paths, create_layout=False):
         def mutate(state: dict[str, Any]) -> tuple[dict[str, Any], Mapping[str, Any]]:
+            # Adoption is one-way.  Reject an ineligible producer identity
+            # before publishing the contract so the task is not stranded in a
+            # required mode that can never create its first snapshot.
+            _producer_ids(paths, state)
             metadata = git.git_metadata(_task_worktree(state, paths))
             baseline = args.baseline_head or metadata["head_sha"]
             try:
@@ -394,6 +426,19 @@ def cmd_integrity_review(args: argparse.Namespace, paths: h.HarnessPaths) -> int
             snapshot = _find(contract["snapshots"], "snapshot_sha256", args.snapshot_sha256, "candidate snapshot")
             if snapshot.get("purpose") != "candidate":
                 raise h.HarnessError("integrity review requires a candidate snapshot")
+            try:
+                records.build_review_result_record(
+                    snapshot_sha256=args.snapshot_sha256,
+                    reviewer_agent_id=args.reviewer_agent_id,
+                    producer_agent_ids=snapshot["producer_agent_ids"],
+                    result_artifact=_preflight_artifact(
+                        args.result_artifact, "integrity review result artifact"
+                    ),
+                    outcome=args.outcome,
+                    finding_ids=sorted(args.finding_id),
+                )
+            except records.IntegrityRecordError as exc:
+                raise h.HarnessError(str(exc)) from exc
             artifact = _bound_artifact(paths, task_id, args.result_artifact, "integrity review result artifact")
             try:
                 review = records.build_review_result_record(
@@ -430,12 +475,25 @@ def cmd_integrity_fix(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
             post = _find(contract["snapshots"], "snapshot_sha256", args.post_fix_snapshot_sha256, "post-fix snapshot")
             if post.get("purpose") != "post_fix":
                 raise h.HarnessError("integrity fix requires an exact post-fix snapshot")
+            producer_agent_ids = _producer_ids(paths, state)
+            try:
+                records.build_fix_record(
+                    finding_id=args.finding_id,
+                    finding_record_sha256=finding["record_sha256"],
+                    post_fix_snapshot_sha256=args.post_fix_snapshot_sha256,
+                    fix_artifact=_preflight_artifact(
+                        args.fix_artifact, "integrity fix artifact"
+                    ),
+                    producer_agent_ids=producer_agent_ids,
+                )
+            except records.IntegrityRecordError as exc:
+                raise h.HarnessError(str(exc)) from exc
             artifact = _bound_artifact(paths, task_id, args.fix_artifact, "integrity fix artifact")
             try:
                 fix = records.build_fix_record(
                     finding_id=args.finding_id, finding_record_sha256=finding["record_sha256"],
                     post_fix_snapshot_sha256=args.post_fix_snapshot_sha256, fix_artifact=artifact,
-                    producer_agent_ids=_producer_ids(paths, state),
+                    producer_agent_ids=producer_agent_ids,
                 )
                 state["integrity_contract"] = records.append_fix(contract, fix)
                 _validate_draft(state)
@@ -459,6 +517,20 @@ def cmd_integrity_verify(args: argparse.Namespace, paths: h.HarnessPaths) -> int
             fix = _find(contract["fixes"], "record_sha256", args.fix_record_sha256, "fix record")
             if fix.get("finding_id") != args.finding_id or fix.get("post_fix_snapshot_sha256") != args.snapshot_sha256:
                 raise h.HarnessError("integrity verification lost exact finding/fix/post-fix binding")
+            try:
+                records.build_review_verification_record(
+                    finding_id=args.finding_id,
+                    fix_record_sha256=args.fix_record_sha256,
+                    snapshot_sha256=args.snapshot_sha256,
+                    reviewer_agent_id=args.reviewer_agent_id,
+                    verification_artifact=_preflight_artifact(
+                        args.verification_artifact,
+                        "integrity verification artifact",
+                    ),
+                    outcome=args.outcome,
+                )
+            except records.IntegrityRecordError as exc:
+                raise h.HarnessError(str(exc)) from exc
             artifact = _bound_artifact(paths, task_id, args.verification_artifact, "integrity verification artifact")
             try:
                 verification = records.build_review_verification_record(
