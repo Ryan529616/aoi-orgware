@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import islice
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence, cast
 
 
 EVENT_SCHEMA_VERSION = 2
@@ -720,7 +720,7 @@ def replay_events(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         assert domain is not None
         if canonical_sha256(domain) != event["result_projection_sha256"]:
             raise SemanticEventError("semantic event result projection mismatch")
-    return projection_for_event(domain, records[-1])
+    return projection_for_event(cast(Mapping[str, Any], domain), records[-1])
 
 
 def _projection_envelope(projection: Mapping[str, Any]) -> dict[str, Any]:

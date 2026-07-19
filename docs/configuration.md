@@ -112,6 +112,71 @@ enabled = false
 
 The full default file is available at `examples/aoi.toml`.
 
+## Codex v0.4 adapter boundary
+
+`codex-init` records the exact resolved AOI hook launcher and installed-package
+provenance before it wires repository-local hooks. It accepts exactly one
+complete source-proof pair: the public release-promotion pair
+(`--promotion-bundle-file` / `--expected-promotion-bundle-sha256`) or the
+separate local pair (`--local-artifact-bundle-file` /
+`--expected-local-artifact-bundle-sha256`). Half a pair, both pairs, or neither
+fails before mutation.
+
+A public promotion receipt keeps its tag/release/PyPI semantics. A local
+`reviewed_local_install_bundle` instead has
+`proof_scope=exact_local_wheel_install_only`: it is not a promotion or release.
+Its v2 receipt/runtime binds caller-supplied bundle SHA, canonical external
+store, clean commit/tree and complete tracked-source manifest, inventory and
+rehearsal, exact wheel path/SHA, PEP 610 `direct_url` archive path/SHA, and
+installed `RECORD` plus runtime bytes. The exact installed console launcher is
+part of that check; do not invoke `codex-init` through a module entry point.
+Manual reviewer identity remains cooperative, while the expected bundle SHA is
+the caller trust anchor. That value is the canonical digest recorded in the
+bundle's `bundle_sha256` field, not the raw JSON file SHA-256. The clean source
+identity is reviewed context: the local bundle does not independently attest
+source-to-wheel derivation, builder-toolchain execution, or execution of its
+caller-supplied test summary.
+
+Both routes bind package version, installed metadata, generated console/hook
+scripts, and a bounded non-cache runtime-package manifest checked against
+wheel `RECORD`. Pip-generated, hashless `__pycache__/*.pyc` files are excluded;
+other files under `__pycache__` are rejected. At hook execution, AOI's
+provenance validator revalidates the persisted receipt, invoked launcher, and
+covered installed package bytes, and `doctor` reports drift. The top-level
+adapter is still fail-open before it can parse and identify the hook event;
+only an identified `PreToolUse` internal failure produces the fixed deny
+response. This cooperative hook is not a pre-import or OS security boundary.
+`RECORD` verifies covered installed payloads; it proves the original wheel
+archive only when the stronger matching archive-digest evidence is available.
+
+The adapter correlates a PreToolUse and PostToolUse pair by exactly
+`(session_id, turn_id, tool_use_id)`. `agent_id` and `event_id` may be retained
+as observations but are not a substitute correlation key. The PreToolUse record
+contains the parser, input digest, canonical target list, session mapping,
+claim-snapshot digest, coverage (`covered`, `unclaimed`, or `uncovered`), and
+allow/deny decision. Provider, runtime profile, and sandbox remain
+`unavailable`. The PostToolUse record names the pre-receipt, input/response
+digests, targets, and completion observation. It may claim a mutation effect
+only from a distinct paired before/after SHA-256 observation; it never prevents
+or rolls back a mutation.
+
+Hook receipts are stored as bounded, canonical, create-only state records. A
+divergent replay for one event identity, corrupted/linked record, or exhausted
+64 KiB-per-record / 1,024-record / 16 MiB aggregate budget is an error: AOI
+does not evict old evidence or silently continue with partial accounting. Only
+supported parseable paths can be cooperatively gated. An unavailable MCP
+registry, unsupported tool, or ambiguous target is `uncovered`, never treated
+as a covered integration.
+
+The v0.4 integrity surface is adopted one way as `required_v1`. It records
+candidate and post-fix Git mutation snapshots against live claims, then binds
+findings, fixes, review results, and independent review verification into a
+terminal seal. Reviewer identities must not equal producer identities, but this
+is a cooperative identity rule, not authentication or a same-user security
+boundary. Offboarding likewise changes only AOI-owned client wiring after
+preimage-drift checks and an archive/receipt; it preserves the AOI state as an
+inert archive unless the user takes a separate explicit action.
+
 ## Interrupted publication and initialization
 
 Root configuration and the state lock have separate fail-closed boundaries:

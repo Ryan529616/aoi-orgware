@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify AOI wheel and sdist artifacts from isolated installations."""
+"""Verify an AOI wheel plus an sdist-derived wheel from isolated installs."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from typing import Sequence
 
 
 CONSOLE_SCRIPTS = ("aoi", "aoi-codex-hook", "aoi-claude-hook")
+BUILD_FRONTEND_VERSION = "1.5.0"
+HATCHLING_VERSION = "1.27.0"
 REQUIRED_PACKAGE_FILES = (
     "aoi_orgware/__init__.py",
     "aoi_orgware/resources/policy.md",
@@ -155,6 +157,10 @@ def _validate_archive_contents(wheel: Path, sdist: Path) -> None:
                 raise VerificationError(
                     f"sdist contains an archive link: {member.name}"
                 )
+            if not (member.isdir() or member.isfile()):
+                raise VerificationError(
+                    f"sdist contains an unsupported archive member: {member.name}"
+                )
 
     for required in REQUIRED_PACKAGE_FILES:
         if required not in wheel_members:
@@ -176,15 +182,28 @@ def _venv_executable(environment: Path, name: str) -> Path:
 
 def _isolated_environment() -> dict[str, str]:
     env = os.environ.copy()
-    for variable in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
-        env.pop(variable, None)
-    env["PYTHONNOUSERSITE"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    # A release verifier must not inherit a caller's index, configuration,
+    # import path, or virtual environment.  Keep this aligned with the PyPI
+    # readback installer: only the exact local artifact is permitted.
+    for variable in tuple(env):
+        if variable.startswith(("PIP_", "PYTHON")) or variable == "VIRTUAL_ENV":
+            env.pop(variable, None)
+    env.update(
+        {
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PIP_CONFIG_FILE": os.devnull,
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INDEX": "1",
+        }
+    )
     return env
 
 
 def _verify_installed_artifact(artifact: Path) -> str:
+    artifact = artifact.resolve(strict=True)
+    if not artifact.is_absolute() or not artifact.is_file():
+        raise VerificationError("distribution artifact is not an absolute regular file")
     with tempfile.TemporaryDirectory(prefix="aoi-dist-verify-") as directory:
         root = Path(directory).resolve()
         environment = root / "environment"
@@ -198,7 +217,11 @@ def _verify_installed_artifact(artifact: Path) -> str:
                 "-m",
                 "pip",
                 "install",
+                "--isolated",
                 "--no-deps",
+                "--no-index",
+                "--only-binary=:all:",
+                "--no-cache-dir",
                 artifact.resolve(),
             ],
             cwd=root,
@@ -227,7 +250,130 @@ def _verify_installed_artifact(artifact: Path) -> str:
         return installed_version
 
 
-def verify_dist(dist_dir: Path, *, expected_version: str) -> None:
+def _verify_build_backend(
+    build_python: Path,
+    *,
+    expected_build_version: str,
+    expected_hatchling_version: str,
+    cwd: Path,
+    env: dict[str, str],
+) -> Path:
+    # Keep the requested executable path intact.  POSIX virtual environments
+    # normally expose ``bin/python`` as a symlink to the base interpreter;
+    # resolving that symlink would escape the venv and probe the wrong
+    # environment.  ``is_file`` still follows the link and rejects a missing
+    # or non-file target without changing the path used for execution.
+    build_python = Path(os.path.abspath(os.fspath(build_python)))
+    if not build_python.is_file():
+        raise VerificationError("build backend Python is not a regular file")
+    probe = _run(
+        [
+            build_python,
+            "-I",
+            "-c",
+            (
+                "import importlib.metadata as metadata, json; "
+                "print(json.dumps({'build': metadata.version('build'), "
+                "'hatchling': metadata.version('hatchling')}, sort_keys=True))"
+            ),
+        ],
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        versions = json.loads(probe.stdout)
+    except json.JSONDecodeError as exc:
+        raise VerificationError(
+            f"build backend returned invalid version probe: {probe.stdout!r}"
+        ) from exc
+    expected = {
+        "build": expected_build_version,
+        "hatchling": expected_hatchling_version,
+    }
+    if versions != expected:
+        raise VerificationError(
+            "build backend versions differ from the release contract: "
+            f"expected {expected!r}, found {versions!r}"
+        )
+    return build_python
+
+
+def _extract_sdist(sdist: Path, destination: Path) -> Path:
+    with tarfile.open(sdist, mode="r:gz") as archive:
+        members = archive.getmembers()
+        _validate_member_names(sdist, tuple(member.name for member in members))
+        roots = {
+            PurePosixPath(member.name.replace("\\", "/")).parts[0]
+            for member in members
+            if member.name
+        }
+        if len(roots) != 1:
+            raise VerificationError("sdist must contain exactly one top-level source directory")
+        for member in members:
+            if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+                raise VerificationError(
+                    f"sdist contains an unsafe archive member: {member.name}"
+                )
+        archive.extractall(destination, members=members)
+    source_root = destination / roots.pop()
+    if not source_root.is_dir() or not (source_root / "pyproject.toml").is_file():
+        raise VerificationError("sdist does not extract to a Python project root")
+    return source_root
+
+
+def _verify_sdist_via_derived_wheel(
+    sdist: Path,
+    *,
+    build_python: Path,
+    expected_build_version: str,
+    expected_hatchling_version: str,
+) -> str:
+    sdist = sdist.resolve(strict=True)
+    env = _isolated_environment()
+    with tempfile.TemporaryDirectory(prefix="aoi-sdist-derive-") as directory:
+        root = Path(directory).resolve()
+        build_python = _verify_build_backend(
+            build_python,
+            expected_build_version=expected_build_version,
+            expected_hatchling_version=expected_hatchling_version,
+            cwd=root,
+            env=env,
+        )
+        source_root = _extract_sdist(sdist, root / "source")
+        derived_dir = root / "derived"
+        derived_dir.mkdir()
+        _run(
+            [
+                build_python,
+                "-I",
+                "-m",
+                "build",
+                "--wheel",
+                "--no-isolation",
+                "--outdir",
+                derived_dir,
+                source_root,
+            ],
+            cwd=root,
+            env=env,
+        )
+        wheels = sorted(derived_dir.glob("*.whl"))
+        if len(wheels) != 1:
+            raise VerificationError(
+                "building the exact sdist must produce exactly one derived wheel; "
+                f"found {len(wheels)}"
+            )
+        return _verify_installed_artifact(wheels[0])
+
+
+def verify_dist(
+    dist_dir: Path,
+    *,
+    expected_version: str,
+    build_python: Path = Path(sys.executable),
+    expected_build_version: str = BUILD_FRONTEND_VERSION,
+    expected_hatchling_version: str = HATCHLING_VERSION,
+) -> None:
     dist_dir = dist_dir.resolve()
     wheels = sorted(dist_dir.glob("*.whl"))
     sdists = sorted(dist_dir.glob("*.tar.gz"))
@@ -251,7 +397,12 @@ def verify_dist(dist_dir: Path, *, expected_version: str) -> None:
 
     _validate_archive_contents(wheel, sdist)
     wheel_version = _verify_installed_artifact(wheel)
-    sdist_version = _verify_installed_artifact(sdist)
+    sdist_version = _verify_sdist_via_derived_wheel(
+        sdist,
+        build_python=build_python,
+        expected_build_version=expected_build_version,
+        expected_hatchling_version=expected_hatchling_version,
+    )
     if wheel_version != sdist_version:
         raise VerificationError(
             "wheel and sdist versions differ: "
@@ -262,7 +413,10 @@ def verify_dist(dist_dir: Path, *, expected_version: str) -> None:
             "artifact version differs from the release expectation: "
             f"{wheel_version!r} != {expected_version!r}"
         )
-    print(f"verified isolated wheel and sdist installs: {wheel.name}, {sdist.name}")
+    print(
+        "verified isolated original-wheel and sdist-derived-wheel installs: "
+        f"{wheel.name}, {sdist.name}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -276,7 +430,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-version",
         required=True,
-        help="exact PEP 440 version expected from both installed artifacts",
+        help="exact PEP 440 version expected from both installed wheels",
+    )
+    parser.add_argument(
+        "--build-python",
+        type=Path,
+        default=Path(sys.executable),
+        help="Python executable in the preinstalled, version-verified build backend environment",
+    )
+    parser.add_argument(
+        "--expected-build-version",
+        default=BUILD_FRONTEND_VERSION,
+        help="exact build frontend version required in --build-python",
+    )
+    parser.add_argument(
+        "--expected-hatchling-version",
+        default=HATCHLING_VERSION,
+        help="exact hatchling version required in --build-python",
     )
     return parser
 
@@ -284,7 +454,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        verify_dist(args.dist_dir, expected_version=args.expected_version)
+        verify_dist(
+            args.dist_dir,
+            expected_version=args.expected_version,
+            build_python=args.build_python,
+            expected_build_version=args.expected_build_version,
+            expected_hatchling_version=args.expected_hatchling_version,
+        )
     except (
         OSError,
         subprocess.SubprocessError,

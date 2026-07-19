@@ -22,6 +22,8 @@ SHA_C = "c" * 64
 SHA_D = "d" * 64
 SHA_E = "e" * 64
 SHA_F = "f" * 64
+OID_C = "c" * 40
+OID_D = "d" * 40
 
 
 def artifacts() -> list[dict[str, object]]:
@@ -34,19 +36,21 @@ def artifacts() -> list[dict[str, object]]:
 def manifest_base(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": 1,
+        "distribution_name": "aoi-orgware",
         "tag": "v0.4.0",
-        "commit_sha256": SHA_C,
-        "tree_sha256": SHA_D,
+        "git_object_format": "sha1",
+        "commit_oid": OID_C,
+        "tree_oid": OID_D,
         "package_version": "0.4.0",
         "build_environment": {
             "platform": "ubuntu-24.04",
             "python_version": "3.13.1",
-            "builder_image_sha256": SHA_E,
+            "builder_environment_receipt_sha256": SHA_E,
         },
         "workflow": {"workflow_name": "release", "run_id": "run-100", "run_attempt": 1},
         "artifacts": artifacts(),
         "producer_results": [{"producer_id": "build-linux", "result_sha256": SHA_F}],
-        "interfaces": {"console_executable": "aoi", "hook_protocol_version": 6, "installed_metadata_sha256": SHA_E},
+        "interfaces": {"console_entry_point": {"name": "aoi", "target": "aoi_orgware.cli:main"}, "codex_hook_entry_point": {"name": "aoi-codex-hook", "target": "aoi_orgware.codex_hook:main"}, "hook_protocol_version": 6, "installed_metadata_sha256": SHA_E},
         "schema_versions": {"semantic-event": 2, "packet": 6},
         "dependencies": [
             {"name": "aoi-core", "release_manifest_sha256": SHA_C, "promotion_receipt_sha256": SHA_D}
@@ -75,11 +79,21 @@ def promotion_base(manifest: dict[str, object], **changes: object) -> dict[str, 
         "schema_version": 1,
         "promotion_id": "pypi-0.4.0",
         "manifest_sha256": manifest["manifest_sha256"],
-        "registry_readback": {"artifacts": artifacts()},
-        "installed": {
+        "artifact_observation_receipt_sha256": SHA_F,
+        "registry_readback": {
+            "registry": "https://pypi.org",
+            "project": "aoi-orgware",
             "package_version": "0.4.0",
+            "observed_at": "2026-07-18T12:34:56.000000Z",
+            "artifacts": artifacts(),
+        },
+        "installed": {
+            "distribution_name": "aoi-orgware",
+            "package_version": "0.4.0",
+            "observed_at": "2026-07-18T12:35:00.000000Z",
             "installed_metadata_sha256": SHA_E,
-            "console_executable": "aoi",
+            "console_entry_point": {"name": "aoi", "target": "aoi_orgware.cli:main"},
+            "codex_hook_entry_point": {"name": "aoi-codex-hook", "target": "aoi_orgware.codex_hook:main"},
             "hook_protocol_version": 6,
         },
         "dependency_promotions": [{"name": "aoi-core", "promotion_receipt_sha256": SHA_D}],
@@ -132,8 +146,11 @@ def test_keyed_release_collections_are_canonical_under_permutation() -> None:
         ]))),
         first,
     )
+    readback = copy.deepcopy(promotion_base(first)["registry_readback"])
+    assert isinstance(readback, dict)
+    readback["artifacts"] = list(reversed(artifacts()))
     receipt_two = seal_promotion_receipt(
-        promotion_base(first, registry_readback={"artifacts": list(reversed(artifacts()))}, dependency_promotions=[
+        promotion_base(first, registry_readback=readback, dependency_promotions=[
             {"name": "a-dep", "promotion_receipt_sha256": SHA_D},
             {"name": "z-dep", "promotion_receipt_sha256": SHA_B},
         ]),
@@ -144,7 +161,7 @@ def test_keyed_release_collections_are_canonical_under_permutation() -> None:
 
 def test_manifest_tamper_tag_tree_artifact_and_receipt_fail_closed() -> None:
     manifest = sealed_manifest()
-    for key, replacement in (("tag", "v0.4.1"), ("tree_sha256", SHA_A)):
+    for key, replacement in (("tag", "v0.4.1"), ("tree_oid", "a" * 40)):
         tampered = copy.deepcopy(manifest)
         tampered[key] = replacement
         with pytest.raises(ReleaseManifestError, match="manifest_sha256"):
@@ -165,6 +182,24 @@ def test_manifest_tamper_tag_tree_artifact_and_receipt_fail_closed() -> None:
     tampered["unexpected"] = True
     with pytest.raises(ReleaseManifestError, match="schema"):
         validate_release_manifest(tampered)
+
+
+def test_manifest_git_object_format_binds_exact_oid_width() -> None:
+    sha256_manifest = sealed_manifest(
+        git_object_format="sha256",
+        commit_oid=SHA_C,
+        tree_oid=SHA_D,
+    )
+    assert sha256_manifest["git_object_format"] == "sha256"
+    assert sha256_manifest["commit_oid"] == SHA_C
+    for changes in (
+        {"git_object_format": "sha1", "commit_oid": SHA_C},
+        {"git_object_format": "sha256", "tree_oid": OID_D},
+        {"git_object_format": "md5", "commit_oid": OID_C, "tree_oid": OID_D},
+        {"commit_oid": OID_C.upper()},
+    ):
+        with pytest.raises(ReleaseManifestError, match="Git object id|git_object_format"):
+            sealed_manifest(**changes)
 
 
 def test_manifest_rejects_duplicate_artifacts_bad_tag_missing_matrix_and_rebuild_substitution() -> None:
@@ -296,11 +331,21 @@ def test_promotion_binds_manifest_registry_installed_interface_and_dependencies(
 
     assert receipt["promotion_receipt_sha256"] == promotion_receipt_sha256(promotion_base(manifest))
     assert validate_promotion_receipt(receipt, manifest) == receipt
+    readback = promotion_base(manifest)["registry_readback"]
+    assert isinstance(readback, dict)
+    wrong_readback = copy.deepcopy(readback)
+    wrong_readback["project"] = "different-project"
+    installed = promotion_base(manifest)["installed"]
+    assert isinstance(installed, dict)
+    wrong_installed = copy.deepcopy(installed)
+    wrong_installed["console_entry_point"]["name"] = "other"
+    wrong_metadata = copy.deepcopy(installed)
+    wrong_metadata["installed_metadata_sha256"] = SHA_A
     for field, replacement, match in (
-        ("registry_readback", {"artifacts": [{"name": "dist/aoi_orgware-0.4.0-py3-none-any.whl", "size_bytes": 1234, "sha256": SHA_C}]}, "registry readback"),
-        ("installed", {"package_version": "0.4.0", "installed_metadata_sha256": SHA_E, "console_executable": "other", "hook_protocol_version": 6}, "installed consumer"),
+        ("registry_readback", wrong_readback, "registry readback"),
+        ("installed", wrong_installed, "installed consumer"),
         ("dependency_promotions", [], "dependency promotions"),
-        ("installed", {"package_version": "0.4.0", "installed_metadata_sha256": SHA_A, "console_executable": "aoi", "hook_protocol_version": 6}, "installed consumer"),
+        ("installed", wrong_metadata, "installed consumer"),
     ):
         changed = promotion_base(manifest)
         changed[field] = replacement
@@ -316,7 +361,9 @@ def test_promotion_tamper_and_compensating_rollback_are_separate_records() -> No
             manifest,
             promotion_id="pypi-0.4.0-rollback",
             rollback_provenance={
-                "prior_promotion_receipt_sha256": initial["promotion_receipt_sha256"],
+                "from_promotion_receipt_sha256": SHA_F,
+                "mode": "prior_manifest",
+                "target_promotion_receipt_sha256": initial["promotion_receipt_sha256"],
                 "compensating_manifest_sha256": manifest["manifest_sha256"],
                 "reason": "restore prior release after incident",
             },
@@ -324,16 +371,72 @@ def test_promotion_tamper_and_compensating_rollback_are_separate_records() -> No
         manifest,
     )
     assert rollback["promotion_receipt_sha256"] != initial["promotion_receipt_sha256"]
-    assert rollback["rollback_provenance"]["prior_promotion_receipt_sha256"] == initial["promotion_receipt_sha256"]  # type: ignore[index]
+    assert rollback["rollback_provenance"]["target_promotion_receipt_sha256"] == initial["promotion_receipt_sha256"]  # type: ignore[index]
     tampered = copy.deepcopy(rollback)
     tampered["promotion_id"] = "rewritten-history"
     with pytest.raises(ReleaseManifestError, match="promotion_receipt_sha256"):
         validate_promotion_receipt(tampered, manifest)
     with pytest.raises(ReleaseManifestError, match="compensating manifest"):
         seal_promotion_receipt(
-            promotion_base(manifest, rollback_provenance={"prior_promotion_receipt_sha256": SHA_A, "compensating_manifest_sha256": SHA_B, "reason": "bad"}),
+            promotion_base(manifest, rollback_provenance={"from_promotion_receipt_sha256": SHA_A, "mode": "compensating_release", "target_promotion_receipt_sha256": None, "compensating_manifest_sha256": SHA_B, "reason": "bad"}),
             manifest,
         )
+
+
+def test_manifest_rejects_zero_artifact_and_zero_workflow_attempt() -> None:
+    with pytest.raises(ReleaseManifestError, match="artifact.size_bytes"):
+        sealed_manifest(
+            artifacts=[
+                {
+                    "name": "dist/empty.whl",
+                    "size_bytes": 0,
+                    "sha256": SHA_A,
+                }
+            ]
+        )
+    workflow = copy.deepcopy(manifest_base()["workflow"])
+    assert isinstance(workflow, dict)
+    workflow["run_attempt"] = 0
+    with pytest.raises(ReleaseManifestError, match="run_attempt"):
+        sealed_manifest(workflow=workflow)
+
+
+def test_rollback_provenance_is_discriminated() -> None:
+    manifest = sealed_manifest()
+    compensating = promotion_base(
+        manifest,
+        rollback_provenance={
+            "from_promotion_receipt_sha256": SHA_A,
+            "mode": "compensating_release",
+            "target_promotion_receipt_sha256": None,
+            "compensating_manifest_sha256": manifest["manifest_sha256"],
+            "reason": "publish a fixed successor",
+        },
+    )
+    assert seal_promotion_receipt(compensating, manifest)["rollback_provenance"][
+        "mode"
+    ] == "compensating_release"
+    for provenance in (
+        {
+            "from_promotion_receipt_sha256": SHA_A,
+            "mode": "prior_manifest",
+            "target_promotion_receipt_sha256": None,
+            "compensating_manifest_sha256": manifest["manifest_sha256"],
+            "reason": "missing target",
+        },
+        {
+            "from_promotion_receipt_sha256": SHA_A,
+            "mode": "compensating_release",
+            "target_promotion_receipt_sha256": SHA_B,
+            "compensating_manifest_sha256": manifest["manifest_sha256"],
+            "reason": "unexpected target",
+        },
+    ):
+        with pytest.raises(ReleaseManifestError):
+            seal_promotion_receipt(
+                promotion_base(manifest, rollback_provenance=provenance),
+                manifest,
+            )
 
 
 def test_promotion_validation_requires_the_bound_manifest() -> None:
@@ -344,3 +447,64 @@ def test_promotion_validation_requires_the_bound_manifest() -> None:
     other_manifest = sealed_manifest(tag="v0.4.1")
     with pytest.raises(ReleaseManifestError, match="manifest_sha256"):
         validate_promotion_receipt(receipt, other_manifest)
+
+
+def test_release_identity_and_registry_readback_are_exact() -> None:
+    with pytest.raises(ReleaseManifestError, match="canonical distribution"):
+        sealed_manifest(distribution_name="AOI_Orgware")
+    for version in ("v0.4", "0.04.0", "0.4.0-rc1", "latest"):
+        with pytest.raises(ReleaseManifestError, match="package_version"):
+            sealed_manifest(package_version=version)
+
+    manifest = sealed_manifest()
+    for key, replacement, match in (
+        ("project", "other-project", "registry readback"),
+        ("package_version", "0.4.1", "registry readback"),
+        ("observed_at", "2026-07-18T12:34:56Z", "canonical UTC"),
+    ):
+        receipt = promotion_base(manifest)
+        readback = copy.deepcopy(receipt["registry_readback"])
+        assert isinstance(readback, dict)
+        readback[key] = replacement
+        receipt["registry_readback"] = readback
+        with pytest.raises(ReleaseManifestError, match=match):
+            seal_promotion_receipt(receipt, manifest)
+
+    receipt = promotion_base(manifest)
+    installed = copy.deepcopy(receipt["installed"])
+    assert isinstance(installed, dict)
+    installed["distribution_name"] = "other-project"
+    receipt["installed"] = installed
+    with pytest.raises(ReleaseManifestError, match="installed consumer"):
+        seal_promotion_receipt(receipt, manifest)
+
+    receipt = promotion_base(manifest)
+    installed = copy.deepcopy(receipt["installed"])
+    assert isinstance(installed, dict)
+    installed["observed_at"] = "2026-07-18T12:35:00Z"
+    receipt["installed"] = installed
+    with pytest.raises(ReleaseManifestError, match="canonical UTC"):
+        seal_promotion_receipt(receipt, manifest)
+
+
+def test_distribution_dependencies_and_promotion_ids_are_canonical() -> None:
+    with pytest.raises(ReleaseManifestError, match="canonical distribution"):
+        sealed_manifest(
+            dependencies=[
+                {
+                    "name": "AOI_Core",
+                    "release_manifest_sha256": SHA_A,
+                    "promotion_receipt_sha256": SHA_B,
+                }
+            ]
+        )
+    manifest = sealed_manifest(dependencies=[])
+    with pytest.raises(ReleaseManifestError, match="promotion_id"):
+        seal_promotion_receipt(
+            promotion_base(
+                manifest,
+                promotion_id="pypi/0.4.0",
+                dependency_promotions=[],
+            ),
+            manifest,
+        )

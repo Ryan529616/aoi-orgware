@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, NoReturn
 
 from .resource_config import resource_plan_sha256, validate_resource_receipt
 from .semantic_events import SemanticEventError, canonical_json_bytes, canonical_sha256
@@ -148,7 +148,7 @@ class RoutingAuthorityError(ValueError):
     """A bounded v6 routing authority, observation, or outcome is invalid."""
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise RoutingAuthorityError(message)
 
 

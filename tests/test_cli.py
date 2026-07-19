@@ -32,13 +32,21 @@ sys.path.insert(0, str(SRC))
 
 from aoi_orgware import __version__ as AOI_VERSION  # noqa: E402
 from aoi_orgware import cli as cli_impl  # noqa: E402
+from aoi_orgware import codex_install_provenance as codex_install_provenance_impl  # noqa: E402
+from aoi_orgware import evidence_artifacts as evidence_artifacts_impl  # noqa: E402
+from aoi_orgware import git_plumbing as git_plumbing_impl  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
+from aoi_orgware import integrity_records as integrity_records_impl  # noqa: E402
+from aoi_orgware import semantic_events as semantic_events_impl  # noqa: E402
 
 
 CLI_MODULE = "aoi_orgware.cli"
 HOOK_MODULE = "aoi_orgware.codex_hook"
 
 from tests.harness_case import HarnessTestCase  # noqa: E402
+from tests.test_commands_codex_onboarding import (  # noqa: E402
+    fake_local_provenance_receipt,
+)
 
 
 class AtomicPrimitiveTests(unittest.TestCase):
@@ -5343,7 +5351,6 @@ class HardeningTests(HarnessTestCase):
         self.assertEqual(json.loads(result.stdout)["remote_sha"], commit)
 
     def test_terminal_delivery_accepts_only_synced_descendant_branch(self) -> None:
-        self.install_hook_layers()
         task_id = "terminal-delivery-lineage"
         self.init_task(task_id)
         tracked = self.root / ".harness-test-root"
@@ -7744,7 +7751,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
     def test_exact_command_packet_is_snapshotted_and_tamper_blocks_dispatch(self) -> None:
         self.init_task("packet-command-authority")
         command = self.root / "exact-command.sh"
-        command.write_text("#!/bin/sh\nprintf 'bounded command\\n'\n", encoding="utf-8")
+        command.write_bytes(
+            b"#!/bin/sh\r\nprintf 'bounded command\\n'\r\n\r\n \t"
+        )
         command_sha = hashlib.sha256(command.read_bytes()).hexdigest()
         self.cli(
             "claim",
@@ -7873,8 +7882,19 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertEqual(created["packet_id"], "exact-command")
         state = json.loads(state_path.read_text(encoding="utf-8"))
         packet = next(item for item in state["packets"] if item["packet_id"] == "exact-command")
-        self.assertEqual(packet["command_sha256"], command_sha)
+        self.assertEqual(packet["command_source_sha256"], command_sha)
+        self.assertEqual(packet["command_supplied_sha256"], command_sha)
+        self.assertEqual(
+            packet["command_normalization"],
+            cli_impl.packet_integrity_impl.EXACT_COMMAND_NORMALIZATION_V1,
+        )
         snapshot = Path(packet["command_path"])
+        self.assertEqual(
+            snapshot.read_bytes(), b"#!/bin/sh\nprintf 'bounded command\\n'\n"
+        )
+        self.assertEqual(
+            packet["command_sha256"], hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        )
         snapshot.write_text("tampered\n", encoding="utf-8")
         state_before_dispatch = state_path.read_bytes()
         rejected = self.cli(
@@ -7976,6 +7996,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             return Path(packet["command_path"])
 
         worker_snapshot = create_exact("exact-worker", "external_operator", "standard")
+        worker_snapshot_bytes = worker_snapshot.read_bytes()
         self.dispatch_packet(task_id, "exact-worker", "/root/exact-worker")
         worker_snapshot.write_text("tampered after dispatch\n", encoding="utf-8")
         before_done = state_path.read_bytes()
@@ -7996,7 +8017,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertIn("exact command artifact identity mismatch", rejected.stderr)
         self.assertEqual(state_path.read_bytes(), before_done)
 
-        worker_snapshot.write_bytes(command.read_bytes())
+        worker_snapshot.write_bytes(worker_snapshot_bytes)
         self.cli(
             "packet-update",
             "--task",
@@ -9262,7 +9283,12 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             replacement_sha = cli_impl.canonical_record_sha256(replacement)
             source["original_status"] = source["status"]
             source["status"] = "skipped"
-            source["superseded_at"] = h.now_iso()
+            replacement_time = h.parse_time(str(replacement.get("recorded_at", "")))
+            self.assertIsNotNone(replacement_time)
+            assert replacement_time is not None
+            source["superseded_at"] = (
+                replacement_time + dt.timedelta(microseconds=1)
+            ).isoformat(timespec="microseconds")
             source["supersession_reason"] = (
                 f"Legacy edge {source_number} names canonical replacement {replacement_number}"
             )
@@ -12512,6 +12538,39 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
 
 
 class V5FeatureTests(HarnessTestCase):
+    def test_start_mini_six_argument_path_derives_bounded_explicit_defaults(self) -> None:
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "small.md").write_text("draft\n", encoding="utf-8")
+        objective = "Update one small document and verify its exact content"
+        result = json.loads(
+            self.cli(
+                "start-mini",
+                "--task-id",
+                "mini-defaults",
+                "--objective",
+                objective,
+                "--owner",
+                "root",
+                "--session-id",
+                "mini-default-session",
+                "--lock",
+                "repo:file:docs/small.md",
+                "--expires-at",
+                "2099-01-01T00:00:00+00:00",
+                "--json",
+            ).stdout
+        )
+        state = h.load_task(h.get_paths(self.root), "mini-defaults")
+        claim = h.load_claim_file(
+            h.claim_path(h.get_paths(self.root), result["claim"], active=True)
+        )
+        self.assertRegex(result["claim"], r"\Amini-[0-9a-f]{24}\Z")
+        self.assertEqual(state["title"], objective)
+        self.assertEqual(state["objective"], objective)
+        self.assertIn(objective, state["completion_boundary"])
+        self.assertEqual(claim["intent"], objective)
+        self.assertIn(objective, claim["validation"])
+
     def test_start_mini_is_atomic_constrained_and_preapproved(self) -> None:
         (self.root / "docs").mkdir()
         (self.root / "docs" / "note.md").write_text("draft\n", encoding="utf-8")
@@ -12681,7 +12740,6 @@ class V5FeatureTests(HarnessTestCase):
         self.assertEqual(state["branch_adoptions"][0]["claim_token"], "branch-claim")
 
     def test_scoped_doctor_ignores_unrelated_task_corruption(self) -> None:
-        self.install_hook_layers()
         self.init_task("doctor-a")
         self.init_task("doctor-b")
         plan_b = self.root / ".aoi" / "tasks" / "doctor-b" / "plan.md"
@@ -12704,7 +12762,6 @@ class V5FeatureTests(HarnessTestCase):
         self.assertNotIn("doctor-b", scoped.stdout)
 
     def test_scoped_doctor_accepts_intentionally_unbound_closed_task(self) -> None:
-        self.install_hook_layers()
         task_id = "closed-doctor"
         session_id = "closed-doctor-session"
         self.init_task(task_id, session_id)
@@ -12859,6 +12916,353 @@ class V5FeatureTests(HarnessTestCase):
             "verify-backup", "--manifest", first["manifest"], ok=False
         )
         self.assertIn("SHA-256", tampered.stderr)
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink boundary; junction coverage is native")
+    def test_doctor_rejects_symlinked_codex_config_leaf(self) -> None:
+        self.install_hook_layers()
+        config = self.root / ".codex" / "config.toml"
+        outside = Path(self.backup_temp.name) / "outside-config.toml"
+        outside.write_text("[features]\nhooks = true\n", encoding="utf-8")
+        config.unlink()
+        config.symlink_to(outside)
+
+        result = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(
+            any(
+                "invalid TOML" in item and ("symlink" in item or "linked" in item)
+                for item in payload["errors"]
+            ),
+            payload["errors"],
+        )
+
+    def test_semantic_v2_task_may_explicitly_adopt_integrity_contract(self) -> None:
+        self.cli(
+            "init-task",
+            "--task-id",
+            "semantic-integrity",
+            "--title",
+            "Semantic integrity genesis",
+            "--objective",
+            "Permit explicit O8 adoption from the semantic task boundary",
+            "--owner",
+            "test-root",
+            "--completion-boundary",
+            "Integrity contract may be adopted before close",
+            "--semantic-v2",
+            "--semantic-command-id",
+            "semantic-integrity-genesis",
+        )
+        state = h.load_task(h.get_paths(self.root), "semantic-integrity")
+        self.assertNotIn("integrity_contract", state)
+        doctor = json.loads(
+            self.cli("doctor", "--task", "semantic-integrity", "--json").stdout
+        )
+        self.assertTrue(doctor["ok"], doctor)
+        def semantic_mutation(
+            command: str, command_id: str, recorded_at: str, *arguments: str
+        ) -> dict[str, object]:
+            head = json.loads(
+                self.cli("semantic-head", "--task", "semantic-integrity", "--json").stdout
+            )
+            result = self.cli(
+                command,
+                "--task",
+                "semantic-integrity",
+                *arguments,
+                "--command-id",
+                command_id,
+                "--recorded-at",
+                recorded_at,
+                "--expected-head-sha256",
+                str(head["event_sha256"]),
+                "--json",
+            )
+            return json.loads(result.stdout)
+
+        genesis_head = json.loads(
+            self.cli("semantic-head", "--task", "semantic-integrity", "--json").stdout
+        )["event_sha256"]
+        adopt_arguments = (
+            "integrity-adopt",
+            "--task",
+            "semantic-integrity",
+            "--command-id",
+            "semantic-integrity-adopt",
+            "--recorded-at",
+            "2099-01-01T00:00:00+00:00",
+            "--expected-head-sha256",
+            str(genesis_head),
+            "--json",
+        )
+        first_adopt = json.loads(self.cli(*adopt_arguments).stdout)
+        self.assertFalse(first_adopt["idempotent_replay"])
+        adopted = h.load_task(h.get_paths(self.root), "semantic-integrity")
+        self.assertEqual(adopted["integrity_contract"]["mode"], "required_v1")
+        adopted_baseline = adopted["integrity_contract"]["baseline_head"]
+
+        # Omitting --baseline-head observes Git HEAD only on first execution.
+        # An exact response-loss retry must still succeed after ambient HEAD moves.
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "advance after integrity adoption",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        replayed_adopt = json.loads(self.cli(*adopt_arguments).stdout)
+        self.assertTrue(replayed_adopt["idempotent_replay"])
+        self.assertEqual(
+            h.load_task(h.get_paths(self.root), "semantic-integrity")["integrity_contract"][
+                "baseline_head"
+            ],
+            adopted_baseline,
+        )
+        candidate = semantic_mutation(
+            "integrity-snapshot",
+            "semantic-integrity-candidate",
+            "2099-01-01T00:00:01+00:00",
+            "--purpose",
+            "candidate",
+        )
+        review_artifact = Path(self.backup_temp.name) / "semantic-integrity-review.json"
+        review_artifact.write_bytes(b'{"outcome":"clean"}\n')
+        review_digest = hashlib.sha256(review_artifact.read_bytes()).hexdigest()
+        blob_root = (
+            h.get_paths(self.root).tasks
+            / "semantic-integrity"
+            / "results"
+            / "artifact-blobs"
+        )
+        blobs_before_reuse = sorted(path for path in blob_root.rglob("*") if path.is_file())
+        current_head = json.loads(
+            self.cli("semantic-head", "--task", "semantic-integrity", "--json").stdout
+        )["event_sha256"]
+        reused = self.cli(
+            "integrity-review",
+            "--task",
+            "semantic-integrity",
+            "--snapshot-sha256",
+            str(candidate["snapshot_sha256"]),
+            "--reviewer-agent-id",
+            "independent-reviewer",
+            "--result-artifact",
+            f"{review_artifact}={review_digest}",
+            "--outcome",
+            "clean",
+            "--command-id",
+            "semantic-integrity-adopt",
+            "--recorded-at",
+            "2099-01-01T00:00:02+00:00",
+            "--expected-head-sha256",
+            str(current_head),
+            ok=False,
+        )
+        self.assertIn("semantic command id already exists", reused.stderr)
+        self.assertEqual(
+            sorted(path for path in blob_root.rglob("*") if path.is_file()),
+            blobs_before_reuse,
+        )
+        semantic_mutation(
+            "integrity-review",
+            "semantic-integrity-review",
+            "2099-01-01T00:00:02+00:00",
+            "--snapshot-sha256",
+            str(candidate["snapshot_sha256"]),
+            "--reviewer-agent-id",
+            "independent-reviewer",
+            "--result-artifact",
+            f"{review_artifact}={review_digest}",
+            "--outcome",
+            "clean",
+        )
+        semantic_mutation(
+            "integrity-seal",
+            "semantic-integrity-seal",
+            "2099-01-01T00:00:03+00:00",
+        )
+        sealed = h.load_task(h.get_paths(self.root), "semantic-integrity")
+        self.assertIsNotNone(sealed["integrity_contract"]["seal"])
+        self.assertEqual(sealed["integrity_contract"]["snapshots"][0]["covered_claim_tokens"], [])
+        doctor = json.loads(
+            self.cli("doctor", "--task", "semantic-integrity", "--json").stdout
+        )
+        self.assertTrue(doctor["ok"], doctor)
+
+    def test_doctor_rejects_self_consistent_integrity_snapshot_with_uncovered_path(self) -> None:
+        """Persisted snapshot tokens/digest do not waive per-path coverage."""
+
+        task_id = "integrity-uncovered"
+        self.init_task(task_id)
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "integrity-base-only",
+            "--owner",
+            "test-root",
+            "--kind",
+            "implementation",
+            "--lock",
+            "repo:file:.harness-test-root",
+            "--intent",
+            "Cover only the tracked fixture",
+            "--validation",
+            "doctor detects a deliberately uncovered sibling",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        self.cli("integrity-adopt", "--task", task_id)
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, task_id)
+        (self.root / ".harness-test-root").write_text("changed\n", encoding="utf-8")
+        (self.root / "uncovered-integrity.txt").write_text("uncovered\n", encoding="utf-8")
+        snapshot = git_plumbing_impl.task_mutation_snapshot(
+            task_id,
+            self.root,
+            state["integrity_contract"]["baseline_head"],
+        )
+        coverage = git_plumbing_impl.task_mutation_snapshot_claim_coverage(
+            snapshot,
+            h.claims_owned_by_task(paths, task_id),
+        )
+        self.assertFalse(coverage["covered"])
+        artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            task_id,
+            semantic_events_impl.canonical_json_bytes(snapshot),
+            label="injected integrity mutation snapshot",
+            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        record = integrity_records_impl.build_snapshot_record(
+            task_id=task_id,
+            worktree=snapshot["worktree"],
+            baseline_head=snapshot["baseline_head"],
+            current_head=snapshot["current_head"],
+            artifact=artifact,
+            snapshot_sha256=snapshot["snapshot_sha256"],
+            claim_scope_sha256=coverage["claim_scope_sha256"],
+            covered_claim_tokens=coverage["covered_claim_tokens"],
+            purpose="candidate",
+            producer_agent_ids=["test-root"],
+        )
+        state["integrity_contract"] = integrity_records_impl.append_snapshot(
+            state["integrity_contract"], record
+        )
+        h.write_task(paths, state)
+
+        result = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(
+            any("uncovered paths" in item for item in payload["errors"]),
+            payload,
+        )
+
+    def test_doctor_validates_nonlatest_post_fix_snapshot_bindings(self) -> None:
+        """Doctor must validate every persisted snapshot, not just candidate."""
+
+        task_id = "integrity-postfix-binding"
+        self.init_task(task_id)
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "integrity-postfix-fixture",
+            "--owner",
+            "test-root",
+            "--kind",
+            "implementation",
+            "--lock",
+            "repo:file:.harness-test-root",
+            "--intent",
+            "Cover the fixture used for the distinct post-fix snapshot",
+            "--validation",
+            "doctor validates every snapshot record binding",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        self.cli("integrity-adopt", "--task", task_id)
+        self.cli("integrity-snapshot", "--task", task_id, "--purpose", "candidate")
+
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, task_id)
+        (self.root / ".harness-test-root").write_text("post-fix\n", encoding="utf-8")
+        snapshot = git_plumbing_impl.task_mutation_snapshot(
+            task_id,
+            self.root,
+            state["integrity_contract"]["baseline_head"],
+        )
+        coverage = git_plumbing_impl.task_mutation_snapshot_claim_coverage(
+            snapshot,
+            h.claims_owned_by_task(paths, task_id),
+        )
+        self.assertTrue(coverage["covered"])
+        artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            task_id,
+            semantic_events_impl.canonical_json_bytes(snapshot),
+            label="injected post-fix binding snapshot",
+            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        record = integrity_records_impl.build_snapshot_record(
+            task_id=task_id,
+            worktree=snapshot["worktree"],
+            baseline_head=snapshot["baseline_head"],
+            current_head="0" * 40,
+            artifact=artifact,
+            snapshot_sha256=snapshot["snapshot_sha256"],
+            claim_scope_sha256=coverage["claim_scope_sha256"],
+            covered_claim_tokens=coverage["covered_claim_tokens"],
+            purpose="post_fix",
+            producer_agent_ids=["test-root"],
+        )
+        state["integrity_contract"] = integrity_records_impl.append_snapshot(
+            state["integrity_contract"], record
+        )
+        h.write_task(paths, state)
+
+        result = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(
+            any("current-head binding differs" in item for item in payload["errors"]),
+            payload,
+        )
 
 
 class ConfigurationTests(HarnessTestCase):
@@ -13063,6 +13467,90 @@ class ConfigurationTests(HarnessTestCase):
         state.symlink_to(outside, target_is_directory=True)
         state_result = self.cli("status", ok=False)
         self.assertIn("state directory may not traverse symlinks", state_result.stderr)
+
+
+class CodexLocalProvenanceDoctorTests(HarnessTestCase):
+    def test_doctor_consumes_strict_local_v2_receipt_and_reports_runtime_drift(
+        self,
+    ) -> None:
+        """Doctor must preserve strict v2 loading and surface liveness drift.
+
+        The local receipt fixture is intentionally a fully shaped schema-v2
+        receipt.  This test owns the doctor boundary only: the dedicated
+        provenance tests exercise the real wheel/RECORD/bundle construction.
+        """
+
+        receipt = fake_local_provenance_receipt(self.root, salt="doctor-v2")
+        self.assertEqual(
+            codex_install_provenance_impl.validate_codex_install_provenance_receipt(
+                receipt
+            ),
+            receipt,
+        )
+        local_bundle = self.root / "reviewed-local-install.json"
+        expected_bundle_sha256 = "b" * 64
+        with mock.patch.object(
+            cli_impl.codex_install_provenance_impl,
+            "validate_codex_local_install_provenance",
+            return_value=receipt,
+        ):
+            initialized = self.cli_in_process(
+                "codex-init",
+                "--local-artifact-bundle-file",
+                str(local_bundle),
+                "--expected-local-artifact-bundle-sha256",
+                expected_bundle_sha256,
+                "--user-skills-root",
+                str(self.root / "user-skills"),
+                "--json",
+            )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        self.assertEqual(
+            codex_install_provenance_impl.load_codex_install_provenance_receipt(
+                self.root
+            ),
+            receipt,
+        )
+
+        def doctor_with_runtime_verifier(
+            *, side_effect: Exception | None = None
+        ) -> tuple[int, dict[str, object]]:
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, self.env, clear=True),
+                mock.patch("sys.stdout", stdout),
+                mock.patch("sys.stderr", new=io.StringIO()),
+                mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "verify_runtime_hook_provenance",
+                    return_value=receipt if side_effect is None else None,
+                    side_effect=side_effect,
+                ),
+            ):
+                returncode = cli_impl.main(["doctor", "--json"])
+            return returncode, json.loads(stdout.getvalue())
+
+        accepted_code, accepted = doctor_with_runtime_verifier()
+        self.assertEqual(accepted_code, 0, accepted)
+        self.assertEqual(accepted["codex_install_provenance"], receipt)
+
+        for drift in (
+            "current wheel RECORD differs from provenance receipt",
+            "local installation proof differs from provenance receipt",
+            "current local installed wheel mapping differs from provenance receipt",
+        ):
+            with self.subTest(drift=drift):
+                code, payload = doctor_with_runtime_verifier(
+                    side_effect=codex_install_provenance_impl.CodexInstallProvenanceError(
+                        drift
+                    )
+                )
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_install_provenance"], receipt)
+                self.assertIn(
+                    f"Codex install provenance is invalid: {drift}",
+                    payload["errors"],
+                )
 
 
 class BytecodeHygieneTests(HarnessTestCase):
@@ -13940,7 +14428,15 @@ class HookTests(HarnessTestCase):
         def invoke(payload: dict) -> None:
             barrier.wait(timeout=10)
             result = subprocess.run(
-                [sys.executable, "-m", HOOK_MODULE, "--hook-version", "6"],
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "from aoi_orgware.codex_hook import dispatch, read_input; "
+                        "dispatch(read_input(), project_root=Path.cwd())"
+                    ),
+                ],
                 cwd=self.root,
                 env=self.env,
                 input=json.dumps(payload).encode("utf-8"),

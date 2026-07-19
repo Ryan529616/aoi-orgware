@@ -1,0 +1,17 @@
+# Type-check-only toolchain for the Ubuntu Python 3.13 CI runner.  Keep every
+# transitive dependency pinned and hash-verified so a changing mypy release
+# cannot silently redefine the acceptance gate.
+--only-binary=:all:
+
+ast-serialize==0.6.0 \
+    --hash=sha256:dcbed41e9386059fc0261d602445ede0976c2ecec2939688bcbcb9ed0b6f28b7
+librt==0.13.0 \
+    --hash=sha256:94b85d664d777bab6c0d709416cb42938251fda9e221b79e3a2215d85df5f4f9
+mypy==2.3.0 \
+    --hash=sha256:7da939dd335cfd2ad788bdfd081c9f4e47634ab995e5a45eb15fd1e5bc052f8b
+mypy-extensions==1.1.0 \
+    --hash=sha256:1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505
+pathspec==1.1.1 \
+    --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

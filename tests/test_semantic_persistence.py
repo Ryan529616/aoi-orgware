@@ -205,6 +205,11 @@ class SemanticPersistenceTests(unittest.TestCase):
         # The bytes need not be a valid event: reaching a second entry is
         # already beyond this test's artificial enumeration budget.
         self.event_path(2).write_bytes(b"{}")
+        if os.name != "nt":
+            # Keep the synthetic entry inside the private namespace contract so
+            # this branch reaches the enumeration-bound check it is meant to
+            # exercise.  The separate assertion below covers non-private mode.
+            self.event_path(2).chmod(0o600)
         with mock.patch.object(store, "MAX_SEMANTIC_EVENT_FILES", 1):
             with self.assertRaisesRegex(store.SemanticStoreError, "enumeration bound"):
                 store.load_semantic_task(self.paths, TASK_ID)

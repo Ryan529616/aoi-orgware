@@ -22,15 +22,15 @@ from aoi_orgware import harnesslib as h  # noqa: E402
 
 
 def _run_hook(payload: bytes) -> int:
-    """Invoke the public hook entrypoint with a real binary-backed stdin."""
+    """Invoke the handler dispatcher with a real binary-backed stdin."""
 
     original_argv = sys.argv
     original_stdin = sys.stdin
     hook_stdin = io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8")
     try:
-        sys.argv = [str(Path(codex_hook.__file__).resolve()), "--hook-version", "6"]
         sys.stdin = hook_stdin
-        return codex_hook.main()
+        codex_hook.dispatch(codex_hook.read_input(), project_root=Path.cwd())
+        return 0
     finally:
         sys.argv = original_argv
         sys.stdin = original_stdin

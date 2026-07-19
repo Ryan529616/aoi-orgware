@@ -123,8 +123,8 @@ def _route_truth(
             raise CohortRuntimeError(
                 "cohort packet has inconsistent routing authority groups"
             )
-    for stages in foreign_plan_packet_slots.values():
-        if stages.get("terminal") != "committed":
+    for foreign_stages in foreign_plan_packet_slots.values():
+        if foreign_stages.get("terminal") != "committed":
             raise CohortRuntimeError(
                 "cohort packet has another active routing authority"
             )

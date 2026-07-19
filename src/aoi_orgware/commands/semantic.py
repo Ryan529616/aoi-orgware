@@ -263,8 +263,11 @@ def _permit_issue_secret(
     authority = getattr(args, "_aoi_chief_authority", None)
     if not isinstance(authority, dict):
         raise h.HarnessError("permit issue requires validated Chief authority")
+    raw_session_id = authority.get("session_id")
+    if not isinstance(raw_session_id, str):
+        raise h.HarnessError("permit issuer Chief session is invalid")
     session_id = h.validate_id(
-        authority.get("session_id"), "permit issuer Chief session"
+        raw_session_id, "permit issuer Chief session"
     )
     epoch = authority.get("epoch")
     if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1:

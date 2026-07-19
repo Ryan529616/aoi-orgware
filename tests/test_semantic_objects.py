@@ -152,6 +152,194 @@ class SemanticObjectTests(unittest.TestCase):
             with self.assertRaises(objects.SemanticObjectError):
                 self.object("d" * 64, "x" * 200, "cohort_plan")
 
+    def test_release_observation_is_a_registered_immutable_object(self) -> None:
+        self.assertIn("release_observation", objects.OBJECT_TYPES)
+        self.assertNotIn("release_observation", objects.SMALL_OBJECT_TYPES)
+        candidate = self.object(
+            "e" * 64,
+            {"observation_receipt_sha256": "e" * 64},
+            "release_observation",
+        )
+        self.assertEqual(
+            objects.publish_semantic_object(self.paths, candidate), candidate
+        )
+
+    def test_release_abandonment_reader_accepts_historical_v1_row(self) -> None:
+        """Namespace v1 remains readable while release writers move to row v2."""
+
+        binding_sha = "a" * 64
+        receipt_sha = "b" * 64
+        original_authority = f"chief:retired-chief:e1:release:{receipt_sha}"
+        original = semantic.create_transition_event(
+            self.events[-1],
+            self.domain,
+            {"task_id": TASK, "stage": 1},
+            event_type=objects.RELEASE_PROMOTION_EVENT_TYPE,
+            command_id="legacy-promote",
+            recorded_at="2026-07-18T00:00:01+00:00",
+            authority_ref=original_authority,
+        )
+        takeover = {
+            "seq": 2,
+            "action": "takeover",
+            "at": "2026-07-18T00:00:02+00:00",
+            "old_epoch": 1,
+            "new_epoch": 2,
+            "session_id": "successor-chief",
+            "previous_session_id": "retired-chief",
+            "reason": "legacy successor disposition",
+            "forced_live": True,
+        }
+        takeover["audit_event_sha256"] = semantic.canonical_sha256(
+            takeover, max_bytes=objects.MAX_BINDING_BYTES
+        )
+        abandonment_authority = (
+            f"chief:successor-chief:e2:release-abandon:{binding_sha}"
+        )
+        row = {
+            "schema_version": 1,
+            "task_id": TASK,
+            "binding_sha256": binding_sha,
+            "binding_kind": "release_promotion",
+            "binding_key": "legacy-release",
+            "expected_semantic_head_sha256": self.events[-1]["event_sha256"],
+            "planned_event_sha256": original["event_sha256"],
+            "result_projection_sha256": original["result_projection_sha256"],
+            "original_event": {
+                key: original[key]
+                for key in ("event_type", "command_id", "recorded_at", "authority_ref", "event_sha256")
+            },
+            "takeover": takeover,
+            "reason": "accept the historical v1 abandonment format",
+            "abandonment_command_id": "legacy-abandon",
+            "abandonment_recorded_at": "2026-07-18T00:00:03+00:00",
+            "abandonment_authority_ref": abandonment_authority,
+        }
+        abandonment_event = semantic.create_transition_event(
+            self.events[-1],
+            self.domain,
+            {
+                **self.domain,
+                objects.BINDING_DISPOSITIONS_KEY: {
+                    "schema_version": 1,
+                    "abandoned": {binding_sha: row},
+                },
+            },
+            event_type=objects.RELEASE_ABANDONMENT_EVENT_TYPE,
+            command_id="legacy-abandon",
+            recorded_at=row["abandonment_recorded_at"],
+            authority_ref=abandonment_authority,
+        )
+        self.assertEqual(
+            objects._validate_release_abandonment_row(
+                row,
+                task_id=TASK,
+                binding_sha256=binding_sha,
+                event=abandonment_event,
+            ),
+            row,
+        )
+
+    def test_release_abandonment_v2_allows_same_session_at_a_strictly_new_epoch(self) -> None:
+        """Epoch fencing, rather than a changed label, proves retirement."""
+
+        binding_sha = "a" * 64
+        receipt_sha = "b" * 64
+        authority = f"chief:retired-chief:e1:release:{receipt_sha}"
+        original = semantic.create_transition_event(
+            self.events[-1],
+            self.domain,
+            {"task_id": TASK, "stage": 1},
+            event_type=objects.RELEASE_PROMOTION_EVENT_TYPE,
+            command_id="same-session-promote",
+            recorded_at="2026-07-18T00:00:01+00:00",
+            authority_ref=authority,
+        )
+        abandonment_authority = f"chief:retired-chief:e2:release-abandon:{binding_sha}"
+        row = {
+            "schema_version": 2,
+            "task_id": TASK,
+            "binding_sha256": binding_sha,
+            "binding_kind": "release_promotion",
+            "binding_key": "same-session-release",
+            "expected_semantic_head_sha256": self.events[-1]["event_sha256"],
+            "planned_event_sha256": original["event_sha256"],
+            "result_projection_sha256": original["result_projection_sha256"],
+            "original_event": {
+                key: original[key]
+                for key in ("event_type", "command_id", "recorded_at", "authority_ref", "event_sha256")
+            },
+            "retirement_proof": {
+                "proof_kind": "monotonic_chief_epoch",
+                "successor_session_id": "retired-chief",
+                "successor_epoch": 2,
+                "issued_at": "2026-07-18T00:00:02+00:00",
+                "expires_at": "2026-07-18T00:01:00+00:00",
+                "current_authority_record_sha256": "c" * 64,
+            },
+            "reason": "same session label with a new fenced epoch",
+            "abandonment_command_id": "same-session-abandon",
+            "abandonment_recorded_at": "2026-07-18T00:00:03+00:00",
+            "abandonment_authority_ref": abandonment_authority,
+        }
+        abandonment_event = semantic.create_transition_event(
+            self.events[-1],
+            self.domain,
+            {
+                **self.domain,
+                objects.BINDING_DISPOSITIONS_KEY: {
+                    "schema_version": 1,
+                    "abandoned": {binding_sha: row},
+                },
+            },
+            event_type=objects.RELEASE_ABANDONMENT_EVENT_TYPE,
+            command_id="same-session-abandon",
+            recorded_at=row["abandonment_recorded_at"],
+            authority_ref=abandonment_authority,
+        )
+        self.assertEqual(
+            objects._validate_release_abandonment_row(
+                row, task_id=TASK, binding_sha256=binding_sha, event=abandonment_event
+            ),
+            row,
+        )
+        stale_epoch = {
+            **row,
+            "retirement_proof": {**row["retirement_proof"], "successor_epoch": 1},
+        }
+        with self.assertRaisesRegex(objects.SemanticObjectError, "successor epoch"):
+            objects._validate_release_abandonment_row(
+                stale_epoch,
+                task_id=TASK,
+                binding_sha256=binding_sha,
+                event=abandonment_event,
+            )
+
+    def test_non_abandonment_event_cannot_inject_binding_dispositions(self) -> None:
+        result = {
+            **self.domain,
+            objects.BINDING_DISPOSITIONS_KEY: {
+                "schema_version": 1,
+                "abandoned": {},
+            },
+        }
+        appended = store.append_semantic_transition(
+            self.paths,
+            TASK,
+            result,
+            event_type="binding_test",
+            command_id="inject-binding-dispositions",
+            recorded_at="2026-07-18T00:00:01+00:00",
+            authority_ref="test",
+            expected_head_sha256=self.events[-1]["event_sha256"],
+        )
+        with self.assertRaisesRegex(
+            objects.SemanticObjectError, "disposition event/delta ownership"
+        ):
+            objects.inspect_semantic_objects(
+                self.paths, TASK, [*self.events, appended.event]
+            )
+
     def test_exact_binding_retry_and_divergent_same_key_fails(self) -> None:
         item = self.publish_object("route-1", {"answer": 7})
         first = objects.publish_semantic_binding(

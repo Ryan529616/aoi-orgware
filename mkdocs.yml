@@ -36,6 +36,7 @@ markdown_extensions:
 
 nav:
   - Overview: index.md
+  - Quickstart: quickstart.md
   - Architecture: architecture.md
   - Configuration: configuration.md
   - Operating policy: POLICY.md
@@ -49,6 +50,7 @@ nav:
       - Method: evaluation.md
       - Pilot protocol: PILOT.md
   - History:
+      - v0.4 implementation and migration plan: v0.4-plan.md
       - v0.3 adoption plan: v0.3-adoption-plan.md
       - v0.3 plan: v0.3-plan.md
       - v0.2 migration: v0.2-migration.md

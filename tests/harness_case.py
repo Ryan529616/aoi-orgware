@@ -325,7 +325,15 @@ class HarnessTestCase(unittest.TestCase):
         if bom:
             raw = b"\xef\xbb\xbf" + raw
         result = subprocess.run(
-            [sys.executable, "-m", HOOK_MODULE, "--hook-version", "6"],
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "from aoi_orgware.codex_hook import dispatch, read_input; "
+                    "dispatch(read_input(), project_root=Path.cwd())"
+                ),
+            ],
             cwd=self.root,
             env=self.env,
             input=raw,

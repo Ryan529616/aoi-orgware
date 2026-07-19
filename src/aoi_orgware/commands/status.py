@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,7 @@ from ..harnesslib import (
     checkpoint_matches,
     chief_authority_summary,
     is_expired,
+    is_semantic_v2_task,
     load_all_claims,
     load_all_tasks,
     load_json,
@@ -37,6 +39,7 @@ from ..harnesslib import (
     task_summary,
     write_index,
 )
+from ..semantic_store import load_semantic_events
 from ..state_lookup import ENGAGED_LANE_STATUSES
 
 
@@ -44,6 +47,7 @@ Handler = Callable[[argparse.Namespace, Any], int]
 JsonArgumentRegistrar = Callable[[argparse.ArgumentParser], None]
 
 _HANDLER_NAMES = frozenset({"resume", "status", "render_index"})
+_SEMANTIC_CURSOR_RE = re.compile(r"([1-9][0-9]*):([0-9a-f]{64})\Z")
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,232 @@ def emit(payload: Any, as_json: bool = False) -> None:
         print(payload)
         return
     print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def _semantic_cursor(event: Mapping[str, Any]) -> str:
+    """Return the stable cursor for one authenticated semantic event."""
+
+    return f"{event['sequence']}:{event['event_sha256']}"
+
+
+def _semantic_delta(
+    task_id: str, cursor: str, events: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str]:
+    """Select the authenticated semantic tail strictly after ``cursor``."""
+
+    match = _SEMANTIC_CURSOR_RE.fullmatch(cursor)
+    if match is None:
+        raise HarnessError(
+            "semantic status cursor is malformed; expected <sequence>:<event-sha256>"
+        )
+    sequence = int(match.group(1))
+    event_sha256 = match.group(2)
+    for index, event in enumerate(events):
+        if event["sequence"] == sequence and event["event_sha256"] == event_sha256:
+            return events[index + 1 :], _semantic_cursor(events[-1])
+    raise HarnessError(
+        f"semantic status cursor is unknown for task {task_id}; "
+        "refusing a partial delta"
+    )
+
+
+def _short(value: Any, length: int = 12) -> str:
+    text_value = str(value or "")
+    return text_value[:length] if text_value else "-"
+
+
+def _claim_text(claim: Mapping[str, Any]) -> str:
+    return f"{claim.get('token', '-')}@{claim.get('owner', '-')}"
+
+
+def _first_line(value: Any, *, fallback: str = "none") -> str:
+    text = str(value or "").strip()
+    return text.splitlines()[0] if text else fallback
+
+
+def _human_claims(claims: list[dict[str, Any]], task_id: str | None = None) -> str:
+    relevant = [
+        claim for claim in claims if task_id is None or claim.get("task_id") == task_id
+    ]
+    active = sorted(
+        [
+            claim
+            for claim in relevant
+            if claim.get("status") in RESERVING_CLAIM_STATUSES
+            and not is_expired(claim.get("expires_at"))
+        ],
+        key=lambda claim: (
+            str(claim.get("task_id", "")),
+            str(claim.get("token", "")),
+            str(claim.get("owner", "")),
+        ),
+    )
+    stale = sorted(
+        [
+            claim
+            for claim in relevant
+            if claim.get("status") in RESERVING_CLAIM_STATUSES
+            and is_expired(claim.get("expires_at"))
+        ],
+        key=lambda claim: (
+            str(claim.get("task_id", "")),
+            str(claim.get("token", "")),
+            str(claim.get("owner", "")),
+        ),
+    )
+
+    def concise(items: list[dict[str, Any]]) -> str:
+        shown = ", ".join(_claim_text(item) for item in items[:3])
+        return shown + (f", +{len(items) - 3}" if len(items) > 3 else "")
+
+    return (
+        f"claims: active={len(active)}"
+        + (f" [{concise(active)}]" if active else "")
+        + f"; stale={len(stale)}"
+        + (f" [{concise(stale)}]" if stale else "")
+    )
+
+
+def _human_event_summary(paths: HarnessPaths, state: dict[str, Any]) -> tuple[str, str]:
+    task_id = str(state["task_id"])
+    if not is_semantic_v2_task(paths, task_id):
+        return "unavailable", "unavailable"
+    events = load_semantic_events(paths, task_id)
+    head = _semantic_cursor(events[-1])
+    recent = ", ".join(
+        f"{event['sequence']}:{event['event_type']}/{event['command_id']}"
+        for event in events[-3:]
+    )
+    return head, recent
+
+
+def _human_task_status(
+    paths: HarnessPaths, state: dict[str, Any], claims: list[dict[str, Any]]
+) -> list[str]:
+    semantic_head, recent_events = _human_event_summary(paths, state)
+    running = sorted(
+        [
+            *(
+                f"packet:{packet.get('packet_id', '-')}"
+                for packet in state.get("packets", [])
+                if packet.get("status") in ACTIVE_PACKET_STATUSES
+            ),
+            *(
+                f"job:{job.get('run_id', '-')}"
+                for job in state.get("jobs", [])
+                if job.get("status") in ACTIVE_JOB_STATUSES
+            ),
+        ]
+    )
+    needs_user = sorted(
+        str(item.get("escalation_id", "-"))
+        for item in state.get("needs_user_escalations", [])
+        if item.get("status") == "needs_user"
+    )
+    blocked = sorted(
+        [
+            *(
+                str(lane.get("lane_id", "-"))
+                for lane in state.get("lanes", [])
+                if lane.get("status") == "blocked"
+            ),
+            *(
+                str(job.get("run_id", "-"))
+                for job in state.get("jobs", [])
+                if job.get("status") == "blocked"
+            ),
+        ]
+    )
+    task_blocked = state.get("status") == "blocked"
+    task_id = str(state["task_id"])
+    try:
+        checkpoint_current, checkpoint_reason = checkpoint_matches(paths, state)
+    except (AttributeError, HarnessError, KeyError, OSError, TypeError, ValueError):
+        checkpoint_current, checkpoint_reason = False, "checkpoint state is invalid"
+    relevant_claims = [claim for claim in claims if claim.get("task_id") == task_id]
+    stale_claim_count = sum(
+        claim.get("status") in RESERVING_CLAIM_STATUSES
+        and is_expired(claim.get("expires_at"))
+        for claim in relevant_claims
+    )
+    verification = state.get("verification", [])
+    last_evidence = verification[-1] if isinstance(verification, list) and verification else None
+    if isinstance(last_evidence, Mapping):
+        evidence_summary = (
+            f"{last_evidence.get('category', 'unclassified')}: "
+            f"{_first_line(last_evidence.get('boundary') or last_evidence.get('evidence'))}"
+        )
+    else:
+        evidence_summary = "none"
+    raw_risks = state.get("risks", [])
+    risks = (
+        [_first_line(item) for item in raw_risks[:3]]
+        if isinstance(raw_risks, list)
+        else ["invalid risk record"]
+    )
+    blocked_summary = (
+        ", ".join(blocked[:3])
+        if blocked
+        else ("task" if task_blocked else "none")
+    )
+    lines = [
+        (
+            f"Task {task_id}: {state.get('status', '-')} "
+            f"profile={state.get('profile', 'full')} phase={state.get('phase', '-')} "
+            f"revision={state.get('revision', '-')} owner={state.get('owner', '-')}"
+        ),
+        f"  semantic-head: {semantic_head}",
+        f"  {_human_claims(claims, task_id)}",
+        (
+            f"  running: {', '.join(running[:3]) if running else 'none'}; "
+            f"needs-user: {', '.join(needs_user[:3]) if needs_user else 'none'}; "
+            f"blocked: {blocked_summary}; checkpoint: "
+            f"{'current' if checkpoint_current else checkpoint_reason}; "
+            f"expired-claims: {stale_claim_count}"
+        ),
+        f"  evidence: {evidence_summary}",
+        f"  risks: {', '.join(risks) if risks else 'none'}",
+        f"  recent-events: {recent_events}",
+    ]
+    if state.get("next_action"):
+        lines.append(f"  next: {state['next_action']}")
+    return lines
+
+
+def _render_human_status(
+    paths: HarnessPaths,
+    tasks: list[dict[str, Any]],
+    claims: list[dict[str, Any]],
+    *,
+    terminal_task_count: int = 0,
+) -> str:
+    chief = chief_authority_summary(paths)
+    lines = [
+        "Chief: "
+        f"{chief.get('status', 'unavailable')} "
+        f"session={_short(chief.get('session_id'))} "
+        f"epoch={chief.get('epoch', '-')} expires={chief.get('expires_at', '-')}",
+        _human_claims(claims),
+    ]
+    if terminal_task_count:
+        lines.append(
+            f"terminal tasks omitted: {terminal_task_count} (use --task <id> or --json)"
+        )
+    for state in sorted(tasks, key=lambda item: str(item.get("task_id", ""))):
+        lines.extend(_human_task_status(paths, state, claims))
+    return "\n".join(lines)
+
+
+def _render_human_semantic_delta(
+    task_id: str, events: list[dict[str, Any]], next_cursor: str
+) -> str:
+    lines = [f"Task {task_id}: semantic delta={len(events)}"]
+    lines.extend(
+        f"  {event['sequence']}: {event['event_type']} command={event['command_id']}"
+        for event in events
+    )
+    lines.append(f"next-cursor: {next_cursor}")
+    return "\n".join(lines)
 
 
 def _clip_critical(value: Any, *, services: StatusCmdServices) -> str:
@@ -414,7 +644,10 @@ def cmd_status(
     *,
     services: StatusCmdServices,
 ) -> int:
+    since = getattr(args, "since", None)
     if args.critical:
+        if since is not None:
+            raise HarnessError("status --since cannot be combined with --critical")
         if not args.task:
             raise HarnessError("status --critical requires --task")
         emit(
@@ -424,8 +657,30 @@ def cmd_status(
             args.json,
         )
         return 0
+    if since is not None:
+        if not args.task:
+            raise HarnessError("status --since requires --task")
+        state = load_task(paths, args.task)
+        if not is_semantic_v2_task(paths, state["task_id"]):
+            raise HarnessError("status --since is unavailable for legacy tasks")
+        events = load_semantic_events(paths, state["task_id"])
+        delta, next_cursor = _semantic_delta(state["task_id"], since, events)
+        delta_payload = {
+            "task_id": state["task_id"],
+            "events": delta,
+            "next_cursor": next_cursor,
+        }
+        if args.json:
+            emit(delta_payload, True)
+        else:
+            emit(_render_human_semantic_delta(state["task_id"], delta, next_cursor))
+        return 0
     if args.task:
-        emit(task_summary(load_task(paths, args.task)), args.json)
+        state = load_task(paths, args.task)
+        if args.json:
+            emit(task_summary(state), True)
+        else:
+            emit(_render_human_status(paths, [state], load_all_claims(paths)))
         return 0
     require_complete_layout(paths)
     tasks = load_all_tasks(paths)
@@ -483,7 +738,20 @@ def cmd_status(
             }
             for claim in legacy
         ]
-    emit(payload, args.json)
+    if args.json:
+        emit(payload, True)
+    else:
+        active_tasks = [
+            task for task in tasks if task.get("status") in {"active", "blocked"}
+        ]
+        emit(
+            _render_human_status(
+                paths,
+                active_tasks,
+                claims,
+                terminal_task_count=len(tasks) - len(active_tasks),
+            )
+        )
     return 0
 
 
@@ -521,6 +789,13 @@ def register_status_commands(
     parser.add_argument("--legacy", action="store_true")
     parser.add_argument("--task")
     parser.add_argument("--critical", action="store_true")
+    parser.add_argument(
+        "--since",
+        help=(
+            "semantic cursor (<sequence>:<event-sha256>) for one task's "
+            "authenticated delta"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["status"])
 

@@ -1,142 +1,432 @@
-name: Publish Python distributions to PyPI
+name: release-rehearsal-publish
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact annotated release tag, for example v0.4.0
+        required: true
+        type: string
+      intent:
+        description: Rehearse offline evidence, or publish the staged exact pair.
+        required: true
+        default: rehearsal
+        type: choice
+        options:
+          - rehearsal
+          - publish
 
-# Deny all GITHUB_TOKEN scopes unless a job explicitly grants one.
+# No job receives a token scope unless it declares the one it needs.
 permissions: {}
 
-# Serialize releases so two published GitHub Releases cannot upload together.
 concurrency:
-  group: pypi-publish
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build and verify distributions
+  producer-linux:
+    name: Build one Linux release candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
-
     steps:
-      - name: Check out the release tag
+      - name: Check out the requested tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: 1
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
-
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
-
-      - name: Verify project name, release tag, and source versions
+      - name: Bind tag, source version, and checked-out commit
         shell: bash
-        run: |
-          python - <<'PY'
-          import ast
-          import os
-          from pathlib import Path
-          import tomllib
-
-          project = tomllib.loads(
-              Path("pyproject.toml").read_text(encoding="utf-8")
-          )
-          project_metadata = project["project"]
-
-          if project_metadata["name"] != "aoi-orgware":
-              raise SystemExit(
-                  "Unexpected PyPI project name: "
-                  f"{project_metadata['name']!r}"
-              )
-          if "version" in project_metadata:
-              raise SystemExit("pyproject.toml contains a second literal version")
-          if project_metadata.get("dynamic") != ["version"]:
-              raise SystemExit("pyproject.toml must declare dynamic = ['version']")
-
-          version_path = project["tool"]["hatch"]["version"]["path"]
-          if version_path != "src/aoi_orgware/_version.py":
-              raise SystemExit(f"Unexpected Hatch version path: {version_path!r}")
-
-          tree = ast.parse(Path(version_path).read_text(encoding="utf-8"))
-          source_versions = []
-          for node in ast.walk(tree):
-              if not isinstance(node, ast.Assign):
-                  continue
-              if any(
-                  isinstance(target, ast.Name)
-                  and target.id == "__version__"
-                  for target in node.targets
-              ):
-                  source_versions.append(ast.literal_eval(node.value))
-          if len(source_versions) != 1 or not isinstance(source_versions[0], str):
-              raise SystemExit(
-                  f"Canonical source version is invalid: {source_versions!r}"
-              )
-          version = source_versions[0]
-          expected_tag = f"v{version}"
-          ref_name = os.environ["GITHUB_REF_NAME"]
-          full_ref = os.environ["GITHUB_REF"]
-
-          if ref_name != expected_tag:
-              raise SystemExit(
-                  f"Release tag {ref_name!r} does not match "
-                  f"pyproject version {version!r}"
-              )
-          if full_ref != f"refs/tags/{expected_tag}":
-              raise SystemExit(f"Unexpected release ref: {full_ref!r}")
-
-          print(f"Verified aoi-orgware {version} from {full_ref}")
-          PY
-
-      - name: Install build verification tools
-        run: |
-          python -m pip install --disable-pip-version-check \
-            "build==1.5.0" \
-            "twine==6.2.0"
-
-      - name: Run unit tests
         env:
-          PYTHONDONTWRITEBYTECODE: "1"
-          PYTHONPATH: src
-        run: python -m unittest discover -s tests -v
-
-      - name: Build wheel and source distribution
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z]+[0-9]+)?([.]post[0-9]+)?([.]dev[0-9]+)?$ ]]
+          version="$(python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])")"
+          test "$RELEASE_TAG" = "v$version"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v2 --untracked-files=all)"
+          printf '%s\n' "$version" > .release-version
+      - name: Build and verify the producer pair
         shell: bash
         run: |
+          set -euo pipefail
+          # requirements/release-tools.lock pins "pytest==8.4.2" and
+          # "hatchling==1.27.0", together with every transitive wheel hash.
+          python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
+          python -m venv .release-tools
+          .release-tools/bin/python -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$GITHUB_WORKSPACE/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
+          .release-tools/bin/python -I - <<'PY'
+          import importlib.metadata as metadata
+          expected = {"build": "1.5.0", "colorama": "0.4.6", "hatchling": "1.27.0", "iniconfig": "2.3.0", "packaging": "26.2", "pathspec": "1.1.1", "pluggy": "1.6.0", "pygments": "2.20.0", "pyproject-hooks": "1.2.0", "pytest": "8.4.2", "trove-classifiers": "2026.6.1.19"}
+          assert {name: metadata.version(name) for name in expected} == expected
+          PY
           epoch="$(git show -s --format=%ct HEAD)"
-          if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
-            echo "Invalid release commit timestamp" >&2
-            exit 1
-          fi
-          SOURCE_DATE_EPOCH="$epoch" \
-            python -m build --sdist --wheel --outdir dist
+          SOURCE_DATE_EPOCH="$epoch" .release-tools/bin/python -I -m build --sdist --wheel --no-isolation --outdir release/dist
+          version="$(<.release-version)"
+          .release-tools/bin/python -I scripts/release_inventory.py capture --dist-dir release/dist --distribution-name aoi-orgware --package-version "$version" --output release/inventory-linux.json
+          .release-tools/bin/python -I scripts/release_inventory.py verify --inventory release/inventory-linux.json --root release/dist
+          wheel="$(.release-tools/bin/python -I - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
 
-      - name: Check package metadata
-        run: python -m twine check --strict dist/*
+          inventory = json.loads(Path("release/inventory-linux.json").read_text(encoding="utf-8"))
+          artifacts = inventory["artifacts"]
+          wheels = [artifact for artifact in artifacts if artifact["name"].endswith(".whl")]
+          if len(artifacts) != 2 or len(wheels) != 1:
+              raise SystemExit("inventory must identify exactly one wheel and one sdist")
+          wheel = wheels[0]
+          path = Path("release/dist") / wheel["name"]
+          if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != wheel["sha256"]:
+              raise SystemExit("inventory-selected wheel bytes do not match")
+          print(path.resolve())
+          PY
+          )"
+          .release-tools/bin/python -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --no-deps "$wheel"
+          .release-tools/bin/python -I - <<'PY'
+          import importlib.metadata as metadata
+          import re
 
-      - name: Verify isolated wheel and sdist installs
+          dist = metadata.distribution("aoi-orgware")
+          expected_version = open(".release-version", encoding="utf-8").read().strip()
+          if dist.version != expected_version:
+              raise SystemExit("installed distribution version does not match exact inventory wheel")
+          entry_points = {entry.name: entry.value for entry in dist.entry_points}
+          expected_entry_points = {
+              "aoi": "aoi_orgware.cli:main",
+              "aoi-codex-hook": "aoi_orgware.codex_hook:main",
+          }
+          if {name: entry_points.get(name) for name in expected_entry_points} != expected_entry_points:
+              raise SystemExit("installed distribution entry points do not match release contract")
+          for entry in dist.entry_points:
+              if entry.name in expected_entry_points:
+                  entry.load()
+          installed_names = {re.sub(r"[-_.]+", "-", item.metadata["Name"].lower()) for item in metadata.distributions() if item.metadata.get("Name")}
+          if "aoi-orgware" not in installed_names:
+              raise SystemExit("release wheel did not install into the locked test environment")
+          PY
+          .release-tools/bin/python -I -m pytest -q \
+            tests/test_release_artifacts.py \
+            tests/test_release_cli.py \
+            tests/test_release_inventory.py \
+            tests/test_release_manifest.py \
+            tests/test_release_metadata.py \
+            tests/test_release_pypi_readback.py \
+            tests/test_release_rehearsal.py \
+            tests/test_release_runtime.py \
+            tests/test_release_workflow_contract.py
+          .release-tools/bin/python -I scripts/verify_dist.py --dist-dir release/dist --expected-version "$version" --build-python "$GITHUB_WORKSPACE/.release-tools/bin/python" --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
+      - name: Record Linux producer evidence
         shell: bash
         run: |
-          expected_version="$(python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])")"
-          python scripts/verify_dist.py \
-            --dist-dir dist \
-            --expected-version "$expected_version"
-
-      - name: Upload verified distributions
+          set -euo pipefail
+          version="$(<.release-version)"
+          inventory_sha256="$(python -c "import json; print(json.load(open('release/inventory-linux.json'))['inventory_sha256'])")"
+          mkdir -p release/evidence release/meta .release-install
+          source_epoch="$(git show -s --format=%ct HEAD)"
+          .release-tools/bin/python -I - <<'PY' > release/evidence/release-toolchain.json
+          import hashlib, importlib.metadata as metadata, json, re
+          from pathlib import Path
+          lock = Path("requirements/release-tools.lock").read_bytes()
+          lines = lock.decode("utf-8").splitlines()
+          entries = []
+          for index, line in enumerate(lines[:-1]):
+              if "==" not in line or not line.rstrip().endswith("\\"):
+                  continue
+              name, version = line.strip()[:-1].strip().split("==", 1)
+              match = re.fullmatch(r"--hash=sha256:([0-9a-f]{64})", lines[index + 1].strip())
+              if match:
+                  entries.append((name, version, match.group(1)))
+          if len(entries) != 11:
+              raise SystemExit("release-tool lock is malformed or incomplete")
+          records = []
+          for raw_name, raw_version, raw_hash in entries:
+              name = re.sub(r"[-_.]+", "-", raw_name.lower())
+              version = raw_version
+              if metadata.version(name) != version:
+                  raise SystemExit(f"installed release tool does not match lock: {name}")
+              records.append({"name": name, "version": version, "artifact_sha256": raw_hash})
+          records.sort(key=lambda item: item["name"])
+          print(json.dumps({"lock_sha256": hashlib.sha256(lock).hexdigest(), "distributions": records}, sort_keys=True, separators=(",", ":")))
+          PY
+          toolchain_json="$(<release/evidence/release-toolchain.json)"
+          .release-tools/bin/python -I scripts/release_rehearsal.py builder-environment --platform linux --python-version "$(.release-tools/bin/python --version | awk '{print $2}')" --workflow-name "$GITHUB_WORKFLOW" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --runner-os "$RUNNER_OS" --runner-arch "$RUNNER_ARCH" --runner-image "$ImageOS" --build-frontend build --build-frontend-version 1.5.0 --source-date-epoch "$source_epoch" --output release/evidence/builder.json
+          producer_result="$(.release-tools/bin/python -I - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.dumps({"command": "pytest O7 modules + build + verify_dist", "release_toolchain": json.loads(Path("release/evidence/release-toolchain.json").read_text()), "sdist_verification": "derived-wheel-offline-install", "status": "pass"}, sort_keys=True, separators=(",", ":")))
+          PY
+          )"
+          .release-tools/bin/python -I scripts/release_rehearsal.py producer --producer-id build-linux --platform linux --inventory-sha256 "$inventory_sha256" --result-json "$producer_result" --output release/evidence/producer-receipt.json
+          python scripts/release_rehearsal.py gate-contract --gate-id dist-verify --contract-json '{"command":"scripts/verify_dist.py","sdist_verification":"derived-wheel-offline-install","status":"pass"}' --output release/evidence/dist-verify-contract-receipt.json
+          contract_sha256="$(python -c "import json; print(json.load(open('release/evidence/dist-verify-contract-receipt.json'))['check_contract_sha256'])")"
+          python scripts/release_rehearsal.py platform-gate --platform linux --gate-id dist-verify --check-contract-sha256 "$contract_sha256" --inventory-sha256 "$inventory_sha256" --details-json '{"command":"scripts/verify_dist.py","sdist_verification":"derived-wheel-offline-install","status":"pass"}' --output release/evidence/linux-dist-verify-receipt.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path("release/evidence")
+          def load(name): return json.loads((root / name).read_text(encoding="utf-8"))
+          def write(name, value): (root / name).write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          producer = load("producer-receipt.json")
+          write("producer-binding.json", {
+              "schema_version": 1,
+              "kind": "producer_binding",
+              "producer_id": producer["producer_id"],
+              "producer_receipt_sha256": producer["receipt_sha256"],
+              "platform": producer["platform"],
+              "inventory_sha256": producer["inventory_sha256"],
+              "result_sha256": producer["result_sha256"],
+          })
+          contract = load("dist-verify-contract-receipt.json")
+          contract_base = {key: contract[key] for key in ("schema_version", "kind", "gate_id", "contract")}
+          write("linux-dist-verify-contract.json", contract_base)
+          write("windows-dist-verify-contract.json", contract_base)
+          linux = load("linux-dist-verify-receipt.json")
+          write("linux-dist-verify.json", {key: value for key, value in linux.items() if key != "receipt_sha256"})
+          PY
+          python -m venv .release-install
+          wheel="$(python -c "import json; print(next(x['name'] for x in json.load(open('release/inventory-linux.json'))['artifacts'] if x['name'].endswith('.whl')))")"
+          .release-install/bin/python -m pip install --isolated --disable-pip-version-check --no-deps --no-index --only-binary=:all: --no-cache-dir "$GITHUB_WORKSPACE/release/dist/$wheel"
+          read -r metadata_sha256 hook_protocol_version < <(.release-install/bin/python - <<'PY'
+          import hashlib
+          import importlib.metadata
+          from pathlib import Path
+          import aoi_orgware.cli as cli
+          dist = importlib.metadata.distribution("aoi-orgware")
+          metadata = next(item for item in dist.files or () if str(item).endswith(".dist-info/METADATA"))
+          metadata_bytes = Path(dist.locate_file(metadata)).read_bytes()
+          Path("release/evidence/installed-metadata.bin").write_bytes(metadata_bytes)
+          print(hashlib.sha256(metadata_bytes).hexdigest(), cli.HOOK_PROTOCOL_VERSION)
+          PY
+          )
+          python scripts/release_rehearsal.py installed-metadata --distribution-name aoi-orgware --package-version "$version" --installed-metadata-sha256 "$metadata_sha256" --console-entry-point-name aoi --console-entry-point-target aoi_orgware.cli:main --codex-hook-entry-point-name aoi-codex-hook --codex-hook-entry-point-target aoi_orgware.codex_hook:main --hook-protocol-version "$hook_protocol_version" --output release/evidence/installed-metadata-receipt.json
+          printf '{}\n' > release/meta/sbom.json
+          printf '{}\n' > release/meta/attestation.json
+          python scripts/release_rehearsal.py placeholder --kind sbom --location meta/sbom.json --input-file release/meta/sbom.json --output release/evidence/sbom-receipt.json
+          python scripts/release_rehearsal.py placeholder --kind attestation --location meta/attestation.json --input-file release/meta/attestation.json --output release/evidence/attestation-receipt.json
+      - name: Upload producer bytes and receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: python-distributions
-          path: dist/
+          name: release-producer
+          path: release/
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
-  publish:
-    name: Publish to PyPI
-    needs: build
+  verify-windows:
+    name: Install the producer bytes on Windows
+    needs: producer-linux
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the requested tag for verification tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Download the one Linux producer artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-producer
+          path: producer
+      - name: Stage, hash, and install exactly those bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+           $version = (Get-Content .release-version -ErrorAction SilentlyContinue)
+           if (-not $version) { $version = (python -c "import json; print(json.load(open('producer/inventory-linux.json'))['package_version'])") }
+           New-Item -ItemType Directory -Force windows | Out-Null
+          python scripts/release_inventory.py verify --inventory producer/inventory-linux.json --root producer/dist
+          python scripts/release_inventory.py stage --inventory producer/inventory-linux.json --source-root producer/dist --destination-root windows/dist | Out-File -Encoding ascii windows/stage-receipt.json
+           python scripts/release_inventory.py capture --dist-dir windows/dist --distribution-name aoi-orgware --package-version $version --output windows/inventory-windows.json
+           python scripts/release_inventory.py verify --inventory producer/inventory-linux.json --root windows/dist
+           python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
+           python -m venv .release-tools
+           $backendPython = (Resolve-Path .release-tools/Scripts/python.exe).Path
+           & $backendPython -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$PWD/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
+           & $backendPython -I -c "import importlib.metadata as metadata; expected={'build':'1.5.0','colorama':'0.4.6','hatchling':'1.27.0','iniconfig':'2.3.0','packaging':'26.2','pathspec':'1.1.1','pluggy':'1.6.0','pygments':'2.20.0','pyproject-hooks':'1.2.0','pytest':'8.4.2','trove-classifiers':'2026.6.1.19'}; assert {name: metadata.version(name) for name in expected} == expected"
+           python scripts/verify_dist.py --dist-dir windows/dist --expected-version $version --build-python $backendPython --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
+          $inventory = Get-Content producer/inventory-linux.json | ConvertFrom-Json
+           $contract = Get-Content producer/evidence/dist-verify-contract-receipt.json | ConvertFrom-Json
+          New-Item -ItemType Directory -Force windows/evidence | Out-Null
+           python scripts/release_rehearsal.py platform-gate --platform windows --gate-id dist-verify --check-contract-sha256 $contract.check_contract_sha256 --inventory-sha256 $inventory.inventory_sha256 --details-json '{"command":"scripts/verify_dist.py","sdist_verification":"derived-wheel-offline-install","status":"pass"}' --output windows/evidence/windows-dist-verify-receipt.json
+           python -c "import json,pathlib; p=pathlib.Path('windows/evidence/windows-dist-verify-receipt.json'); v=json.loads(p.read_text()); pathlib.Path('windows/evidence/windows-dist-verify.json').write_text(json.dumps({k:x for k,x in v.items() if k!='receipt_sha256'},sort_keys=True,separators=(',',':')))"
+      - name: Upload Windows evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows
+          path: windows/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  rebuild-linux:
+    name: Clean Linux reproducible rebuild
+    needs: producer-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the requested tag in a clean worktree
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Download producer inventory only
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-producer
+          path: ${{ runner.temp }}/producer
+      - name: Rebuild and require the producer inventory exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v2 --untracked-files=all)"
+          python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
+          python -m venv .release-tools
+          .release-tools/bin/python -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$GITHUB_WORKSPACE/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
+          .release-tools/bin/python -I - <<'PY'
+          import importlib.metadata as metadata
+          expected = {"build": "1.5.0", "colorama": "0.4.6", "hatchling": "1.27.0", "iniconfig": "2.3.0", "packaging": "26.2", "pathspec": "1.1.1", "pluggy": "1.6.0", "pygments": "2.20.0", "pyproject-hooks": "1.2.0", "pytest": "8.4.2", "trove-classifiers": "2026.6.1.19"}
+          assert {name: metadata.version(name) for name in expected} == expected
+          PY
+          epoch="$(git show -s --format=%ct HEAD)"
+          SOURCE_DATE_EPOCH="$epoch" .release-tools/bin/python -I -m build --sdist --wheel --no-isolation --outdir "$RUNNER_TEMP/rebuild/dist"
+          version="$(python -c "import json; print(json.load(open('$RUNNER_TEMP/producer/inventory-linux.json'))['package_version'])")"
+          python scripts/release_inventory.py capture --dist-dir "$RUNNER_TEMP/rebuild/dist" --distribution-name aoi-orgware --package-version "$version" --output "$RUNNER_TEMP/rebuild/inventory-rebuild.json"
+          cmp "$RUNNER_TEMP/producer/inventory-linux.json" "$RUNNER_TEMP/rebuild/inventory-rebuild.json"
+          python scripts/release_inventory.py verify --inventory "$RUNNER_TEMP/producer/inventory-linux.json" --root "$RUNNER_TEMP/rebuild/dist"
+      - name: Upload clean rebuild bytes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-rebuild
+          path: ${{ runner.temp }}/rebuild/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  assemble-observe:
+    name: Assemble and observe release evidence
+    needs: [producer-linux, verify-windows, rebuild-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the observed tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Download producer, Windows, and rebuild evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-producer
+          path: ${{ runner.temp }}/artifact
+      - name: Download Windows evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-windows
+          path: ${{ runner.temp }}/windows
+      - name: Download clean rebuild evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-rebuild
+          path: ${{ runner.temp }}/rebuild
+      - name: Assemble, observe, and stage the exact pair
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          ARTIFACT_ROOT: ${{ runner.temp }}/artifact
+          WINDOWS_ROOT: ${{ runner.temp }}/windows
+          REBUILD_ROOT: ${{ runner.temp }}/rebuild
+        run: |
+          set -euo pipefail
+          cp "$WINDOWS_ROOT/evidence/windows-dist-verify.json" "$ARTIFACT_ROOT/evidence/windows-dist-verify.json"
+          cp "$WINDOWS_ROOT/evidence/windows-dist-verify-receipt.json" "$ARTIFACT_ROOT/evidence/windows-dist-verify-receipt.json"
+          RELEASE_TAG="$RELEASE_TAG" python - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          def git(*args): return subprocess.check_output(["git", *args], text=True).strip()
+          artifact = Path(os.environ["ARTIFACT_ROOT"])
+          windows = Path(os.environ["WINDOWS_ROOT"])
+          rebuild = Path(os.environ["REBUILD_ROOT"])
+          inventory = json.loads((artifact / "inventory-linux.json").read_text())
+          version = inventory["package_version"]
+          tag = os.environ["RELEASE_TAG"]
+          if tag != f"v{version}": raise SystemExit("tag/version mismatch")
+          matrix = {}
+          for platform, receipt in (("linux", "evidence/linux-dist-verify.json"), ("windows", "evidence/windows-dist-verify.json")):
+              contract = f"evidence/{platform}-dist-verify-contract.json"
+              matrix[f"{platform}/dist-verify"] = {"check_contract": {"path": contract, "sha256": sha(artifact / contract)}, "receipt": {"path": receipt, "sha256": sha(artifact / receipt)}}
+          request = {
+              "schema_version": 1,
+              "manifest": {"distribution_name": "aoi-orgware", "tag": tag, "git_object_format": git("rev-parse", "--show-object-format"), "commit_oid": git("rev-parse", "HEAD"), "tree_oid": git("rev-parse", "HEAD^{tree}"), "package_version": version, "workflow": {"workflow_name": os.environ["GITHUB_WORKFLOW"], "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"])}, "schema_versions": {"release": 1}, "dependencies": []},
+              "inventory_paths": {"linux": str((artifact / "inventory-linux.json").resolve()), "windows": str((windows / "inventory-windows.json").resolve()), "rebuild": str((rebuild / "inventory-rebuild.json").resolve())},
+              "inventory_roots": {"linux": str((artifact / "dist").resolve()), "windows": str((windows / "dist").resolve()), "rebuild": str((rebuild / "dist").resolve())},
+              "builder_environment_receipt_path": str((artifact / "evidence/builder.json").resolve()), "producer_receipt_paths": {"build-linux": str((artifact / "evidence/producer-receipt.json").resolve())}, "gate_contract_paths": {"dist-verify": str((artifact / "evidence/dist-verify-contract-receipt.json").resolve())}, "platform_gate_receipt_paths": {"linux": {"dist-verify": str((artifact / "evidence/linux-dist-verify-receipt.json").resolve())}, "windows": {"dist-verify": str((artifact / "evidence/windows-dist-verify-receipt.json").resolve())}}, "installed_metadata_receipt_path": str((artifact / "evidence/installed-metadata-receipt.json").resolve()), "sbom_receipt_path": str((artifact / "evidence/sbom-receipt.json").resolve()), "attestation_receipt_path": str((artifact / "evidence/attestation-receipt.json").resolve()),
+              "worktree": str(Path.cwd().resolve()), "artifact_root": str(artifact.resolve()), "rebuild_root": str(rebuild.resolve()),
+              "evidence_files": {"producer_results": {"build-linux": {"path": "evidence/producer-binding.json", "sha256": sha(artifact / "evidence/producer-binding.json")}}, "builder_environment": {"path": "evidence/builder.json", "sha256": sha(artifact / "evidence/builder.json")}, "matrix": matrix, "installed_metadata": {"path": "evidence/installed-metadata.bin", "sha256": sha(artifact / "evidence/installed-metadata.bin")}, "reviewed_exception_receipt": None}, "dependency_files": {},
+              "outputs": {"release_manifest": str((artifact / "release-manifest.json").resolve()), "observation_request": str((artifact / "observation-request.json").resolve())}}
+          (artifact.parent / "assemble-request.json").write_text(json.dumps(request, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          PYTHONPATH=src python scripts/release_rehearsal.py assemble --request-file "$RUNNER_TEMP/assemble-request.json"
+          PYTHONPATH=src python -m aoi_orgware.cli release-manifest-observe --request-file "$ARTIFACT_ROOT/observation-request.json" > "$ARTIFACT_ROOT/observation-result.json"
+          rm -rf "$RUNNER_TEMP/publish-stage"
+          mkdir -p "$RUNNER_TEMP/publish-stage"
+          python scripts/release_inventory.py stage --inventory "$ARTIFACT_ROOT/inventory-linux.json" --source-root "$ARTIFACT_ROOT/dist" --destination-root "$RUNNER_TEMP/publish-stage/dist" > "$ARTIFACT_ROOT/publish-stage-receipt.json"
+          cp "$ARTIFACT_ROOT/inventory-linux.json" "$RUNNER_TEMP/publish-stage/inventory-linux.json"
+          cp "$ARTIFACT_ROOT/release-manifest.json" "$RUNNER_TEMP/publish-stage/release-manifest.json"
+          mkdir "$RUNNER_TEMP/publish-stage/evidence"
+          cp "$ARTIFACT_ROOT/evidence/producer-receipt.json" "$RUNNER_TEMP/publish-stage/evidence/producer-receipt.json"
+      - name: Upload rehearsal observation candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-observation-candidate
+          path: ${{ runner.temp }}/artifact/observation-result.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Upload the exact staged publication evidence
+        if: ${{ inputs.intent == 'publish' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-exact-stage
+          path: ${{ runner.temp }}/publish-stage/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish-pypi:
+    name: Publish the staged pair to PyPI
+    if: ${{ inputs.intent == 'publish' }}
+    needs: assemble-observe
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -144,18 +434,147 @@ jobs:
       url: https://pypi.org/p/aoi-orgware
     permissions:
       id-token: write
-
     steps:
-      - name: Download verified distributions
+      - name: Download the staged publication evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: python-distributions
-          path: dist/
+          name: pypi-exact-stage
+          path: publish-input
+      - name: Re-verify the exact staged producer bytes before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
 
-      - name: Publish distributions with Trusted Publishing
+          root = Path("publish-input").resolve()
+          expected_paths = {
+              "inventory-linux.json",
+              "release-manifest.json",
+              "evidence/producer-receipt.json",
+          }
+          def pairs(items):
+              value = {}
+              for key, item in items:
+                  if key in value:
+                      raise SystemExit(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+          def load(relative):
+              path = root / relative
+              raw = path.read_bytes()
+              value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+              if raw != canonical(value):
+                  raise SystemExit(f"{relative} is not canonical JSON")
+              return value
+          def sha(raw):
+              return hashlib.sha256(raw).hexdigest()
+          inventory = load("inventory-linux.json")
+          required_inventory = {"schema_version", "distribution_name", "package_version", "artifacts", "inventory_sha256"}
+          if set(inventory) != required_inventory or inventory["schema_version"] != 1:
+              raise SystemExit("inventory schema is invalid")
+          inventory_base = {key: inventory[key] for key in required_inventory - {"inventory_sha256"}}
+          if sha(canonical(inventory_base)) != inventory["inventory_sha256"]:
+              raise SystemExit("inventory SHA-256 does not match")
+          if inventory["distribution_name"] != "aoi-orgware" or not isinstance(inventory["package_version"], str):
+              raise SystemExit("inventory distribution/version is invalid")
+          artifacts = inventory["artifacts"]
+          if not isinstance(artifacts, list) or len(artifacts) != 2:
+              raise SystemExit("inventory must name exactly the wheel and sdist")
+          names = set()
+          for artifact in artifacts:
+              if set(artifact) != {"name", "size_bytes", "sha256"}:
+                  raise SystemExit("inventory artifact schema is invalid")
+              name, size, digest = artifact["name"], artifact["size_bytes"], artifact["sha256"]
+              if not isinstance(name, str) or Path(name).name != name or name in names:
+                  raise SystemExit("inventory artifact filename is invalid")
+              if not isinstance(size, int) or isinstance(size, bool) or size < 1 or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                  raise SystemExit("inventory artifact size or SHA-256 is invalid")
+              path = root / "dist" / name
+              if not path.is_file() or path.stat().st_size != size or sha(path.read_bytes()) != digest:
+                  raise SystemExit(f"staged artifact does not match inventory: {name}")
+              names.add(name)
+              expected_paths.add(f"dist/{name}")
+          if {name.endswith(".whl") for name in names} != {False, True} or sum(name.endswith(".tar.gz") for name in names) != 1:
+              raise SystemExit("inventory does not name exactly one wheel and one sdist")
+          manifest = load("release-manifest.json")
+          if sha(canonical({key: value for key, value in manifest.items() if key != "manifest_sha256"})) != manifest.get("manifest_sha256"):
+              raise SystemExit("release manifest SHA-256 does not match")
+          if manifest.get("distribution_name") != inventory["distribution_name"] or manifest.get("package_version") != inventory["package_version"]:
+              raise SystemExit("release manifest distribution/version does not match inventory")
+          if manifest.get("artifacts") != [{"name": f"dist/{item['name']}", "size_bytes": item["size_bytes"], "sha256": item["sha256"]} for item in artifacts]:
+              raise SystemExit("release manifest artifacts do not exactly match inventory")
+          producer = load("evidence/producer-receipt.json")
+          if sha(canonical({key: value for key, value in producer.items() if key != "receipt_sha256"})) != producer.get("receipt_sha256"):
+              raise SystemExit("producer receipt SHA-256 does not match")
+          producer_fields = {"schema_version", "kind", "producer_id", "platform", "inventory_sha256", "result", "result_sha256", "receipt_sha256"}
+          if set(producer) != producer_fields or producer.get("schema_version") != 1 or producer.get("kind") != "producer" or producer.get("platform") != "linux" or producer.get("inventory_sha256") != inventory["inventory_sha256"]:
+              raise SystemExit("producer receipt does not bind the Linux inventory")
+          if sha(canonical(producer["result"])) != producer.get("result_sha256"):
+              raise SystemExit("producer receipt result SHA-256 does not match")
+          producer_binding = {
+              "schema_version": 1,
+              "kind": "producer_binding",
+              "producer_id": producer["producer_id"],
+              "producer_receipt_sha256": producer["receipt_sha256"],
+              "platform": "linux",
+              "inventory_sha256": inventory["inventory_sha256"],
+              "result_sha256": producer["result_sha256"],
+          }
+          if manifest.get("producer_results") != [{"producer_id": producer["producer_id"], "result_sha256": sha(canonical(producer_binding))}]:
+              raise SystemExit("release manifest producer chain does not match receipt and inventory")
+          observed_paths = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+          if observed_paths != expected_paths:
+              raise SystemExit("staged publication evidence contains missing or unexpected files")
+          PY
+      - name: Publish the exact staged pair with Trusted Publishing
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
-          packages-dir: dist/
+          packages-dir: publish-input/dist
           verify-metadata: true
           attestations: true
           print-hash: true
+
+  post-pypi-readback:
+    name: Read back the PyPI candidate
+    if: ${{ inputs.intent == 'publish' }}
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the requested tag for the readback tool
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Download the sealed observation result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-observation-candidate
+          path: observation
+      - name: Produce a post-PyPI readback candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+          PYTHONPATH=src python scripts/release_pypi_readback.py --observation-result-file observation/observation-result.json --promotion-id "pypi-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --observed-at "$observed_at" --trusted-publisher-repository Ryan529616/aoi-orgware --trusted-publisher-workflow publish.yml > pypi-readback-candidate.json
+      - name: Upload the readback candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-readback-candidate
+          path: pypi-readback-candidate.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

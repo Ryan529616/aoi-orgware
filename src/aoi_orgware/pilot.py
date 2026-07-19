@@ -685,7 +685,9 @@ def _atomic_write(
         path = canonicalize_no_link_traversal(path, "pilot write destination")
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
             if os.name != "nt":
-                os.fchmod(handle.fileno(), mode)
+                # ``fchmod`` is absent from the Windows stdlib stub, but this
+                # branch is unreachable there and must keep POSIX files private.
+                getattr(os, "fchmod")(handle.fileno(), mode)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())

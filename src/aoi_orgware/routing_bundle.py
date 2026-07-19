@@ -8,7 +8,7 @@ place this full authority/outcome bundle in a task projection.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, NoReturn
 
 from .routing_authority import (
     MAX_RECORD_BYTES,
@@ -53,7 +53,7 @@ class RoutingBundleError(ValueError):
     """A pure routing bundle, record, or terminal pair is invalid."""
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise RoutingBundleError(message)
 
 

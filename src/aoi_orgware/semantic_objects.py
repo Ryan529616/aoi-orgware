@@ -15,7 +15,7 @@ import re
 import stat
 from itertools import islice
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, cast
 
 from . import harnesslib as h
 from . import semantic_events as semantic
@@ -36,6 +36,13 @@ MAX_BINDING_KEY_CHARS = 512
 # (even before its required wrapper fields).  Keep this independent iterator
 # cap above that representable maximum so hostile iterables are never drained.
 MAX_OBJECT_REFERENCES_PER_BINDING = 1_024
+MAX_BINDING_DISPOSITIONS = 256
+MAX_BINDING_DISPOSITION_BYTES = 2 * 1024 * 1024
+
+BINDING_DISPOSITIONS_KEY = "semantic_binding_dispositions"
+BINDING_DISPOSITION_SCHEMA_VERSION = 1
+RELEASE_ABANDONMENT_EVENT_TYPE = "release_promotion_abandoned"
+RELEASE_PROMOTION_EVENT_TYPE = "release_promoted"
 
 OBJECT_TYPES = frozenset(
     {
@@ -46,7 +53,9 @@ OBJECT_TYPES = frozenset(
         "transition_permit",
         "cohort_plan",
         "release_manifest",
+        "release_observation",
         "promotion_receipt",
+        "release_promotion_intent",
     }
 )
 SMALL_OBJECT_TYPES = frozenset(
@@ -88,6 +97,76 @@ _BINDING_FIELDS = frozenset(
         "object_sha256s",
         "binding_sha256",
     }
+)
+_DISPOSITION_FIELDS = frozenset({"schema_version", "abandoned"})
+_ABANDONMENT_V1_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "binding_sha256",
+        "binding_kind",
+        "binding_key",
+        "expected_semantic_head_sha256",
+        "planned_event_sha256",
+        "result_projection_sha256",
+        "original_event",
+        "takeover",
+        "reason",
+        "abandonment_command_id",
+        "abandonment_recorded_at",
+        "abandonment_authority_ref",
+    }
+)
+_ABANDONMENT_V2_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "binding_sha256",
+        "binding_kind",
+        "binding_key",
+        "expected_semantic_head_sha256",
+        "planned_event_sha256",
+        "result_projection_sha256",
+        "original_event",
+        "retirement_proof",
+        "reason",
+        "abandonment_command_id",
+        "abandonment_recorded_at",
+        "abandonment_authority_ref",
+    }
+)
+_ORIGINAL_EVENT_FIELDS = frozenset(
+    {"event_type", "command_id", "recorded_at", "authority_ref", "event_sha256"}
+)
+_TAKEOVER_FIELDS = frozenset(
+    {
+        "seq",
+        "action",
+        "at",
+        "old_epoch",
+        "new_epoch",
+        "session_id",
+        "previous_session_id",
+        "reason",
+        "forced_live",
+        "audit_event_sha256",
+    }
+)
+_RETIREMENT_PROOF_FIELDS = frozenset(
+    {
+        "proof_kind",
+        "successor_session_id",
+        "successor_epoch",
+        "issued_at",
+        "expires_at",
+        "current_authority_record_sha256",
+    }
+)
+_RELEASE_AUTHORITY_REF = re.compile(
+    r"chief:([A-Za-z0-9._-]{1,128}):e([1-9][0-9]*):release:([0-9a-f]{64})"
+)
+_RELEASE_ABANDON_AUTHORITY_REF = re.compile(
+    r"chief:([A-Za-z0-9._-]{1,128}):e([1-9][0-9]*):release-abandon:([0-9a-f]{64})"
 )
 
 
@@ -246,8 +325,8 @@ def validate_semantic_object(value: Mapping[str, Any]) -> dict[str, Any]:
     try:
         base = _object_base(
             object_type=object_type,
-            task_id=value.get("task_id"),
-            object_identity=value.get("object_identity"),
+            task_id=value["task_id"],
+            object_identity=value["object_identity"],
             payload=value.get("payload"),
         )
     except (h.HarnessError, TypeError, ValueError) as exc:
@@ -348,13 +427,13 @@ def validate_semantic_binding(value: Mapping[str, Any]) -> dict[str, Any]:
     _validate_version(value.get("schema_version"), BINDING_SCHEMA_VERSION, "semantic binding")
     try:
         base = _binding_base(
-            binding_kind=value.get("binding_kind"),
-            task_id=value.get("task_id"),
-            binding_key=value.get("binding_key"),
-            expected_semantic_head_sha256=value.get("expected_semantic_head_sha256"),
-            planned_event_sha256=value.get("planned_event_sha256"),
-            result_projection_sha256=value.get("result_projection_sha256"),
-            object_sha256s=value.get("object_sha256s"),
+            binding_kind=value["binding_kind"],
+            task_id=value["task_id"],
+            binding_key=value["binding_key"],
+            expected_semantic_head_sha256=value["expected_semantic_head_sha256"],
+            planned_event_sha256=value["planned_event_sha256"],
+            result_projection_sha256=value["result_projection_sha256"],
+            object_sha256s=value["object_sha256s"],
         )
     except (h.HarnessError, TypeError, ValueError) as exc:
         raise _error("semantic binding fields are invalid", exc) from exc
@@ -603,7 +682,7 @@ def _authenticated_event_chain(
     paths: h.HarnessPaths,
     event_chain: Iterable[Mapping[str, Any]],
     task_id: str,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str]:
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str, dict[str, Any]]:
     """Replay one bounded task-local chain and match it to the live ledger head."""
 
     try:
@@ -637,8 +716,8 @@ def _authenticated_event_chain(
             digest = record["event_sha256"]
             if digest in by_sha:
                 raise SemanticObjectError("semantic ledger contains duplicate event SHA-256")
-            by_sha[digest] = record
-        return records, by_sha, head
+            by_sha[digest] = cast(dict[str, Any], record)
+        return cast(list[dict[str, Any]], records), by_sha, cast(str, head), projection
     except SemanticObjectError:
         raise
     except (KeyError, TypeError, h.HarnessError, semantic.SemanticEventError) as exc:
@@ -661,17 +740,394 @@ def _validate_binding_event_match(
     return True
 
 
+def _disposition_time(value: Any, label: str):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 64
+    ):
+        raise SemanticObjectError(f"{label} is invalid")
+    parsed = h.parse_tz_aware_time(value)
+    if parsed is None:
+        raise SemanticObjectError(f"{label} is invalid")
+    return parsed
+
+
+def _validate_release_abandonment_row_v1(
+    value: Any,
+    *,
+    task_id: str,
+    binding_sha256: str,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one ledger-owned release-binding abandonment row."""
+
+    if not isinstance(value, Mapping) or set(value) != _ABANDONMENT_V1_FIELDS:
+        raise SemanticObjectError("semantic binding abandonment row schema is invalid")
+    row = _clone(value, max_bytes=MAX_BINDING_DISPOSITION_BYTES)
+    if row["schema_version"] != BINDING_DISPOSITION_SCHEMA_VERSION:
+        raise SemanticObjectError("semantic binding abandonment row version is unsupported")
+    try:
+        if h.validate_id(row["task_id"], "task id") != task_id:
+            raise SemanticObjectError("semantic binding abandonment task identity is invalid")
+        h.validate_id(row["abandonment_command_id"], "semantic command id")
+    except (h.HarnessError, TypeError) as exc:
+        raise _error("semantic binding abandonment identity is invalid", exc) from exc
+    if row["binding_sha256"] != binding_sha256:
+        raise SemanticObjectError("semantic binding abandonment key/digest mismatch")
+    for key, label in (
+        ("binding_sha256", "semantic binding abandonment binding SHA-256"),
+        ("expected_semantic_head_sha256", "semantic binding abandonment expected head"),
+        ("planned_event_sha256", "semantic binding abandonment planned event"),
+        ("result_projection_sha256", "semantic binding abandonment result projection"),
+    ):
+        _validate_sha(row[key], label)
+    if row["binding_kind"] != "release_promotion":
+        raise SemanticObjectError("semantic binding abandonment kind is unsupported")
+    _validate_text(row["binding_key"], "semantic binding abandonment key", MAX_BINDING_KEY_CHARS)
+    reason = row["reason"]
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or reason != reason.strip()
+        or len(reason.encode("utf-8")) > 2048
+        or any(ord(character) < 0x20 for character in reason)
+    ):
+        raise SemanticObjectError("semantic binding abandonment reason is invalid")
+
+    original = row["original_event"]
+    if not isinstance(original, Mapping) or set(original) != _ORIGINAL_EVENT_FIELDS:
+        raise SemanticObjectError("semantic binding abandonment original event is invalid")
+    try:
+        h.validate_id(original["command_id"], "semantic command id")
+    except (h.HarnessError, TypeError) as exc:
+        raise _error("semantic binding abandonment original command is invalid", exc) from exc
+    original_at = _disposition_time(
+        original["recorded_at"], "semantic binding abandonment original recorded_at"
+    )
+    if (
+        original["event_type"] != RELEASE_PROMOTION_EVENT_TYPE
+        or original["event_sha256"] != row["planned_event_sha256"]
+    ):
+        raise SemanticObjectError("semantic binding abandonment original event does not match binding")
+    old_authority = _RELEASE_AUTHORITY_REF.fullmatch(str(original["authority_ref"]))
+    if old_authority is None:
+        raise SemanticObjectError("semantic binding abandonment original authority is invalid")
+
+    takeover = row["takeover"]
+    if not isinstance(takeover, Mapping) or set(takeover) != _TAKEOVER_FIELDS:
+        raise SemanticObjectError("semantic binding abandonment takeover proof is invalid")
+    audit_base = {
+        key: takeover[key]
+        for key in _TAKEOVER_FIELDS
+        if key != "audit_event_sha256"
+    }
+    if takeover["audit_event_sha256"] != _sha(audit_base, max_bytes=MAX_BINDING_BYTES):
+        raise SemanticObjectError("semantic binding abandonment takeover digest is invalid")
+    if (
+        not isinstance(takeover["seq"], int)
+        or isinstance(takeover["seq"], bool)
+        or takeover["seq"] < 1
+        or takeover["action"] != "takeover"
+        or not isinstance(takeover["old_epoch"], int)
+        or isinstance(takeover["old_epoch"], bool)
+        or takeover["old_epoch"] < 1
+        or not isinstance(takeover["new_epoch"], int)
+        or isinstance(takeover["new_epoch"], bool)
+        or takeover["new_epoch"] != takeover["old_epoch"] + 1
+        or not isinstance(takeover["forced_live"], bool)
+    ):
+        raise SemanticObjectError("semantic binding abandonment takeover fields are invalid")
+    try:
+        h.validate_id(takeover["session_id"], "Chief session id")
+        h.validate_id(takeover["previous_session_id"], "previous Chief session id")
+    except (h.HarnessError, TypeError) as exc:
+        raise _error("semantic binding abandonment takeover identity is invalid", exc) from exc
+    takeover_reason = takeover["reason"]
+    if (
+        not isinstance(takeover_reason, str)
+        or not takeover_reason.strip()
+        or takeover_reason != takeover_reason.strip()
+        or len(takeover_reason.encode("utf-8")) > 2048
+    ):
+        raise SemanticObjectError("semantic binding abandonment takeover reason is invalid")
+    takeover_at = _disposition_time(
+        takeover["at"], "semantic binding abandonment takeover time"
+    )
+    abandonment_at = _disposition_time(
+        row["abandonment_recorded_at"],
+        "semantic binding abandonment recorded_at",
+    )
+    if not original_at < takeover_at <= abandonment_at:
+        raise SemanticObjectError("semantic binding abandonment time order is invalid")
+    if (
+        old_authority.group(1) != takeover["previous_session_id"]
+        or int(old_authority.group(2)) != takeover["old_epoch"]
+    ):
+        raise SemanticObjectError("semantic binding abandonment takeover does not retire original authority")
+
+    abandon_authority = _RELEASE_ABANDON_AUTHORITY_REF.fullmatch(
+        str(row["abandonment_authority_ref"])
+    )
+    if (
+        abandon_authority is None
+        or abandon_authority.group(1) != takeover["session_id"]
+        or int(abandon_authority.group(2)) != takeover["new_epoch"]
+        or abandon_authority.group(3) != binding_sha256
+        or event.get("event_type") != RELEASE_ABANDONMENT_EVENT_TYPE
+        or event.get("command_id") != row["abandonment_command_id"]
+        or event.get("recorded_at") != row["abandonment_recorded_at"]
+        or event.get("authority_ref") != row["abandonment_authority_ref"]
+        or event.get("prev_event_sha256") != row["expected_semantic_head_sha256"]
+    ):
+        raise SemanticObjectError("semantic binding abandonment event metadata is invalid")
+    return row
+
+
+def _validate_release_abandonment_row_v2(
+    value: Any,
+    *,
+    task_id: str,
+    binding_sha256: str,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the audit-tail-independent retirement proof row."""
+
+    if not isinstance(value, Mapping) or set(value) != _ABANDONMENT_V2_FIELDS:
+        raise SemanticObjectError("semantic binding abandonment row schema is invalid")
+    row = _clone(value, max_bytes=MAX_BINDING_DISPOSITION_BYTES)
+    if row["schema_version"] != 2:
+        raise SemanticObjectError("semantic binding abandonment row version is unsupported")
+    try:
+        if h.validate_id(row["task_id"], "task id") != task_id:
+            raise SemanticObjectError("semantic binding abandonment task identity is invalid")
+        h.validate_id(row["abandonment_command_id"], "semantic command id")
+    except (h.HarnessError, TypeError) as exc:
+        raise _error("semantic binding abandonment identity is invalid", exc) from exc
+    if row["binding_sha256"] != binding_sha256:
+        raise SemanticObjectError("semantic binding abandonment key/digest mismatch")
+    for key, label in (
+        ("binding_sha256", "semantic binding abandonment binding SHA-256"),
+        ("expected_semantic_head_sha256", "semantic binding abandonment expected head"),
+        ("planned_event_sha256", "semantic binding abandonment planned event"),
+        ("result_projection_sha256", "semantic binding abandonment result projection"),
+    ):
+        _validate_sha(row[key], label)
+    if row["binding_kind"] != "release_promotion":
+        raise SemanticObjectError("semantic binding abandonment kind is unsupported")
+    _validate_text(row["binding_key"], "semantic binding abandonment key", MAX_BINDING_KEY_CHARS)
+    reason = row["reason"]
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or reason != reason.strip()
+        or len(reason.encode("utf-8")) > 2048
+        or any(ord(character) < 0x20 for character in reason)
+    ):
+        raise SemanticObjectError("semantic binding abandonment reason is invalid")
+    original = row["original_event"]
+    if not isinstance(original, Mapping) or set(original) != _ORIGINAL_EVENT_FIELDS:
+        raise SemanticObjectError("semantic binding abandonment original event is invalid")
+    try:
+        h.validate_id(original["command_id"], "semantic command id")
+    except (h.HarnessError, TypeError) as exc:
+        raise _error("semantic binding abandonment original command is invalid", exc) from exc
+    original_at = _disposition_time(
+        original["recorded_at"], "semantic binding abandonment original recorded_at"
+    )
+    if (
+        original["event_type"] != RELEASE_PROMOTION_EVENT_TYPE
+        or original["event_sha256"] != row["planned_event_sha256"]
+    ):
+        raise SemanticObjectError("semantic binding abandonment original event does not match binding")
+    retired_authority = _RELEASE_AUTHORITY_REF.fullmatch(str(original["authority_ref"]))
+    if retired_authority is None:
+        raise SemanticObjectError("semantic binding abandonment original authority is invalid")
+    proof = row["retirement_proof"]
+    if not isinstance(proof, Mapping) or set(proof) != _RETIREMENT_PROOF_FIELDS:
+        raise SemanticObjectError("semantic binding abandonment retirement proof is invalid")
+    if proof["proof_kind"] != "monotonic_chief_epoch":
+        raise SemanticObjectError("semantic binding abandonment retirement proof kind is invalid")
+    try:
+        successor_session_id = h.validate_id(proof["successor_session_id"], "Chief session id")
+    except (h.HarnessError, TypeError) as exc:
+        raise _error("semantic binding abandonment successor identity is invalid", exc) from exc
+    successor_epoch = proof["successor_epoch"]
+    retired_epoch = int(retired_authority.group(2))
+    if (
+        not isinstance(successor_epoch, int)
+        or isinstance(successor_epoch, bool)
+        or successor_epoch <= retired_epoch
+    ):
+        raise SemanticObjectError("semantic binding abandonment successor epoch is invalid")
+    _validate_sha(
+        proof["current_authority_record_sha256"],
+        "semantic binding abandonment authority record SHA-256",
+    )
+    issued_at = _disposition_time(
+        proof["issued_at"], "semantic binding abandonment successor issued_at"
+    )
+    expires_at = _disposition_time(
+        proof["expires_at"], "semantic binding abandonment successor expires_at"
+    )
+    abandonment_at = _disposition_time(
+        row["abandonment_recorded_at"],
+        "semantic binding abandonment recorded_at",
+    )
+    if not original_at < issued_at <= abandonment_at < expires_at:
+        raise SemanticObjectError("semantic binding abandonment time order is invalid")
+    abandon_authority = _RELEASE_ABANDON_AUTHORITY_REF.fullmatch(
+        str(row["abandonment_authority_ref"])
+    )
+    if (
+        abandon_authority is None
+        or abandon_authority.group(1) != successor_session_id
+        or int(abandon_authority.group(2)) != successor_epoch
+        or abandon_authority.group(3) != binding_sha256
+        or event.get("event_type") != RELEASE_ABANDONMENT_EVENT_TYPE
+        or event.get("command_id") != row["abandonment_command_id"]
+        or event.get("recorded_at") != row["abandonment_recorded_at"]
+        or event.get("authority_ref") != row["abandonment_authority_ref"]
+        or event.get("prev_event_sha256") != row["expected_semantic_head_sha256"]
+    ):
+        raise SemanticObjectError("semantic binding abandonment event metadata is invalid")
+    return row
+
+
+def _validate_release_abandonment_row(
+    value: Any,
+    *,
+    task_id: str,
+    binding_sha256: str,
+    event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Dual-read historical v1 rows and write-era v2 rows under namespace v1."""
+
+    if not isinstance(value, Mapping):
+        raise SemanticObjectError("semantic binding abandonment row schema is invalid")
+    if value.get("schema_version") == 1:
+        return _validate_release_abandonment_row_v1(
+            value, task_id=task_id, binding_sha256=binding_sha256, event=event
+        )
+    if value.get("schema_version") == 2:
+        return _validate_release_abandonment_row_v2(
+            value, task_id=task_id, binding_sha256=binding_sha256, event=event
+        )
+    raise SemanticObjectError("semantic binding abandonment row version is unsupported")
+
+
+def _validated_binding_dispositions(
+    records: list[dict[str, Any]],
+    projection: Mapping[str, Any],
+    task_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Authenticate the append-only disposition namespace in one linear scan."""
+
+    genesis = records[0]["payload"]["snapshot"]
+    if isinstance(genesis, Mapping) and BINDING_DISPOSITIONS_KEY in genesis:
+        raise SemanticObjectError("semantic binding dispositions may not be injected at genesis")
+    dispositions: dict[str, dict[str, Any]] = {}
+    for event in records[1:]:
+        payload = event["payload"]
+        delta = payload["delta"]
+        operations = delta["operations"]
+        touches = [
+            operation
+            for operation in operations
+            if isinstance(operation, Mapping)
+            and isinstance(operation.get("path"), list)
+            and operation["path"]
+            and operation["path"][0] == BINDING_DISPOSITIONS_KEY
+        ]
+        if not touches and event["event_type"] != RELEASE_ABANDONMENT_EVENT_TYPE:
+            continue
+        if event["event_type"] != RELEASE_ABANDONMENT_EVENT_TYPE or len(operations) != 1 or len(touches) != 1:
+            raise SemanticObjectError("semantic binding disposition event/delta ownership is invalid")
+        operation = touches[0]
+        if operation.get("op") != "set" or set(operation) != {"op", "path", "value"}:
+            raise SemanticObjectError("semantic binding disposition must be one set operation")
+        path = operation["path"]
+        value = operation["value"]
+        if not dispositions:
+            if path != [BINDING_DISPOSITIONS_KEY]:
+                raise SemanticObjectError("first semantic binding disposition must create its namespace")
+            if not isinstance(value, Mapping) or set(value) != _DISPOSITION_FIELDS:
+                raise SemanticObjectError("semantic binding disposition namespace schema is invalid")
+            abandoned = value.get("abandoned")
+            if (
+                value.get("schema_version") != BINDING_DISPOSITION_SCHEMA_VERSION
+                or not isinstance(abandoned, Mapping)
+                or len(abandoned) != 1
+            ):
+                raise SemanticObjectError("first semantic binding disposition namespace is invalid")
+            binding_sha256, raw_row = next(iter(abandoned.items()))
+        else:
+            if (
+                len(path) != 3
+                or path[:2] != [BINDING_DISPOSITIONS_KEY, "abandoned"]
+            ):
+                raise SemanticObjectError("semantic binding disposition append path is invalid")
+            binding_sha256 = path[2]
+            raw_row = value
+        _validate_sha(binding_sha256, "semantic binding disposition key")
+        if binding_sha256 in dispositions:
+            raise SemanticObjectError("semantic binding disposition may not overwrite a row")
+        if len(dispositions) >= MAX_BINDING_DISPOSITIONS:
+            raise SemanticObjectError("semantic binding disposition count exceeds its bound")
+        row = _validate_release_abandonment_row(
+            raw_row,
+            task_id=task_id,
+            binding_sha256=binding_sha256,
+            event=event,
+        )
+        dispositions[binding_sha256] = {
+            "row": row,
+            "event_sha256": event["event_sha256"],
+        }
+        namespace = {
+            "schema_version": BINDING_DISPOSITION_SCHEMA_VERSION,
+            "abandoned": {
+                digest: item["row"] for digest, item in sorted(dispositions.items())
+            },
+        }
+        semantic.canonical_json_bytes(
+            namespace, max_bytes=MAX_BINDING_DISPOSITION_BYTES
+        )
+
+    domain = semantic.projection_domain(projection)
+    expected_namespace = (
+        {
+            "schema_version": BINDING_DISPOSITION_SCHEMA_VERSION,
+            "abandoned": {
+                digest: item["row"] for digest, item in sorted(dispositions.items())
+            },
+        }
+        if dispositions
+        else None
+    )
+    if domain.get(BINDING_DISPOSITIONS_KEY) != expected_namespace:
+        if expected_namespace is None and BINDING_DISPOSITIONS_KEY not in domain:
+            return dispositions
+        raise SemanticObjectError("semantic binding disposition projection differs from its ledger events")
+    return dispositions
+
+
 def _validated_binding_namespace(
     paths: h.HarnessPaths,
     task_id: str,
     objects: Mapping[str, Mapping[str, Any]],
     event_by_sha: Mapping[str, Mapping[str, Any]],
     current_head: str,
-) -> list[tuple[str, Path, dict[str, Any]]]:
+    dispositions: Mapping[str, Mapping[str, Any]],
+) -> list[tuple[str, Path, dict[str, Any], str, dict[str, Any] | None]]:
     """Authenticate all bindings, references, event matches, and planned-event uniqueness."""
 
-    entries: list[tuple[str, Path, dict[str, Any]]] = []
+    entries: list[
+        tuple[str, Path, dict[str, Any], str, dict[str, Any] | None]
+    ] = []
     planned_events: set[str] = set()
+    observed_bindings: set[str] = set()
     pending_count = 0
     for kind, path in _scan_binding_paths(paths, task_id):
         binding = _load_binding(path, task_id, kind)
@@ -682,13 +1138,46 @@ def _validated_binding_namespace(
         for digest in binding["object_sha256s"]:
             if digest not in objects:
                 raise SemanticObjectError("semantic binding references a missing object")
-        if not _validate_binding_event_match(binding, event_by_sha):
+        binding_sha256 = binding["binding_sha256"]
+        observed_bindings.add(binding_sha256)
+        disposition = dispositions.get(binding_sha256)
+        committed = _validate_binding_event_match(binding, event_by_sha)
+        if committed and disposition is not None:
+            raise SemanticObjectError("semantic binding is both committed and abandoned")
+        if committed:
+            classification = "committed"
+            abandonment = None
+        elif disposition is not None:
+            row = disposition.get("row")
+            if not isinstance(row, Mapping):
+                raise SemanticObjectError("semantic binding abandonment report is invalid")
+            for field in (
+                "task_id",
+                "binding_sha256",
+                "binding_kind",
+                "binding_key",
+                "expected_semantic_head_sha256",
+                "planned_event_sha256",
+                "result_projection_sha256",
+            ):
+                if row.get(field) != binding[field]:
+                    raise SemanticObjectError("semantic binding abandonment differs from its binding")
+            classification = "abandoned"
+            abandonment = {
+                "row": _clone(row, max_bytes=MAX_BINDING_DISPOSITION_BYTES),
+                "event_sha256": disposition.get("event_sha256"),
+            }
+        else:
             if binding["expected_semantic_head_sha256"] != current_head:
                 raise SemanticObjectError("semantic binding pending retry expected head is no longer current")
+            classification = "pending"
+            abandonment = None
             pending_count += 1
             if pending_count > 1:
                 raise SemanticObjectError("semantic binding store has more than one pending binding")
-        entries.append((kind, path, binding))
+        entries.append((kind, path, binding, classification, abandonment))
+    if set(dispositions) != observed_bindings.intersection(dispositions):
+        raise SemanticObjectError("semantic binding disposition references a missing binding")
     return entries
 
 
@@ -750,11 +1239,14 @@ def publish_semantic_binding(
     task_id = wrapped["task_id"]
     kind = wrapped["binding_kind"]
     raw = semantic.canonical_json_bytes(wrapped, max_bytes=MAX_BINDING_BYTES)
-    _records, event_by_sha, current_head = _authenticated_event_chain(paths, event_chain, task_id)
+    records, event_by_sha, current_head, projection = _authenticated_event_chain(
+        paths, event_chain, task_id
+    )
+    dispositions = _validated_binding_dispositions(records, projection, task_id)
     object_entries, _aggregate = _validated_object_namespace(paths, task_id)
     stored_objects = {item["object_sha256"]: item for _path, item in object_entries}
     existing_entries = _validated_binding_namespace(
-        paths, task_id, stored_objects, event_by_sha, current_head
+        paths, task_id, stored_objects, event_by_sha, current_head, dispositions
     )
     destination = semantic_binding_path(paths, task_id, kind, wrapped["binding_key"])
     if destination.exists() or h._path_is_link_like(destination):
@@ -762,22 +1254,17 @@ def publish_semantic_binding(
         stored_raw = semantic.canonical_json_bytes(stored, max_bytes=MAX_BINDING_BYTES)
         if stored_raw != raw:
             raise SemanticObjectError("semantic binding key collision has divergent bytes")
-        if (
-            not _validate_binding_event_match(stored, event_by_sha)
-            and stored["expected_semantic_head_sha256"] != current_head
-        ):
-            raise SemanticObjectError("semantic binding pending retry expected head is no longer current")
         return _clone(stored, max_bytes=MAX_BINDING_BYTES)
     if any(
-        not _validate_binding_event_match(existing, event_by_sha)
-        for _existing_kind, _existing_path, existing in existing_entries
+        classification == "pending"
+        for _existing_kind, _existing_path, _existing, classification, _abandonment in existing_entries
     ):
         raise SemanticObjectError("semantic task has a pending binding")
     if len(existing_entries) >= MAX_BINDINGS_PER_TASK:
         raise SemanticObjectError("semantic binding store exceeds binding count bound")
     if any(
         existing["planned_event_sha256"] == wrapped["planned_event_sha256"]
-        for _existing_kind, _existing_path, existing in existing_entries
+        for _existing_kind, _existing_path, existing, _classification, _abandonment in existing_entries
     ):
         raise SemanticObjectError("semantic binding planned ledger event is already bound")
     # Validate all references before publishing the binding, so an ordinary
@@ -810,35 +1297,53 @@ def inspect_semantic_objects(
     """Authenticate stored items and classify bindings against a full ledger chain."""
 
     task_id = h.validate_id(task_id, "task id")
-    _records, event_by_sha, current_head = _authenticated_event_chain(paths, event_chain, task_id)
+    records, event_by_sha, current_head, projection = _authenticated_event_chain(
+        paths, event_chain, task_id
+    )
+    dispositions = _validated_binding_dispositions(records, projection, task_id)
     object_entries, _aggregate = _validated_object_namespace(paths, task_id)
     objects = {wrapped["object_sha256"]: wrapped for _path, wrapped in object_entries}
     bindings: list[dict[str, Any]] = []
     references: dict[str, list[str]] = {digest: [] for digest in objects}
-    for _kind, _path, wrapped in _validated_binding_namespace(
-        paths, task_id, objects, event_by_sha, current_head
+    for _kind, _path, wrapped, classification, abandonment in _validated_binding_namespace(
+        paths, task_id, objects, event_by_sha, current_head, dispositions
     ):
         for digest in wrapped["object_sha256s"]:
             references[digest].append(wrapped["binding_sha256"])
-        bindings.append({
+        row = {
             **_clone(wrapped, max_bytes=MAX_BINDING_BYTES),
-            "classification": (
-                "committed"
-                if _validate_binding_event_match(wrapped, event_by_sha)
-                else "pending"
-            ),
-        })
-    bindings.sort(key=lambda item: (item["binding_kind"], item["binding_key"], item["binding_sha256"]))
-    object_rows = [
-        {
-            **_clone(wrapped, max_bytes=_object_limit(wrapped["object_type"])),
-            "classification": "orphan" if not references[digest] else "referenced",
-            "binding_sha256s": sorted(references[digest]),
+            "classification": classification,
         }
-        for digest, wrapped in sorted(objects.items())
-    ]
+        if abandonment is not None:
+            row["abandonment"] = abandonment["row"]
+            row["abandonment_event_sha256"] = abandonment["event_sha256"]
+        bindings.append(row)
+    bindings.sort(key=lambda item: (item["binding_kind"], item["binding_key"], item["binding_sha256"]))
+    binding_classification = {
+        item["binding_sha256"]: item["classification"] for item in bindings
+    }
+    object_rows = []
+    for digest, wrapped in sorted(objects.items()):
+        owners = sorted(references[digest])
+        object_rows.append(
+            {
+                **_clone(wrapped, max_bytes=_object_limit(wrapped["object_type"])),
+                "classification": "orphan" if not owners else "referenced",
+                "binding_sha256s": owners,
+                "committed_binding_sha256s": [
+                    owner for owner in owners if binding_classification[owner] == "committed"
+                ],
+                "pending_binding_sha256s": [
+                    owner for owner in owners if binding_classification[owner] == "pending"
+                ],
+                "abandoned_binding_sha256s": [
+                    owner for owner in owners if binding_classification[owner] == "abandoned"
+                ],
+            }
+        )
     pending = [item["binding_sha256"] for item in bindings if item["classification"] == "pending"]
     committed = [item["binding_sha256"] for item in bindings if item["classification"] == "committed"]
+    abandoned = [item["binding_sha256"] for item in bindings if item["classification"] == "abandoned"]
     orphans = [item["object_sha256"] for item in object_rows if item["classification"] == "orphan"]
     return {
         "task_id": task_id,
@@ -846,6 +1351,7 @@ def inspect_semantic_objects(
         "bindings": bindings,
         "committed_binding_sha256s": sorted(committed),
         "pending_binding_sha256s": sorted(pending),
+        "abandoned_binding_sha256s": sorted(abandoned),
         "orphan_object_sha256s": sorted(orphans),
     }
 

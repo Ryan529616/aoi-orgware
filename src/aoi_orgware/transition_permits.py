@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from datetime import datetime
 import re
-from typing import Any
+from typing import Any, NoReturn
 
 from .semantic_events import SemanticEventError, canonical_sha256
 
@@ -64,7 +64,7 @@ class TransitionPermitError(ValueError):
     """A transition permit or attempted consumption is invalid."""
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise TransitionPermitError(message)
 
 

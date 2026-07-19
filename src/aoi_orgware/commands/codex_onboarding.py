@@ -13,12 +13,13 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
-import tempfile
+import stat
 import tomllib
 from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, cast
 
 
 Handler = Callable[[argparse.Namespace, Any], int]
@@ -26,7 +27,6 @@ JsonArgumentRegistrar = Callable[[argparse.ArgumentParser], None]
 
 _HANDLER_NAMES = frozenset({"codex_init"})
 
-HOOK_COMMAND = "aoi-codex-hook --hook-version 6"
 HOOK_COMMAND_HEAD = "aoi-codex-hook"
 HOOK_TIMEOUT_SECONDS = 30
 SESSION_START_MATCHER = "startup|resume|clear|compact"
@@ -34,34 +34,807 @@ CODEX_HOOK_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
     "SubagentStart",
+    "SubagentStop",
+    "PreToolUse",
+    "PostToolUse",
     "Stop",
 )
 _STATUS_MESSAGES = {
     "SessionStart": "Loading AOI state",
     "UserPromptSubmit": "Checking AOI task binding",
     "SubagentStart": "Loading AOI packet contract",
+    "SubagentStop": "Checking AOI subagent completion",
+    "PreToolUse": "Checking AOI claim gate",
+    "PostToolUse": "Recording AOI tool receipt",
     "Stop": "Checking AOI checkpoint state",
 }
+_SHA256_HEX = frozenset("0123456789abcdef")
+_MAX_ONBOARDING_TEXT_BYTES = 1024 * 1024
+_UNSET = object()
+# Tests may replace this narrowly-scoped hook to force a parent-path switch
+# during the pre-publication critical section.
+_atomic_publish_test_hook: Callable[[Path], None] | None = None
 
 
 class CodexOnboardingError(Exception):
     """Raised when repository-local Codex configuration is unsafe to merge."""
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.aoi-", suffix=".tmp", dir=path.parent
+def _windows_api(ctypes_module: Any, name: str) -> Any:
+    """Return a Windows-only ``ctypes`` API without importing platform stubs.
+
+    The callers are reached only from the Windows publication path.  Looking up
+    these APIs dynamically keeps POSIX static analysis honest while retaining
+    the existing fail-closed behaviour if the required Windows primitive is
+    unavailable at runtime.
+    """
+
+    value = getattr(ctypes_module, name, None)
+    if value is None:
+        raise OSError(f"required Windows ctypes API is unavailable: {name}")
+    return value
+
+
+def _windows_dll(ctypes_module: Any, name: str) -> Any:
+    return _windows_api(ctypes_module, "WinDLL")(name, use_last_error=True)
+
+
+def _windows_last_error(ctypes_module: Any) -> int:
+    return int(_windows_api(ctypes_module, "get_last_error")())
+
+
+def _windows_error_message(ctypes_module: Any, error: int) -> str:
+    windows_error = _windows_api(ctypes_module, "WinError")(error)
+    message = getattr(windows_error, "strerror", None)
+    return message if isinstance(message, str) else str(windows_error)
+
+
+def _absolute_path(path: Path | str | os.PathLike[str], label: str) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise CodexOnboardingError(f"{label} must be an absolute path")
+    # ``resolve`` would follow exactly the aliases this boundary must reject.
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    return bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
-    temporary = Path(temporary_name)
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return os.path.samestat(left, right)
+
+
+def _lstat(path: Path) -> os.stat_result | None:
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CodexOnboardingError(f"cannot inspect {path}: {exc}") from exc
+
+
+def _require_safe_directory(path: Path, metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        raise CodexOnboardingError(f"unsafe linked directory in Codex path: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CodexOnboardingError(f"Codex path parent is not a directory: {path}")
+
+
+def _require_safe_regular_file(path: Path, metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        raise CodexOnboardingError(f"unsafe linked Codex file: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise CodexOnboardingError(f"Codex target is not a regular file: {path}")
+
+
+def _directory_components(path: Path) -> tuple[Path, tuple[str, ...]]:
+    anchor = Path(path.anchor)
+    if not path.anchor:
+        raise CodexOnboardingError(f"Codex path has no filesystem anchor: {path}")
+    try:
+        return anchor, path.relative_to(anchor).parts
+    except ValueError as exc:
+        raise CodexOnboardingError(f"cannot inspect Codex path: {path}") from exc
+
+
+def _audit_directory_chain(path: Path, *, create_missing: bool) -> os.stat_result | None:
+    """Reject every existing linked parent; optionally create safe gaps.
+
+    The audit intentionally starts at the filesystem anchor instead of resolving
+    the requested path.  This keeps a repo ``.codex`` or user skill root from
+    escaping through any existing symlink, junction, or other reparse point.
+    """
+
+    path = _absolute_path(path, "Codex path")
+    current, components = _directory_components(path)
+    root_metadata = _lstat(current)
+    if root_metadata is None:
+        raise CodexOnboardingError(f"Codex filesystem anchor is missing: {current}")
+    _require_safe_directory(current, root_metadata)
+    latest = root_metadata
+    created_any = False
+    for component in components:
+        current /= component
+        metadata = _lstat(current)
+        if metadata is None:
+            if not create_missing:
+                return None
+            try:
+                current.mkdir()
+                created_any = True
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise CodexOnboardingError(
+                    f"cannot create Codex directory {current}: {exc}"
+                ) from exc
+            metadata = _lstat(current)
+            if metadata is None:
+                raise CodexOnboardingError(
+                    f"Codex directory disappeared after creation: {current}"
+                )
+        _require_safe_directory(current, metadata)
+        latest = metadata
+    if created_any:
+        # Creation is not itself proof that no concurrent replacement turned a
+        # parent into a link.  Walk the complete established chain once more.
+        revalidated = _audit_directory_chain(path, create_missing=False)
+        if revalidated is None:
+            raise CodexOnboardingError(
+                f"Codex directory disappeared after creation: {path}"
+            )
+        return revalidated
+    return latest
+
+
+def _safe_leaf_snapshot(path: Path) -> os.stat_result | None:
+    metadata = _lstat(path)
+    if metadata is not None:
+        _require_safe_regular_file(path, metadata)
+    return metadata
+
+
+def _same_leaf_snapshot(
+    expected: os.stat_result | None | object,
+    current: os.stat_result | None,
+) -> bool:
+    return expected is _UNSET or (
+        (expected is None) == (current is None)
+        and (
+            expected is None
+            or current is None
+            or _same_identity(cast(os.stat_result, expected), current)
+        )
+    )
+
+
+def _run_atomic_publish_test_hook(path: Path) -> None:
+    if _atomic_publish_test_hook is not None:
+        _atomic_publish_test_hook(path)
+
+
+def _posix_atomic_publish_supported() -> bool:
+    return (
+        os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd
+    )
+
+
+def _windows_atomic_publish_supported() -> bool:
+    """Check native handle-relative primitives before any target mutation."""
+
+    try:
+        import ctypes
+        import msvcrt  # noqa: F401
+
+        kernel32 = _windows_dll(ctypes, "kernel32")
+        ntdll = _windows_dll(ctypes, "ntdll")
+    except (AttributeError, ImportError, OSError):
+        return False
+    return all(
+        hasattr(kernel32, name)
+        for name in ("CreateFileW", "DuplicateHandle", "FlushFileBuffers", "WriteFile")
+    ) and all(
+        hasattr(ntdll, name)
+        for name in ("NtCreateFile", "NtSetInformationFile", "RtlNtStatusToDosError")
+    )
+
+
+def _posix_open_verified_directory(path: Path, expected: os.stat_result) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CodexOnboardingError(f"cannot open Codex target parent {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _require_safe_directory(path, opened)
+        if not _same_identity(expected, opened):
+            raise CodexOnboardingError(f"Codex target parent changed before publish: {path}")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _posix_leaf_snapshot(directory_fd: int, name: str, label: Path) -> os.stat_result | None:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CodexOnboardingError(f"cannot inspect {label}: {exc}") from exc
+    _require_safe_regular_file(label, metadata)
+    return metadata
+
+
+def _posix_create_temporary(directory_fd: int, target_name: str) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(128):
+        name = f".{target_name}.aoi-{secrets.token_hex(16)}.tmp"
+        try:
+            return os.open(name, flags, 0o600, dir_fd=directory_fd), name
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise CodexOnboardingError(f"cannot create Codex temporary for {target_name}: {exc}") from exc
+    raise CodexOnboardingError(f"cannot allocate unique Codex temporary for {target_name}")
+
+
+def _atomic_write_text_posix(
+    path: Path,
+    text: str,
+    *,
+    parent_metadata: os.stat_result,
+    expected_leaf: os.stat_result | None | object,
+) -> None:
+    """Use openat/renameat so publication cannot chase a replaced parent."""
+
+    directory_fd = _posix_open_verified_directory(path.parent, parent_metadata)
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
+    published = False
+    try:
+        initial_leaf = _posix_leaf_snapshot(directory_fd, path.name, path)
+        if not _same_leaf_snapshot(expected_leaf, initial_leaf):
+            raise CodexOnboardingError(f"{path} changed after Codex preflight")
+        temporary_fd, temporary_name = _posix_create_temporary(directory_fd, path.name)
+        try:
+            encoded = text.encode("utf-8")
+            with os.fdopen(temporary_fd, "wb", closefd=False) as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary_metadata = os.fstat(temporary_fd)
+            _require_safe_regular_file(Path(temporary_name), temporary_metadata)
+            current_leaf = _posix_leaf_snapshot(directory_fd, path.name, path)
+            if not _same_leaf_snapshot(expected_leaf, current_leaf):
+                raise CodexOnboardingError(f"{path} changed before Codex publish")
+            current_temporary = _posix_leaf_snapshot(
+                directory_fd, temporary_name, Path(temporary_name)
+            )
+            if current_temporary is None or not _same_identity(
+                temporary_metadata, current_temporary
+            ):
+                raise CodexOnboardingError(
+                    f"Codex temporary changed before publish: {temporary_name}"
+                )
+            _run_atomic_publish_test_hook(path)
+            # POSIX renameat atomically replaces the destination when present.
+            os.rename(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            published = True
+            os.fsync(directory_fd)
+        finally:
+            os.close(temporary_fd)
+            temporary_fd = None
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_name is not None and not published:
+            try:
+                temporary = _posix_leaf_snapshot(
+                    directory_fd, temporary_name, Path(temporary_name)
+                )
+                if temporary is not None:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+            except (CodexOnboardingError, OSError):
+                pass
+        os.close(directory_fd)
+
+
+def _windows_nt_create_relative(
+    directory_handle: int,
+    name: str,
+    *,
+    desired_access: int,
+    disposition: int,
+    options: int,
+) -> int:
+    """Open a relative leaf through an already verified Windows directory handle."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class unicode_string(ctypes.Structure):
+        _fields_ = (
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        )
+
+    class object_attributes(ctypes.Structure):
+        _fields_ = (
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(unicode_string)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", ctypes.c_void_p),
+            ("SecurityQualityOfService", ctypes.c_void_p),
+        )
+
+    class io_status_block_union(ctypes.Union):
+        _fields_ = (("Status", ctypes.c_long), ("Pointer", ctypes.c_void_p))
+
+    class io_status_block(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = (("u", io_status_block_union), ("Information", ctypes.c_size_t))
+
+    name_buffer = ctypes.create_unicode_buffer(name)
+    encoded_name = name.encode("utf-16-le")
+    unicode = unicode_string(
+        len(encoded_name), len(encoded_name), ctypes.cast(name_buffer, wintypes.LPWSTR)
+    )
+    attributes = object_attributes(
+        ctypes.sizeof(object_attributes),
+        wintypes.HANDLE(directory_handle),
+        ctypes.pointer(unicode),
+        0,
+        None,
+        None,
+    )
+    status_block = io_status_block()
+    handle = wintypes.HANDLE()
+    ntdll = _windows_dll(ctypes, "ntdll")
+    create = ntdll.NtCreateFile
+    create.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(object_attributes),
+        ctypes.POINTER(io_status_block),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+    )
+    create.restype = ctypes.c_long
+    status = create(
+        ctypes.byref(handle),
+        desired_access,
+        ctypes.byref(attributes),
+        ctypes.byref(status_block),
+        None,
+        0x80,  # FILE_ATTRIBUTE_NORMAL
+        0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        disposition,
+        options,
+        None,
+        0,
+    )
+    if status < 0:
+        rtl_status_to_dos = ntdll.RtlNtStatusToDosError
+        rtl_status_to_dos.argtypes = (ctypes.c_long,)
+        rtl_status_to_dos.restype = wintypes.ULONG
+        error = rtl_status_to_dos(status)
+        raise OSError(error, _windows_error_message(ctypes, error))
+    return _windows_handle_value(handle)
+
+
+def _windows_handle_value(handle: Any) -> int:
+    value = getattr(handle, "value", handle)
+    if value is None:
+        raise OSError("Windows returned a null file handle")
+    return int(value)
+
+
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close = _windows_dll(ctypes, "kernel32").CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    if not close(wintypes.HANDLE(handle)):
+        error = _windows_last_error(ctypes)
+        raise OSError(error, _windows_error_message(ctypes, error))
+
+
+def _windows_handle_snapshot(handle: int) -> os.stat_result:
+    """Return a Python stat snapshot without surrendering the supplied handle."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = _windows_dll(ctypes, "kernel32")
+    duplicate = wintypes.HANDLE()
+    duplicate_handle = kernel32.DuplicateHandle
+    duplicate_handle.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    duplicate_handle.restype = wintypes.BOOL
+    current_process = kernel32.GetCurrentProcess()
+    if not duplicate_handle(
+        current_process,
+        wintypes.HANDLE(handle),
+        current_process,
+        ctypes.byref(duplicate),
+        0,
+        False,
+        0x00000002,  # DUPLICATE_SAME_ACCESS
+    ):
+        error = _windows_last_error(ctypes)
+        raise OSError(error, _windows_error_message(ctypes, error))
+    try:
+        descriptor = cast(Any, msvcrt).open_osfhandle(
+            _windows_handle_value(duplicate), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+    except OSError:
+        _windows_close_handle(_windows_handle_value(duplicate))
+        raise
+    try:
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _windows_open_verified_directory(path: Path, expected: os.stat_result) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = _windows_dll(ctypes, "kernel32")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x00000001 | 0x00000002 | 0x00000020 | 0x00000080 | 0x00100000,
+        # LIST_DIRECTORY | ADD_FILE | TRAVERSE | READ_ATTRIBUTES | SYNCHRONIZE
+        0x00000007,
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if _windows_handle_value(handle) == ctypes.c_void_p(-1).value:
+        error = _windows_last_error(ctypes)
+        raise CodexOnboardingError(
+            f"cannot open Codex target parent {path}: {_windows_error_message(ctypes, error)}"
+        )
+    try:
+        opened = _windows_handle_snapshot(_windows_handle_value(handle))
+        _require_safe_directory(path, opened)
+        if not _same_identity(expected, opened):
+            raise CodexOnboardingError(f"Codex target parent changed before publish: {path}")
+        return _windows_handle_value(handle)
+    except Exception:
+        _windows_close_handle(_windows_handle_value(handle))
+        raise
+
+
+def _windows_relative_leaf_snapshot(
+    directory_handle: int, name: str, label: Path
+) -> os.stat_result | None:
+    try:
+        handle = _windows_nt_create_relative(
+            directory_handle,
+            name,
+            desired_access=0x00000080 | 0x00100000,  # READ_ATTRIBUTES | SYNCHRONIZE
+            disposition=1,  # FILE_OPEN
+            options=0x00000040 | 0x00000020 | 0x00200000,
+        )
+    except OSError as exc:
+        if exc.errno in {2, 3}:
+            return None
+        raise CodexOnboardingError(f"cannot inspect {label}: {exc}") from exc
+    try:
+        metadata = _windows_handle_snapshot(handle)
+        _require_safe_regular_file(label, metadata)
+        return metadata
+    finally:
+        _windows_close_handle(handle)
+
+
+def _windows_write_and_flush(handle: int, raw: bytes) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = _windows_dll(ctypes, "kernel32")
+    write = kernel32.WriteFile
+    write.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    )
+    write.restype = wintypes.BOOL
+    buffer = ctypes.create_string_buffer(raw)
+    written = wintypes.DWORD()
+    if not write(
+        wintypes.HANDLE(handle), buffer, len(raw), ctypes.byref(written), None
+    ) or written.value != len(raw):
+        error = _windows_last_error(ctypes)
+        raise CodexOnboardingError(
+            f"cannot write Codex temporary: {_windows_error_message(ctypes, error)}"
+        )
+    flush = kernel32.FlushFileBuffers
+    flush.argtypes = (wintypes.HANDLE,)
+    flush.restype = wintypes.BOOL
+    if not flush(wintypes.HANDLE(handle)):
+        error = _windows_last_error(ctypes)
+        raise CodexOnboardingError(
+            f"cannot fsync Codex temporary: {_windows_error_message(ctypes, error)}"
+        )
+
+
+def _windows_rename_relative(
+    source_handle: int, directory_handle: int, target_name: str
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class file_rename_info(ctypes.Structure):
+        _fields_ = (
+            ("ReplaceIfExists", wintypes.BOOL),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        )
+
+    encoded_name = target_name.encode("utf-16-le")
+    # Win32 documents this as ``sizeof(FILE_RENAME_INFO) + FileNameLength``;
+    # retain the ABI tail padding rather than truncating at FileName.offset.
+    size = ctypes.sizeof(file_rename_info) + len(encoded_name)
+    buffer = ctypes.create_string_buffer(size)
+    info = ctypes.cast(buffer, ctypes.POINTER(file_rename_info)).contents
+    info.ReplaceIfExists = True
+    info.RootDirectory = wintypes.HANDLE(directory_handle)
+    info.FileNameLength = len(encoded_name)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + file_rename_info.FileName.offset,
+        encoded_name,
+        len(encoded_name),
+    )
+    class io_status_block_union(ctypes.Union):
+        _fields_ = (("Status", ctypes.c_long), ("Pointer", ctypes.c_void_p))
+
+    class io_status_block(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = (("u", io_status_block_union), ("Information", ctypes.c_size_t))
+
+    status_block = io_status_block()
+    ntdll = _windows_dll(ctypes, "ntdll")
+    set_information = ntdll.NtSetInformationFile
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(io_status_block),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    set_information.restype = ctypes.c_long
+    status = set_information(
+        wintypes.HANDLE(source_handle),
+        ctypes.byref(status_block),
+        buffer,
+        size,
+        10,  # FileRenameInformation
+    )
+    if status < 0:
+        status_to_dos = ntdll.RtlNtStatusToDosError
+        status_to_dos.argtypes = (ctypes.c_long,)
+        status_to_dos.restype = wintypes.ULONG
+        error = status_to_dos(status)
+        raise CodexOnboardingError(
+            f"cannot publish Codex target: {_windows_error_message(ctypes, error)}"
+        )
+
+
+def _windows_delete_open_file(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    delete = wintypes.BOOL(True)
+    set_information = _windows_dll(ctypes, "kernel32").SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    if not set_information(
+        wintypes.HANDLE(handle), 4, ctypes.byref(delete), ctypes.sizeof(delete)
+    ):
+        error = _windows_last_error(ctypes)
+        raise OSError(error, _windows_error_message(ctypes, error))
+
+
+def _atomic_write_text_windows(
+    path: Path,
+    text: str,
+    *,
+    parent_metadata: os.stat_result,
+    expected_leaf: os.stat_result | None | object,
+) -> None:
+    """Publish with a directory-rooted NT create and handle-relative rename."""
+
+    directory_handle = _windows_open_verified_directory(path.parent, parent_metadata)
+    temporary_handle: int | None = None
+    published = False
+    try:
+        initial_leaf = _windows_relative_leaf_snapshot(directory_handle, path.name, path)
+        if not _same_leaf_snapshot(expected_leaf, initial_leaf):
+            raise CodexOnboardingError(f"{path} changed after Codex preflight")
+        # Windows prevents moving a directory with an open child file even when
+        # that child shares delete access.  Exercise the adversarial switch
+        # while only the stable directory handle is held; all later mutations
+        # remain relative to that verified handle.
+        _run_atomic_publish_test_hook(path)
+        for _ in range(128):
+            try:
+                temporary_handle = _windows_nt_create_relative(
+                    directory_handle,
+                    f".{path.name}.aoi-{secrets.token_hex(16)}.tmp",
+                    desired_access=0x40000000 | 0x00010000 | 0x00000080 | 0x00100000,
+                    disposition=2,  # FILE_CREATE
+                    options=0x00000040 | 0x00000020,
+                )
+                break
+            except OSError as exc:
+                if exc.errno != 80:  # ERROR_FILE_EXISTS
+                    raise CodexOnboardingError(
+                        f"cannot create Codex temporary for {path.name}: {exc}"
+                    ) from exc
+        if temporary_handle is None:
+            raise CodexOnboardingError(f"cannot allocate unique Codex temporary for {path.name}")
+        _windows_write_and_flush(temporary_handle, text.encode("utf-8"))
+        temporary_metadata = _windows_handle_snapshot(temporary_handle)
+        _require_safe_regular_file(path, temporary_metadata)
+        current_leaf = _windows_relative_leaf_snapshot(directory_handle, path.name, path)
+        if not _same_leaf_snapshot(expected_leaf, current_leaf):
+            raise CodexOnboardingError(f"{path} changed before Codex publish")
+        _windows_rename_relative(temporary_handle, directory_handle, path.name)
+        published = True
+    finally:
+        if temporary_handle is not None:
+            if not published:
+                try:
+                    _windows_delete_open_file(temporary_handle)
+                except OSError:
+                    pass
+            try:
+                _windows_close_handle(temporary_handle)
+            except OSError:
+                pass
+        try:
+            _windows_close_handle(directory_handle)
+        except OSError:
+            pass
+
+
+def _read_safe_text(path: Path, *, label: str) -> tuple[str, os.stat_result | None]:
+    """Read a bounded regular file without accepting replacement-time drift."""
+
+    path = _absolute_path(path, label)
+    if _audit_directory_chain(path.parent, create_missing=False) is None:
+        return "", None
+    before = _safe_leaf_snapshot(path)
+    if before is None:
+        return "", None
+    if before.st_size > _MAX_ONBOARDING_TEXT_BYTES:
+        raise CodexOnboardingError(f"{path} exceeds the Codex onboarding size bound")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CodexOnboardingError(f"cannot open {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _require_safe_regular_file(path, opened)
+        if not _same_identity(before, opened):
+            raise CodexOnboardingError(f"{path} changed while being opened")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(_MAX_ONBOARDING_TEXT_BYTES + 1)
+        if len(raw) > _MAX_ONBOARDING_TEXT_BYTES:
+            raise CodexOnboardingError(f"{path} exceeds the Codex onboarding size bound")
+    finally:
+        os.close(descriptor)
+    after = _safe_leaf_snapshot(path)
+    if after is None or not _same_identity(before, after):
+        raise CodexOnboardingError(f"{path} changed while being read")
+    try:
+        # Match ``Path.read_text``'s universal-newline behavior so the
+        # replacement SHA remains stable across an existing CRLF user skill.
+        return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"), before
+    except UnicodeDecodeError as exc:
+        raise CodexOnboardingError(f"cannot decode {path} as UTF-8: {exc}") from exc
+
+
+def read_verified_codex_text(path: Path, *, label: str) -> str:
+    """Read one Codex-owned text leaf through the onboarding identity checks."""
+
+    text, _snapshot = _read_safe_text(path, label=label)
+    return text
+
+
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    expected_leaf: os.stat_result | None | object = _UNSET,
+) -> None:
+    """Publish through the verified parent identity, never its later pathname."""
+
+    path = _absolute_path(path, "Codex target")
+    if os.name != "nt" and not _posix_atomic_publish_supported():
+        raise CodexOnboardingError(
+            "this platform cannot publish Codex files through a verified directory handle"
+        )
+    if os.name == "nt" and not _windows_atomic_publish_supported():
+        raise CodexOnboardingError(
+            "Windows cannot provide safe handle-relative Codex publication"
+        )
+    parent_metadata = _audit_directory_chain(path.parent, create_missing=True)
+    assert parent_metadata is not None
+    if os.name == "nt":
+        try:
+            _atomic_write_text_windows(
+                path,
+                text,
+                parent_metadata=parent_metadata,
+                expected_leaf=expected_leaf,
+            )
+        except (AttributeError, ImportError, OSError) as exc:
+            # Never fall back to a pathname replace: without the native
+            # handle-relative primitives, publication must leave no target write.
+            raise CodexOnboardingError(
+                "Windows cannot provide safe handle-relative Codex publication"
+            ) from exc
+        return
+    _atomic_write_text_posix(
+        path,
+        text,
+        parent_metadata=parent_metadata,
+        expected_leaf=expected_leaf,
+    )
 
 
 def _hook_handler(command: str, command_windows: str, event: str) -> dict[str, Any]:
@@ -83,6 +856,57 @@ def _aoi_hook_entry(
     if event == "SessionStart":
         entry["matcher"] = SESSION_START_MATCHER
     return entry
+
+
+def _is_absolute_path(value: str) -> bool:
+    return PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
+def _validate_absolute_path(value: str | os.PathLike[str], label: str) -> str:
+    raw = os.fspath(value)
+    if not isinstance(raw, str) or not raw or not _is_absolute_path(raw):
+        raise CodexOnboardingError(f"{label} must be an absolute path")
+    if any(character in raw for character in {'"', "'", "\r", "\n", "\x00"}):
+        raise CodexOnboardingError(f"{label} contains an unsafe path character")
+    return raw
+
+
+def _validate_digest(value: str, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or set(value) - _SHA256_HEX
+    ):
+        raise CodexOnboardingError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def build_codex_hook_command(
+    launcher: str | os.PathLike[str],
+    project_root: str | os.PathLike[str],
+    provenance_sha256: str,
+) -> str:
+    """Build the sole supported current AOI Codex hook command.
+
+    The caller supplies paths already verified against the promoted wheel and
+    project receipt.  This helper makes the persisted hook representation
+    unambiguous; it deliberately never emits a PATH-resolved command.
+    """
+
+    launcher_text = _validate_absolute_path(launcher, "Codex hook launcher")
+    root_text = _validate_absolute_path(project_root, "Codex project root")
+    if not _executable_names(launcher_text) & {
+        HOOK_COMMAND_HEAD,
+        f"{HOOK_COMMAND_HEAD}.exe",
+    }:
+        raise CodexOnboardingError(
+            "Codex hook launcher must name the aoi-codex-hook entry point"
+        )
+    digest = _validate_digest(provenance_sha256, "Codex provenance SHA-256")
+    return (
+        f'"{launcher_text}" --hook-version 6 --project-root "{root_text}" '
+        f'--provenance-sha256 "{digest}"'
+    )
 
 
 def _strip_wrapping_quotes(value: str) -> str:
@@ -170,34 +994,89 @@ def _direct_aoi_hook_argv(value: Any) -> list[str] | None:
     return None
 
 
-def is_aoi_codex_hook_command(value: Any, *, require_current: bool = True) -> bool:
-    """Recognize direct AOI-owned commands, optionally at any hook version."""
+def is_aoi_codex_hook_command(
+    value: Any,
+    *,
+    require_current: bool = True,
+    expected_launcher: str | os.PathLike[str] | None = None,
+    expected_project_root: str | os.PathLike[str] | None = None,
+    expected_provenance_sha256: str | None = None,
+) -> bool:
+    """Recognize a current bound command or a legacy AOI-owned command.
 
+    ``require_current=False`` is deliberately for ownership migration only:
+    it recognizes the historical three-argument AOI commands so onboarding and
+    offboarding can replace/remove them.  It does not make a legacy command a
+    current trusted hook.  When any expected current identity is given, all
+    three are required and the rendered command must match byte-for-byte.
+    """
+
+    expected_values = (
+        expected_launcher,
+        expected_project_root,
+        expected_provenance_sha256,
+    )
+    if any(item is not None for item in expected_values) and not all(
+        item is not None for item in expected_values
+    ):
+        raise CodexOnboardingError(
+            "expected launcher, project root, and provenance SHA-256 must be supplied together"
+        )
     argv = _direct_aoi_hook_argv(value)
     if argv is None:
         return False
-    versioned = (
+    legacy = (
         len(argv) == 3
         and argv[1] == "--hook-version"
         and re.fullmatch(r"\d+", argv[2]) is not None
     )
-    if not versioned:
-        return False
     if not require_current:
-        return True
-    return argv[2] == "6"
+        return legacy
+    current = (
+        len(argv) == 7
+        and _is_absolute_path(argv[0])
+        and argv[1] == "--hook-version"
+        and argv[2] == "6"
+        and argv[3] == "--project-root"
+        and _is_absolute_path(argv[4])
+        and argv[5] == "--provenance-sha256"
+        and isinstance(argv[6], str)
+        and len(argv[6]) == 64
+        and not (set(argv[6]) - _SHA256_HEX)
+    )
+    if not current:
+        return False
+    if value != build_codex_hook_command(argv[0], argv[4], argv[6]):
+        return False
+    if all(item is not None for item in expected_values):
+        assert expected_launcher is not None
+        assert expected_project_root is not None
+        assert expected_provenance_sha256 is not None
+        return value == build_codex_hook_command(
+            expected_launcher,
+            expected_project_root,
+            expected_provenance_sha256,
+        )
+    return True
 
 
 def _command_invokes_aoi(value: Any) -> bool:
-    return is_aoi_codex_hook_command(value, require_current=False)
+    # Legacy recognition is only an ownership migration capability.  A current
+    # command is separately recognized so reinstall stays idempotent without
+    # treating the legacy form as current.
+    return is_aoi_codex_hook_command(value) or is_aoi_codex_hook_command(
+        value, require_current=False
+    )
 
 
 def _validate_hook_command(value: str, label: str) -> str:
-    command = value.strip()
+    if not isinstance(value, str) or value != value.strip():
+        raise CodexOnboardingError(f"{label} must be an exact quoted command string")
+    command = value
     if not is_aoi_codex_hook_command(command):
         raise CodexOnboardingError(
-            f"{label} must directly invoke aoi-codex-hook --hook-version 6 "
-            "(an absolute path or narrow 'wsl [--exec]' launcher is allowed)"
+            f"{label} must be an exact absolute aoi-codex-hook command bound to "
+            "hook version 6, project root, and provenance SHA-256"
         )
     return command
 
@@ -260,15 +1139,13 @@ def _validate_event_entries(event: str, entries: list[Any]) -> None:
 def _merge_codex_hook_settings_detailed(
     settings: Mapping[str, Any],
     *,
-    command: str = HOOK_COMMAND,
-    command_windows: str | None = None,
+    command: str,
+    command_windows: str,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     """Return merged settings plus added and upgraded AOI event lists."""
 
     command = _validate_hook_command(command, "Codex hook command")
-    command_windows = _validate_hook_command(
-        command_windows or command, "Codex Windows hook command"
-    )
+    command_windows = _validate_hook_command(command_windows, "Codex Windows hook command")
     merged: dict[str, Any] = dict(settings)
     raw_hooks = merged.get("hooks")
     if raw_hooks is not None and not isinstance(raw_hooks, dict):
@@ -326,8 +1203,8 @@ def _merge_codex_hook_settings_detailed(
 def merge_codex_hook_settings(
     settings: Mapping[str, Any],
     *,
-    command: str = HOOK_COMMAND,
-    command_windows: str | None = None,
+    command: str,
+    command_windows: str,
 ) -> tuple[dict[str, Any], list[str]]:
     """Return ``(new_settings, events_added)`` while upgrading AOI handlers."""
 
@@ -342,13 +1219,14 @@ def merge_codex_hook_settings(
 def install_codex_hooks(
     hooks_path: Path,
     *,
-    command: str = HOOK_COMMAND,
-    command_windows: str | None = None,
+    command: str,
+    command_windows: str,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {}
-    if hooks_path.exists():
+    hooks_text, hooks_snapshot = _read_safe_text(hooks_path, label="Codex hooks path")
+    if hooks_snapshot is not None:
         try:
-            loaded = json.loads(hooks_path.read_text(encoding="utf-8"))
+            loaded = json.loads(hooks_text)
         except json.JSONDecodeError as exc:
             raise CodexOnboardingError(
                 f"{hooks_path} is not valid JSON; fix it before wiring AOI: {exc}"
@@ -361,11 +1239,12 @@ def install_codex_hooks(
     merged, added, updated = _merge_codex_hook_settings_detailed(
         payload, command=command, command_windows=command_windows
     )
-    changed = merged != payload or not hooks_path.exists()
+    changed = merged != payload or hooks_snapshot is None
     if changed:
         _atomic_write_text(
             hooks_path,
             json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+            expected_leaf=hooks_snapshot,
         )
     return {
         "hooks_path": str(hooks_path),
@@ -377,7 +1256,7 @@ def install_codex_hooks(
             if event not in added and event not in updated
         ],
         "hook_command": command,
-        "hook_command_windows": command_windows or command,
+        "hook_command_windows": command_windows,
         "trust_required": True,
         "changed": changed,
     }
@@ -386,18 +1265,18 @@ def install_codex_hooks(
 def preflight_codex_onboarding(
     root: Path,
     *,
-    command: str = HOOK_COMMAND,
-    command_windows: str | None = None,
+    command: str,
+    command_windows: str,
 ) -> dict[str, Any]:
     """Validate all existing Codex client files without mutating the repo."""
 
+    root = _absolute_path(root, "Codex project root")
+    if _audit_directory_chain(root, create_missing=False) is None:
+        raise CodexOnboardingError(f"Codex project root is missing: {root}")
     config_path = root / ".codex" / "config.toml"
-    try:
-        config_text = (
-            config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-        )
-    except (OSError, UnicodeError) as exc:
-        raise CodexOnboardingError(f"cannot read {config_path}: {exc}") from exc
+    config_text, _config_snapshot = _read_safe_text(
+        config_path, label="Codex config path"
+    )
     merged_config, config_changed = merge_codex_config_toml(config_text)
     # The merge helper already parses the candidate; keep the value live here
     # so a future refactor cannot silently turn this into a syntax-only probe.
@@ -406,11 +1285,10 @@ def preflight_codex_onboarding(
 
     hooks_path = root / ".codex" / "hooks.json"
     payload: dict[str, Any] = {}
-    if hooks_path.exists():
+    hooks_text, hooks_snapshot = _read_safe_text(hooks_path, label="Codex hooks path")
+    if hooks_snapshot is not None:
         try:
-            loaded = json.loads(hooks_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError) as exc:
-            raise CodexOnboardingError(f"cannot read {hooks_path}: {exc}") from exc
+            loaded = json.loads(hooks_text)
         except json.JSONDecodeError as exc:
             raise CodexOnboardingError(
                 f"{hooks_path} is not valid JSON; fix it before wiring AOI: {exc}"
@@ -505,10 +1383,10 @@ def merge_codex_config_toml(text: str) -> tuple[str, bool]:
 
 
 def install_codex_config(config_path: Path) -> dict[str, Any]:
-    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    text, config_snapshot = _read_safe_text(config_path, label="Codex config path")
     merged, changed = merge_codex_config_toml(text)
-    if changed or not config_path.exists():
-        _atomic_write_text(config_path, merged)
+    if changed or config_snapshot is None:
+        _atomic_write_text(config_path, merged, expected_leaf=config_snapshot)
     return {
         "config_path": str(config_path),
         "hooks_feature_enabled": True,
@@ -562,27 +1440,22 @@ def enable_aoi_codex_hooks_policy(text: str) -> tuple[str, bool]:
     )
 
 
-def preflight_codex_user_skill(
+def _preflight_codex_user_skill(
     skills_root: Path,
     skill_text: str,
     *,
     replace_sha256: str | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], os.stat_result | None]:
     """Validate a user-scope AOI skill install without changing it."""
 
-    skills_root = skills_root.expanduser()
-    if not skills_root.is_absolute():
-        raise CodexOnboardingError(
-            "Codex user skills root must be absolute; use $HOME/.agents/skills "
-            "or pass the Codex host's explicit user-skill directory"
-        )
+    skills_root = _absolute_path(skills_root, "Codex user skills root")
     skill_path = skills_root / "aoi" / "SKILL.md"
-    existing_text: str | None = None
-    if skill_path.exists():
-        try:
-            existing_text = skill_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise CodexOnboardingError(f"cannot read {skill_path}: {exc}") from exc
+    read_text, skill_snapshot = _read_safe_text(
+        skill_path, label="Codex user skill path"
+    )
+    existing_text: str | None = read_text
+    if skill_snapshot is None:
+        existing_text = None
     existing_sha256 = (
         hashlib.sha256(existing_text.encode("utf-8")).hexdigest()
         if existing_text is not None
@@ -613,7 +1486,23 @@ def preflight_codex_user_skill(
         "existing_sha256": existing_sha256,
         "packaged_sha256": hashlib.sha256(skill_text.encode("utf-8")).hexdigest(),
         "changed": changed,
-    }
+    }, skill_snapshot
+
+
+def preflight_codex_user_skill(
+    skills_root: Path,
+    skill_text: str,
+    *,
+    replace_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate a user-scope AOI skill install without changing it."""
+
+    result, _snapshot = _preflight_codex_user_skill(
+        skills_root,
+        skill_text,
+        replace_sha256=replace_sha256,
+    )
+    return result
 
 
 def install_codex_user_skill(
@@ -622,13 +1511,18 @@ def install_codex_user_skill(
     *,
     replace_sha256: str | None = None,
 ) -> dict[str, Any]:
-    result = preflight_codex_user_skill(
+    result, skill_snapshot = _preflight_codex_user_skill(
         skills_root,
         skill_text,
         replace_sha256=replace_sha256,
     )
     if result["changed"]:
-        _atomic_write_text(Path(result["skill_path"]), skill_text)
+        skill_path = Path(result["skill_path"])
+        _atomic_write_text(
+            skill_path,
+            skill_text,
+            expected_leaf=skill_snapshot,
+        )
     result["updated"] = bool(result["changed"] and result["existing_sha256"] is not None)
     result["created"] = bool(result["changed"] and result["existing_sha256"] is None)
     return result
@@ -650,15 +1544,28 @@ def register_codex_onboarding_commands(
     parser = subparsers.add_parser("codex-init")
     parser.add_argument("--project-name")
     parser.add_argument(
-        "--hook-command",
-        default=HOOK_COMMAND,
-        help="POSIX hook command; defaults to the installed aoi-codex-hook entry point",
+        "--promotion-bundle-file",
+        help="exact promoted release-promotion bundle used to verify this AOI install",
     )
     parser.add_argument(
-        "--hook-command-windows",
+        "--expected-promotion-bundle-sha256",
         help=(
-            "optional Windows AOI hook command override; direct absolute paths "
-            "and a narrow 'wsl [--exec] aoi-codex-hook ...' launcher are allowed"
+            "lowercase canonical bundle digest recorded in the promotion "
+            "bundle, not the raw JSON file SHA-256"
+        ),
+    )
+    parser.add_argument(
+        "--local-artifact-bundle-file",
+        help=(
+            "exact reviewed local-install bundle for this AOI install; this is "
+            "not a release or promotion"
+        ),
+    )
+    parser.add_argument(
+        "--expected-local-artifact-bundle-sha256",
+        help=(
+            "lowercase canonical bundle digest recorded in the reviewed local "
+            "bundle, not the raw JSON file SHA-256"
         ),
     )
     parser.add_argument(
@@ -679,9 +1586,9 @@ def register_codex_onboarding_commands(
 __all__ = [
     "CODEX_HOOK_EVENTS",
     "CodexOnboardingError",
-    "HOOK_COMMAND",
     "HOOK_TIMEOUT_SECONDS",
     "SESSION_START_MATCHER",
+    "build_codex_hook_command",
     "enable_aoi_codex_hooks_policy",
     "install_codex_config",
     "install_codex_hooks",
@@ -691,5 +1598,6 @@ __all__ = [
     "merge_codex_hook_settings",
     "preflight_codex_onboarding",
     "preflight_codex_user_skill",
+    "read_verified_codex_text",
     "register_codex_onboarding_commands",
 ]

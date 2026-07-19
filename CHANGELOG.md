@@ -7,6 +7,52 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+### v0.4.0a1 (unreleased)
+
+- **O1 — semantic commit v2.** Event-authoritative task state, replayable
+  projections, exact retry, and recovery are covered by focused semantic tests.
+- **O2 — legacy migration.** Byte-preserving legacy snapshots, quiescence
+  checks, migration receipts, and pre-transition rollback are covered by
+  focused migration tests.
+- **O3 — dispatch v6.** Immutable arm-time routing authority, startup receipt
+  registration, and explicit `unavailable` runtime-routing fields are covered
+  by focused packet and hook-receipt tests.
+- **O4 — permits.** One-shot, Chief-authorized transition permits and exact
+  consumption/replay checks are covered by focused semantic-object tests.
+- **O5 — cohorts.** Deterministic manual waves and no-launch-overclaim receipts
+  are covered by focused cohort/permit tests; this does not claim a transport
+  launch.
+- **O6 — Codex adapter.** Provenance-bound hook definitions, bounded hook
+  receipts, and cooperative tool-path coverage reporting are covered by focused
+  adapter tests. Hook installation remains distinct from runtime trust; live
+  Codex `/hooks` delivery and user trust remain unproven in this checkpoint.
+- **O7 — release promotion.** Exact artifact inventory, release manifest,
+  promotion bundle, and local rehearsal contracts are covered by focused release
+  tests. This is not a claim of GitHub Actions, PyPI publication/readback, or a
+  live canary.
+- **Reviewed local install proof.** `reviewed_local_install_bundle` v2 is a
+  separate, unpublished route with
+  `proof_scope=exact_local_wheel_install_only`, not a release or promotion.
+  It cross-binds a caller-approved bundle SHA and external store with clean
+  source commit/tree/manifest, inventory/rehearsal, exact wheel bytes, PEP 610
+  archive evidence, installed `RECORD`, and runtime bytes. It does not claim a
+  tag, GitHub Release, PyPI publication, or live Codex `/hooks` trust. The
+  source identity is reviewed context, not an independent source-to-wheel,
+  builder-toolchain, or test-execution attestation; the test summary is
+  explicitly caller-supplied.
+- **O8 — integrity and adoption (implemented; promotion still pending).** The
+  one-way, eligible-task `required_v1` adoption contract, seven integrity
+  commands, claim-bound mutation snapshots, review/fix/verification chains,
+  exact retry, close seal, concise status, and preview-first offboarding are
+  implemented. The complete WSL pytest collection passed `1,312` tests with
+  `28` platform skips; Windows `unittest discover` passed `1,102` tests with
+  `28` skips, supplemented by final pytest coverage for free-function
+  provenance/workflow and host-native onboarding paths. `required_v1` is not a
+  mandatory semantic-v2 genesis field. Push and live canary are still open; no
+  GitHub Actions, PyPI, tag, or live-client result is claimed. Manual
+  reviewer identity remains a cooperative assertion, and unavailable MCP
+  registry paths are reported as uncovered.
+
 ### Added
 - **Codex startup byte-state registration and strict resource timeline.**
   Startup-only hook receipts now persist bounded managed project-file SHA-256
@@ -42,18 +88,18 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   no tier. This converts the previously declarative tier ledger into a
   dispatch-request gate on the Claude host; it does not observe actual model
   routing, and Workflow-orchestrated spawns still bypass `PreToolUse`.
-- **Typed package.** The full `src/aoi_orgware` surface type-checks clean
-  (mypy, 57 -> 0 errors, behavior-preserving) and ships a PEP 561
-  `py.typed` marker with a `Typing :: Typed` classifier; CI gains a mypy
-  gate. One pre-existing latent defect found during the pass is documented
-  in the typing patches (receipt rollback `plan` access order) and left
-  behavior-identical for a separate fix.
+- **Typed package and deterministic CI tooling.** The full `src/aoi_orgware`
+  surface has a clean mypy gate, with `mypy==2.3.0` and its toolchain
+  hash-locked. Test and documentation Actions use SHA-pinned inputs rather
+  than floating action revisions. The package ships a PEP 561 `py.typed` marker
+  with a `Typing :: Typed` classifier.
 - **Python 3.14** added to the CI matrix and trove classifiers.
 - **Coverage gate.** Subprocess-aware coverage job (the suite drives the
   CLI through real subprocesses; naive measurement understates by ~30
   points) with an enforced 80% floor — measured 83% at this baseline.
 - **Documentation site.** mkdocs-material site built from `docs/` with a
-  strict-mode build, deployed to GitHub Pages.
+  strict-mode local build and configured for GitHub Pages deployment; no remote
+  deployment result is claimed here.
 - **Community files.** CONTRIBUTING, bug-report and PR templates, and a
   Dependabot config watching the SHA-pinned GitHub Actions.
 

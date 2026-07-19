@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from itertools import islice
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, cast
 
 from . import harnesslib as h
 from . import cohorts
@@ -1232,7 +1232,7 @@ def _require_current_lane_snapshot(
     if not isinstance(raw_snapshot, Mapping):
         raise RoutingPersistenceError(f"{label} is invalid")
     snapshot = dict(raw_snapshot)
-    lane_id = h.validate_id(snapshot.get("lane_id"), f"{label} lane id")
+    lane_id = h.validate_id(cast(str, snapshot.get("lane_id")), f"{label} lane id")
     raw_lanes = domain.get("lanes", [])
     if not isinstance(raw_lanes, list) or len(raw_lanes) > MAX_LEGACY_PACKETS:
         raise RoutingPersistenceError("semantic prefix lane collection is invalid or over bound")
@@ -1440,7 +1440,7 @@ def _prefix_execution_occupancy(
     for packet in raw_packets:
         if not isinstance(packet, Mapping):
             raise RoutingPersistenceError("semantic prefix packet row is invalid")
-        packet_id = h.validate_id(packet.get("packet_id"), "packet id")
+        packet_id = h.validate_id(cast(str, packet.get("packet_id")), "packet id")
         if packet_id in seen_state_packet_ids:
             raise RoutingPersistenceError("semantic prefix repeats a packet id")
         seen_state_packet_ids.add(packet_id)
@@ -1496,7 +1496,7 @@ def _prefix_execution_occupancy(
             raise RoutingPersistenceError("semantic prefix job row is invalid")
         if job.get("status") not in h.ACTIVE_JOB_STATUSES:
             continue
-        run_id = h.validate_id(job.get("run_id"), "job run id")
+        run_id = h.validate_id(cast(str, job.get("run_id")), "job run id")
         if run_id in seen_run_ids:
             raise RoutingPersistenceError("semantic prefix repeats an active job id")
         seen_run_ids.add(run_id)
@@ -2048,7 +2048,7 @@ def _routing_report_from_generic(
     projection: Mapping[str, Any],
     event_chain: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    task_id = h.validate_id(report.get("task_id"), "task id")
+    task_id = h.validate_id(cast(str, report.get("task_id")), "task id")
     object_rows = report.get("objects")
     binding_rows = report.get("bindings")
     if not isinstance(object_rows, list) or not isinstance(binding_rows, list):
@@ -2060,8 +2060,7 @@ def _routing_report_from_generic(
     for event in records:
         if not isinstance(event, Mapping):
             raise RoutingPersistenceError("routing event chain row is invalid")
-        digest = event.get("event_sha256")
-        _sha(digest, "routing event SHA-256")
+        digest = _sha(event.get("event_sha256"), "routing event SHA-256")
         if digest in event_by_sha:
             raise RoutingPersistenceError("routing event chain repeats an event SHA-256")
         event_by_sha[digest] = event
@@ -2437,7 +2436,7 @@ def classify_legacy_cutover(packets: Iterable[Mapping[str, Any]]) -> dict[str, A
         packet = _clone(raw, max_bytes=authority.MAX_RECORD_BYTES)
         if not isinstance(packet, dict):
             raise RoutingPersistenceError("packet snapshot is invalid")
-        packet_id = h.validate_id(packet.get("packet_id"), "packet id")
+        packet_id = h.validate_id(cast(str, packet.get("packet_id")), "packet id")
         version = packet.get("packet_schema_version", packet.get("schema_version", 0))
         version = _exact_int(version, "packet schema version", maximum=6)
         status = packet.get("status")

@@ -599,3 +599,32 @@ different digest as an error. Authenticated `aoi init` automatically replaces
 known AOI-managed predecessor policies; an unrecognized/custom policy requires
 `--replace-policy-sha256 <exact-current-digest>` after review. Existing task
 records are never silently reinterpreted.
+
+## v0.4 integrity adoption and offboarding
+
+An eligible task may adopt the one-way `required_v1` integrity contract with an
+exact baseline head. After adoption, candidate and post-fix mutation snapshots,
+findings, fixes, review results, and review-verification records are bounded
+and content-addressed. A terminal seal binds the latest candidate snapshot,
+latest review result, and the current live-claim scope digest; incomplete,
+stale, tampered, duplicate, or self-reviewing graphs fail closed. A sealed
+integrity contract is immutable.
+
+The mutation snapshot is a NUL-safe Git observation that includes tracked,
+untracked, rename, case-only, and deletion states. It is compared with the
+task's live cooperative claims, so the seal says which claimed scope was
+examined. It does not prove that every filesystem mutation was observed, nor
+does it make claims an operating-system access-control mechanism. A reviewer
+identity must differ from all recorded producer identities, but identities are
+cooperative agent assertions, not authenticated humans or independent security
+principals. A same-OS-user process can bypass AOI, edit source or state, and
+manufacture evidence outside this boundary.
+
+`offboard` is preview-first and applies only a reviewed
+`aoi-owned-only-offboard` plan. It verifies each current preimage before change,
+archives exact backups and a receipt outside the repository, removes only
+AOI-owned hook/wiring fragments, and rolls back changed client files if apply
+or receipt publication fails. It preserves user/foreign hook definitions and
+leaves `aoi.toml` and `.aoi/` as an inert archive by default. It neither deletes
+project evidence nor claims to revoke an already trusted hook or protect a
+same-user environment.

@@ -139,6 +139,18 @@ class ServicesInjectionTests(unittest.TestCase):
 
 
 class PureValidatorTests(unittest.TestCase):
+    def test_exact_command_normalization_is_shared_and_body_preserving(self) -> None:
+        self.assertEqual(
+            pi.normalize_exact_command_bytes(
+                b"printf 'keep trailing body space '  \r\n\r\n\t"
+            ),
+            b"printf 'keep trailing body space '\n",
+        )
+        with self.assertRaisesRegex(HarnessError, "empty"):
+            pi.normalize_exact_command_bytes(b" \r\n\t")
+        with self.assertRaisesRegex(HarnessError, "NUL"):
+            pi.normalize_exact_command_bytes(b"echo x\x00\n")
+
     def test_packet_command_integrity_error_modes(self) -> None:
         self.assertIsNone(pi.packet_command_integrity_error({"packet_mode": "legacy"}))
         self.assertIsNone(
@@ -155,6 +167,12 @@ class PureValidatorTests(unittest.TestCase):
         )
         self.assertEqual(
             missing, "packet p2 exact command artifact is missing/non-regular"
+        )
+        self.assertEqual(
+            pi.packet_command_integrity_error(
+                {"packet_id": "p3", "packet_mode": "exact_command"}
+            ),
+            "packet p3 exact command artifact is missing/non-regular",
         )
 
     def test_packet_result_integrity_errors_requires_terminal_status(self) -> None:

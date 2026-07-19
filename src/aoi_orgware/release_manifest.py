@@ -9,6 +9,7 @@ an artifact registry.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, timezone
 import json
 from pathlib import PurePosixPath
 import re
@@ -21,12 +22,31 @@ RELEASE_MANIFEST_SCHEMA_VERSION = 1
 PROMOTION_RECEIPT_SCHEMA_VERSION = 1
 MAX_RELEASE_MANIFEST_BYTES = 256 * 1024
 MAX_PROMOTION_RECEIPT_BYTES = 128 * 1024
+# Keep the pure manifest contract within the observer's supported private-file
+# envelope.  AOI distributions are small; accepting larger declarations here
+# would create manifests that the supported observation API can never verify.
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_ARTIFACT_AGGREGATE_BYTES = 128 * 1024 * 1024
 MAX_ARTIFACTS = 256
 MAX_NAMED_RECORDS = 256
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_GIT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}")
-_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+!_-]{0,127}")
+_RECORD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_DISTRIBUTION_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+# Deliberately accept the normalized release subset used by AOI rather than
+# pretending the previous broad token expression implemented all of PEP 440.
+_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))*"
+    r"(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?"
+    r"(?:\.post(?:0|[1-9][0-9]*))?"
+    r"(?:\.dev(?:0|[1-9][0-9]*))?"
+    r"(?:\+[a-z0-9]+(?:[.-][a-z0-9]+)*)?"
+)
+_CANONICAL_UTC = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z"
+)
 _GIT_REF_FORBIDDEN_CHARS = frozenset(" ~^:?*[\\")
 _WINDOWS_UNSAFE_PATH_CHARS = frozenset('<>:"|?*')
 _WINDOWS_RESERVED_DEVICE = re.compile(
@@ -36,13 +56,17 @@ _WINDOWS_RESERVED_DEVICE = re.compile(
 
 _ARTIFACT_FIELDS = {"name", "size_bytes", "sha256"}
 _PRODUCER_FIELDS = {"producer_id", "result_sha256"}
-_BUILD_ENVIRONMENT_FIELDS = {"platform", "python_version", "builder_image_sha256"}
+_BUILD_ENVIRONMENT_FIELDS = {
+    "platform", "python_version", "builder_environment_receipt_sha256",
+}
 _WORKFLOW_FIELDS = {"workflow_name", "run_id", "run_attempt"}
 _INTERFACE_FIELDS = {
-    "console_executable",
+    "console_entry_point",
+    "codex_hook_entry_point",
     "hook_protocol_version",
     "installed_metadata_sha256",
 }
+_ENTRY_POINT_FIELDS = {"name", "target"}
 _DEPENDENCY_FIELDS = {"name", "release_manifest_sha256", "promotion_receipt_sha256"}
 _MATRIX_FIELDS = {
     "platform",
@@ -57,9 +81,11 @@ _EXCEPTION_REBUILD_FIELDS = {"status", "review_receipt_sha256", "explanation"}
 _LOCATION_FIELDS = {"location", "sha256"}
 _MANIFEST_BASE_FIELDS = {
     "schema_version",
+    "distribution_name",
     "tag",
-    "commit_sha256",
-    "tree_sha256",
+    "git_object_format",
+    "commit_oid",
+    "tree_oid",
     "package_version",
     "build_environment",
     "workflow",
@@ -74,16 +100,27 @@ _MANIFEST_BASE_FIELDS = {
 }
 _MANIFEST_SEALED_FIELDS = _MANIFEST_BASE_FIELDS | {"manifest_sha256"}
 
-_REGISTRY_READBACK_FIELDS = {"artifacts"}
-_INSTALLED_FIELDS = {
+_REGISTRY_READBACK_FIELDS = {
+    "registry",
+    "project",
     "package_version",
+    "observed_at",
+    "artifacts",
+}
+_INSTALLED_FIELDS = {
+    "distribution_name",
+    "package_version",
+    "observed_at",
     "installed_metadata_sha256",
-    "console_executable",
+    "console_entry_point",
+    "codex_hook_entry_point",
     "hook_protocol_version",
 }
 _PROMOTED_DEPENDENCY_FIELDS = {"name", "promotion_receipt_sha256"}
 _ROLLBACK_FIELDS = {
-    "prior_promotion_receipt_sha256",
+    "from_promotion_receipt_sha256",
+    "mode",
+    "target_promotion_receipt_sha256",
     "compensating_manifest_sha256",
     "reason",
 }
@@ -91,6 +128,7 @@ _PROMOTION_BASE_FIELDS = {
     "schema_version",
     "promotion_id",
     "manifest_sha256",
+    "artifact_observation_receipt_sha256",
     "registry_readback",
     "installed",
     "dependency_promotions",
@@ -126,8 +164,31 @@ def _sha256(value: Any, label: str) -> str:
     return value
 
 
+def _git_object_format(value: Any) -> str:
+    if not isinstance(value, str) or value not in _GIT_OID_LENGTHS:
+        _fail("git_object_format is invalid")
+    return value
+
+
+def _git_oid(value: Any, object_format: str, label: str) -> str:
+    length = _GIT_OID_LENGTHS[object_format]
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or re.fullmatch(r"[0-9a-f]+", value) is None
+    ):
+        _fail(f"{label} is not a lowercase {object_format} Git object id")
+    return value
+
+
 def _identifier(value: Any, label: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+        _fail(f"{label} is invalid")
+    return value
+
+
+def _record_id(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _RECORD_ID.fullmatch(value):
         _fail(f"{label} is invalid")
     return value
 
@@ -156,13 +217,35 @@ def _tag(value: Any) -> str:
 
 
 def _version(value: Any) -> str:
-    if not isinstance(value, str) or not _VERSION.fullmatch(value) or ".." in value:
+    if not isinstance(value, str) or not _VERSION.fullmatch(value):
         _fail("package_version is invalid")
     return value
 
 
-def _nonnegative_size(value: Any, label: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+def _distribution_name(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _DISTRIBUTION_NAME.fullmatch(value):
+        _fail(f"{label} is not a canonical distribution name")
+    return value
+
+
+def _canonical_utc(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _CANONICAL_UTC.fullmatch(value):
+        _fail(f"{label} is not a canonical UTC instant")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        _fail(f"{label} is not a canonical UTC instant")
+    if parsed.tzinfo != timezone.utc:
+        _fail(f"{label} is not a canonical UTC instant")
+    return value
+
+
+def _positive_int(value: Any, label: str, *, maximum: int) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= maximum
+    ):
         _fail(f"{label} is invalid")
     return value
 
@@ -214,6 +297,7 @@ def _artifacts(value: Any, label: str = "artifacts") -> list[dict[str, Any]]:
         _fail(f"{label} is invalid")
     names: set[str] = set()
     result: list[dict[str, Any]] = []
+    aggregate = 0
     for entry in value:
         item = _object(entry, _ARTIFACT_FIELDS, "artifact")
         name = _artifact_name(item["name"])
@@ -221,9 +305,17 @@ def _artifacts(value: Any, label: str = "artifacts") -> list[dict[str, Any]]:
         if identity in names:
             _fail(f"{label} contains duplicate artifact names")
         names.add(identity)
+        size = _positive_int(
+            item["size_bytes"],
+            "artifact.size_bytes",
+            maximum=MAX_ARTIFACT_BYTES,
+        )
+        aggregate += size
+        if aggregate > MAX_ARTIFACT_AGGREGATE_BYTES:
+            _fail(f"{label} exceeds its aggregate byte bound")
         result.append({
             "name": name,
-            "size_bytes": _nonnegative_size(item["size_bytes"], "artifact.size_bytes"),
+            "size_bytes": size,
             "sha256": _sha256(item["sha256"], "artifact.sha256"),
         })
     return sorted(result, key=lambda entry: _windows_path_identity(entry["name"]))
@@ -249,7 +341,10 @@ def _build_environment(value: Any) -> dict[str, str]:
     return {
         "platform": _text(item["platform"], "build_environment.platform", limit=128),
         "python_version": _text(item["python_version"], "build_environment.python_version", limit=64),
-        "builder_image_sha256": _sha256(item["builder_image_sha256"], "build_environment.builder_image_sha256"),
+        "builder_environment_receipt_sha256": _sha256(
+            item["builder_environment_receipt_sha256"],
+            "build_environment.builder_environment_receipt_sha256",
+        ),
     }
 
 
@@ -258,8 +353,21 @@ def _workflow(value: Any) -> dict[str, Any]:
     return {
         "workflow_name": _identifier(item["workflow_name"], "workflow.workflow_name"),
         "run_id": _identifier(item["run_id"], "workflow.run_id"),
-        "run_attempt": _nonnegative_size(item["run_attempt"], "workflow.run_attempt"),
+        "run_attempt": _positive_int(
+            item["run_attempt"], "workflow.run_attempt", maximum=1_000_000
+        ),
     }
+
+
+def _entry_point(value: Any, label: str) -> dict[str, str]:
+    item = _object(value, _ENTRY_POINT_FIELDS, label)
+    name = _identifier(item["name"], f"{label}.name")
+    target = item["target"]
+    if not isinstance(target, str) or re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*", target
+    ) is None:
+        _fail(f"{label}.target is invalid")
+    return {"name": name, "target": target}
 
 
 def _interfaces(value: Any) -> dict[str, Any]:
@@ -267,8 +375,11 @@ def _interfaces(value: Any) -> dict[str, Any]:
     version = item["hook_protocol_version"]
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         _fail("interfaces.hook_protocol_version is invalid")
+    console = _entry_point(item["console_entry_point"], "interfaces.console_entry_point")
+    hook = _entry_point(item["codex_hook_entry_point"], "interfaces.codex_hook_entry_point")
     return {
-        "console_executable": _identifier(item["console_executable"], "interfaces.console_executable"),
+        "console_entry_point": console,
+        "codex_hook_entry_point": hook,
         "hook_protocol_version": version,
         "installed_metadata_sha256": _sha256(
             item["installed_metadata_sha256"], "interfaces.installed_metadata_sha256"
@@ -295,7 +406,7 @@ def _dependencies(value: Any) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for entry in value:
         item = _object(entry, _DEPENDENCY_FIELDS, "dependency")
-        name = _identifier(item["name"], "dependency.name")
+        name = _distribution_name(item["name"], "dependency.name")
         if name in names:
             _fail("dependencies contains duplicate names")
         names.add(name)
@@ -402,12 +513,17 @@ def _manifest_base(value: Any) -> dict[str, Any]:
     artifacts = _artifacts(item["artifacts"])
     sbom = _location(item["sbom"], "sbom")
     attestation = _location(item["attestation"], "attestation")
+    object_format = _git_object_format(item["git_object_format"])
     _validate_global_location_uniqueness(artifacts, sbom, attestation)
     return {
         "schema_version": RELEASE_MANIFEST_SCHEMA_VERSION,
+        "distribution_name": _distribution_name(
+            item["distribution_name"], "distribution_name"
+        ),
         "tag": _tag(item["tag"]),
-        "commit_sha256": _sha256(item["commit_sha256"], "commit_sha256"),
-        "tree_sha256": _sha256(item["tree_sha256"], "tree_sha256"),
+        "git_object_format": object_format,
+        "commit_oid": _git_oid(item["commit_oid"], object_format, "commit_oid"),
+        "tree_oid": _git_oid(item["tree_oid"], object_format, "tree_oid"),
         "package_version": _version(item["package_version"]),
         "build_environment": _build_environment(item["build_environment"]),
         "workflow": _workflow(item["workflow"]),
@@ -455,7 +571,19 @@ def validate_release_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
 def _registry_readback(value: Any) -> dict[str, Any]:
     item = _object(value, _REGISTRY_READBACK_FIELDS, "registry_readback")
-    return {"artifacts": _artifacts(item["artifacts"], "registry_readback.artifacts")}
+    return {
+        "registry": _identifier(item["registry"], "registry_readback.registry"),
+        "project": _distribution_name(
+            item["project"], "registry_readback.project"
+        ),
+        "package_version": _version(item["package_version"]),
+        "observed_at": _canonical_utc(
+            item["observed_at"], "registry_readback.observed_at"
+        ),
+        "artifacts": _artifacts(
+            item["artifacts"], "registry_readback.artifacts"
+        ),
+    }
 
 
 def _installed(value: Any) -> dict[str, Any]:
@@ -464,9 +592,16 @@ def _installed(value: Any) -> dict[str, Any]:
     if not isinstance(hook_version, int) or isinstance(hook_version, bool) or hook_version < 1:
         _fail("installed.hook_protocol_version is invalid")
     return {
+        "distribution_name": _distribution_name(
+            item["distribution_name"], "installed.distribution_name"
+        ),
         "package_version": _version(item["package_version"]),
+        "observed_at": _canonical_utc(
+            item["observed_at"], "installed.observed_at"
+        ),
         "installed_metadata_sha256": _sha256(item["installed_metadata_sha256"], "installed.installed_metadata_sha256"),
-        "console_executable": _identifier(item["console_executable"], "installed.console_executable"),
+        "console_entry_point": _entry_point(item["console_entry_point"], "installed.console_entry_point"),
+        "codex_hook_entry_point": _entry_point(item["codex_hook_entry_point"], "installed.codex_hook_entry_point"),
         "hook_protocol_version": hook_version,
     }
 
@@ -478,7 +613,9 @@ def _dependency_promotions(value: Any) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for entry in value:
         item = _object(entry, _PROMOTED_DEPENDENCY_FIELDS, "dependency_promotion")
-        name = _identifier(item["name"], "dependency_promotion.name")
+        name = _distribution_name(
+            item["name"], "dependency_promotion.name"
+        )
         if name in names:
             _fail("dependency_promotions contains duplicate names")
         names.add(name)
@@ -486,15 +623,35 @@ def _dependency_promotions(value: Any) -> list[dict[str, str]]:
     return sorted(result, key=lambda entry: entry["name"])
 
 
-def _rollback_provenance(value: Any, manifest_sha256: str) -> dict[str, str] | None:
+def _rollback_provenance(
+    value: Any, manifest_sha256: str
+) -> dict[str, Any] | None:
     if value is None:
         return None
     item = _object(value, _ROLLBACK_FIELDS, "rollback_provenance")
     compensating = _sha256(item["compensating_manifest_sha256"], "rollback_provenance.compensating_manifest_sha256")
     if compensating != manifest_sha256:
         _fail("rollback_provenance must name this compensating manifest")
+    mode = item["mode"]
+    if mode not in {"prior_manifest", "compensating_release"}:
+        _fail("rollback_provenance mode is invalid")
+    target = item["target_promotion_receipt_sha256"]
+    if mode == "prior_manifest":
+        target = _sha256(
+            target,
+            "rollback_provenance.target_promotion_receipt_sha256",
+        )
+    elif target is not None:
+        _fail(
+            "compensating_release rollback may not name a target promotion receipt"
+        )
     return {
-        "prior_promotion_receipt_sha256": _sha256(item["prior_promotion_receipt_sha256"], "rollback_provenance.prior_promotion_receipt_sha256"),
+        "from_promotion_receipt_sha256": _sha256(
+            item["from_promotion_receipt_sha256"],
+            "rollback_provenance.from_promotion_receipt_sha256",
+        ),
+        "mode": mode,
+        "target_promotion_receipt_sha256": target,
         "compensating_manifest_sha256": compensating,
         "reason": _text(item["reason"], "rollback_provenance.reason", limit=2048),
     }
@@ -507,8 +664,12 @@ def _promotion_base(value: Any) -> dict[str, Any]:
     manifest_sha = _sha256(item["manifest_sha256"], "manifest_sha256")
     return {
         "schema_version": PROMOTION_RECEIPT_SCHEMA_VERSION,
-        "promotion_id": _identifier(item["promotion_id"], "promotion_id"),
+        "promotion_id": _record_id(item["promotion_id"], "promotion_id"),
         "manifest_sha256": manifest_sha,
+        "artifact_observation_receipt_sha256": _sha256(
+            item["artifact_observation_receipt_sha256"],
+            "artifact_observation_receipt_sha256",
+        ),
         "registry_readback": _registry_readback(item["registry_readback"]),
         "installed": _installed(item["installed"]),
         "dependency_promotions": _dependency_promotions(item["dependency_promotions"]),
@@ -519,14 +680,21 @@ def _promotion_base(value: Any) -> dict[str, Any]:
 def _validate_promotion_binding(receipt: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
     if receipt["manifest_sha256"] != manifest["manifest_sha256"]:
         _fail("promotion manifest_sha256 does not match manifest")
-    if receipt["registry_readback"]["artifacts"] != manifest["artifacts"]:
+    readback = receipt["registry_readback"]
+    if (
+        readback["project"] != manifest["distribution_name"]
+        or readback["package_version"] != manifest["package_version"]
+        or readback["artifacts"] != manifest["artifacts"]
+    ):
         _fail("registry readback artifacts do not exactly match manifest")
     installed = receipt["installed"]
     interfaces = manifest["interfaces"]
     if (
-        installed["package_version"] != manifest["package_version"]
+        installed["distribution_name"] != manifest["distribution_name"]
+        or installed["package_version"] != manifest["package_version"]
         or installed["installed_metadata_sha256"] != interfaces["installed_metadata_sha256"]
-        or installed["console_executable"] != interfaces["console_executable"]
+        or installed["console_entry_point"] != interfaces["console_entry_point"]
+        or installed["codex_hook_entry_point"] != interfaces["codex_hook_entry_point"]
         or installed["hook_protocol_version"] != interfaces["hook_protocol_version"]
     ):
         _fail("installed consumer does not exactly match manifest interface")
@@ -577,6 +745,8 @@ def validate_promotion_receipt(
 
 __all__ = [
     "MAX_ARTIFACTS",
+    "MAX_ARTIFACT_AGGREGATE_BYTES",
+    "MAX_ARTIFACT_BYTES",
     "MAX_PROMOTION_RECEIPT_BYTES",
     "MAX_RELEASE_MANIFEST_BYTES",
     "PROMOTION_RECEIPT_SCHEMA_VERSION",

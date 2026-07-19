@@ -350,6 +350,90 @@ def preserve_bound_artifacts(
     return preserved
 
 
+def preserve_generated_artifact_blob(
+    paths: HarnessPaths,
+    task_id: str,
+    data: bytes,
+    *,
+    label: str,
+    max_bytes: int = TERMINAL_ARTIFACT_MAX_BYTES,
+) -> dict[str, Any]:
+    """Publish generated evidence bytes into the task-local CAS.
+
+    Unlike :func:`prepare_bound_artifacts`, this boundary has no external
+    pathname to trust: the caller already generated the exact bytes being
+    sealed.  Publication is create-only (or exact idempotent reuse), and the
+    returned path is relative to the task directory so it can be persisted in
+    compact semantic projections without embedding a host-specific AOI root.
+    """
+
+    if not isinstance(data, bytes) or not data or len(data) > max_bytes:
+        raise HarnessError(
+            f"{label} must be non-empty bytes at most {max_bytes} bytes"
+        )
+    digest = hashlib.sha256(data).hexdigest()
+    destination = artifact_blob_path(paths, task_id, digest)
+    ensure_artifact_blob_parent(paths, task_id, digest, create=True)
+    if destination.exists():
+        _, existing = read_regular_artifact(
+            destination, label, max_bytes=max_bytes
+        )
+        if existing != data or hashlib.sha256(existing).hexdigest() != digest:
+            raise HarnessError(
+                f"canonical {label} blob is missing or tampered: {destination}"
+            )
+    else:
+        try:
+            atomic_create_bytes(destination, data)
+        except HarnessError:
+            if not destination.exists():
+                raise
+            _, existing = read_regular_artifact(
+                destination, f"concurrent {label} blob", max_bytes=max_bytes
+            )
+            if existing != data or hashlib.sha256(existing).hexdigest() != digest:
+                raise
+    relative = destination.relative_to(task_dir(paths, task_id)).as_posix()
+    return {"path": relative, "sha256": digest, "size_bytes": len(data)}
+
+
+def verify_generated_artifact_blob(
+    paths: HarnessPaths,
+    task_id: str,
+    artifact: dict[str, Any],
+    *,
+    label: str,
+    max_bytes: int = TERMINAL_ARTIFACT_MAX_BYTES,
+) -> bytes:
+    """Read back one canonical generated-artifact reference exactly."""
+
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "path",
+        "sha256",
+        "size_bytes",
+    }:
+        raise HarnessError(f"{label} reference schema is invalid")
+    digest = str(artifact.get("sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise HarnessError(f"{label} reference SHA-256 is invalid")
+    size = artifact.get("size_bytes")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+        or size > max_bytes
+    ):
+        raise HarnessError(f"{label} reference size is invalid")
+    expected = artifact_blob_path(paths, task_id, digest)
+    relative = expected.relative_to(task_dir(paths, task_id)).as_posix()
+    if artifact.get("path") != relative:
+        raise HarnessError(f"{label} reference path is not canonical")
+    _path, data = read_regular_artifact(expected, label, max_bytes=max_bytes)
+    if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        raise HarnessError(f"{label} reference bytes are missing or tampered")
+    return data
+
+
 def canonical_recovery_archive_member(member_name: str) -> str:
     """Return the canonical relative POSIX member name used in recovery receipts."""
 
@@ -777,8 +861,10 @@ __all__ = [
     "packet_recovery_integrity_errors",
     "prepare_bound_artifacts",
     "preserve_bound_artifacts",
+    "preserve_generated_artifact_blob",
     "read_recovery_tar_member",
     "read_regular_artifact",
     "recovery_record_preimage",
     "snapshot_evidence_artifact",
+    "verify_generated_artifact_blob",
 ]

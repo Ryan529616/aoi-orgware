@@ -162,6 +162,9 @@ class CriticalProjectionTests(unittest.TestCase):
 
 
 class CommandBehaviorTests(unittest.TestCase):
+    SEMANTIC_SHA_1 = "a" * 64
+    SEMANTIC_SHA_2 = "b" * 64
+
     def test_resolve_resume_task_uses_validated_session_mapping(self) -> None:
         paths = object()
         services = _services(check_session_id=lambda value: f"checked-{value}")
@@ -241,6 +244,267 @@ class CommandBehaviorTests(unittest.TestCase):
                 object(),
                 services=_services(),
             )
+
+    def test_status_json_without_since_preserves_machine_payload(self) -> None:
+        task = {"task_id": "task-a"}
+        structured = {
+            "token": "active-claim",
+            "task_id": "task-a",
+            "owner": "owner",
+            "status": "active",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "locks": ["repo:file:one.py"],
+        }
+        legacy = {
+            "legacy": True,
+            "token": "legacy-claim",
+            "status": "active",
+            "legacy_classification": "expired_unverified",
+        }
+        with (
+            mock.patch.object(status_cmds, "require_complete_layout"),
+            mock.patch.object(status_cmds, "load_all_tasks", return_value=[task]),
+            mock.patch.object(
+                status_cmds, "load_all_claims", return_value=[structured, legacy]
+            ),
+            mock.patch.object(
+                status_cmds,
+                "chief_authority_summary",
+                return_value={"status": "active"},
+            ),
+            mock.patch.object(
+                status_cmds, "task_summary", return_value={"task_id": "task-a"}
+            ),
+            mock.patch.object(status_cmds, "emit") as emit,
+        ):
+            result = status_cmds.cmd_status(
+                SimpleNamespace(
+                    critical=False, task=None, legacy=False, json=True, since=None
+                ),
+                SimpleNamespace(root=Path("root")),
+                services=_services(),
+            )
+        self.assertEqual(result, 0)
+        emit.assert_called_once_with(
+            {
+                "root": "root",
+                "chief_authority": {"status": "active"},
+                "tasks": [{"task_id": "task-a"}],
+                "structured_claims": [
+                    {
+                        "token": "active-claim",
+                        "task_id": "task-a",
+                        "owner": "owner",
+                        "status": "active",
+                        "expires_at": "2099-01-01T00:00:00+00:00",
+                        "expired_still_reserved": False,
+                        "locks": ["repo:file:one.py"],
+                    }
+                ],
+                "legacy_pending_count": 1,
+                "legacy_expired_unverified_count": 1,
+            },
+            True,
+        )
+
+    def test_bare_status_renders_compact_human_summary(self) -> None:
+        state = {
+            "task_id": "task-a",
+            "status": "active",
+            "profile": "full",
+            "phase": "implementing",
+            "revision": 4,
+            "owner": "root-owner",
+            "packets": [{"packet_id": "packet-a", "status": "queued"}],
+            "jobs": [{"run_id": "job-a", "status": "running"}],
+            "needs_user_escalations": [
+                {"escalation_id": "ask-user", "status": "needs_user"}
+            ],
+            "lanes": [{"lane_id": "lane-a", "status": "blocked"}],
+            "verification": [
+                {
+                    "category": "unit_test",
+                    "boundary": "Focused status tests passed\nsecondary detail",
+                }
+            ],
+            "risks": ["Runtime delivery remains unobserved"],
+            "next_action": "resolve the gate",
+        }
+        claims = [
+            {
+                "task_id": "task-a",
+                "token": "active-claim",
+                "owner": "owner",
+                "status": "active",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "task_id": "task-a",
+                "token": "stale-claim",
+                "owner": "owner",
+                "status": "active",
+                "expires_at": "2000-01-01T00:00:00+00:00",
+            },
+        ]
+        with (
+            mock.patch.object(
+                status_cmds,
+                "chief_authority_summary",
+                return_value={
+                    "status": "active",
+                    "session_id": "chief-session",
+                    "epoch": 3,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                },
+            ),
+            mock.patch.object(status_cmds, "is_semantic_v2_task", return_value=False),
+            mock.patch.object(
+                status_cmds,
+                "checkpoint_matches",
+                return_value=(False, "checkpoint revision differs from state revision"),
+            ),
+        ):
+            rendered = status_cmds._render_human_status(object(), [state], claims)
+        self.assertIn("Chief: active", rendered)
+        self.assertIn(
+            "Task task-a: active profile=full phase=implementing revision=4 owner=root-owner",
+            rendered,
+        )
+        self.assertIn("semantic-head: unavailable", rendered)
+        self.assertIn("claims: active=1", rendered)
+        self.assertIn("stale=1", rendered)
+        self.assertIn("job:job-a", rendered)
+        self.assertIn("needs-user: ask-user", rendered)
+        self.assertIn("blocked: lane-a", rendered)
+        self.assertIn("checkpoint revision differs from state revision", rendered)
+        self.assertIn("evidence: unit_test: Focused status tests passed", rendered)
+        self.assertIn("risks: Runtime delivery remains unobserved", rendered)
+        self.assertNotIn('"task_id"', rendered)
+
+    def test_bare_global_status_omits_terminal_tasks_but_json_contract_keeps_them(self) -> None:
+        active = {"task_id": "active-task", "status": "active", "revision": 1}
+        done = {"task_id": "done-task", "status": "done", "revision": 2}
+        with (
+            mock.patch.object(status_cmds, "require_complete_layout"),
+            mock.patch.object(status_cmds, "load_all_tasks", return_value=[active, done]),
+            mock.patch.object(status_cmds, "load_all_claims", return_value=[]),
+            mock.patch.object(
+                status_cmds, "chief_authority_summary", return_value={"status": "active"}
+            ),
+            mock.patch.object(status_cmds, "is_semantic_v2_task", return_value=False),
+            mock.patch.object(
+                status_cmds, "checkpoint_matches", return_value=(False, "not recorded")
+            ),
+            mock.patch.object(status_cmds, "emit") as emit,
+        ):
+            status_cmds.cmd_status(
+                SimpleNamespace(
+                    critical=False, task=None, legacy=False, json=False, since=None
+                ),
+                SimpleNamespace(root=Path("root")),
+                services=_services(),
+            )
+        rendered = emit.call_args.args[0]
+        self.assertIn("Task active-task:", rendered)
+        self.assertNotIn("Task done-task:", rendered)
+        self.assertIn("terminal tasks omitted: 1", rendered)
+
+    def test_status_since_current_head_returns_empty_delta_and_cursor(self) -> None:
+        events = [
+            {
+                "sequence": 1,
+                "event_sha256": self.SEMANTIC_SHA_1,
+                "event_type": "genesis",
+                "command_id": "genesis-command",
+            },
+            {
+                "sequence": 2,
+                "event_sha256": self.SEMANTIC_SHA_2,
+                "event_type": "advance",
+                "command_id": "advance-command",
+            },
+        ]
+        with (
+            mock.patch.object(
+                status_cmds, "load_task", return_value={"task_id": "semantic-task"}
+            ),
+            mock.patch.object(status_cmds, "is_semantic_v2_task", return_value=True),
+            mock.patch.object(status_cmds, "load_semantic_events", return_value=events),
+            mock.patch.object(status_cmds, "emit") as emit,
+        ):
+            result = status_cmds.cmd_status(
+                SimpleNamespace(
+                    critical=False,
+                    task="semantic-task",
+                    legacy=False,
+                    json=True,
+                    since=f"2:{self.SEMANTIC_SHA_2}",
+                ),
+                object(),
+                services=_services(),
+            )
+        self.assertEqual(result, 0)
+        emit.assert_called_once_with(
+            {
+                "task_id": "semantic-task",
+                "events": [],
+                "next_cursor": f"2:{self.SEMANTIC_SHA_2}",
+            },
+            True,
+        )
+
+    def test_status_since_rejects_malformed_or_unknown_cursor(self) -> None:
+        events = [
+            {
+                "sequence": 1,
+                "event_sha256": self.SEMANTIC_SHA_1,
+                "event_type": "genesis",
+                "command_id": "genesis-command",
+            }
+        ]
+        args = SimpleNamespace(
+            critical=False,
+            task="semantic-task",
+            legacy=False,
+            json=True,
+            since="not-a-cursor",
+        )
+        with (
+            mock.patch.object(
+                status_cmds, "load_task", return_value={"task_id": "semantic-task"}
+            ),
+            mock.patch.object(status_cmds, "is_semantic_v2_task", return_value=True),
+            mock.patch.object(status_cmds, "load_semantic_events", return_value=events),
+            mock.patch.object(status_cmds, "emit") as emit,
+        ):
+            with self.assertRaisesRegex(HarnessError, "malformed"):
+                status_cmds.cmd_status(args, object(), services=_services())
+            args.since = f"2:{self.SEMANTIC_SHA_2}"
+            with self.assertRaisesRegex(HarnessError, "unknown"):
+                status_cmds.cmd_status(args, object(), services=_services())
+        emit.assert_not_called()
+
+    def test_status_since_is_unavailable_for_legacy_task(self) -> None:
+        with (
+            mock.patch.object(
+                status_cmds, "load_task", return_value={"task_id": "legacy-task"}
+            ),
+            mock.patch.object(status_cmds, "is_semantic_v2_task", return_value=False),
+            mock.patch.object(status_cmds, "load_semantic_events") as events,
+        ):
+            with self.assertRaisesRegex(HarnessError, "unavailable for legacy"):
+                status_cmds.cmd_status(
+                    SimpleNamespace(
+                        critical=False,
+                        task="legacy-task",
+                        legacy=False,
+                        json=True,
+                        since=f"1:{self.SEMANTIC_SHA_1}",
+                    ),
+                    object(),
+                    services=_services(),
+                )
+        events.assert_not_called()
 
     def test_render_index_preserves_lock_and_write_order(self) -> None:
         paths = SimpleNamespace(index=Path("INDEX.md"))

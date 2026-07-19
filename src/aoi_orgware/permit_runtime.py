@@ -2639,11 +2639,11 @@ def inspect_permit_runtime(
                 ) from exc
             checked_marker = _validate_issuance_group(marker, task_id, group)
         elif marker["schema_version"] == COHORT_PERMIT_ISSUANCE_SCHEMA_VERSION:
-            binding = binding_by_sha256.get(marker["binding_sha256"])
-            if binding is None:
+            issuance_binding = binding_by_sha256.get(marker["binding_sha256"])
+            if issuance_binding is None:
                 # Objects-only issuance is valid before reservation.  Rebuild
                 # the exact detached binding shape from the marker itself.
-                binding = objects.create_semantic_binding(
+                issuance_binding = objects.create_semantic_binding(
                     binding_kind="cohort_advance",
                     task_id=task_id,
                     binding_key=marker["consumption_identity"],
@@ -2654,14 +2654,14 @@ def inspect_permit_runtime(
                     result_projection_sha256=marker["result_projection_sha256"],
                     object_sha256s=marker["object_sha256s"],
                 )
-                if binding["binding_sha256"] != marker["binding_sha256"]:
+                if issuance_binding["binding_sha256"] != marker["binding_sha256"]:
                     raise PermitRuntimeError(
                         "cohort permit issuance marker binding SHA-256 is invalid"
                     )
             try:
                 group = _cohort_contract_group(
                     [by_digest[digest] for digest in marker["object_sha256s"]],
-                    binding,
+                    issuance_binding,
                     task_id,
                 )
             except KeyError as exc:
@@ -2744,14 +2744,14 @@ def inspect_permit_runtime(
             identity, expected_receipt = _cohort_consumption_receipt(group)
             expected_event_type = _COHORT_EVENT_TYPE
         identity = permits.permit_consumption_identity(permit)
-        marker = issuance_by_permit.get(permit["permit_sha256"])
-        if marker is None:
+        issuance_marker = issuance_by_permit.get(permit["permit_sha256"])
+        if issuance_marker is None:
             raise PermitRuntimeError(
                 "permit consumption binding has no Chief issuance marker"
             )
         if (
-            marker["binding_sha256"] != binding["binding_sha256"]
-            or marker["planned_event_sha256"]
+            issuance_marker["binding_sha256"] != binding["binding_sha256"]
+            or issuance_marker["planned_event_sha256"]
             != binding["planned_event_sha256"]
         ):
             raise PermitRuntimeError(

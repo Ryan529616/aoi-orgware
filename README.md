@@ -84,11 +84,14 @@ question is unmeasured — see
 
 From the repository you want to govern, paste this into Codex or Claude Code:
 
-> Inspect https://github.com/Ryan529616/aoi-orgware, the latest published release
-> at https://pypi.org/project/aoi-orgware/, and my current repository without
-> modifying my project. Resolve that AOI release to an exact version, tag, and
-> commit, then show me the proposed AOI revision, project files, user-scope files,
-> hooks, and trust boundary. Wait for my approval. Install that exact published
+> Inspect https://github.com/Ryan529616/aoi-orgware, the reviewed local install
+> bundle at `<absolute-local-install-bundle-path>` with SHA-256
+> `<approved-local-install-bundle-sha256>`, and my current repository without
+> modifying my project. Use only `aoi-orgware==0.4.0a1` and the wheel whose
+> SHA-256 is bound by that bundle; do not infer unreleased bytes from GitHub or
+> PyPI. Then show
+> me the proposed AOI revision, project files, user-scope files,
+> hooks, and trust boundary. Wait for my approval. Install that exact reviewed
 > version in an isolated tool environment, use AOI's bootstrap flow when a
 > project-specific profile is justified, bind this repository to the current
 > coding-agent client, preserve unrelated settings, run AOI doctor and the
@@ -103,23 +106,44 @@ project hooks is a supply-chain and trust decision.
 
 ### Direct install
 
-> **This README documents the v0.3 alpha line.** The default install resolves to
-> the latest *stable* release (0.2.x), which does not have the governance-honesty
-> gates described below — `close-task --outcome`, `retarget-task`, and the
-> evidence self-reference gate are v0.3 only. Pass `--pre` to get the line this
-> page describes, and expect alpha breakage.
+> **This README documents the v0.4 alpha line.** Install exactly
+> `aoi-orgware==0.4.0a1` from an exact reviewed local-install bundle. A
+> `reviewed_local_install_bundle` has
+> `proof_scope=exact_local_wheel_install_only`: it is not a release record or
+> promotion, and it makes no tag, GitHub Release, or PyPI claim. Do not use an
+> unpinned install command or substitute a different alpha build.
 
-```bash
-uv tool install --prerelease=allow aoi-orgware   # or: pipx install --pip-args=--pre aoi-orgware
-                                                 # or: python -m pip install --pre aoi-orgware
+```powershell
+$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a1'
+python -m venv $aoiToolRoot
+$aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
+$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a1-py3-none-any.whl').Path
+$expectedWheelSha256 = '<reviewed-wheel-sha256>'
+if ((Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant() -ne $expectedWheelSha256) { throw 'wheel SHA-256 mismatch' }
+& $aoiPython -m pip install --isolated --no-index --no-deps $aoiWheel
+$aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
 
-# Run one of these from the repository you want to govern.
-aoi codex-init  --project-name "My Project" --json
-aoi claude-init --project-name "My Project" --json
+# Run from the repository to govern. Use the installed console launcher exactly.
+& $aoiLauncher codex-init `
+  --project-name 'My Project' `
+  --local-artifact-bundle-file 'C:\reviewed-local-install\reviewed-local-install-bundle.json' `
+  --expected-local-artifact-bundle-sha256 '<approved-local-install-bundle-sha256>' `
+  --json
 ```
 
-For a repeatable deployment, pin the reviewed release as
-`aoi-orgware==<reviewed-version>` instead of accepting a future update.
+`codex-init` accepts exactly one complete proof pair: the local pair shown
+above, or the public `--promotion-bundle-file` plus
+`--expected-promotion-bundle-sha256` pair. Half a pair, both pairs, or neither
+fails before mutation. On POSIX, invoke `<venv>/bin/aoi codex-init ...`, never
+the module entry point. The package version must report `0.4.0a1`. See the
+[v0.4 quickstart](docs/quickstart.md) for both routes and the complete
+isolated-install, mini-task, status, and offboarding sequence.
+
+The expected bundle value is the lowercase canonical digest recorded in the
+bundle's `bundle_sha256` field, not a raw-file SHA-256. For the local route, the
+bound source identity is review context: the bundle does not independently
+attest source-to-wheel derivation, the builder toolchain, or execution of the
+caller-supplied test summary.
 
 | Client | Repository-local integration | User-scope skill |
 |---|---|---|
@@ -127,8 +151,13 @@ For a repeatable deployment, pin the reviewed release as
 | Claude Code | `.claude/settings.json` | `$HOME/.claude/skills/aoi/SKILL.md` |
 
 Codex still requires the user to review and trust the exact hook definitions in
-its own `/hooks` UI; AOI does not cross that boundary on the user's behalf. See
-each command's `--help` and the [configuration guide](docs/configuration.md).
+its own `/hooks` UI; AOI does not cross that boundary on the user's behalf.
+Hook installation is not runtime trust. Current O6 evidence is focused/local;
+it has not proved live Codex `/hooks` delivery or a user trust decision. If an
+MCP registry is unavailable, that integration is **uncovered**, not implicitly
+trusted. A manual reviewer identity is likewise a cooperative assertion, not
+independent authentication. See each command's `--help` and the
+[configuration guide](docs/configuration.md).
 
 Requires Python 3.11+, Git, and Linux/WSL with reliable POSIX metadata or native
 Windows on an ordinary local filesystem. Do not alternate WSL and native-Windows
@@ -297,6 +326,8 @@ See the [evaluation protocol](docs/evaluation.md) and
 - [Architecture](docs/architecture.md)
 - [Operating policy](docs/POLICY.md)
 - [Configuration](docs/configuration.md)
+- [v0.4 quickstart](docs/quickstart.md)
+- [v0.4 implementation and migration plan](docs/v0.4-plan.md)
 - [Recovery and interrupted bootstrap](docs/recovery.md)
 - [Resource control](docs/resource_control.md)
 - [v0.3 development plan](docs/v0.3-plan.md)
@@ -317,8 +348,9 @@ cd aoi-orgware
 python -m venv .venv
 # PowerShell: .\.venv\Scripts\Activate.ps1
 # POSIX:      . .venv/bin/activate
-python -m pip install -e .
-python -m unittest discover -s tests -v
+python -m pip install --require-hashes -r requirements/release-tools.lock
+python -m pip install --no-build-isolation --no-deps -e .
+python -m pytest -q tests
 ```
 
 AOI is pure Python with no runtime dependencies. CI targets Linux and Windows on

@@ -2617,7 +2617,9 @@ def _open_atomic_temporary(path: Path, operation: str) -> tuple[int, Path]:
             continue
         try:
             if os.name != "nt":
-                os.fchmod(descriptor, 0o600)
+                # ``fchmod`` is absent from the Windows stdlib stub, but this
+                # branch is unreachable there and must keep POSIX files private.
+                getattr(os, "fchmod")(descriptor, 0o600)
         except BaseException:
             # The caller cannot clean resources that have not yet been
             # returned.  Keep allocation failure local and best-effort remove
@@ -3323,6 +3325,25 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
         raise HarnessError(
             f"unsupported resource session registration schema{where}"
         )
+    # Adoption is one-way but legacy projections intentionally remain readable.
+    # Keep this import local: integrity_records is a pure schema layer and must
+    # not create a harness import cycle.
+    if "integrity_contract" in state:
+        from .integrity_records import integrity_contract_errors
+
+        contract_errors = integrity_contract_errors(
+            state["integrity_contract"],
+            task_id=state.get("task_id"),
+            worktree=state.get("worktree"),
+            require_complete=(
+                state.get("status") == "done" or state.get("phase") == "closing"
+            ),
+        )
+        if contract_errors:
+            raise HarnessError(
+                f"task integrity contract is invalid{where}: "
+                + "; ".join(contract_errors)
+            )
     _validate_mini_finish_record(state, source)
 
 

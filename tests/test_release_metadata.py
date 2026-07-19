@@ -6,6 +6,7 @@ import contextlib
 import io
 import re
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -92,6 +93,27 @@ class ReleaseMetadataTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             dist_verify.build_parser().parse_args([])
 
+    def test_release_verifier_scrubs_ambient_python_and_pip_configuration(self) -> None:
+        with mock.patch.dict(
+            dist_verify.os.environ,
+            {
+                "PIP_INDEX_URL": "https://attacker.invalid/simple",
+                "PIP_CONFIG_FILE": "attacker-pip.conf",
+                "PYTHONPATH": "attacker-imports",
+                "PYTHONHOME": "attacker-home",
+                "VIRTUAL_ENV": "attacker-venv",
+                "SAFE": "retained",
+            },
+            clear=True,
+        ):
+            environment = dist_verify._isolated_environment()
+        self.assertEqual(environment["SAFE"], "retained")
+        self.assertEqual(environment["PIP_CONFIG_FILE"], dist_verify.os.devnull)
+        self.assertEqual(environment["PIP_NO_INDEX"], "1")
+        self.assertTrue(environment["PYTHONNOUSERSITE"] == "1")
+        self.assertFalse(any(name.startswith(("PIP_", "PYTHON")) and name not in {"PIP_CONFIG_FILE", "PIP_DISABLE_PIP_VERSION_CHECK", "PIP_NO_INDEX", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE"} for name in environment))
+        self.assertNotIn("VIRTUAL_ENV", environment)
+
     def test_release_verifier_rejects_extra_entries_and_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -111,11 +133,128 @@ class ReleaseMetadataTests(unittest.TestCase):
             ), mock.patch.object(
                 dist_verify,
                 "_verify_installed_artifact",
-                side_effect=["0.3.0a2", "0.3.0a2"],
+                return_value="0.3.0a2",
+            ), mock.patch.object(
+                dist_verify,
+                "_verify_sdist_via_derived_wheel",
+                return_value="0.3.0a2",
             ), self.assertRaisesRegex(
                 dist_verify.VerificationError, "release expectation"
             ):
                 dist_verify.verify_dist(root, expected_version="0.3.0a1")
+
+    def test_release_verifier_derives_a_wheel_from_the_exact_sdist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "candidate.whl"
+            sdist = root / "candidate.tar.gz"
+            wheel.write_bytes(b"wheel")
+            sdist.write_bytes(b"sdist")
+            with mock.patch.object(
+                dist_verify, "_validate_archive_contents", return_value=None
+            ), mock.patch.object(
+                dist_verify,
+                "_verify_installed_artifact",
+                return_value="0.3.0a1",
+            ) as installed, mock.patch.object(
+                dist_verify,
+                "_verify_sdist_via_derived_wheel",
+                return_value="0.3.0a1",
+            ) as derived:
+                dist_verify.verify_dist(root, expected_version="0.3.0a1")
+
+            installed.assert_called_once_with(wheel)
+            derived.assert_called_once_with(
+                sdist,
+                build_python=Path(sys.executable),
+                expected_build_version=dist_verify.BUILD_FRONTEND_VERSION,
+                expected_hatchling_version=dist_verify.HATCHLING_VERSION,
+            )
+
+    def test_release_verifier_rejects_a_mismatched_build_backend(self) -> None:
+        probe = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"build": "0.0.0", "hatchling": "1.27.0"}\n',
+            stderr="",
+        )
+        with mock.patch.object(dist_verify, "_run", return_value=probe), self.assertRaisesRegex(
+            dist_verify.VerificationError, "build backend versions differ"
+        ):
+            dist_verify._verify_build_backend(
+                Path(sys.executable),
+                expected_build_version="1.5.0",
+                expected_hatchling_version="1.27.0",
+                cwd=REPO,
+                env=dist_verify._isolated_environment(),
+            )
+
+    def test_sdist_build_preserves_a_symlinked_virtualenv_python(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdist = root / "candidate.tar.gz"
+            sdist.write_bytes(b"placeholder")
+            build_python = root / "release-tools-python"
+            try:
+                build_python.symlink_to(Path(sys.executable).resolve())
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+
+            source_root = root / "source-root"
+            source_root.mkdir()
+            calls: list[list[str | Path]] = []
+
+            def run_build(command, *, cwd, env, timeout=180):  # type: ignore[no-untyped-def]
+                rendered = list(command)
+                calls.append(rendered)
+                if "-c" in rendered:
+                    return subprocess.CompletedProcess(
+                        args=rendered,
+                        returncode=0,
+                        stdout='{"build": "1.5.0", "hatchling": "1.27.0"}\n',
+                        stderr="",
+                    )
+                output = Path(rendered[rendered.index("--outdir") + 1])
+                output.mkdir(exist_ok=True)
+                (output / "derived.whl").write_bytes(b"wheel")
+                return subprocess.CompletedProcess(
+                    args=rendered,
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+
+            with mock.patch.object(
+                dist_verify, "_extract_sdist", return_value=source_root
+            ), mock.patch.object(
+                dist_verify, "_verify_installed_artifact", return_value="0.4.0a1"
+            ), mock.patch.object(dist_verify, "_run", side_effect=run_build):
+                version = dist_verify._verify_sdist_via_derived_wheel(
+                    sdist,
+                    build_python=build_python,
+                    expected_build_version="1.5.0",
+                    expected_hatchling_version="1.27.0",
+                )
+
+            self.assertEqual(version, "0.4.0a1")
+            build_call = next(command for command in calls if "build" in command)
+            self.assertEqual(Path(build_call[0]), build_python.absolute())
+            self.assertNotEqual(Path(build_call[0]), Path(sys.executable).resolve())
+
+    def test_release_verifier_rejects_multi_root_sdist_before_building(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdist = root / "candidate.tar.gz"
+            with tarfile.open(sdist, "w:gz") as archive:
+                for name in ("first/pyproject.toml", "second/pyproject.toml"):
+                    payload = b"[build-system]\n"
+                    member = tarfile.TarInfo(name)
+                    member.size = len(payload)
+                    archive.addfile(member, io.BytesIO(payload))
+            with self.assertRaisesRegex(
+                dist_verify.VerificationError, "one top-level source directory"
+            ):
+                dist_verify._extract_sdist(sdist, root / "extracted")
 
     def test_workflow_binds_expected_version_and_smokes_windows_artifact(self) -> None:
         workflow = (REPO / ".github" / "workflows" / "test.yml").read_text(
@@ -123,7 +262,15 @@ class ReleaseMetadataTests(unittest.TestCase):
         )
         self.assertIn("--expected-version", workflow)
         self.assertIn("package-windows-smoke:", workflow)
-        self.assertIn("actions/download-artifact@v4", workflow)
+        self.assertIn(
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+            workflow,
+        )
+        self.assertNotIn("actions/download-artifact@v", workflow)
+        self.assertGreaterEqual(workflow.count("requirements/release-tools.lock"), 4)
+        self.assertEqual(workflow.count("--build-python"), 2)
+        self.assertEqual(workflow.count("--expected-build-version 1.5.0"), 2)
+        self.assertEqual(workflow.count("--expected-hatchling-version 1.27.0"), 2)
 
     def test_publish_workflow_consumes_the_dynamic_version_and_shared_verifier(
         self,
@@ -132,10 +279,18 @@ class ReleaseMetadataTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(VERSION_PATH, workflow)
-        self.assertIn("project_metadata.get(\"dynamic\")", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("inputs.intent", workflow)
         self.assertIn("scripts/verify_dist.py", workflow)
-        self.assertNotIn('["project"]["version"]', workflow)
-        self.assertNotIn('Path("src/aoi_orgware/__init__.py")', workflow)
+        self.assertIn("scripts/release_inventory.py", workflow)
+        self.assertIn("scripts/release_rehearsal.py", workflow)
+        self.assertIn("scripts/release_pypi_readback.py", workflow)
+        self.assertIn('"pytest==8.4.2"', workflow)
+        self.assertIn('"hatchling==1.27.0"', workflow)
+        self.assertIn("--no-isolation", workflow)
+        self.assertIn("--build-python", workflow)
+        self.assertNotIn("AOI_CHIEF_", workflow)
+        self.assertNotIn("release-promote", workflow)
 
 
 if __name__ == "__main__":

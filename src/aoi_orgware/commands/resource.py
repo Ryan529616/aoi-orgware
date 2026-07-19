@@ -1123,6 +1123,10 @@ def cmd_codex_config_rollback(
                 "resource config event is not the unique effective-current apply"
             )
         event = matches[0]
+        if event is None:
+            raise HarnessError(
+                "resource config event is not the unique effective-current apply"
+            )
         receipt_path = Path(str(event.get("receipt_path", "")))
         expected_receipt_path = (
             task_dir(paths, state["task_id"])

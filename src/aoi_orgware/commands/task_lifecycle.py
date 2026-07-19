@@ -970,17 +970,35 @@ def cmd_init_task(args: argparse.Namespace, paths: HarnessPaths, *, services: Ta
     return 0
 
 
+def _mini_default_token(task_id: str, objective: str) -> str:
+    """Return one stable, valid claim id without copying prose into authority."""
+
+    digest = hashlib.sha256(
+        f"{task_id}\0{objective}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"mini-{digest}"
+
+
 def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices) -> int:
     task_id = validate_id(args.task_id, "task id")
-    token = validate_id(args.token, "claim token")
+    objective = require_text(args.objective, "objective")
+    token = validate_id(
+        args.token or _mini_default_token(task_id, objective), "claim token"
+    )
     session_id = services.check_session_id(args.session_id)
     locks = services.validate_mini_locks(args.lock)
-    title = require_text(args.title, "title")
-    objective = require_text(args.objective, "objective")
+    title = require_text(args.title or objective, "title")
     owner = require_text(args.owner, "owner")
-    completion = require_text(args.completion_boundary, "completion boundary")
-    intent = require_text(args.intent, "intent")
-    validation = require_text(args.validation, "validation")
+    completion = require_text(
+        args.completion_boundary
+        or f"The mini objective is complete and focused verification passes: {objective}",
+        "completion boundary",
+    )
+    intent = require_text(args.intent or objective, "intent")
+    validation = require_text(
+        args.validation or f"Focused verification demonstrates: {objective}",
+        "validation",
+    )
     metadata = git_metadata(Path(args.worktree) if args.worktree else paths.root)
     mini_worktree = Path(metadata["worktree"])
     locks = list(
@@ -2063,17 +2081,23 @@ def register_task_lifecycle_commands(
 
     parser = subparsers.add_parser("start-mini")
     parser.add_argument("--task-id", required=True)
-    parser.add_argument("--title", required=True)
+    parser.add_argument("--title", help="defaults to --objective")
     parser.add_argument("--objective", required=True)
     parser.add_argument("--owner", required=True)
-    parser.add_argument("--completion-boundary", required=True)
+    parser.add_argument(
+        "--completion-boundary",
+        help="defaults to an objective-bound focused-verification boundary",
+    )
     parser.add_argument("--next-action")
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--worktree")
-    parser.add_argument("--token", required=True)
+    parser.add_argument("--token", help="defaults to a stable task/objective digest")
     parser.add_argument("--lock", action="append", required=True)
-    parser.add_argument("--intent", required=True)
-    parser.add_argument("--validation", required=True)
+    parser.add_argument("--intent", help="defaults to --objective")
+    parser.add_argument(
+        "--validation",
+        help="defaults to an objective-bound focused-verification statement",
+    )
     parser.add_argument("--expires-at", required=True)
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["start_mini"])

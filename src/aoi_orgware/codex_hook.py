@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,11 @@ SUBAGENT_PARENT_MAPPING_KIND = "subagent_parent"
 STARTUP_RECEIPT_WARNING = (
     "Fresh-session registration is unavailable until a valid startup. "
 )
+PRETOOL_FAIL_CLOSED_DENY_MESSAGE = "AOI receipt store unavailable; PreToolUse is denied."
+# Kept as a compatibility alias for callers that previously named only the
+# receipt-store failure.  Every internal PreToolUse fault now shares this exact
+# non-diagnostic denial.
+RECEIPT_STORE_DENY_MESSAGE = PRETOOL_FAIL_CLOSED_DENY_MESSAGE
 
 
 def root_path() -> Path:
@@ -35,7 +41,22 @@ def read_input() -> dict[str, Any]:
     if len(payload) > HOOK_INPUT_MAX_BYTES:
         raise ValueError("hook payload exceeds the supported size")
     raw = payload.decode("utf-8-sig")
-    value = json.loads(raw or "{}")
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("hook payload has a duplicate JSON field")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"hook payload has non-finite JSON number: {value}")
+
+    value = json.loads(
+        raw or "{}",
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
     return value if isinstance(value, dict) else {}
 
 
@@ -52,6 +73,425 @@ def exact_payload_string(payload: dict[str, Any], key: str) -> str:
 
     value = payload.get(key)
     return value if type(value) is str else ""
+
+
+def _json_sha256(value: Any) -> str:
+    raw = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(raw) > HOOK_INPUT_MAX_BYTES:
+        raise ValueError("hook observation exceeds the supported size")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _observation(value: Any) -> dict[str, str | None]:
+    if value is None:
+        return {"status": "missing", "value": None}
+    if type(value) is not str:
+        return {"status": "invalid_type", "value": None}
+    if not value or len(value) > 4096 or "\x00" in value:
+        return {"status": "unsafe", "value": None}
+    return {"status": "observed", "value": value}
+
+
+def _tool_event_identity(payload: dict[str, Any]) -> dict[str, str]:
+    session_id = exact_payload_string(payload, "session_id")
+    turn_id = exact_payload_string(payload, "turn_id")
+    tool_use_id = exact_payload_string(payload, "tool_use_id")
+    if not all((session_id, turn_id, tool_use_id)):
+        raise ValueError("tool hook identity is incomplete")
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "tool_use_id": tool_use_id,
+    }
+
+
+def _stop_event_identity(payload: dict[str, Any]) -> dict[str, str]:
+    session_id = exact_payload_string(payload, "session_id")
+    turn_id = exact_payload_string(payload, "turn_id")
+    agent_id = exact_payload_string(payload, "agent_id")
+    if not all((session_id, turn_id, agent_id)):
+        raise ValueError("subagent stop identity is incomplete")
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "agent_id": agent_id,
+        # SubagentStop has no separate event id.  One child turn emits its stop
+        # lifecycle event under the observed turn id.
+        "event_id": turn_id,
+    }
+
+
+def _semantic_v2_mapping(
+    root: Path, session_id: str
+) -> tuple[str, tuple[dict[str, Any], Path] | None]:
+    """Recognize only an exact v2 session mapping without reading state.json."""
+
+    if not session_id or len(session_id) > 512 or "\x00" in session_id:
+        return "corrupt", None
+    paths = get_paths(root)
+    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    mapping_path = paths.sessions / f"{key}.json"
+    try:
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        if not isinstance(mapping, dict) or mapping.get("session_id") != session_id:
+            return "corrupt", None
+        task_id = mapping.get("task_id")
+        if type(task_id) is not str or not SAFE_TASK_ID.fullmatch(task_id):
+            return "corrupt", None
+        task_dir = paths.tasks / task_id
+        if not is_semantic_v2_task(paths, task_id):
+            return "corrupt", None
+        if mapping.get("mapping_kind", ROOT_SESSION_MAPPING_KIND) not in {
+            ROOT_SESSION_MAPPING_KIND,
+            SUBAGENT_PARENT_MAPPING_KIND,
+        }:
+            return "corrupt", None
+        return "v2", ({"task_id": task_id}, task_dir)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return "corrupt", None
+
+
+def tool_session_state(
+    root: Path, session_id: str
+) -> tuple[str, tuple[dict[str, Any], Path] | None]:
+    status, mapped = session_state(root, session_id)
+    if status != "corrupt":
+        return status, mapped
+    return _semantic_v2_mapping(root, session_id)
+
+
+def _mapping_observation(
+    status: str, mapped: tuple[dict[str, Any], Path] | None
+) -> dict[str, Any]:
+    if status in {"valid", "subagent_parent", "v2"} and mapped:
+        task_id = mapped[0].get("task_id")
+        if type(task_id) is str and task_id:
+            return {
+                "status": "mapped",
+                "task_id": {"status": "observed", "value": task_id},
+            }
+    if status == "unbound":
+        return {
+            "status": "missing",
+            "task_id": {"status": "missing", "value": None},
+        }
+    return {
+        "status": "mismatch",
+        "task_id": {"status": "unsafe", "value": None},
+    }
+
+
+def _claim_snapshot_observation(
+    paths: Any,
+    status: str,
+    mapped: tuple[dict[str, Any], Path] | None,
+) -> dict[str, str | None]:
+    if status != "valid" or mapped is None:
+        return {"status": "missing", "value": None}
+    try:
+        from .harnesslib import claims_for_task
+
+        claims = claims_for_task(paths, mapped[0], validate_reserving=False)
+        return {"status": "observed", "value": _json_sha256(claims)}
+    except Exception:
+        return {"status": "unsafe", "value": None}
+
+
+def _is_direct_aoi_path(value: str) -> bool:
+    normalized = value.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized == ".aoi" or normalized.startswith(".aoi/")
+
+
+def _direct_aoi_targets(tool_name: str, tool_input: Any) -> tuple[str, ...]:
+    """Return exact direct AOI-state mutation targets for a mandatory deny."""
+
+    if not isinstance(tool_input, dict):
+        return ()
+    command = tool_input.get("command")
+    if type(command) is not str or not command:
+        return ()
+    raw_targets: list[str] = []
+    if tool_name == "apply_patch":
+        for line in command.splitlines():
+            match = re.fullmatch(r"\*\*\* (?:Add|Update|Delete) File: (.+)", line)
+            moved = re.fullmatch(r"\*\*\* Move to: (.+)", line)
+            raw = match.group(1) if match else moved.group(1) if moved else ""
+            if raw and _is_direct_aoi_path(raw):
+                raw_targets.append(raw.replace("\\", "/"))
+    elif tool_name in {"Bash", "shell_command"}:
+        if any(character in command for character in "\r\n;&|<>`$*?[]{}()"):
+            return ()
+        try:
+            words = shlex.split(command, posix=True)
+        except ValueError:
+            return ()
+        mutators = {
+            "mkdir",
+            "touch",
+            "rm",
+            "remove",
+            "cp",
+            "copy",
+            "mv",
+            "move",
+            "new-item",
+            "remove-item",
+            "copy-item",
+            "move-item",
+            "set-content",
+            "add-content",
+            "out-file",
+        }
+        if words and words[0].lower() in mutators:
+            raw_targets.extend(
+                word.replace("\\", "/")
+                for word in words[1:]
+                if not word.startswith("-") and _is_direct_aoi_path(word)
+            )
+    return tuple(sorted({f"repo:file:{target}" for target in raw_targets}))
+
+
+def _pretool_receipt(
+    root: Path, payload: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    from .codex_adapter_contracts import (
+        CODEX_PRETOOL_CLAIM_DECISION_V1,
+        seal_codex_pretool_claim_decision_receipt,
+    )
+    from .codex_tool_paths import claim_gate_decision, parse_codex_tool_targets
+
+    identity = _tool_event_identity(payload)
+    tool_name = exact_payload_string(payload, "tool_name")
+    if not tool_name:
+        raise ValueError("PreToolUse tool_name is incomplete")
+    tool_input = payload.get("tool_input")
+    input_sha256 = _json_sha256(tool_input)
+    paths = get_paths(root)
+    mapping_status, mapped = tool_session_state(root, identity["session_id"])
+    direct_aoi = _direct_aoi_targets(tool_name, tool_input)
+    parsed = parse_codex_tool_targets(tool_name, tool_input)
+    if direct_aoi:
+        decision = "deny"
+        coverage = "unclaimed"
+        targets = list(direct_aoi)
+        reason = "direct_aoi_state_mutation_denied"
+    else:
+        state = mapped[0] if mapped else {}
+        gate = claim_gate_decision(
+            paths,
+            state,
+            parsed,
+            mapping_status=mapping_status,
+            mapping_task_id=(
+                state.get("task_id") if type(state.get("task_id")) is str else None
+            ),
+        )
+        decision = gate.decision
+        coverage = (
+            "covered"
+            if gate.covered
+            else "unclaimed"
+            if gate.decision == "deny"
+            else "uncovered"
+        )
+        targets = list(gate.targets)
+        reason = gate.reason
+    receipt = seal_codex_pretool_claim_decision_receipt(
+        {
+            "receipt_type": CODEX_PRETOOL_CLAIM_DECISION_V1,
+            "event_identity": identity,
+            "tool_name": tool_name,
+            "input_sha256": input_sha256,
+            "parser": {"id": "aoi-codex-tool-targets", "version": "1"},
+            "targets": sorted(targets),
+            "session_mapping": _mapping_observation(mapping_status, mapped),
+            "claim_snapshot_sha256": _claim_snapshot_observation(
+                paths, mapping_status, mapped
+            ),
+            "claim_coverage": coverage,
+            "decision": decision,
+            "provider_verification": "unavailable",
+            "profile_verification": "unavailable",
+            "sandbox_verification": "unavailable",
+        }
+    )
+    return receipt, reason
+
+
+def _deny_pretool_fail_closed() -> None:
+    """Emit the sole non-diagnostic response for an internal PreToolUse fault."""
+
+    write_output(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": PRETOOL_FAIL_CLOSED_DENY_MESSAGE,
+            }
+        }
+    )
+
+
+def pre_tool_use(root: Path, payload: dict[str, Any]) -> None:
+    from .codex_hook_receipts import store_codex_hook_receipt
+
+    try:
+        # Identity extraction, receipt sealing/schema validation, target parsing,
+        # claim resolution, and durable storage are one cooperative permission
+        # boundary.  No internal failure may be reclassified as an allow.
+        receipt, reason = _pretool_receipt(root, payload)
+        store_codex_hook_receipt(get_paths(root), receipt)
+    except Exception:
+        _deny_pretool_fail_closed()
+        return
+    if receipt["decision"] == "deny":
+        write_output(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "AOI cooperative claim gate denied this exact target "
+                        f"({reason})."
+                    ),
+                }
+            }
+        )
+        return
+    allow()
+
+
+def post_tool_use(root: Path, payload: dict[str, Any]) -> None:
+    from .codex_adapter_contracts import (
+        CODEX_POSTTOOL_MUTATION_OBSERVATION_V1,
+        CODEX_PRETOOL_CLAIM_DECISION_V1,
+        seal_codex_posttool_mutation_observation_receipt,
+    )
+    from .codex_hook_receipts import (
+        load_codex_hook_receipt_by_identity,
+        store_codex_hook_receipt,
+    )
+
+    identity = _tool_event_identity(payload)
+    paths = get_paths(root)
+    pre = load_codex_hook_receipt_by_identity(
+        paths,
+        receipt_type=CODEX_PRETOOL_CLAIM_DECISION_V1,
+        event_identity=identity,
+    )
+    input_sha256 = _json_sha256(payload.get("tool_input"))
+    if pre["input_sha256"] != input_sha256:
+        raise ValueError("PostToolUse input differs from its PreToolUse receipt")
+    receipt = seal_codex_posttool_mutation_observation_receipt(
+        {
+            "receipt_type": CODEX_POSTTOOL_MUTATION_OBSERVATION_V1,
+            "event_identity": identity,
+            "pre_receipt_sha256": pre["receipt_sha256"],
+            "input_sha256": input_sha256,
+            "response_sha256": _json_sha256(payload.get("tool_response")),
+            "targets": pre["targets"],
+            # Codex emits PostToolUse only after the tool produced a successful
+            # output.  This observes completion, not a verified filesystem diff.
+            "tool_completion_observed": True,
+            "mutation_effect_verified": {"status": "unavailable"},
+        }
+    )
+    store_codex_hook_receipt(paths, receipt)
+    allow()
+
+
+def subagent_stop(root: Path, payload: dict[str, Any]) -> None:
+    if payload.get("stop_hook_active") is True:
+        allow()
+        return
+    from .codex_adapter_contracts import (
+        CODEX_SUBAGENT_STOP_V1,
+        seal_codex_subagent_stop_receipt,
+    )
+    from .codex_hook_receipts import (
+        CodexHookReceiptError,
+        load_codex_hook_receipt_by_identity,
+        store_codex_hook_receipt,
+    )
+    from .harnesslib import now_iso
+
+    identity = _stop_event_identity(payload)
+    transcript = payload.get("agent_transcript_path")
+    if transcript is None:
+        transcript = payload.get("transcript_path")
+    message = payload.get("last_assistant_message")
+    last_message: dict[str, dict[str, str | None]]
+    if type(message) is str:
+        raw_message = message.encode("utf-8")
+        last_message = {
+            "sha256": {
+                "status": "observed",
+                "value": hashlib.sha256(raw_message).hexdigest(),
+            },
+            "size_bytes": {"status": "observed", "value": str(len(raw_message))},
+            "presence": {"status": "observed", "value": "present"},
+        }
+    elif message is None:
+        last_message = {
+            "sha256": {"status": "missing", "value": None},
+            "size_bytes": {"status": "missing", "value": None},
+            "presence": {"status": "observed", "value": "absent"},
+        }
+    else:
+        last_message = {
+            "sha256": {"status": "invalid_type", "value": None},
+            "size_bytes": {"status": "invalid_type", "value": None},
+            "presence": {"status": "invalid_type", "value": None},
+        }
+    paths = get_paths(root)
+    observations = {
+        "transcript_path_observation": _observation(transcript),
+        "last_assistant_message": last_message,
+        "model_observation": _observation(payload.get("model")),
+        "permission_mode_observation": _observation(payload.get("permission_mode")),
+        # v0.3 start observations are not sealed O6 adapter receipts.  Do not
+        # relabel their digest as a start receipt merely to claim a stronger
+        # correlation than the available platform evidence.
+        "start_correlation": {
+            "status": "missing",
+            "start_receipt_sha256": {"status": "missing", "value": None},
+        },
+        "no_material_work_verified": False,
+    }
+    try:
+        existing = load_codex_hook_receipt_by_identity(
+            paths,
+            receipt_type=CODEX_SUBAGENT_STOP_V1,
+            event_identity=identity,
+        )
+    except CodexHookReceiptError as exc:
+        if "missing" not in str(exc):
+            raise
+    else:
+        if all(existing.get(key) == value for key, value in observations.items()):
+            allow()
+            return
+        raise CodexHookReceiptError(
+            "SubagentStop replay has divergent observations for one event identity"
+        )
+    receipt = seal_codex_subagent_stop_receipt(
+        {
+            "receipt_type": CODEX_SUBAGENT_STOP_V1,
+            "event_identity": identity,
+            "observed_at": now_iso(),
+            **observations,
+        }
+    )
+    store_codex_hook_receipt(paths, receipt)
+    allow()
 
 
 def session_state(
@@ -485,8 +925,8 @@ def stop(root: Path, payload: dict[str, Any]) -> None:
     allow()
 
 
-def dispatch(payload: dict[str, Any]) -> None:
-    root = root_path()
+def dispatch(payload: dict[str, Any], *, project_root: Path | None = None) -> None:
+    root = project_root if project_root is not None else root_path()
     event = str(payload.get("hook_event_name", ""))
     if event == "SessionStart":
         session_start(root, payload)
@@ -494,6 +934,12 @@ def dispatch(payload: dict[str, Any]) -> None:
         user_prompt_submit(root, payload)
     elif event == "SubagentStart":
         subagent_start(root, payload)
+    elif event == "SubagentStop":
+        subagent_stop(root, payload)
+    elif event == "PreToolUse":
+        pre_tool_use(root, payload)
+    elif event == "PostToolUse":
+        post_tool_use(root, payload)
     elif event == "Stop":
         stop(root, payload)
     else:
@@ -505,12 +951,46 @@ def main() -> int:
         description="Optional fail-open Codex lifecycle adapter for AOI"
     )
     parser.add_argument("--hook-version", required=True)
+    parser.add_argument("--project-root")
+    parser.add_argument("--provenance-sha256")
     args = parser.parse_args()
-    if args.hook_version != SUPPORTED_HOOK_VERSION:
+    if (
+        args.hook_version != SUPPORTED_HOOK_VERSION
+        or not args.project_root
+        or not args.provenance_sha256
+    ):
+        # Legacy/unbound hook definitions must not become an argparse failure
+        # that strands Codex.  They also must not process the event as trusted.
         allow()
         return 0
     try:
-        dispatch(read_input())
+        from .codex_install_provenance import verify_runtime_hook_provenance
+
+        project_root = Path(args.project_root)
+        verify_runtime_hook_provenance(
+            project_root,
+            args.provenance_sha256,
+            Path(sys.argv[0]),
+        )
+        # Provenance is checked before reading stdin so a stale or shadowed
+        # launcher cannot process a payload under a trusted project identity.
+        payload = read_input()
+    except Exception:
+        # Hooks must never strand a task because the local harness is missing or
+        # malformed. Doctor/status expose the defect on the next normal turn.
+        allow()
+        return 0
+    if exact_payload_string(payload, "hook_event_name") == "PreToolUse":
+        try:
+            dispatch(payload, project_root=project_root)
+        except Exception:
+            # This is a second fence for failures before PreToolUse reaches its
+            # own boundary; other lifecycle receipts keep their honest
+            # fail-open adapter semantics below.
+            _deny_pretool_fail_closed()
+        return 0
+    try:
+        dispatch(payload, project_root=project_root)
     except Exception:
         # Hooks must never strand a task because the local harness is missing or
         # malformed. Doctor/status expose the defect on the next normal turn.

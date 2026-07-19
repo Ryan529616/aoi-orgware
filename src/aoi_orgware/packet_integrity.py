@@ -69,6 +69,27 @@ DISPATCH_PROVENANCES = {
     *HOOK_OBSERVED_DISPATCH_PROVENANCES,
     "manual_unverified",
 }
+EXACT_COMMAND_NORMALIZATION_V1 = "terminal-whitespace-lf-v1"
+
+
+def normalize_exact_command_bytes(value: bytes) -> bytes:
+    """Canonicalize text-only command authority without changing line bodies.
+
+    CRLF/CR become LF and terminal spaces, tabs, and blank lines collapse to
+    one final newline.  Whitespace inside a line remains byte-significant.
+    """
+
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError("exact command artifact must be UTF-8") from exc
+    if "\x00" in text:
+        raise HarnessError("exact command artifact may not contain NUL")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.rstrip(" \t\n")
+    if not normalized:
+        raise HarnessError("exact command artifact may not be empty")
+    return (normalized + "\n").encode("utf-8")
 
 
 class ValidatePacketResourceEnvelope(Protocol):
@@ -147,13 +168,35 @@ def packet_command_integrity_error(packet: dict[str, Any]) -> str | None:
     if mode != "exact_command":
         return f"packet {packet.get('packet_id')} has invalid packet mode {mode!r}"
     path = Path(str(packet.get("command_path", "")))
+    try:
+        _, data = read_regular_artifact(
+            path,
+            "exact command artifact",
+            max_bytes=COMMAND_ARTIFACT_MAX_BYTES,
+            require_utf8=True,
+        )
+    except HarnessError:
+        return f"packet {packet.get('packet_id')} exact command artifact is missing/non-regular"
+    # The recorded command is the primary evidence for exact-command packets.
+    # Validate its regular-file boundary before metadata, so an empty or absent
+    # command_path cannot be masked by missing digest fields.
     expected_sha = str(packet.get("command_sha256", ""))
     expected_size = packet.get("command_size_bytes")
-    if not path.is_file() or path.is_symlink():
-        return f"packet {packet.get('packet_id')} exact command artifact is missing/non-regular"
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
         return f"packet {packet.get('packet_id')} exact command SHA-256 is invalid"
-    if sha256_file(path) != expected_sha or path.stat().st_size != expected_size:
+    normalization = packet.get("command_normalization")
+    if normalization not in {None, "", EXACT_COMMAND_NORMALIZATION_V1}:
+        return f"packet {packet.get('packet_id')} exact command normalization is invalid"
+    try:
+        if normalization == EXACT_COMMAND_NORMALIZATION_V1:
+            if data != normalize_exact_command_bytes(data):
+                return f"packet {packet.get('packet_id')} exact command artifact identity mismatch"
+            for field in ("command_source_sha256", "command_supplied_sha256"):
+                if not re.fullmatch(r"[0-9a-f]{64}", str(packet.get(field, ""))):
+                    return f"packet {packet.get('packet_id')} exact command source identity is invalid"
+    except HarnessError:
+        return f"packet {packet.get('packet_id')} exact command artifact is missing/non-regular"
+    if hashlib.sha256(data).hexdigest() != expected_sha or len(data) != expected_size:
         return f"packet {packet.get('packet_id')} exact command artifact identity mismatch"
     return None
 
@@ -207,6 +250,25 @@ def packet_contract_integrity_error(
             return f"packet {packet_id} contract lost its exact resource authority"
     elif resource_digest_lines or "## AOI resource authority" in contract_lines:
         return f"packet {packet_id} contract resource authority was removed from state"
+    command_authority = "## Exact command authority" in contract_lines
+    if packet.get("packet_mode") == "exact_command":
+        expected_command_lines = {
+            f"- Path: `{packet.get('command_path', '')}`",
+            f"- SHA-256: `{packet.get('command_sha256', '')}`",
+            f"- Size: `{packet.get('command_size_bytes', '')}` bytes",
+        }
+        if packet.get("command_normalization") == EXACT_COMMAND_NORMALIZATION_V1:
+            expected_command_lines.update(
+                {
+                    f"- Normalization: `{EXACT_COMMAND_NORMALIZATION_V1}`",
+                    f"- Source SHA-256: `{packet.get('command_source_sha256', '')}`",
+                    f"- Supplied SHA-256: `{packet.get('command_supplied_sha256', '')}`",
+                }
+            )
+        if not command_authority or not expected_command_lines.issubset(contract_lines):
+            return f"packet {packet_id} contract lost its exact command authority"
+    elif command_authority:
+        return f"packet {packet_id} contract command authority was removed from state"
     helper_budget = packet.get("helper_spawn_budget", 0)
     helper_budget_lines = [
         line
@@ -1096,6 +1158,7 @@ __all__ = [
     "ActiveDispatchAttempt",
     "DISPATCH_ARM_MAX_SECONDS",
     "DISPATCH_PROVENANCES",
+    "EXACT_COMMAND_NORMALIZATION_V1",
     "DispatchAttemptAuthoritySha256",
     "HOOK_ID_RE",
     "HOOK_PROTOCOL_VERSION",
@@ -1116,6 +1179,7 @@ __all__ = [
     "packet_lock_integrity_errors",
     "packet_resource_envelope_integrity_errors",
     "packet_result_integrity_errors",
+    "normalize_exact_command_bytes",
     "selection_done_packet_authority_errors",
     "subagent_incident_integrity_errors",
 ]

@@ -340,6 +340,54 @@ active receipt as required treats non-healthy/non-fresh status as a doctor,
 Steward-brief, and close-gate error. See
 [the codebase-memory contract](codebase-memory.md).
 
+### Codex hook provenance and mutation receipts (v0.4)
+
+The optional Codex adapter records bounded, sealed observations; it does not
+turn hook delivery into a security boundary. Installation provenance binds the
+resolved hook launcher, package version and distribution metadata, the promoted
+wheel identity, generated launcher, and a bounded manifest of every non-cache
+runtime package file checked against `RECORD`. Pip-generated, hashless
+`__pycache__/*.pyc` files are an explicit cooperative-runtime exclusion; other
+files under `__pycache__` are rejected. At hook execution, AOI's provenance
+validator rechecks that receipt against the invoked launcher and current
+installed package bytes, and `doctor` reports any mismatch.
+Editable/source-checkout installs, link traversal, `.pth` shadows, mixed
+site-package resolution, entry-point mismatch, and any covered package or
+launcher drift are rejected by that validator. Before a hook event has been
+parsed and identified, however, the top-level hook adapter remains fail-open;
+only identified `PreToolUse` processing failures use the fixed deny response.
+This is not a pre-import or OS security boundary. A `RECORD`/installed-package comparison is not always a
+cryptographic proof that the original wheel archive was installed: without a
+matching `direct_url` archive digest the receipt reports only its weaker
+package-and-installer mapping.
+
+PreToolUse and PostToolUse correlate only the exact stable triple
+`(session_id, turn_id, tool_use_id)`; optional agent/event fields are
+attribution, not correlation authority. The PreToolUse receipt records parser,
+input digest, sorted targets, session mapping, claim snapshot and the decision.
+It deliberately keeps provider, profile, and sandbox verification
+`unavailable`. PostToolUse binds that pre-receipt digest plus input and response
+digests, targets, and completion observation. A mutation is verified only when
+it has paired, distinct before/after SHA-256 values; otherwise it remains
+`unavailable`. Thus PreToolUse is a cooperative decision and PostToolUse is an
+observation/receipt, never prevention, rollback, or a general write monitor.
+
+Receipts are canonical, create-only records keyed by receipt type and event
+identity under the AOI state lock. The store accepts at most 1,024 records and
+16 MiB total (each record at most 64 KiB); a same-identity byte difference,
+corruption, link/identity anomaly, or capacity exhaustion fails closed rather
+than overwriting, evicting, or partially accounting for an event. Supported,
+parseable paths can be `covered`, `unclaimed`, or `uncovered`. An unavailable
+MCP registry is explicitly **uncovered**, not trusted or implicitly covered.
+
+Close/doctor mutation snapshots bind NUL-safe Git status, including untracked,
+renamed, case-only, and deleted paths, to the live task claims. The required-v1
+integrity ledger binds candidate/post-fix snapshots, findings, fixes, reviewer
+results, and independent verification before its terminal seal. Those records
+are cooperative evidence: reviewer identity must differ from recorded producer
+identities, but it is not authenticated human identity or protection from a
+same-OS-user writer that bypasses AOI.
+
 ## Known v0.3 alpha boundaries
 
 - One state tree may be written from POSIX/WSL or native Windows, not both.

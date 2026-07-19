@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   unit:
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -21,15 +21,19 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - name: Resolve the hash-locked test-tool wheelhouse
+        run: python -m pip download --require-hashes --dest .test-wheelhouse -r requirements/release-tools.lock
+      - name: Install the test toolchain offline
+        run: python -m pip install --no-index --find-links .test-wheelhouse --require-hashes -r requirements/release-tools.lock
       - name: Install package
-        run: python -m pip install .
+        run: python -m pip install --no-build-isolation --no-deps .
       - name: Smoke installed CLI
         run: |
           aoi --version
@@ -37,24 +41,36 @@ jobs:
       - name: Run unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-          PYTHONPATH: src
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest -q tests
 
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
           cache: pip
-      - name: Install package verification tools
-        run: python -m pip install build twine
+      - name: Resolve the hash-locked release-tool wheelhouse
+        run: |
+          python -m pip download \
+            --require-hashes \
+            --dest .release-wheelhouse \
+            -r requirements/release-tools.lock
+      - name: Install the release toolchain offline
+        run: |
+          python -m venv .release-tools
+          .release-tools/bin/python -m pip install \
+            --no-index \
+            --find-links .release-wheelhouse \
+            --require-hashes \
+            -r requirements/release-tools.lock
+          python -m pip install "twine==6.2.0"
       - name: Build wheel and source distribution
-        run: python -m build
+        run: .release-tools/bin/python -m build --no-isolation
       - name: Validate distribution metadata
         run: python -m twine check --strict dist/*
       - name: Verify isolated artifact installs
@@ -63,9 +79,14 @@ jobs:
         shell: bash
         run: |
           expected_version="$(python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])")"
-          python scripts/verify_dist.py --dist-dir dist --expected-version "$expected_version"
+          python scripts/verify_dist.py \
+            --dist-dir dist \
+            --expected-version "$expected_version" \
+            --build-python .release-tools/bin/python \
+            --expected-build-version 1.5.0 \
+            --expected-hatchling-version 1.27.0
       - name: Upload verified distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-distributions
           path: |
@@ -78,38 +99,70 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
           cache: pip
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: python-distributions
           path: dist
+      - name: Resolve the hash-locked release-tool wheelhouse
+        shell: pwsh
+        run: |
+          python -m pip download `
+            --require-hashes `
+            --dest .release-wheelhouse `
+            -r requirements/release-tools.lock
+      - name: Install the release toolchain offline
+        shell: pwsh
+        run: |
+          python -m venv .release-tools
+          .\.release-tools\Scripts\python.exe -m pip install `
+            --no-index `
+            --find-links .release-wheelhouse `
+            --require-hashes `
+            -r requirements/release-tools.lock
       - name: Verify packaged entry points on Windows
         shell: pwsh
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           $expectedVersion = python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])"
-          python scripts/verify_dist.py --dist-dir dist --expected-version $expectedVersion
+          python scripts/verify_dist.py `
+            --dist-dir dist `
+            --expected-version $expectedVersion `
+            --build-python .\.release-tools\Scripts\python.exe `
+            --expected-build-version 1.5.0 `
+            --expected-hatchling-version 1.27.0
 
   typing:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
           cache: pip
-      - name: Install mypy
-        run: python -m pip install mypy
+      - name: Resolve the hash-locked type-check wheelhouse
+        run: |
+          python -m pip download \
+            --require-hashes \
+            --dest .typecheck-wheelhouse \
+            -r requirements/typecheck-tools.lock
+      - name: Install the type-check toolchain offline
+        run: |
+          python -m pip install \
+            --no-index \
+            --find-links .typecheck-wheelhouse \
+            --require-hashes \
+            -r requirements/typecheck-tools.lock
       - name: Type-check the published package surface (both platforms)
         # The locking/credential code has os.name-guarded branches; check the
         # native platform and an emulated win32 pass so neither side regresses.
@@ -121,10 +174,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
           cache: pip

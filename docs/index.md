@@ -31,23 +31,29 @@ ran.
 
 ## Install
 
-!!! warning "These docs describe the v0.3 alpha line"
+!!! warning "These docs describe the v0.4 alpha line"
 
-    The default install resolves to the latest *stable* release (0.2.x), which
-    does not have the governance-honesty gates documented here. Pass `--pre` for
-    the line these docs describe, and expect alpha breakage.
+    This checkpoint supports either a public release-promotion bundle or an
+    independent reviewed local-install bundle. It does not claim a tag, GitHub
+    Release, PyPI publication, or live Codex hook trust.
+
+For a reviewed local install, create a repository-external venv, install the
+exact bundle-bound wheel with `--no-index --no-deps`, then run the venv's exact
+`aoi` console launcher. `codex-init` needs one complete proof pair:
 
 ```bash
-uv tool install --prerelease=allow aoi-orgware   # or: pipx install --pip-args=--pre aoi-orgware
-
-# from the repository you want to govern:
-aoi codex-init  --project-name "My Project" --json   # Codex
-aoi claude-init --project-name "My Project" --json   # Claude Code
+<venv>/bin/aoi codex-init --project-name "My Project" \
+  --local-artifact-bundle-file /absolute/reviewed-local-install-bundle.json \
+  --expected-local-artifact-bundle-sha256 '<approved-local-install-bundle-sha256>' \
+  --json
 ```
 
-Alpha releases ship on [PyPI](https://pypi.org/project/aoi-orgware/). For a
-repeatable deployment, pin the reviewed release as
-`aoi-orgware==<reviewed-version>`.
+The local `reviewed_local_install_bundle` has
+`proof_scope=exact_local_wheel_install_only`: it is neither a release nor a
+promotion. Public releases instead use
+`--promotion-bundle-file` with `--expected-promotion-bundle-sha256`. Half a
+pair, both pairs, or no pair fails before mutation. See the full
+[v0.4 quickstart](quickstart.md).
 
 ## What AOI records
 
