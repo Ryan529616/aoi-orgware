@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import hashlib
 import itertools
 import json
 import sys
@@ -180,6 +181,89 @@ class PermitRuntimeTests(unittest.TestCase):
             objects.publish_semantic_binding(
                 self.paths, transaction["binding"], self.events
             )
+
+    def test_v1_marker_bytes_and_path_are_frozen(self) -> None:
+        arm = root_arm("packet-golden")
+        arm["attempt_identity"].update(
+            {
+                "armed_at": "2026-07-18T12:00:00Z",
+                "expires_at": "2026-07-18T12:15:00Z",
+            }
+        )
+        arm = authority.validate_arm_authority(arm)
+        arm_sha256 = authority.authority_sha256(arm)
+        decision = permits.seal_transition_decision(
+            {
+                "schema_version": 1,
+                "task_id": TASK,
+                "action": "packet.arm",
+                "target_ids": ["packet-golden"],
+                "parameters": {
+                    "packet_id": "packet-golden",
+                    "packet_schema_version": 6,
+                    "routing_authority_sha256": arm_sha256,
+                },
+                "technical_payload_sha256": arm_sha256,
+            }
+        )
+        permit = permits.seal_transition_permit(
+            {
+                "schema_version": 1,
+                "task_id": TASK,
+                "expected_semantic_head_sha256": self.events[-1]["event_sha256"],
+                "decision_sha256": decision["decision_sha256"],
+                "action": "packet.arm",
+                "target_ids": decision["target_ids"],
+                "parameters": decision["parameters"],
+                "expires_at": "2026-07-18T12:10:00Z",
+                "nonce": "permit-golden-nonce-0001",
+                "chief_authority": {"session_id": "session-1", "epoch": 1},
+            }
+        )
+        transaction = runtime.prepare_permitted_arm_transaction(
+            task_id=TASK,
+            event_chain=self.events,
+            decision=decision,
+            permit=permit,
+            arm=arm,
+            command_id="permit-golden-command",
+            recorded_at="2026-07-18T12:01:00Z",
+        )
+        transaction_raw = semantic.canonical_json_bytes(
+            transaction, max_bytes=runtime.MAX_PERMIT_TRANSACTION_BYTES
+        )
+        self.assertEqual(len(transaction_raw), 21563)
+        self.assertEqual(
+            hashlib.sha256(transaction_raw).hexdigest(),
+            "5de453c7ba694c287bd3b5c4e30f93dc9b5374167e38541d95de9f0a92ae0209",
+        )
+        self.assertEqual(
+            transaction["transaction_sha256"],
+            "31c7f13eb3c6eb5a3ecd80d98a34bc403d97f95b6b7b0a235126f791d53adb7a",
+        )
+        marker = runtime._create_permit_issuance(
+            transaction,
+            runtime._contract_group(transaction["objects"], TASK),
+            authority_record_sha256="5" * 64,
+            issued_at="2026-07-18T12:01:00.000000Z",
+        )
+        raw = semantic.canonical_json_bytes(
+            marker, max_bytes=runtime.MAX_PERMIT_ISSUANCE_BYTES
+        )
+        self.assertEqual(len(raw), 1512)
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "c861dc401b45ff8f127a2bab21d22f2e111f30a6979905f7b749a0e589e7a031",
+        )
+        self.assertEqual(
+            marker["issuance_sha256"],
+            "436fbc595e3d06c6ea953387da80256e3ff3f608a9f2f20ee6c5d13f942cc566",
+        )
+        path = runtime.permit_issuance_path(
+            self.paths, TASK, marker["permit_sha256"]
+        )
+        self.assertEqual(path.parent.name, "permit-issuances-v1")
+        self.assertEqual(path.name, f"{marker['permit_sha256']}.json")
 
     def append_unrelated(self, label: str) -> None:
         with h.state_lock(self.paths, create_layout=False):

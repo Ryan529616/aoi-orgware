@@ -691,6 +691,15 @@ class ChiefAuthorityTests(HarnessTestCase):
         self.assertNotIn(
             "permit-consume", cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS
         )
+        for command in (
+            "cohort-round-preview",
+            "cohort-round-prepare",
+            "cohort-show",
+        ):
+            self.assertIn(command, cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS)
+            self.assertFalse(
+                cli_impl.command_requires_chief(command, initialized=True), command
+            )
         for command in cli_impl.CHIEF_STANDALONE_WRITER_COMMANDS:
             self.assertTrue(
                 cli_impl.command_requires_chief(command, initialized=True), command

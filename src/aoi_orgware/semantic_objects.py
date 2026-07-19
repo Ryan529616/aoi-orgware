@@ -25,6 +25,7 @@ OBJECT_SCHEMA_VERSION = 1
 BINDING_SCHEMA_VERSION = 1
 MAX_OBJECT_BYTES = 512 * 1024
 MAX_SMALL_OBJECT_BYTES = 64 * 1024
+MAX_COHORT_OBJECT_BYTES = 128 * 1024
 MAX_BINDING_BYTES = 64 * 1024
 MAX_OBJECTS_PER_TASK = 16_384
 MAX_BINDINGS_PER_TASK = 16_384
@@ -49,7 +50,7 @@ OBJECT_TYPES = frozenset(
     }
 )
 SMALL_OBJECT_TYPES = frozenset(
-    {"routing_terminal", "transition_decision", "transition_permit", "cohort_plan"}
+    {"routing_terminal", "transition_decision", "transition_permit"}
 )
 BINDING_KINDS = frozenset(
     {
@@ -219,7 +220,7 @@ def create_semantic_object(
             object_identity=object_identity,
             payload=payload,
         )
-        maximum = MAX_SMALL_OBJECT_BYTES if object_type in SMALL_OBJECT_TYPES else MAX_OBJECT_BYTES
+        maximum = _object_limit(object_type)
         digest = _sha(base, max_bytes=maximum)
         wrapped = {**base, "object_sha256": digest}
         _clone(wrapped, max_bytes=maximum)
@@ -253,7 +254,7 @@ def validate_semantic_object(value: Mapping[str, Any]) -> dict[str, Any]:
         raise _error("semantic object fields are invalid", exc) from exc
     if value.get("payload_sha256") != base["payload_sha256"]:
         raise SemanticObjectError("semantic object payload SHA-256 is invalid")
-    maximum = MAX_SMALL_OBJECT_BYTES if object_type in SMALL_OBJECT_TYPES else MAX_OBJECT_BYTES
+    maximum = _object_limit(object_type)
     expected = _sha(base, max_bytes=maximum)
     if value.get("object_sha256") != expected:
         raise SemanticObjectError("semantic object SHA-256 is invalid")
@@ -448,6 +449,8 @@ def _read_private_json(path: Path, label: str, *, maximum: int) -> dict[str, Any
 
 
 def _object_limit(object_type: str) -> int:
+    if object_type == "cohort_plan":
+        return MAX_COHORT_OBJECT_BYTES
     return MAX_SMALL_OBJECT_BYTES if object_type in SMALL_OBJECT_TYPES else MAX_OBJECT_BYTES
 
 

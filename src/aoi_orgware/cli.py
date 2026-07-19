@@ -176,6 +176,9 @@ from .commands.status import (
     resolve_resume_task,
 )
 from .commands.semantic import (
+    cmd_cohort_round_prepare,
+    cmd_cohort_round_preview,
+    cmd_cohort_show,
     cmd_permit_consume,
     cmd_permit_issue,
     cmd_semantic_head,
@@ -634,6 +637,9 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "codebase-memory-benchmark-validate",
     "codex-config-plan",
     "codex-startup-receipt-show",
+    "cohort-round-prepare",
+    "cohort-round-preview",
+    "cohort-show",
     "inspect-legacy",
     "reconcile",
     "resume",
@@ -6532,6 +6538,9 @@ def build_parser(
     register_semantic_commands(
         sub,
         handlers={
+            "cohort_round_prepare": cmd_cohort_round_prepare,
+            "cohort_round_preview": cmd_cohort_round_preview,
+            "cohort_show": cmd_cohort_show,
             "permit_consume": cmd_permit_consume,
             "permit_issue": cmd_permit_issue,
             "semantic_head": cmd_semantic_head,
@@ -6960,6 +6969,9 @@ def _reload_locked_paths(paths: HarnessPaths) -> HarnessPaths:
 _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "check-locks",
     "close-task",
+    "cohort-round-prepare",
+    "cohort-round-preview",
+    "cohort-show",
     "doctor",
     "inspect-legacy",
     "permit-consume",

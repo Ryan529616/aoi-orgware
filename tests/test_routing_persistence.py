@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import cohorts  # noqa: E402
+from aoi_orgware import permit_projection  # noqa: E402
 from aoi_orgware import routing_authority as authority  # noqa: E402
 from aoi_orgware import routing_persistence as routing  # noqa: E402
 from aoi_orgware import resource_governance  # noqa: E402
@@ -487,7 +488,7 @@ class RoutingPersistenceTests(unittest.TestCase):
                 "target_ids": decision["target_ids"],
                 "parameters": decision["parameters"],
                 "expires_at": "2026-01-01T00:10:03Z",
-                "nonce": "cohort-permit-nonce-0001",
+                "nonce": f"cohort-permit-nonce-{wave_index:04d}",
                 "chief_authority": {"session_id": "session-1", "epoch": 1},
             }
         )
@@ -515,6 +516,25 @@ class RoutingPersistenceTests(unittest.TestCase):
             )["result_state"]
             if partial_projection
             else batch["result_state"]
+        )
+        consumption_identity, consumption_receipt = (
+            permit_projection.cohort_consumption_receipt(
+                decision,
+                permit,
+                cohort_sha256=plan["cohort_sha256"],
+                wave_index=wave_index,
+                selection_sha256=selection["selection_sha256"],
+                routing_slots=[
+                    entry["outcome_slot_sha256"]
+                    for entry in batch["routing_entries"]
+                    if entry["packet_id"] in selected_packet_ids
+                ],
+            )
+        )
+        result_state = permit_projection.advance_permit_projection(
+            result_state,
+            consumption_identity,
+            consumption_receipt,
         )
         if supersede_selection_in_event:
             result_state = copy.deepcopy(result_state)

@@ -138,6 +138,20 @@ class SemanticObjectTests(unittest.TestCase):
             with self.assertRaises(objects.SemanticObjectError):
                 self.object("b" * 64, "x" * 200, "transition_permit")
 
+    def test_cohort_plan_wrapper_has_a_distinct_payload_safe_bound(self) -> None:
+        self.assertIn("cohort_plan", objects.OBJECT_TYPES)
+        self.assertNotIn("cohort_plan", objects.SMALL_OBJECT_TYPES)
+        candidate = self.object(
+            "c" * 64,
+            {"padding": "x" * 65_500},
+            "cohort_plan",
+        )
+        stored = objects.publish_semantic_object(self.paths, candidate)
+        self.assertEqual(stored, candidate)
+        with mock.patch.object(objects, "MAX_COHORT_OBJECT_BYTES", 100):
+            with self.assertRaises(objects.SemanticObjectError):
+                self.object("d" * 64, "x" * 200, "cohort_plan")
+
     def test_exact_binding_retry_and_divergent_same_key_fails(self) -> None:
         item = self.publish_object("route-1", {"answer": 7})
         first = objects.publish_semantic_binding(

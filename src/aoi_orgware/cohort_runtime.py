@@ -280,9 +280,62 @@ def derive_cohort_status(
     return _clone(base)
 
 
+def preview_cohort_round(
+    paths: h.HarnessPaths,
+    task_id: str,
+    event_chain: Iterable[Mapping[str, Any]],
+    cohort_plan: Mapping[str, Any],
+    *,
+    wave_index: int,
+    arms: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Preview the sole exact eligible round without issuing or launching it."""
+
+    task_id = h.validate_id(task_id, "task id")
+    try:
+        effect = routing.prepare_cohort_authority_effect(
+            paths,
+            task_id=task_id,
+            event_chain=event_chain,
+            cohort_plan=cohort_plan,
+            wave_index=wave_index,
+            arms=arms,
+        )
+    except routing.RoutingPersistenceError as exc:
+        raise _fail("cohort round preview is not eligible", exc) from exc
+    base = {
+        "schema_version": COHORT_STATUS_SCHEMA_VERSION,
+        "task_id": task_id,
+        "cohort_id": effect["cohort_plan"]["cohort_id"],
+        "cohort_sha256": effect["cohort_plan"]["cohort_sha256"],
+        "wave_index": effect["wave_index"],
+        "selection": effect["selection"],
+        "technical_payload_sha256": effect["selection"]["selection_sha256"],
+        "packet_states": effect["packet_states"],
+        "available_capacity": effect["available_capacity"],
+        "routing_authority_object_sha256s": [
+            row["object_sha256"]
+            for row in effect["routing_authority_objects"]
+        ],
+        "routing_slots": sorted(
+            row["outcome_slot_sha256"] for row in effect["routing_entries"]
+        ),
+        "transport_launch_claimed": False,
+        "launch_actor": "unavailable",
+    }
+    try:
+        base["preview_sha256"] = semantic.canonical_sha256(
+            base, max_bytes=MAX_COHORT_STATUS_BYTES
+        )
+    except semantic.SemanticEventError as exc:
+        raise _fail("cohort round preview exceeds its byte bound", exc) from exc
+    return _clone(base)
+
+
 __all__ = [
     "COHORT_STATUS_SCHEMA_VERSION",
     "MAX_COHORT_STATUS_BYTES",
     "CohortRuntimeError",
     "derive_cohort_status",
+    "preview_cohort_round",
 ]

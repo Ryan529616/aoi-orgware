@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping
 
 from . import harnesslib as h
 from . import cohorts
+from . import permit_projection
 from . import resource_governance
 from . import resource_config
 from . import routing_authority as authority
@@ -670,6 +671,166 @@ def prepare_authority_batch_effect(
         "routing_authority_objects": route_objects,
         "routing_entries": entries,
         "result_state": result_state,
+    }
+
+
+def prepare_cohort_authority_effect(
+    paths: h.HarnessPaths,
+    *,
+    task_id: str,
+    event_chain: Iterable[Mapping[str, Any]],
+    cohort_plan: Mapping[str, Any],
+    wave_index: int,
+    arms: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the exact eligible routing after-image for one cohort round.
+
+    This is the shared preparation oracle used by Chief issuance and
+    controller commit.  The authenticated inspector reuses the same exact-head
+    selection derivation, so preparation cannot silently widen eligibility.
+    """
+
+    task_id = h.validate_id(task_id, "task id")
+    records, replayed = _freeze_event_chain(event_chain, task_id)
+    try:
+        plan = cohorts.validate_cohort(cohort_plan)
+    except cohorts.CohortError as exc:
+        raise _fail("cohort routing plan is invalid", exc) from exc
+    if (
+        not isinstance(wave_index, int)
+        or isinstance(wave_index, bool)
+        or not 0 <= wave_index < len(plan["waves"])
+    ):
+        raise RoutingPersistenceError("cohort routing wave index is invalid")
+    raw_arms = _bounded_records(
+        arms, cohorts.MAX_CONCURRENCY, "cohort routing authority batch"
+    )
+    if not raw_arms:
+        raise RoutingPersistenceError("cohort routing authority batch is empty")
+    checked_arms: list[dict[str, Any]] = []
+    selected_packet_ids: list[str] = []
+    selection_id: str | None = None
+    refs = {
+        ref["packet_id"]: ref["routing_authority_sha256"]
+        for ref in plan["packet_refs"]
+    }
+    transport_slots = {
+        slot["packet_id"]: slot for slot in plan["transport_slots"]
+    }
+    for raw_arm in raw_arms:
+        try:
+            arm = authority.validate_arm_authority(raw_arm)
+            authority_sha256 = authority.authority_sha256(arm)
+            arm_selection_id = _arm_execution_selection_id(arm)
+        except authority.RoutingAuthorityError as exc:
+            raise _fail("cohort routing authority is invalid", exc) from exc
+        packet = arm["packet_authority"]
+        packet_id = packet["packet_id"]
+        slot = transport_slots.get(packet_id)
+        depth = _exact_int(
+            packet.get("delegation_depth"),
+            "cohort routing delegation depth",
+            minimum=1,
+            maximum=resource_config.AOI_MAX_DELEGATION_DEPTH,
+        )
+        if depth != 1:
+            raise RoutingPersistenceError(
+                "cohort advance schema v1 supports depth-one routing authorities only"
+            )
+        if selection_id is None:
+            selection_id = arm_selection_id
+        elif selection_id != arm_selection_id:
+            raise RoutingPersistenceError(
+                "cohort routing authorities differ in execution-selection identity"
+            )
+        if (
+            arm["task_id"] != task_id
+            or refs.get(packet_id) != authority_sha256
+            or plan["resource_envelope_sha256"]
+            != arm["resource_envelope"]["snapshot_sha256"]
+            or slot is None
+            or slot["transport"] != arm["transport_authority"]["transport"]
+            or slot["parent_session_id"] != arm["parent_authority"]["session_id"]
+            or slot["expected_agent_type"]
+            != arm["transport_authority"]["expected_agent_type"]
+        ):
+            raise RoutingPersistenceError(
+                "cohort routing authority differs from its sealed plan or slot"
+            )
+        checked_arms.append(arm)
+        selected_packet_ids.append(packet_id)
+    assert selection_id is not None
+    expected_order = [
+        packet_id
+        for packet_id in plan["waves"][wave_index]
+        if packet_id in set(selected_packet_ids)
+    ]
+    if (
+        len(set(selected_packet_ids)) != len(selected_packet_ids)
+        or selected_packet_ids != expected_order
+    ):
+        raise RoutingPersistenceError(
+            "cohort routing authority selection is not unique in wave order"
+        )
+    try:
+        selection_identity_sha256 = cohorts.execution_selection_identity_sha256(
+            selection_id
+        )
+    except cohorts.CohortError as exc:
+        raise _fail("cohort routing execution-selection identity is invalid", exc) from exc
+    if plan["execution_selection_identity_sha256"] != selection_identity_sha256:
+        raise RoutingPersistenceError(
+            "cohort plan differs from its arms' execution-selection identity"
+        )
+    batch = prepare_authority_batch_effect(
+        task_id=task_id,
+        event_chain=records,
+        arms=checked_arms,
+    )
+    selection_base = {
+        "schema_version": cohorts.COHORT_ADVANCE_SELECTION_SCHEMA_VERSION,
+        "cohort_sha256": plan["cohort_sha256"],
+        "wave_index": wave_index,
+        "routes": [
+            {
+                "packet_id": arm["packet_authority"]["packet_id"],
+                "routing_authority_sha256": authority.authority_sha256(arm),
+                "outcome_slot_sha256": entry["outcome_slot_sha256"],
+            }
+            for arm, entry in zip(
+                checked_arms, batch["routing_entries"], strict=True
+            )
+        ],
+    }
+    generic = objects.inspect_semantic_objects(paths, task_id, records)
+    by_digest: dict[str, dict[str, Any]] = {}
+    try:
+        for row in generic["objects"]:
+            wrapped = objects.validate_semantic_object(
+                {key: row[key] for key in _SEMANTIC_OBJECT_FIELDS}
+            )
+            by_digest[wrapped["object_sha256"]] = wrapped
+    except (KeyError, objects.SemanticObjectError, TypeError) as exc:
+        raise _fail("cohort routing semantic object report is invalid", exc) from exc
+    derived = _derive_cohort_exact_head_selection(
+        prefix_projection=replayed,
+        by_digest=by_digest,
+        task_id=task_id,
+        plan=plan,
+        groups=[{"authority": arm} for arm in checked_arms],
+        selection_base=selection_base,
+        execution_selection_id=selection_id,
+    )
+    return {
+        "cohort_plan": plan,
+        "wave_index": wave_index,
+        "selection": derived["selection"],
+        "routing_authorities": checked_arms,
+        "routing_authority_objects": batch["routing_authority_objects"],
+        "routing_entries": batch["routing_entries"],
+        "result_state": batch["result_state"],
+        "packet_states": derived["packet_states"],
+        "available_capacity": derived["available_capacity"],
     }
 
 
@@ -1366,6 +1527,137 @@ def _prefix_execution_occupancy(
     }
 
 
+def _derive_cohort_exact_head_selection(
+    *,
+    prefix_projection: Mapping[str, Any],
+    by_digest: Mapping[str, Mapping[str, Any]],
+    task_id: str,
+    plan: Mapping[str, Any],
+    groups: list[Mapping[str, Any]],
+    selection_base: Mapping[str, Any],
+    execution_selection_id: str,
+) -> dict[str, Any]:
+    """Derive the sole eligible cohort round from one authenticated head."""
+
+    prefix_truth = _cohort_prefix_truth(prefix_projection, by_digest, task_id)
+    occupancy = _prefix_execution_occupancy(
+        prefix_projection,
+        prefix_truth["active_packets"],
+        prefix_truth["terminal_packet_ids"],
+    )
+    selection_contract = _require_active_v2_execution_selection(
+        prefix_projection,
+        execution_selection_id,
+        plan,
+        groups,
+    )
+    active_packets = occupancy["active_packets"]
+    standalone_jobs = occupancy["standalone_jobs"]
+    foreign_packets = [
+        packet_id
+        for packet_id, truth in active_packets.items()
+        if truth["selection_id"] != execution_selection_id
+    ]
+    foreign_jobs = [
+        row["run_id"]
+        for row in standalone_jobs
+        if row["selection_id"] != execution_selection_id
+    ]
+    if foreign_packets or foreign_jobs:
+        raise RoutingPersistenceError(
+            "cohort advance is blocked by a foreign or implicit execution epoch"
+        )
+    active_total = len(active_packets)
+    active_first_level = sum(
+        truth["delegation_depth"] == 1 for truth in active_packets.values()
+    ) + len(standalone_jobs)
+    max_total = selection_contract["max_active_total_agents"]
+    max_first_level = selection_contract["max_active_first_level_agents"]
+    if active_total > max_total or active_first_level > max_first_level:
+        raise RoutingPersistenceError(
+            "cohort exact-head occupancy already exceeds its execution envelope"
+        )
+    packet_states: dict[str, dict[str, str | None]] = {}
+    for ref in plan["packet_refs"]:
+        packet_id = ref["packet_id"]
+        active_packet_truth = active_packets.get(packet_id)
+        if (
+            active_packet_truth is not None
+            and active_packet_truth["routing_authority_sha256"]
+            != ref["routing_authority_sha256"]
+        ):
+            raise RoutingPersistenceError(
+                "cohort packet has another active authority at its exact head"
+            )
+        route_state = prefix_truth["by_authority"].get(
+            ref["routing_authority_sha256"]
+        )
+        if route_state is None:
+            if packet_id in active_packets:
+                raise RoutingPersistenceError(
+                    "cohort packet has another active authority at its exact head"
+                )
+            packet_states[packet_id] = {
+                "status": "planned",
+                "terminal_outcome": None,
+            }
+            continue
+        if (
+            route_state["packet_id"] != packet_id
+            or route_state["selection_id"] != execution_selection_id
+            or route_state["resource_envelope_sha256"]
+            != plan["resource_envelope_sha256"]
+        ):
+            raise RoutingPersistenceError(
+                "cohort prefix route differs from its plan identity or envelope"
+            )
+        packet_states[packet_id] = {
+            "status": route_state["status"],
+            "terminal_outcome": route_state["terminal_outcome"],
+        }
+    available_capacity = max(
+        0,
+        min(
+            max_total - active_total,
+            max_first_level - active_first_level,
+        ),
+    )
+    try:
+        sealed_selection = cohorts.seal_cohort_advance_selection(
+            plan,
+            selection_base,
+            packet_states,
+            available_capacity=available_capacity,
+        )
+    except cohorts.CohortError as exc:
+        raise _fail(
+            "cohort routing selection is ineligible at its exact semantic head",
+            exc,
+        ) from exc
+    selected_packet_ids = {
+        route["packet_id"] for route in sealed_selection["routes"]
+    }
+    selected_slots = [
+        slot
+        for slot in plan["transport_slots"]
+        if slot["packet_id"] in selected_packet_ids
+    ]
+    for selected_slot in selected_slots:
+        if any(
+            _transport_slots_collide(selected_slot, occupied)
+            for occupied in prefix_truth["armed_transport_slots"]
+        ):
+            raise RoutingPersistenceError(
+                "cohort routing selection collides with an armed transport slot"
+            )
+    return {
+        "selection": sealed_selection,
+        "packet_states": packet_states,
+        "available_capacity": available_capacity,
+        "selection_contract": selection_contract,
+    }
+
+
 def _cohort_composite_groups(
     binding: Mapping[str, Any],
     by_digest: Mapping[str, Mapping[str, Any]],
@@ -1597,6 +1889,7 @@ def _validate_cohort_exact_head_contracts(
         invariant = {
             "binding": binding,
             "decision": group["decision"],
+            "permit": group["permit"],
             "cohort_plan": group["cohort_plan"],
             "selection": group["selection"],
             "execution_selection_id": group["execution_selection_id"],
@@ -1657,106 +1950,18 @@ def _validate_cohort_exact_head_contracts(
 
         head_contracts = by_head.get(event["event_sha256"], [])
         if head_contracts:
-            prefix_truth = _cohort_prefix_truth(prefix_projection, by_digest, task_id)
-            occupancy = _prefix_execution_occupancy(
-                prefix_projection,
-                prefix_truth["active_packets"],
-                prefix_truth["terminal_packet_ids"],
-            )
             for contract in head_contracts:
                 plan = contract["cohort_plan"]
-                selection_base = contract["selection"]
-                selection_id = contract["execution_selection_id"]
-                selection_contract = _require_active_v2_execution_selection(
-                    prefix_projection,
-                    selection_id,
-                    plan,
-                    contract["groups"],
+                derived = _derive_cohort_exact_head_selection(
+                    prefix_projection=prefix_projection,
+                    by_digest=by_digest,
+                    task_id=task_id,
+                    plan=plan,
+                    groups=contract["groups"],
+                    selection_base=contract["selection"],
+                    execution_selection_id=contract["execution_selection_id"],
                 )
-                active_packets = occupancy["active_packets"]
-                standalone_jobs = occupancy["standalone_jobs"]
-                foreign_packets = [
-                    packet_id
-                    for packet_id, truth in active_packets.items()
-                    if truth["selection_id"] != selection_id
-                ]
-                foreign_jobs = [
-                    row["run_id"]
-                    for row in standalone_jobs
-                    if row["selection_id"] != selection_id
-                ]
-                if foreign_packets or foreign_jobs:
-                    raise RoutingPersistenceError(
-                        "cohort advance is blocked by a foreign or implicit execution epoch"
-                    )
-                active_total = len(active_packets)
-                active_first_level = sum(
-                    truth["delegation_depth"] == 1
-                    for truth in active_packets.values()
-                ) + len(standalone_jobs)
-                max_total = selection_contract["max_active_total_agents"]
-                max_first_level = selection_contract[
-                    "max_active_first_level_agents"
-                ]
-                if active_total > max_total or active_first_level > max_first_level:
-                    raise RoutingPersistenceError(
-                        "cohort exact-head occupancy already exceeds its execution envelope"
-                    )
-                packet_states: dict[str, dict[str, str | None]] = {}
-                for ref in plan["packet_refs"]:
-                    packet_id = ref["packet_id"]
-                    active_packet_truth = active_packets.get(packet_id)
-                    if (
-                        active_packet_truth is not None
-                        and active_packet_truth["routing_authority_sha256"]
-                        != ref["routing_authority_sha256"]
-                    ):
-                        raise RoutingPersistenceError(
-                            "cohort packet has another active authority at its exact head"
-                        )
-                    route_state = prefix_truth["by_authority"].get(
-                        ref["routing_authority_sha256"]
-                    )
-                    if route_state is None:
-                        if packet_id in active_packets:
-                            raise RoutingPersistenceError(
-                                "cohort packet has another active authority at its exact head"
-                            )
-                        packet_states[packet_id] = {
-                            "status": "planned",
-                            "terminal_outcome": None,
-                        }
-                        continue
-                    if (
-                        route_state["packet_id"] != packet_id
-                        or route_state["selection_id"] != selection_id
-                        or route_state["resource_envelope_sha256"]
-                        != plan["resource_envelope_sha256"]
-                    ):
-                        raise RoutingPersistenceError(
-                            "cohort prefix route differs from its plan identity or envelope"
-                        )
-                    packet_states[packet_id] = {
-                        "status": route_state["status"],
-                        "terminal_outcome": route_state["terminal_outcome"],
-                    }
-                remaining_total = max_total - active_total
-                remaining_first_level = max_first_level - active_first_level
-                available_capacity = max(
-                    0, min(remaining_total, remaining_first_level)
-                )
-                try:
-                    sealed_selection = cohorts.seal_cohort_advance_selection(
-                        plan,
-                        selection_base,
-                        packet_states,
-                        available_capacity=available_capacity,
-                    )
-                except cohorts.CohortError as exc:
-                    raise _fail(
-                        "cohort routing selection is ineligible at its exact semantic head",
-                        exc,
-                    ) from exc
+                sealed_selection = derived["selection"]
                 if (
                     contract["decision"]["technical_payload_sha256"]
                     != sealed_selection["selection_sha256"]
@@ -1764,24 +1969,9 @@ def _validate_cohort_exact_head_contracts(
                     raise RoutingPersistenceError(
                         "cohort routing decision technical payload differs from exact selection"
                     )
-                selected_packet_ids = {
-                    route["packet_id"] for route in sealed_selection["routes"]
-                }
-                selected_slots = [
-                    slot
-                    for slot in plan["transport_slots"]
-                    if slot["packet_id"] in selected_packet_ids
-                ]
-                for selected_slot in selected_slots:
-                    if any(
-                        _transport_slots_collide(selected_slot, occupied)
-                        for occupied in prefix_truth["armed_transport_slots"]
-                    ):
-                        raise RoutingPersistenceError(
-                            "cohort routing selection collides with an armed transport slot"
-                        )
                 for group in contract["groups"]:
                     group["selection"] = sealed_selection
+                contract["selection"] = sealed_selection
                 validated.add(contract["binding"]["binding_sha256"])
 
         planned_contracts = by_planned_event.get(event["event_sha256"], [])
@@ -1808,6 +1998,27 @@ def _validate_cohort_exact_head_contracts(
                 expected_domain[ROUTING_NAMESPACE_KEY] = validate_routing_namespace(
                     expected_namespace
                 )
+                try:
+                    identity, receipt = permit_projection.cohort_consumption_receipt(
+                        contract["decision"],
+                        contract["permit"],
+                        cohort_sha256=contract["cohort_plan"]["cohort_sha256"],
+                        wave_index=contract["decision"]["parameters"]["wave_index"],
+                        selection_sha256=contract["selection"]["selection_sha256"],
+                        routing_slots=[
+                            group["slot"] for group in contract["groups"]
+                        ],
+                    )
+                    expected_domain = permit_projection.advance_permit_projection(
+                        expected_domain, identity, receipt
+                    )
+                except (
+                    permit_projection.PermitProjectionError,
+                    permits.TransitionPermitError,
+                ) as exc:
+                    raise _fail(
+                        "cohort planned event permit after-image is invalid", exc
+                    ) from exc
                 after_image_validated.add(binding_sha256)
             try:
                 expected_bytes = semantic.canonical_json_bytes(
@@ -2272,6 +2483,7 @@ __all__ = [
     "inspect_routing_persistence",
     "prepare_authority_effect",
     "prepare_authority_batch_effect",
+    "prepare_cohort_authority_effect",
     "prepare_authority_transaction",
     "prepare_outcome_transaction",
     "prepare_terminal_transaction",

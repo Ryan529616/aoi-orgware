@@ -8,12 +8,19 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 from typing import Any, Callable
 
+from .. import cohort_runtime
+from .. import cohorts
 from .. import harnesslib as h
 from .. import permit_runtime as permit_runtime
 from .. import semantic_events as semantic
 from .. import semantic_store as store
+
+
+COHORT_ROUND_REQUEST_SCHEMA_VERSION = 1
+MAX_COHORT_ROUND_REQUEST_BYTES = 2 * 1024 * 1024
 
 
 def _emit(payload: Any, as_json: bool) -> None:
@@ -33,8 +40,125 @@ def _authority_ref(args: argparse.Namespace) -> str:
     return value
 
 
+def _load_canonical_json_artifact(
+    raw_path: str,
+    *,
+    label: str,
+    maximum: int,
+) -> Any:
+    """Read one exact bounded canonical JSON artifact without link traversal."""
+
+    if not isinstance(raw_path, str) or not raw_path:
+        raise h.HarnessError(f"{label} is required")
+    requested = Path(raw_path)
+    path = requested if requested.is_absolute() else Path.cwd() / requested
+    try:
+        canonical = h.canonicalize_no_link_traversal(path, label)
+        if canonical != path:
+            raise h.HarnessError(f"{label} path is non-canonical")
+        h.validate_existing_regular_file(path, label)
+        before = path.lstat()
+        if (
+            h._path_is_link_like(path)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
+            raise h.HarnessError(f"{label} must be one regular non-linked file")
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise h.HarnessError(f"{label} changed while being opened")
+            raw = handle.read(maximum + 1)
+            finished = os.fstat(handle.fileno())
+        after = path.lstat()
+    except FileNotFoundError as exc:
+        raise h.HarnessError(f"{label} is missing") from exc
+    except OSError as exc:
+        raise h.HarnessError(f"cannot read {label}: {exc}") from exc
+    if len(raw) > maximum:
+        raise h.HarnessError(f"{label} exceeds its byte bound")
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if (
+        identity != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        or identity
+        != (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns)
+        or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or opened.st_nlink != 1
+        or finished.st_nlink != 1
+        or after.st_nlink != 1
+        or len(raw) != finished.st_size
+        or h.canonicalize_no_link_traversal(path, label) != path
+    ):
+        raise h.HarnessError(f"{label} changed while being read")
+
+    def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise h.HarnessError(f"{label} has duplicate JSON key {key!r}")
+            result[key] = item
+        return result
+
+    try:
+        decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
+        canonical_bytes = semantic.canonical_json_bytes(decoded, max_bytes=maximum)
+    except h.HarnessError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise h.HarnessError(f"{label} is invalid: {exc}") from exc
+    if raw != canonical_bytes:
+        raise h.HarnessError(f"{label} must contain exact canonical JSON bytes")
+    return decoded
+
+
+def _load_cohort_round_request(
+    raw_path: str, *, require_permit: bool
+) -> dict[str, Any]:
+    label = "cohort round request"
+    decoded = _load_canonical_json_artifact(
+        raw_path,
+        label=label,
+        maximum=MAX_COHORT_ROUND_REQUEST_BYTES,
+    )
+    common = {"schema_version", "cohort_plan", "wave_index", "arms"}
+    expected = common | ({"decision", "permit"} if require_permit else set())
+    if not isinstance(decoded, dict) or set(decoded) != expected:
+        raise h.HarnessError(f"{label} schema is invalid")
+    version = decoded["schema_version"]
+    wave_index = decoded["wave_index"]
+    arms = decoded["arms"]
+    if (
+        version != COHORT_ROUND_REQUEST_SCHEMA_VERSION
+        or isinstance(version, bool)
+        or not isinstance(wave_index, int)
+        or isinstance(wave_index, bool)
+        or wave_index < 0
+        or not isinstance(arms, list)
+        or not arms
+        or len(arms) > cohorts.MAX_CONCURRENCY
+    ):
+        raise h.HarnessError(f"{label} values are invalid")
+    return decoded
+
+
+def _write_canonical_stdout(value: Any, *, maximum: int) -> None:
+    raw = semantic.canonical_json_bytes(value, max_bytes=maximum)
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        sys.stdout.write(raw.decode("utf-8"))
+        sys.stdout.flush()
+        return
+    stream.write(raw)
+    stream.flush()
+
+
 def _load_permit_transaction(raw_path: str) -> dict[str, Any]:
     """Read one exact bounded canonical detached permit transaction artifact."""
+
+    maximum = max(
+        permit_runtime.MAX_PERMIT_TRANSACTION_BYTES,
+        permit_runtime.MAX_COHORT_PERMIT_TRANSACTION_BYTES,
+    )
 
     if not isinstance(raw_path, str) or not raw_path:
         raise h.HarnessError("permit transaction file is required")
@@ -60,14 +184,14 @@ def _load_permit_transaction(raw_path: str) -> dict[str, Any]:
                 raise h.HarnessError(
                     "permit transaction file changed while being opened"
                 )
-            raw = handle.read(permit_runtime.MAX_PERMIT_TRANSACTION_BYTES + 1)
+            raw = handle.read(maximum + 1)
             finished = os.fstat(handle.fileno())
         after = path.lstat()
     except FileNotFoundError as exc:
         raise h.HarnessError("permit transaction file is missing") from exc
     except OSError as exc:
         raise h.HarnessError(f"cannot read permit transaction file: {exc}") from exc
-    if len(raw) > permit_runtime.MAX_PERMIT_TRANSACTION_BYTES:
+    if len(raw) > maximum:
         raise h.HarnessError("permit transaction file exceeds its byte bound")
     identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     if (
@@ -95,9 +219,23 @@ def _load_permit_transaction(raw_path: str) -> dict[str, Any]:
 
     try:
         decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
-        transaction = permit_runtime.validate_permitted_arm_transaction(decoded)
+        version = decoded.get("schema_version") if isinstance(decoded, dict) else None
+        if version == permit_runtime.PERMIT_TRANSACTION_SCHEMA_VERSION:
+            transaction = permit_runtime.validate_permitted_arm_transaction(decoded)
+            transaction_maximum = permit_runtime.MAX_PERMIT_TRANSACTION_BYTES
+        elif version == permit_runtime.COHORT_PERMIT_TRANSACTION_SCHEMA_VERSION:
+            transaction = permit_runtime.validate_permitted_cohort_transaction(
+                decoded
+            )
+            transaction_maximum = (
+                permit_runtime.MAX_COHORT_PERMIT_TRANSACTION_BYTES
+            )
+        else:
+            raise h.HarnessError(
+                "permit transaction schema version is unsupported"
+            )
         canonical_bytes = semantic.canonical_json_bytes(
-            transaction, max_bytes=permit_runtime.MAX_PERMIT_TRANSACTION_BYTES
+            transaction, max_bytes=transaction_maximum
         )
     except h.HarnessError:
         raise
@@ -170,7 +308,13 @@ def cmd_permit_issue(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
     transaction = _load_permit_transaction(args.transaction_file)
     task_id = _require_transaction_task(args, transaction)
     session_id, epoch, token = _permit_issue_secret(args, paths)
-    result = permit_runtime.issue_permitted_arm_transaction(
+    issue = (
+        permit_runtime.issue_permitted_cohort_transaction
+        if transaction["schema_version"]
+        == permit_runtime.COHORT_PERMIT_TRANSACTION_SCHEMA_VERSION
+        else permit_runtime.issue_permitted_arm_transaction
+    )
+    result = issue(
         paths,
         transaction,
         store.load_semantic_events(paths, task_id),
@@ -188,7 +332,13 @@ def cmd_permit_consume(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
     task_id = _require_transaction_task(args, transaction)
     with h.state_lock(paths, create_layout=False):
         paths = _reload_permit_paths(paths)
-        result = permit_runtime.commit_permitted_arm_transaction(
+        commit = (
+            permit_runtime.commit_permitted_cohort_transaction
+            if transaction["schema_version"]
+            == permit_runtime.COHORT_PERMIT_TRANSACTION_SCHEMA_VERSION
+            else permit_runtime.commit_permitted_arm_transaction
+        )
+        result = commit(
             paths,
             transaction,
             store.load_semantic_events(paths, task_id),
@@ -215,6 +365,86 @@ def cmd_permit_consume(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
         },
         args.json,
     )
+    return 0
+
+
+def cmd_cohort_round_preview(
+    args: argparse.Namespace, paths: h.HarnessPaths
+) -> int:
+    task_id = h.validate_id(args.task, "task id")
+    request = _load_cohort_round_request(args.request_file, require_permit=False)
+    result = cohort_runtime.preview_cohort_round(
+        paths,
+        task_id,
+        store.load_semantic_events(paths, task_id),
+        request["cohort_plan"],
+        wave_index=request["wave_index"],
+        arms=request["arms"],
+    )
+    _emit(result, args.json)
+    return 0
+
+
+def cmd_cohort_round_prepare(
+    args: argparse.Namespace, paths: h.HarnessPaths
+) -> int:
+    task_id = h.validate_id(args.task, "task id")
+    request = _load_cohort_round_request(args.request_file, require_permit=True)
+    decision_parameters = (
+        request["decision"].get("parameters")
+        if isinstance(request["decision"], dict)
+        else None
+    )
+    permit_parameters = (
+        request["permit"].get("parameters")
+        if isinstance(request["permit"], dict)
+        else None
+    )
+    if (
+        not isinstance(decision_parameters, dict)
+        or not isinstance(permit_parameters, dict)
+        or decision_parameters.get("wave_index") != request["wave_index"]
+        or permit_parameters.get("wave_index") != request["wave_index"]
+    ):
+        raise h.HarnessError(
+            "cohort round request wave_index differs from its decision or permit"
+        )
+    transaction = permit_runtime.prepare_permitted_cohort_transaction(
+        paths,
+        task_id=task_id,
+        event_chain=store.load_semantic_events(paths, task_id),
+        decision=request["decision"],
+        permit=request["permit"],
+        cohort_plan=request["cohort_plan"],
+        arms=request["arms"],
+        command_id=args.command_id,
+        recorded_at=args.recorded_at,
+    )
+    _write_canonical_stdout(
+        transaction,
+        maximum=permit_runtime.MAX_COHORT_PERMIT_TRANSACTION_BYTES,
+    )
+    return 0
+
+
+def cmd_cohort_show(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
+    task_id = h.validate_id(args.task, "task id")
+    decoded = _load_canonical_json_artifact(
+        args.cohort_file,
+        label="cohort plan file",
+        maximum=MAX_COHORT_ROUND_REQUEST_BYTES,
+    )
+    try:
+        plan = cohorts.validate_cohort(decoded)
+    except cohorts.CohortError as exc:
+        raise h.HarnessError(f"cohort plan file is invalid: {exc}") from exc
+    result = cohort_runtime.derive_cohort_status(
+        paths,
+        task_id,
+        store.load_semantic_events(paths, task_id),
+        plan,
+    )
+    _emit(result, args.json)
     return 0
 
 
@@ -355,3 +585,31 @@ def register_semantic_commands(
     consume.add_argument("--transaction-file", required=True)
     add_json_argument(consume)
     consume.set_defaults(handler=handlers["permit_consume"])
+
+    preview = sub.add_parser(
+        "cohort-round-preview",
+        help="preview one exact eligible cohort wave without launching it",
+    )
+    preview.add_argument("--task", required=True)
+    preview.add_argument("--request-file", required=True)
+    add_json_argument(preview)
+    preview.set_defaults(handler=handlers["cohort_round_preview"])
+
+    prepare = sub.add_parser(
+        "cohort-round-prepare",
+        help="emit one canonical detached permitted cohort transaction",
+    )
+    prepare.add_argument("--task", required=True)
+    prepare.add_argument("--request-file", required=True)
+    prepare.add_argument("--command-id", required=True)
+    prepare.add_argument("--recorded-at", required=True)
+    prepare.set_defaults(handler=handlers["cohort_round_prepare"])
+
+    show = sub.add_parser(
+        "cohort-show",
+        help="derive cohort status from the authenticated routing ledger",
+    )
+    show.add_argument("--task", required=True)
+    show.add_argument("--cohort-file", required=True)
+    add_json_argument(show)
+    show.set_defaults(handler=handlers["cohort_show"])
