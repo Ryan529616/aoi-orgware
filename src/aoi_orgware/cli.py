@@ -34,7 +34,7 @@ from . import codex_install_provenance as codex_install_provenance_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import evidence_artifacts as evidence_artifacts_impl
-from .agent_identity import AGENT_ID_RE
+from .agent_identity import AgentIdentityError, AGENT_ID_RE, validate_agent_id
 from . import execution_topology as execution_topology_impl
 from . import integrity_records as integrity_records_impl
 from . import job_integrity as job_integrity_impl
@@ -2321,8 +2321,8 @@ def _selection_terminal_packet_bindings(
     )
 
 
-def _steward_packet_binding(
-    state: dict[str, Any], selection_id: str, packet_id: str
+def _build_steward_packet_binding(
+    state: dict[str, Any], selection_id: str, packet_id: str, *, strict_agent_id: bool
 ) -> dict[str, Any]:
     packet = _packet_by_id(state, packet_id)
     if (
@@ -2336,10 +2336,25 @@ def _steward_packet_binding(
         raise HarnessError(
             "execution brief requires a done Steward synthesis packet bound to current specialist results"
         )
+    if strict_agent_id:
+        try:
+            steward_agent_id = validate_agent_id(
+                packet.get("agent_id"), "Steward packet agent id"
+            )
+        except AgentIdentityError as exc:
+            raise HarnessError(
+                "legacy Steward packet has a non-canonical agent identity; "
+                "create a new Steward packet before recording a new execution brief"
+            ) from exc
+    else:
+        # Reconstruct the original v3 binding byte-for-byte for already sealed
+        # briefs.  Old writers stringified this field, including legacy display
+        # names; read compatibility must not elevate that value into new authority.
+        steward_agent_id = str(packet.get("agent_id", ""))
     return {
         "packet_id": packet_id,
         "lane_id": str(packet.get("lane_id", "")),
-        "agent_id": str(packet.get("agent_id", "")),
+        "agent_id": steward_agent_id,
         "result_sha256": str(packet.get("result_sha256", "")),
         "dispatch_provenance": str(
             packet.get("dispatch_provenance") or "legacy_unverified"
@@ -2354,6 +2369,26 @@ def _steward_packet_binding(
             packet.get("steward_input_bindings", [])
         ),
     }
+
+
+def _steward_packet_binding(
+    state: dict[str, Any], selection_id: str, packet_id: str
+) -> dict[str, Any]:
+    """Reconstruct an existing v3 binding with original reader semantics."""
+
+    return _build_steward_packet_binding(
+        state, selection_id, packet_id, strict_agent_id=False
+    )
+
+
+def _new_steward_packet_binding(
+    state: dict[str, Any], selection_id: str, packet_id: str
+) -> dict[str, Any]:
+    """Build a new v3 binding only from a canonical current identity."""
+
+    return _build_steward_packet_binding(
+        state, selection_id, packet_id, strict_agent_id=True
+    )
 
 
 def _execution_brief_coverage_error(
@@ -2551,7 +2586,7 @@ def _execution_selection_cmd_services() -> ExecutionSelectionCmdServices:
         build_execution_resource_envelope=_build_execution_resource_envelope,
         lane_authority_snapshot=_lane_authority_snapshot,
         execution_brief_coverage_error=_execution_brief_coverage_error,
-        steward_packet_binding=_steward_packet_binding,
+        steward_packet_binding=_new_steward_packet_binding,
         selection_terminal_packet_bindings=_selection_terminal_packet_bindings,
         packet_authority_integrity_errors=packet_authority_integrity_errors,
         packet_result_integrity_errors=packet_result_integrity_errors,
@@ -2768,6 +2803,7 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
             args.artifact_ref, "verification artifact ref"
         )
         review_packet = None
+        reviewer_agent_id: str | None = None
         if args.category == "independent_review":
             if not args.review_packet_id:
                 raise HarnessError(
@@ -2781,9 +2817,27 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     item["sha256"] for item in prepared_artifact_refs
                 },
             )
+            try:
+                reviewer_agent_id = validate_agent_id(
+                    review_packet.get("agent_id"), "reviewer packet agent id"
+                )
+            except AgentIdentityError as exc:
+                raise HarnessError(
+                    "legacy reviewer packet has a non-canonical agent identity; "
+                    "create a new reviewer packet before recording a new verification"
+                ) from exc
         elif args.review_packet_id:
             raise HarnessError(
                 "--review-packet-id is accepted only for independent_review verification"
+            )
+        category = require_text(args.category, "category")
+        evidence = require_evidence_detail(args.evidence, "evidence")
+        asserts_completion_boundary = bool(
+            getattr(args, "asserts_completion_boundary", False)
+        )
+        if asserts_completion_boundary and args.status != "pass":
+            raise HarnessError(
+                "--asserts-completion-boundary is valid only on a passing verification"
             )
         artifact_refs = preserve_bound_artifacts(
             paths, args.task, prepared_artifact_refs
@@ -2791,9 +2845,9 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
         item = {
             "integrity_version": 1,
             "artifact_snapshot_version": 1,
-            "category": require_text(args.category, "category"),
+            "category": category,
             "status": args.status,
-            "evidence": require_evidence_detail(args.evidence, "evidence"),
+            "evidence": evidence,
             "command": command,
             "boundary": boundary,
             "run_id": args.run_id or "",
@@ -2801,12 +2855,7 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "artifact_refs": artifact_refs,
             "recorded_at": now_iso(),
         }
-        if getattr(args, "asserts_completion_boundary", False):
-            if args.status != "pass":
-                raise HarnessError(
-                    "--asserts-completion-boundary is valid only on a passing "
-                    "verification"
-                )
+        if asserts_completion_boundary:
             item["asserts_completion_boundary"] = True
             # Bind the assertion to the exact boundary text it covered so a
             # later retarget cannot be closed against a stale assertion.
@@ -2814,9 +2863,10 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 str(state.get("completion_boundary", "")).encode("utf-8")
             ).hexdigest()
         if review_packet is not None:
+            assert reviewer_agent_id is not None
             item["review_packet_id"] = review_packet["packet_id"]
             item["review_result_sha256"] = review_packet["result_sha256"]
-            item["reviewer_agent_id"] = review_packet["agent_id"]
+            item["reviewer_agent_id"] = reviewer_agent_id
         state.setdefault("verification", []).append(item)
         bump_task(state)
         write_task(paths, state)
@@ -4658,6 +4708,12 @@ def _derived_routing_verified(state: dict[str, Any], packet: dict[str, Any]) -> 
 
 
 def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
+    supplied_agent = ""
+    if args.agent_id is not None:
+        try:
+            supplied_agent = validate_agent_id(args.agent_id, "packet agent id")
+        except AgentIdentityError as exc:
+            raise HarnessError(str(exc)) from exc
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "update packet for")
@@ -4725,11 +4781,24 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             raise HarnessError(
                 f"invalid packet transition {previous_status!r} -> {args.status!r}"
             )
-        existing_agent = str(packet.get("agent_id", ""))
-        supplied_agent = str(args.agent_id or "")
-        if existing_agent and supplied_agent and existing_agent != supplied_agent:
+        existing_agent_value = packet.get("agent_id", "")
+        existing_agent = (
+            existing_agent_value if isinstance(existing_agent_value, str) else ""
+        )
+        existing_agent_is_canonical = bool(AGENT_ID_RE.fullmatch(existing_agent))
+        if (
+            existing_agent
+            and supplied_agent
+            and existing_agent != supplied_agent
+            and (existing_agent_is_canonical or previous_status == "dispatched")
+        ):
             raise HarnessError("packet agent id is immutable after dispatch")
-        agent_id = existing_agent or supplied_agent
+        reusable_existing_agent = (
+            existing_agent
+            if existing_agent_is_canonical or previous_status == "dispatched"
+            else ""
+        )
+        agent_id = reusable_existing_agent or supplied_agent
         if args.status == "dispatched" and not agent_id:
             raise HarnessError("dispatched packet requires --agent-id")
         if previous_status == "dispatched" and not agent_id:
@@ -4741,6 +4810,11 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             raise HarnessError("actual routing verification requires --routing-evidence")
         if args.routing_evidence and not actual_pair:
             raise HarnessError("--routing-evidence requires actual role and model tier")
+        routing_evidence = (
+            require_evidence_detail(args.routing_evidence, "routing evidence")
+            if args.routing_evidence
+            else ""
+        )
         if args.actual_role and args.actual_role != packet.get("agent_role"):
             raise HarnessError(
                 f"actual role {args.actual_role} differs from requested {packet.get('agent_role')}"
@@ -4846,7 +4920,7 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             and not packet.get("dispatch_provenance")
         ):
             packet["dispatch_provenance"] = "legacy_unverified"
-        if agent_id:
+        if supplied_agent:
             packet["agent_id"] = agent_id
         if (
             args.status == "dispatched"
@@ -4857,10 +4931,8 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             packet["actual_role"] = args.actual_role
         if args.actual_model_tier:
             packet["actual_model_tier"] = args.actual_model_tier
-        if args.routing_evidence:
-            packet["routing_evidence"] = require_evidence_detail(
-                args.routing_evidence, "routing evidence"
-            )
+        if routing_evidence:
+            packet["routing_evidence"] = routing_evidence
         if args.actual_role or args.actual_model_tier or args.routing_evidence:
             # Operator statements stay recorded, but only as an explicit claim:
             # they can never flip routing_verified on their own.

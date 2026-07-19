@@ -25,11 +25,13 @@ the wiring is caught.
 from __future__ import annotations
 
 import ast
+import argparse
 import dataclasses
 import functools
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +42,7 @@ sys.path.insert(0, str(SRC))
 
 from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware.commands import improvement as improvement_cmds  # noqa: E402
+from aoi_orgware.harnesslib import HarnessError  # noqa: E402
 
 
 class ImportBoundaryTests(unittest.TestCase):
@@ -160,6 +163,58 @@ class ServicesFactoryWiringTests(unittest.TestCase):
             services.skill_release_semantic_integrity_errors,
             cli_impl._skill_release_semantic_integrity_errors,
         )
+
+
+class NewReleaseIdentityTests(unittest.TestCase):
+    def test_new_skill_release_reviewer_uses_shared_identity_contract(self) -> None:
+        for reviewer in (
+            "/root/reviewer",
+            "operator@example.invalid",
+            "/" + "a" * 511,
+        ):
+            with self.subTest(reviewer=reviewer):
+                self.assertEqual(
+                    improvement_cmds._new_release_reviewer_agent_id(reviewer),
+                    reviewer,
+                )
+
+        for reviewer in (
+            "legacy reviewer",
+            "reviewer+identity",
+            "審查者",
+            "/" + "a" * 512,
+            ["/root/reviewer"],
+        ):
+            with self.subTest(reviewer=reviewer), self.assertRaisesRegex(
+                HarnessError, "create a new reviewer packet"
+            ):
+                improvement_cmds._new_release_reviewer_agent_id(reviewer)
+
+    def test_invalid_release_metadata_fails_before_snapshot_capability(self) -> None:
+        base = {
+            "release_id": "release-1",
+            "skill_id": "skill-1",
+            "bundle_sha256": "a" * 64,
+            "skill_version": "0.4.0",
+            "maintenance_owner": "operator@example.invalid",
+            "rollback_plan": "Restore the exact previously adopted skill bundle bytes",
+        }
+        invalid_cases = (
+            {"skill_version": ""},
+            {"maintenance_owner": ""},
+            {"rollback_plan": "short"},
+        )
+        for changes in invalid_cases:
+            args = argparse.Namespace(**{**base, **changes})
+            with self.subTest(changes=changes), mock.patch.object(
+                improvement_cmds, "state_lock"
+            ) as lock, self.assertRaises(HarnessError):
+                improvement_cmds.cmd_skill_release_record(
+                    args,
+                    mock.sentinel.paths,
+                    services=cli_impl._improvement_cmd_services(),
+                )
+            lock.assert_not_called()
 
 
 if __name__ == "__main__":

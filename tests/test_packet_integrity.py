@@ -263,6 +263,62 @@ class SubagentIncidentSchemaTests(unittest.TestCase):
                 )
             )
         )
+        for status in ({}, []):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    any(
+                        "invalid schema" in error
+                        for error in pi.subagent_incident_integrity_errors(
+                            self._state(self._incident(status=status)),
+                            services=_services(),
+                        )
+                    )
+                )
+
+    def test_incident_identity_fields_preserve_legacy_and_validate_current(self) -> None:
+        legacy = self._incident(
+            parent_session_id="legacy parent",
+            agent_id="legacy agent+label",
+        )
+        self.assertEqual(
+            pi.subagent_incident_integrity_errors(
+                self._state(legacy), services=_services()
+            ),
+            [],
+        )
+
+        current = self._incident(
+            incident_identity_version=1,
+            parent_session_id="/root/chief",
+            agent_id="",
+        )
+        self.assertEqual(
+            pi.subagent_incident_integrity_errors(
+                self._state(current), services=_services()
+            ),
+            [],
+        )
+        for field, malformed in (
+            ("parent_session_id", ["/root/chief"]),
+            ("agent_id", {"id": "/root/agent"}),
+            ("agent_id", "legacy agent"),
+        ):
+            values = {
+                "incident_identity_version": 1,
+                "parent_session_id": "/root/chief",
+                "agent_id": "/root/agent",
+                field: malformed,
+            }
+            bad = self._incident(**values)
+            with self.subTest(field=field, malformed=malformed):
+                self.assertTrue(
+                    any(
+                        field in error
+                        for error in pi.subagent_incident_integrity_errors(
+                            self._state(bad), services=_services()
+                        )
+                    )
+                )
         bad_arms = self._incident(live_arms="not-a-list")
         self.assertTrue(
             any(
@@ -272,6 +328,49 @@ class SubagentIncidentSchemaTests(unittest.TestCase):
                 )
             )
         )
+
+
+class ReviewerPacketIdentityTests(HarnessTestCase):
+    def _require_reviewer(self, agent_id: object) -> dict:
+        paths = h.get_paths(self.root)
+        result = h.task_dir(paths, "audit") / "results" / "review.md"
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text("bounded independent review\n", encoding="utf-8")
+        packet = {
+            "packet_id": "review",
+            "status": "done",
+            "agent_role": "reviewer",
+            "agent_id": agent_id,
+            "integrity_version": 1,
+            "result_path": str(result),
+            "result_sha256": h.sha256_file(result),
+        }
+        state = {"task_id": "audit", "packets": [packet]}
+        with mock.patch.object(
+            pi, "packet_authority_integrity_errors", return_value=[]
+        ):
+            return pi._require_done_reviewer_packet(
+                paths, state, "review", services=_services()
+            )
+
+    def test_reviewer_packet_accepts_canonical_and_legacy_string_identities(self) -> None:
+        for agent_id in (
+            "/root/reviewer",
+            "operator@example.invalid",
+            "/" + "a" * 511,
+            "legacy reviewer",
+            "reviewer+identity",
+            "審查者",
+        ):
+            with self.subTest(agent_id=agent_id):
+                self.assertEqual(self._require_reviewer(agent_id)["agent_id"], agent_id)
+
+    def test_reviewer_packet_rejects_missing_or_non_string_identity(self) -> None:
+        for agent_id in ("", None, ["/root/reviewer"]):
+            with self.subTest(agent_id=agent_id), self.assertRaisesRegex(
+                HarnessError, "done reviewer assignment with an agent identity"
+            ):
+                self._require_reviewer(agent_id)
 
 
 class EvidenceSelfReferenceGateTests(unittest.TestCase):

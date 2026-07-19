@@ -12,6 +12,7 @@ from datetime import datetime
 import re
 from typing import Any, NoReturn
 
+from .agent_identity import AgentIdentityError, validate_agent_id
 from .semantic_events import SemanticEventError, canonical_sha256
 
 
@@ -116,9 +117,24 @@ def _timestamp(value: Any) -> str:
     return text
 
 
-def _identity(value: Any, fields: set[str]) -> dict[str, str]:
+def _identity(
+    value: Any, fields: set[str], *, strict_agent_id: bool = True
+) -> dict[str, str]:
     item = _object(value, fields, "event_identity")
-    return {field: _text(item[field], f"event_identity.{field}", maximum=512) for field in sorted(fields)}
+    identity: dict[str, str] = {}
+    for field in sorted(fields):
+        if field == "agent_id" and strict_agent_id:
+            try:
+                identity[field] = validate_agent_id(
+                    item[field], "event_identity.agent_id"
+                )
+            except AgentIdentityError as exc:
+                raise CodexAdapterContractError(str(exc)) from exc
+        else:
+            identity[field] = _text(
+                item[field], f"event_identity.{field}", maximum=512
+            )
+    return identity
 
 
 def _observation(value: Any, label: str, *, sha256: bool = False, decimal: bool = False,
@@ -154,7 +170,7 @@ def _targets(value: Any) -> list[str]:
     return targets
 
 
-def _stop_base(value: Any) -> dict[str, Any]:
+def _stop_base(value: Any, *, strict_agent_id: bool = True) -> dict[str, Any]:
     item = _object(value, _STOP_FIELDS, "codex subagent stop receipt")
     if item["receipt_type"] != CODEX_SUBAGENT_STOP_V1:
         _fail("receipt_type is invalid for stop receipt")
@@ -173,7 +189,11 @@ def _stop_base(value: Any) -> dict[str, Any]:
         _fail("unresolved start correlation cannot name one start receipt")
     return {
         "receipt_type": CODEX_SUBAGENT_STOP_V1,
-        "event_identity": _identity(item["event_identity"], _STOP_IDENTITY_FIELDS),
+        "event_identity": _identity(
+            item["event_identity"],
+            _STOP_IDENTITY_FIELDS,
+            strict_agent_id=strict_agent_id,
+        ),
         "observed_at": _timestamp(item["observed_at"]),
         "transcript_path_observation": _observation(item["transcript_path_observation"], "transcript_path_observation"),
         "last_assistant_message": {
@@ -263,12 +283,12 @@ def _post_base(value: Any) -> dict[str, Any]:
     }
 
 
-def _base(receipt: Any) -> dict[str, Any]:
+def _base(receipt: Any, *, strict_agent_id: bool = True) -> dict[str, Any]:
     if not isinstance(receipt, Mapping):
         _fail("receipt must be an object")
     receipt_type = receipt.get("receipt_type")
     if receipt_type == CODEX_SUBAGENT_STOP_V1:
-        return _stop_base(receipt)
+        return _stop_base(receipt, strict_agent_id=strict_agent_id)
     if receipt_type == CODEX_PRETOOL_CLAIM_DECISION_V1:
         return _pre_base(receipt)
     if receipt_type == CODEX_POSTTOOL_MUTATION_OBSERVATION_V1:
@@ -314,8 +334,15 @@ def validate_codex_adapter_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]
     if set(item) != required_fields | {"receipt_sha256"}:
         _fail("sealed receipt schema is invalid")
     supplied = _sha256(item["receipt_sha256"], "receipt_sha256")
-    base = _base({field: item[field] for field in required_fields})
-    expected = codex_adapter_receipt_sha256(base)
+    # v1 readers retain compatibility with receipts sealed before the shared
+    # agent grammar was enforced.  All current hash/seal writers remain strict.
+    base = _base(
+        {field: item[field] for field in required_fields}, strict_agent_id=False
+    )
+    try:
+        expected = canonical_sha256(base, max_bytes=MAX_RECEIPT_BYTES)
+    except SemanticEventError as exc:
+        raise CodexAdapterContractError(str(exc)) from exc
     if supplied != expected:
         _fail("receipt_sha256 does not match receipt")
     return {**base, "receipt_sha256": expected}

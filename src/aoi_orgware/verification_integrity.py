@@ -91,7 +91,14 @@ def verification_legacy_materialization_preimage(
 
     preimage = copy.deepcopy(record)
     refs: list[dict[str, Any]] = []
-    for artifact in preimage.get("artifact_refs", []):
+    artifact_refs = preimage.get("artifact_refs", [])
+    if not isinstance(artifact_refs, list):
+        raise HarnessError("replacement materialization artifact_refs must be an array")
+    for artifact in artifact_refs:
+        if not isinstance(artifact, dict):
+            raise HarnessError(
+                "replacement materialization artifact reference is malformed"
+            )
         if not _is_canonical_snapshot_version(artifact.get("snapshot_version")):
             raise HarnessError(
                 "replacement materialization preimage requires canonical snapshots"
@@ -113,11 +120,20 @@ def verification_legacy_materialization_preimage(
 
 def verification_integrity_warnings(state: dict[str, Any]) -> list[str]:
     warnings: list[str] = []
-    for index, item in enumerate(state.get("verification", []), start=1):
+    records = state.get("verification", [])
+    if not isinstance(records, list):
+        return warnings
+    for index, item in enumerate(records, start=1):
+        if not isinstance(item, dict):
+            continue
+        artifact_refs = item.get("artifact_refs", [])
+        if not isinstance(artifact_refs, list):
+            continue
         legacy_refs = [
             artifact
-            for artifact in item.get("artifact_refs", [])
-            if _is_legacy_snapshot_version(artifact.get("snapshot_version"))
+            for artifact in artifact_refs
+            if isinstance(artifact, dict)
+            and _is_legacy_snapshot_version(artifact.get("snapshot_version"))
         ]
         if not legacy_refs:
             continue
@@ -139,8 +155,13 @@ def verification_supersession_errors(state: dict[str, Any]) -> list[str]:
 
     records = state.get("verification", [])
     errors: list[str] = []
+    if not isinstance(records, list):
+        return ["verification records must be an array"]
     for source_index, source in enumerate(records, start=1):
         label = f"verification #{source_index}"
+        if not isinstance(source, dict):
+            errors.append(f"{label} is malformed")
+            continue
         superseded_raw = source.get("superseded_at")
         superseded = superseded_raw is not None and superseded_raw != ""
         metadata_present = any(
@@ -172,7 +193,9 @@ def verification_supersession_errors(state: dict[str, Any]) -> list[str]:
         elif canonical_record_sha256(verification_source_preimage(source)) != source_sha:
             errors.append(f"{label} source preimage SHA-256 mismatch")
         original_status = source.get("original_status")
-        if original_status not in ACCOUNTED_VERIFICATION_STATUSES - {"skipped"}:
+        if not isinstance(original_status, str) or original_status not in (
+            ACCOUNTED_VERIFICATION_STATUSES - {"skipped"}
+        ):
             errors.append(f"{label} has invalid original superseded status")
         replacement_index = source.get("replacement_index")
         if (
@@ -185,6 +208,9 @@ def verification_supersession_errors(state: dict[str, Any]) -> list[str]:
             errors.append(f"{label} has invalid replacement index")
             continue
         replacement = records[replacement_index - 1]
+        if not isinstance(replacement, dict):
+            errors.append(f"{label} replacement record is malformed")
+            continue
         stored_replacement_sha = str(source.get("replacement_record_sha256", ""))
         if not re.fullmatch(r"[0-9a-f]{64}", stored_replacement_sha):
             errors.append(f"{label} replacement record SHA-256 is invalid")
@@ -270,6 +296,11 @@ def verification_supersession_errors(state: dict[str, Any]) -> list[str]:
                 break
             seen.add(cursor)
             current = records[cursor - 1]
+            if not isinstance(current, dict):
+                errors.append(
+                    f"{label} replacement chain record #{cursor} is malformed"
+                )
+                break
             if not current.get("superseded_at"):
                 if current.get("status") != "pass":
                     errors.append(f"{label} replacement chain does not end in pass")
@@ -303,20 +334,28 @@ def verification_record_integrity_errors(
     )
     for index, item in records:
         label = f"verification #{index}"
+        if not isinstance(item, dict):
+            errors.append(f"{label} is malformed")
+            continue
         if not _is_exact_int(item.get("integrity_version"), 1):
             errors.append(f"{label} lacks integrity_version=1")
             continue
-        if item.get("category") not in policy.verification_categories:
-            errors.append(f"{label} has unknown category {item.get('category')!r}")
-        if item.get("status") not in VERIFICATION_STATUSES:
-            errors.append(f"{label} has invalid status {item.get('status')!r}")
-        if not str(item.get("evidence", "")).strip():
+        category = item.get("category")
+        status = item.get("status")
+        if not isinstance(category, str) or category not in policy.verification_categories:
+            errors.append(f"{label} has unknown category {category!r}")
+        if not isinstance(status, str) or status not in VERIFICATION_STATUSES:
+            errors.append(f"{label} has invalid status {status!r}")
+        evidence = item.get("evidence")
+        boundary = item.get("boundary")
+        command = item.get("command")
+        if not isinstance(evidence, str) or not evidence.strip():
             errors.append(f"{label} has empty evidence")
-        if not str(item.get("boundary", "")).strip():
+        if not isinstance(boundary, str) or not boundary.strip():
             errors.append(f"{label} has empty evidence boundary")
-        if item.get("status") in {"pass", "fail"} and not str(
-            item.get("command", "")
-        ).strip():
+        if isinstance(status, str) and status in {"pass", "fail"} and (
+            not isinstance(command, str) or not command.strip()
+        ):
             errors.append(f"{label} pass/fail record has empty command or method")
         if item.get("superseded_at"):
             if item.get("status") != "skipped":
@@ -344,9 +383,17 @@ def verification_record_integrity_errors(
                 r"[0-9a-f]{64}", str(item.get("review_result_sha256", ""))
             ):
                 errors.append(f"{label} lacks reviewer result SHA-256")
-            if not str(item.get("reviewer_agent_id", "")).strip():
+            reviewer_agent_id = item.get("reviewer_agent_id")
+            if not isinstance(reviewer_agent_id, str) or not reviewer_agent_id.strip():
                 errors.append(f"{label} lacks reviewer agent identity")
-        for artifact in item.get("artifact_refs", []):
+        artifact_refs = item.get("artifact_refs", [])
+        if not isinstance(artifact_refs, list):
+            errors.append(f"{label} artifact_refs must be an array")
+            continue
+        for artifact in artifact_refs:
+            if not isinstance(artifact, dict):
+                errors.append(f"{label} artifact reference is malformed")
+                continue
             if item.get("superseded_at") and _is_legacy_snapshot_version(
                 artifact.get("snapshot_version")
             ):

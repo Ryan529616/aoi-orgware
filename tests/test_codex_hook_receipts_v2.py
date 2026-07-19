@@ -159,6 +159,37 @@ class CodexHookReceiptStoreTests(HarnessTestCase):
         )
         self.assertEqual(receipts.store_codex_hook_receipt(self.paths, sealed), sealed)
 
+        legacy_base = {
+            key: value for key, value in sealed.items() if key != "receipt_sha256"
+        }
+        legacy_base["event_identity"] = {
+            **legacy_base["event_identity"],  # type: ignore[arg-type]
+            "agent_id": "legacy reviewer",
+        }
+        legacy = {
+            **legacy_base,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(legacy_base)
+            ).hexdigest(),
+        }
+        self.assertEqual(
+            contracts.validate_codex_subagent_stop_receipt(legacy), legacy
+        )
+        with self.assertRaisesRegex(
+            receipts.CodexHookReceiptError, "canonical agent identity"
+        ):
+            receipts.store_codex_hook_receipt(self.paths, legacy)
+
+        directory = receipts.codex_hook_receipts_dir(self.paths)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = receipts.codex_hook_receipt_path(self.paths, legacy)
+        h.atomic_create_bytes(path, canonical_json_bytes(legacy))
+        with mock.patch.object(h, "atomic_create_bytes") as create:
+            self.assertEqual(
+                receipts.store_codex_hook_receipt(self.paths, legacy), legacy
+            )
+        create.assert_not_called()
+
     def test_store_holds_cooperative_lock_through_create(self) -> None:
         real_create = h.atomic_create_bytes
 

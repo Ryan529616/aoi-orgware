@@ -11,6 +11,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 
 from aoi_orgware import codex_adapter_contracts as contracts
+from aoi_orgware.semantic_events import canonical_sha256
 
 
 SHA_A = "a" * 64
@@ -105,6 +106,44 @@ def test_stop_is_identity_bound_and_never_uses_no_material_work_as_completion() 
         malformed[field] = value
         with pytest.raises(contracts.CodexAdapterContractError):
             contracts.validate_codex_subagent_stop_receipt(malformed)
+
+
+def test_stop_agent_identity_uses_shared_canonical_grammar_and_boundary() -> None:
+    for agent_id in (
+        "/root/reviewer",
+        "operator@example.invalid",
+        "/" + "a" * 511,
+    ):
+        value = stop_receipt()
+        value["event_identity"]["agent_id"] = agent_id  # type: ignore[index]
+        sealed = contracts.seal_codex_subagent_stop_receipt(value)
+        assert sealed["event_identity"]["agent_id"] == agent_id
+
+    for agent_id in (
+        "agent identity",
+        "agent+identity",
+        "agent\nidentity",
+        "代理者",
+        "/" + "a" * 512,
+    ):
+        value = stop_receipt()
+        value["event_identity"]["agent_id"] = agent_id  # type: ignore[index]
+        with pytest.raises(contracts.CodexAdapterContractError, match="1-512 ASCII"):
+            contracts.seal_codex_subagent_stop_receipt(value)
+
+
+def test_stop_v1_reader_preserves_legacy_identity_compatibility() -> None:
+    legacy = stop_receipt()
+    legacy["event_identity"]["agent_id"] = "legacy reviewer"  # type: ignore[index]
+    sealed = {
+        **legacy,
+        "receipt_sha256": canonical_sha256(
+            legacy, max_bytes=contracts.MAX_RECEIPT_BYTES
+        ),
+    }
+    assert contracts.validate_codex_subagent_stop_receipt(sealed) == sealed
+    with pytest.raises(contracts.CodexAdapterContractError, match="1-512 ASCII"):
+        contracts.seal_codex_subagent_stop_receipt(legacy)
 
 
 def test_observation_contract_never_coerces_integers_to_text() -> None:

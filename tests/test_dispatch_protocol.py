@@ -119,8 +119,38 @@ class DispatchProtocolTests(unittest.TestCase):
 
         self.assertEqual(first, replay)
         self.assertNotEqual(first, next_protocol)
+        malformed_ids = {
+            dispatch.subagent_event_id(
+                {**payload, "agent_id": value}, policy=protocol_policy(6)
+            )
+            for value in (
+                123,
+                [123],
+                {"id": 123},
+                None,
+                "",
+                "123",
+                "x\ny",
+                "x\r\ny",
+                "a" * 513,
+                "b" * 513,
+            )
+        }
+        self.assertEqual(
+            len(malformed_ids),
+            10,
+        )
         self.assertRegex(first, r"^spawn-[0-9a-f]{32}$")
         self.assertEqual(unsafe, "")
+        self.assertEqual(
+            dispatch.safe_agent_identity_observation("/root/reviewer"),
+            "/root/reviewer",
+        )
+        self.assertEqual(
+            dispatch.safe_agent_identity_observation("legacy reviewer"), ""
+        )
+        with self.assertRaisesRegex(dispatch.HarnessError, "missing or unsafe"):
+            dispatch.validate_hook_identity(123, "hook identity", policy=protocol_policy())
 
     def test_incident_recording_is_idempotent_and_canonicalizes_candidates(self) -> None:
         payload = {
@@ -151,6 +181,24 @@ class DispatchProtocolTests(unittest.TestCase):
         self.assertEqual(len(state["subagent_incidents"]), 1)
         self.assertEqual(first["candidate_packet_ids"], ["packet-a", "packet-b"])
         self.assertEqual(first["reason_code"], "no_matching_arm")
+
+    def test_incident_records_invalid_identity_observations_as_absent(self) -> None:
+        incident = dispatch.record_subagent_incident(
+            {},
+            {
+                "session_id": "legacy parent",
+                "turn_id": "turn-forensic",
+                "agent_id": "agent+identity",
+                "agent_type": "default",
+            },
+            reason_code="invalid_transport_event",
+            candidate_packet_ids=[],
+            observed_at="2026-07-15T02:00:00+00:00",
+            policy=protocol_policy(),
+        )
+        self.assertEqual(incident["parent_session_id"], "")
+        self.assertEqual(incident["agent_id"], "")
+        self.assertEqual(incident["turn_id"], "turn-forensic")
 
     def test_initial_rejection_reason_preserves_fail_closed_precedence(self) -> None:
         packet = armed_packet()

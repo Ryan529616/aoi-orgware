@@ -189,7 +189,26 @@ def test_cohort_lifecycle_identifiers_are_canonical_and_bounded() -> None:
         sealed(packet_refs=[{"packet_id": "packet/path", "routing_authority_sha256": SHA_A}])
     with pytest.raises(CohortError, match="wave packet_id is invalid"):
         sealed(waves=[["packet/path"], ["packet-b"], ["packet-c"]])
-    for parent_session_id in ("parent\ninvalid", "p" * 513):
+    for parent_session_id in (
+        "/root/parent",
+        "operator@example.invalid",
+        "/" + "p" * 511,
+    ):
+        plan = sealed(
+            transport_slots=[
+                slot("packet-a", parent_session_id=parent_session_id),
+                slot("packet-b"),
+                slot("packet-c"),
+            ]
+        )
+        assert plan["transport_slots"][0]["parent_session_id"] == parent_session_id
+    for parent_session_id in (
+        "parent identity",
+        "parent+identity",
+        "parent\ninvalid",
+        "父工作階段",
+        "p" * 513,
+    ):
         with pytest.raises(CohortError, match="transport_slot.parent_session_id is invalid"):
             sealed(
                 transport_slots=[

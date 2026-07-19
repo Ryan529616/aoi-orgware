@@ -496,6 +496,82 @@ class CodexHookV2Tests(HarnessTestCase):
             1,
         )
 
+    def test_subagent_stop_validates_agent_identity_before_receipt_work(self) -> None:
+        payload = {
+            "session_id": "child-session",
+            "turn_id": "child-turn",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "/root/reviewer",
+        }
+        self.assertEqual(
+            codex_hook._stop_event_identity(payload)["agent_id"],
+            "/root/reviewer",
+        )
+        payload["agent_id"] = "/" + "a" * 511
+        self.assertEqual(
+            codex_hook._stop_event_identity(payload)["agent_id"],
+            payload["agent_id"],
+        )
+        for agent_id in (
+            "agent identity",
+            "agent+identity",
+            "agent\nidentity",
+            "代理者",
+            "/" + "a" * 512,
+        ):
+            payload["agent_id"] = agent_id
+            with self.subTest(agent_id=agent_id), mock.patch.object(
+                receipts, "store_codex_hook_receipt"
+            ) as store:
+                with pytest.raises(ValueError, match="1-512 ASCII"):
+                    codex_hook.subagent_stop(self.root, payload)
+                store.assert_not_called()
+
+    def test_subagent_stop_replays_existing_legacy_identity_receipt(self) -> None:
+        payload = {
+            "session_id": "child-session",
+            "turn_id": "child-turn",
+            "hook_event_name": "SubagentStop",
+            "stop_hook_active": False,
+            "agent_id": "legacy reviewer",
+        }
+        missing = lambda: {"status": "missing", "value": None}
+        legacy_base = {
+            "receipt_type": contracts.CODEX_SUBAGENT_STOP_V1,
+            "event_identity": codex_hook._stop_event_identity(
+                payload, strict_agent_id=False
+            ),
+            "observed_at": "2026-07-19T01:02:03Z",
+            "transcript_path_observation": missing(),
+            "last_assistant_message": {
+                "sha256": missing(),
+                "size_bytes": missing(),
+                "presence": {"status": "observed", "value": "absent"},
+            },
+            "model_observation": missing(),
+            "permission_mode_observation": missing(),
+            "start_correlation": {
+                "status": "missing",
+                "start_receipt_sha256": missing(),
+            },
+            "no_material_work_verified": False,
+        }
+        legacy = {
+            **legacy_base,
+            "receipt_sha256": canonical_sha256(legacy_base),
+        }
+        paths = h.get_paths(self.root)
+        directory = receipts.codex_hook_receipts_dir(paths)
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        path = receipts.codex_hook_receipt_path(paths, legacy)
+        h.atomic_create_bytes(path, canonical_json_bytes(legacy))
+        before = path.read_bytes()
+
+        self.assertEqual(self.call(codex_hook.subagent_stop, payload), {"continue": True})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(receipts.inspect_codex_hook_receipt_store(paths)["entry_count"], 1)
+
     def test_main_verifies_provenance_before_reading_stdin_and_fails_open(self) -> None:
         argv = [
             str(_launcher(self.root, "aoi-codex-hook")),

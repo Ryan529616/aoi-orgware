@@ -15,6 +15,7 @@ import json
 import re
 from typing import Any
 
+from .agent_identity import AgentIdentityError, validate_agent_id
 from .semantic_events import SemanticEventError, canonical_json_bytes, canonical_sha256
 
 
@@ -28,7 +29,6 @@ MAX_CONCURRENCY = 12
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_PARENT_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}")
 _CANONICAL_AGENT_TYPES = frozenset(
     {
         "architect",
@@ -220,9 +220,10 @@ def _max_concurrency(value: Any) -> int:
 
 
 def _parent_session_id(value: Any) -> str:
-    if not isinstance(value, str) or not _PARENT_SESSION_ID.fullmatch(value):
-        _fail("transport_slot.parent_session_id is invalid")
-    return value
+    try:
+        return validate_agent_id(value, "transport_slot.parent_session_id")
+    except AgentIdentityError as exc:
+        raise CohortError("transport_slot.parent_session_id is invalid") from exc
 
 
 def _expected_agent_type(value: Any) -> str:

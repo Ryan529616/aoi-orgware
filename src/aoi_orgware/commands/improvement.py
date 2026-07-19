@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..agent_identity import AgentIdentityError, validate_agent_id
 from ..harnesslib import (
     HarnessError,
     HarnessPaths,
@@ -162,6 +163,18 @@ class ImprovementCmdServices:
     records_fingerprint: _RecordsFingerprint
     require_done_reviewer_packet: _RequireDoneReviewerPacket
     skill_release_semantic_integrity_errors: _SkillReleaseSemanticIntegrityErrors
+
+
+def _new_release_reviewer_agent_id(value: Any) -> str:
+    """Require canonical identity for a newly persisted skill-release record."""
+
+    try:
+        return validate_agent_id(value, "skill release reviewer agent id")
+    except AgentIdentityError as exc:
+        raise HarnessError(
+            "legacy reviewer packet has a non-canonical agent identity; "
+            "create a new reviewer packet before recording a new skill release"
+        ) from exc
 
 
 def emit(payload: Any, as_json: bool = False) -> None:
@@ -418,6 +431,11 @@ def cmd_skill_release_record(
     expected_bundle_sha = require_text(args.bundle_sha256, "skill bundle SHA-256").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected_bundle_sha):
         raise HarnessError("skill bundle SHA-256 must be full 64 hex")
+    skill_version = require_text(args.skill_version, "skill version")
+    maintenance_owner = require_text(
+        args.maintenance_owner, "skill maintenance owner"
+    )
+    rollback_plan = require_evidence_detail(args.rollback_plan, "skill rollback plan")
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "record skill release for")
@@ -457,9 +475,9 @@ def cmd_skill_release_record(
         if (
             manifest.get("skill_release_manifest_version") != 1
             or manifest.get("skill_id") != skill_id
-            or manifest.get("skill_version") != args.skill_version
-            or manifest.get("maintenance_owner") != args.maintenance_owner
-            or manifest.get("rollback_plan") != args.rollback_plan
+            or manifest.get("skill_version") != skill_version
+            or manifest.get("maintenance_owner") != maintenance_owner
+            or manifest.get("rollback_plan") != rollback_plan
             or manifest.get("bundle_sha256") != bundle_sha
             or manifest.get("validation_receipt_sha256") != validation_sha
             or not _valid_skill_manifest_files(manifest.get("files"))
@@ -498,6 +516,9 @@ def cmd_skill_release_record(
             review_packet_id,
             required_artifact_shas=required_artifact_shas,
         )
+        reviewer_agent_id = _new_release_reviewer_agent_id(
+            review_packet.get("agent_id")
+        )
         project_records = [
             item
             for item in project.get("verification", [])
@@ -526,7 +547,7 @@ def cmd_skill_release_record(
             or independent_record.get("review_result_sha256")
             != review_packet.get("result_sha256")
             or independent_record.get("reviewer_agent_id")
-            != review_packet.get("agent_id")
+            != reviewer_agent_id
         ):
             raise HarnessError(
                 "independent review verification is not bound to the reviewer result identity"
@@ -547,13 +568,9 @@ def cmd_skill_release_record(
             "request_id": request["request_id"],
             "project_task_id": project_task_id,
             "skill_id": skill_id,
-            "skill_version": require_text(args.skill_version, "skill version"),
-            "maintenance_owner": require_text(
-                args.maintenance_owner, "skill maintenance owner"
-            ),
-            "rollback_plan": require_evidence_detail(
-                args.rollback_plan, "skill rollback plan"
-            ),
+            "skill_version": skill_version,
+            "maintenance_owner": maintenance_owner,
+            "rollback_plan": rollback_plan,
             "status": "release_candidate",
             "bundle_path": str(bundle_snapshot),
             "bundle_sha256": bundle_sha,
@@ -565,7 +582,7 @@ def cmd_skill_release_record(
             "independent_review": {
                 "review_packet_id": review_packet["packet_id"],
                 "review_result_sha256": review_packet["result_sha256"],
-                "reviewer_agent_id": review_packet["agent_id"],
+                "reviewer_agent_id": reviewer_agent_id,
             },
             "recorded_at": recorded,
         }

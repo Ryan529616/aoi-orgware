@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .agent_identity import validate_agent_id
 from .harnesslib import get_paths, is_semantic_v2_task
 
 
@@ -111,12 +112,16 @@ def _tool_event_identity(payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _stop_event_identity(payload: dict[str, Any]) -> dict[str, str]:
+def _stop_event_identity(
+    payload: dict[str, Any], *, strict_agent_id: bool = True
+) -> dict[str, str]:
     session_id = exact_payload_string(payload, "session_id")
     turn_id = exact_payload_string(payload, "turn_id")
     agent_id = exact_payload_string(payload, "agent_id")
     if not all((session_id, turn_id, agent_id)):
         raise ValueError("subagent stop identity is incomplete")
+    if strict_agent_id:
+        agent_id = validate_agent_id(agent_id, "subagent stop agent_id")
     return {
         "session_id": session_id,
         "turn_id": turn_id,
@@ -423,7 +428,7 @@ def subagent_stop(root: Path, payload: dict[str, Any]) -> None:
     )
     from .harnesslib import now_iso
 
-    identity = _stop_event_identity(payload)
+    lookup_identity = _stop_event_identity(payload, strict_agent_id=False)
     transcript = payload.get("agent_transcript_path")
     if transcript is None:
         transcript = payload.get("transcript_path")
@@ -470,7 +475,7 @@ def subagent_stop(root: Path, payload: dict[str, Any]) -> None:
         existing = load_codex_hook_receipt_by_identity(
             paths,
             receipt_type=CODEX_SUBAGENT_STOP_V1,
-            event_identity=identity,
+            event_identity=lookup_identity,
         )
     except CodexHookReceiptError as exc:
         if "missing" not in str(exc):
@@ -482,6 +487,10 @@ def subagent_stop(root: Path, payload: dict[str, Any]) -> None:
         raise CodexHookReceiptError(
             "SubagentStop replay has divergent observations for one event identity"
         )
+    # Existing v1 receipt lookup deliberately uses the original identity
+    # grammar.  Only a genuinely new receipt adopts the current shared agent
+    # identity contract.
+    identity = _stop_event_identity(payload)
     receipt = seal_codex_subagent_stop_receipt(
         {
             "receipt_type": CODEX_SUBAGENT_STOP_V1,

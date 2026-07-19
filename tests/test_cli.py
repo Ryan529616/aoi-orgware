@@ -6793,6 +6793,34 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         self.assertIn("result SHA-256 mismatch", rejected_brief.stderr)
         self.assertEqual(state_path.read_bytes(), before_state)
         synthesis_result.write_bytes(original_result)
+        for legacy_agent_id in ("legacy steward", ["legacy-steward"]):
+            legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+            next(
+                packet
+                for packet in legacy_state["packets"]
+                if packet["packet_id"] == "parallel-review-steward-synthesis"
+            )["agent_id"] = legacy_agent_id
+            state_path.write_text(
+                json.dumps(legacy_state, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            legacy_bytes = state_path.read_bytes()
+            with self.subTest(legacy_agent_id=legacy_agent_id):
+                rejected_identity = self.cli(*brief_args, ok=False)
+                self.assertIn(
+                    "create a new Steward packet", rejected_identity.stderr
+                )
+                self.assertEqual(state_path.read_bytes(), legacy_bytes)
+        restored_state = json.loads(state_path.read_text(encoding="utf-8"))
+        next(
+            packet
+            for packet in restored_state["packets"]
+            if packet["packet_id"] == "parallel-review-steward-synthesis"
+        )["agent_id"] = "/root/parallel-review-steward-synthesis"
+        state_path.write_text(
+            json.dumps(restored_state, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         brief = json.loads(
             self.cli(
                 *brief_args,
@@ -6809,6 +6837,36 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             ],
             2,
         )
+        legacy_state = copy.deepcopy(self.task_state(task_id))
+        legacy_packet = next(
+            packet
+            for packet in legacy_state["packets"]
+            if packet["packet_id"] == "parallel-review-steward-synthesis"
+        )
+        legacy_packet["agent_id"] = "legacy steward"
+        legacy_brief = legacy_state["execution_briefs"][-1]
+        legacy_brief["steward_packet_binding"]["agent_id"] = "legacy steward"
+        legacy_preimage = copy.deepcopy(legacy_brief)
+        legacy_preimage.pop("brief_sha256")
+        legacy_brief["brief_sha256"] = cli_impl.canonical_record_sha256(
+            legacy_preimage
+        )
+        legacy_selection = next(
+            item
+            for item in legacy_state["execution_selections"]
+            if item["selection_id"] == "parallel-reviews"
+        )
+        self.assertIsNone(
+            cli_impl._execution_brief_coverage_error(
+                h.get_paths(self.root), legacy_state, legacy_selection
+            )
+        )
+        with self.assertRaisesRegex(h.HarnessError, "create a new Steward packet"):
+            cli_impl._new_steward_packet_binding(
+                legacy_state,
+                "parallel-reviews",
+                "parallel-review-steward-synthesis",
+            )
         self.cli(
             "execution-select",
             "--task",
@@ -13782,6 +13840,43 @@ class HookTests(HarnessTestCase):
             cli_impl.packet_integrity_errors(h.get_paths(self.root), state), []
         )
 
+    def test_failed_dispatch_input_validation_publishes_no_parent_mapping(self) -> None:
+        task_id = "failed-dispatch-mapping-atomicity"
+        packet_id = "mapping-safe-packet"
+        agent_id = "/root/mapping-safe-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm_packet(
+            task_id,
+            packet_id,
+            expected_agent_type="explorer",
+            parent_session_id="harness-test-chief",
+        )
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        before = state_path.read_bytes()
+
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            agent_id,
+            "--actual-role",
+            "explorer",
+            "--actual-model-tier",
+            "standard",
+            "--routing-evidence",
+            "short",
+            ok=False,
+        )
+        self.assertIn("routing evidence", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertFalse(h.session_path(h.get_paths(self.root), agent_id).exists())
+
     def test_unrelated_expired_arm_does_not_pollute_incident_attribution(self) -> None:
         task_id = "expired-arm-attribution"
         packet_id = "expired-explorer"
@@ -14142,6 +14237,197 @@ class HookTests(HarnessTestCase):
             doctor,
         )
 
+    def test_packet_update_rejects_invalid_supplied_agent_without_mutation(self) -> None:
+        task_id = "manual-agent-identity-gate"
+        packet_id = "manual-agent-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        before = state_path.read_bytes()
+        for agent_id in (
+            "agent identity",
+            "agent+identity",
+            "agent\nidentity",
+            "代理者",
+            "/" + "a" * 512,
+        ):
+            rejected = self.cli(
+                "packet-update",
+                "--task",
+                task_id,
+                "--packet-id",
+                packet_id,
+                "--status",
+                "dispatched",
+                "--agent-id",
+                agent_id,
+                ok=False,
+            )
+            self.assertIn("packet agent id must use 1-512 ASCII", rejected.stderr)
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_packet_update_does_not_coerce_existing_legacy_agent_identity(self) -> None:
+        task_id = "legacy-agent-read-compatibility"
+        packet_id = "legacy-agent-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = self.task_state(task_id)
+        state["packets"][0]["agent_id"] = ["legacy-invalid-type"]
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "cancelled",
+            "--summary",
+            "Cancel a legacy packet without re-persisting a coerced identity",
+        )
+        self.assertEqual(
+            self.task_state(task_id)["packets"][0]["agent_id"],
+            ["legacy-invalid-type"],
+        )
+
+    def test_new_dispatch_replaces_but_never_reuses_legacy_string_identity(self) -> None:
+        task_id = "legacy-agent-new-dispatch-gate"
+        packet_id = "legacy-string-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        self.arm_packet(task_id, packet_id)
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        state = self.task_state(task_id)
+        state["packets"][0]["agent_id"] = "legacy reviewer"
+        state_path.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        before = state_path.read_bytes()
+
+        rejected = self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            ok=False,
+        )
+        self.assertIn("dispatched packet requires --agent-id", rejected.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+        self.cli(
+            "packet-update",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--status",
+            "dispatched",
+            "--agent-id",
+            "/root/replacement-agent",
+        )
+        packet = self.task_state(task_id)["packets"][0]
+        self.assertEqual(packet["agent_id"], "/root/replacement-agent")
+        self.assertEqual(packet["status"], "dispatched")
+
+    def test_new_verification_rejects_legacy_reviewer_without_mutation(self) -> None:
+        task_id = "legacy-reviewer-new-verification-gate"
+        self.init_task(task_id, session_id="harness-test-chief")
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        before = state_path.read_bytes()
+        artifact = self.root / "legacy-review-candidate.bin"
+        artifact.write_bytes(b"candidate bytes\n")
+        artifact_ref = f"{artifact}={hashlib.sha256(artifact.read_bytes()).hexdigest()}"
+        args = cli_impl.build_parser().parse_args(
+            [
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "independent_review",
+                "--status",
+                "pass",
+                "--evidence",
+                "A legacy reviewer packet cannot authorize a new record",
+                "--command",
+                "review exact candidate",
+                "--boundary",
+                "Exact candidate review only",
+                "--review-packet-id",
+                "legacy-review-packet",
+                "--artifact-ref",
+                artifact_ref,
+            ]
+        )
+        legacy_packet = {
+            "packet_id": "legacy-review-packet",
+            "agent_id": "legacy reviewer",
+            "result_sha256": "a" * 64,
+        }
+        with mock.patch.object(
+            cli_impl, "_require_done_reviewer_packet", return_value=legacy_packet
+        ), self.assertRaisesRegex(h.HarnessError, "create a new reviewer packet"):
+            cli_impl.cmd_add_verification(args, h.get_paths(self.root))
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertFalse(
+            (
+                self.root
+                / ".aoi"
+                / "tasks"
+                / task_id
+                / "results"
+                / "artifact-blobs"
+            ).exists()
+        )
+
+    def test_failed_verification_validation_writes_no_artifact_blob(self) -> None:
+        task_id = "failed-verification-artifact-atomicity"
+        self.init_task(task_id, session_id="harness-test-chief")
+        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
+        before = state_path.read_bytes()
+        artifact = self.root / "failed-verification-candidate.bin"
+        artifact.write_bytes(b"candidate bytes\n")
+        artifact_ref = f"{artifact}={hashlib.sha256(artifact.read_bytes()).hexdigest()}"
+        args = cli_impl.build_parser().parse_args(
+            [
+                "add-verification",
+                "--task",
+                task_id,
+                "--category",
+                "static_check",
+                "--status",
+                "fail",
+                "--evidence",
+                "The failing check cannot assert the completion boundary",
+                "--command",
+                "run bounded static analysis",
+                "--boundary",
+                "Exact static-analysis result only",
+                "--asserts-completion-boundary",
+                "--artifact-ref",
+                artifact_ref,
+            ]
+        )
+        with self.assertRaisesRegex(h.HarnessError, "valid only on a passing"):
+            cli_impl.cmd_add_verification(args, h.get_paths(self.root))
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertFalse(
+            (
+                self.root
+                / ".aoi"
+                / "tasks"
+                / task_id
+                / "results"
+                / "artifact-blobs"
+            ).exists()
+        )
+
     def test_legacy_task_packet_creation_and_manual_upgrade_set_dispatch_version(self) -> None:
         task_id = "hook-progressive-dispatch-migration"
         packet_id = "legacy-ready-packet"
@@ -14295,6 +14581,59 @@ class HookTests(HarnessTestCase):
         packet = self.task_state(task_id)["packets"][0]
         self.assertEqual(packet["status"], "dispatched")
         self.assertEqual(packet["agent_id"], "/root/index-safe-packet")
+
+    def _observe_malformed_dispatch_identity(
+        self, task_id: str, malformed_agent_id: object
+    ) -> tuple[dict, dict]:
+        packet_id = "exact-string-packet"
+        self.init_task(task_id, session_id="harness-test-chief")
+        self.create_hook_packet(task_id, packet_id)
+        expires_at = (
+            dt.datetime.now().astimezone() + dt.timedelta(minutes=5)
+        ).isoformat()
+        self.cli(
+            "packet-arm",
+            "--task",
+            task_id,
+            "--packet-id",
+            packet_id,
+            "--expected-agent-type",
+            "explorer",
+            "--expires-at",
+            expires_at,
+        )
+        event = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "harness-test-chief",
+            "turn_id": "malformed-identity",
+            "agent_id": malformed_agent_id,
+            "agent_type": "explorer",
+        }
+        outcome = cli_impl.observe_subagent_start(h.get_paths(self.root), event)
+        self.assertEqual(outcome["status"], "incident")
+        self.assertEqual(outcome["reason_code"], "invalid_event")
+        state = self.task_state(task_id)
+        packet = state["packets"][0]
+        self.assertEqual(packet["status"], "armed")
+        self.assertNotIn("agent_id", packet)
+        self.assertEqual(packet["dispatch_provenance"], "none")
+        self.assertEqual(state["subagent_incidents"][-1]["agent_id"], "")
+        return event, outcome
+
+    def test_numeric_agent_identity_cannot_alias_valid_dispatch_replay(self) -> None:
+        task_id = "hook-numeric-dispatch-identity"
+        event, malformed = self._observe_malformed_dispatch_identity(task_id, 123)
+        authorized = cli_impl.observe_subagent_start(
+            h.get_paths(self.root), {**event, "agent_id": "123"}
+        )
+        self.assertNotEqual(authorized.get("incident_id"), malformed.get("incident_id"))
+        self.assertEqual(authorized["status"], "authorized")
+        self.assertEqual(self.task_state(task_id)["packets"][0]["agent_id"], "123")
+
+    def test_list_agent_identity_never_becomes_dispatch_authority(self) -> None:
+        self._observe_malformed_dispatch_identity(
+            "hook-list-dispatch-identity", ["/root/worker"]
+        )
 
     def test_unarmed_subagent_start_records_and_accounts_incident(self) -> None:
         task_id = "hook-unmanaged-dispatch"

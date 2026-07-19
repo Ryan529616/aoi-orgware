@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .agent_identity import AgentIdentityError, validate_agent_id
 from .harnesslib import (
     HarnessError,
     HarnessPaths,
@@ -162,7 +163,9 @@ def active_dispatch_attempt(packet: dict[str, Any]) -> dict[str, Any]:
 def validate_hook_identity(
     value: Any, label: str, *, policy: DispatchProtocolPolicy
 ) -> str:
-    text = str(value or "")
+    if not isinstance(value, str):
+        raise HarnessError(f"{label} is missing or unsafe")
+    text = value
     if (
         not policy.hook_id_re.fullmatch(text)
         or "\x00" in text
@@ -182,6 +185,56 @@ def safe_hook_observation_text(
     ):
         return ""
     return text
+
+
+def safe_exact_hook_observation_text(
+    value: Any, *, policy: DispatchProtocolPolicy
+) -> str:
+    """Return bounded hook text only when the transport supplied a string."""
+
+    if not isinstance(value, str):
+        return ""
+    return safe_hook_observation_text(value, policy=policy)
+
+
+def safe_hook_identity_observation(
+    value: Any, *, policy: DispatchProtocolPolicy
+) -> str:
+    """Return one exact transport identity, or explicit absence."""
+
+    try:
+        return validate_hook_identity(value, "observed hook identity", policy=policy)
+    except HarnessError:
+        return ""
+
+
+def event_identity_component(value: Any, *, policy: DispatchProtocolPolicy) -> str:
+    """Preserve valid legacy string keys and separate malformed JSON types."""
+
+    if isinstance(value, str):
+        safe = safe_exact_hook_observation_text(value, policy=policy)
+        if value == "" or safe:
+            return safe
+        return "!invalid-string-" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+    try:
+        payload = json.dumps(
+            value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        payload = type(value).__qualname__.encode("utf-8", errors="backslashreplace")
+    # The sentinel cannot collide with a valid hook identity because ``!`` is
+    # outside the public identity grammar.  The digest also keeps the preimage
+    # bounded when malformed JSON values are large.
+    return "!invalid-json-" + hashlib.sha256(payload).hexdigest()
+
+
+def safe_agent_identity_observation(value: Any) -> str:
+    """Persist a canonical identity, or an explicit absence for unsafe input."""
+
+    try:
+        return validate_agent_id(value, "observed agent identity")
+    except AgentIdentityError:
+        return ""
 
 
 def expire_dispatch_arms(
@@ -217,16 +270,14 @@ def subagent_event_id(
     payload: dict[str, Any], *, policy: DispatchProtocolPolicy
 ) -> str:
     identity = {
-        "session_id": safe_hook_observation_text(
+        "session_id": event_identity_component(
             payload.get("session_id", ""), policy=policy
         ),
-        "turn_id": safe_hook_observation_text(
-            payload.get("turn_id", ""), policy=policy
-        ),
-        "agent_id": safe_hook_observation_text(
+        "turn_id": event_identity_component(payload.get("turn_id", ""), policy=policy),
+        "agent_id": event_identity_component(
             payload.get("agent_id", ""), policy=policy
         ),
-        "agent_type": safe_hook_observation_text(
+        "agent_type": event_identity_component(
             payload.get("agent_type", ""), policy=policy
         ),
         "hook_protocol_version": policy.hook_protocol_version,
@@ -284,18 +335,17 @@ def record_subagent_incident(
         return existing[0]
     incident = {
         "incident_id": incident_id,
+        "incident_identity_version": 1,
         "kind": "unmanaged_subagent_start",
         "status": "open",
-        "parent_session_id": safe_hook_observation_text(
+        "parent_session_id": safe_hook_identity_observation(
             payload.get("session_id", ""), policy=policy
         ),
-        "turn_id": safe_hook_observation_text(
+        "turn_id": safe_exact_hook_observation_text(
             payload.get("turn_id", ""), policy=policy
         ),
-        "agent_id": safe_hook_observation_text(
-            payload.get("agent_id", ""), policy=policy
-        ),
-        "agent_type": safe_hook_observation_text(
+        "agent_id": safe_agent_identity_observation(payload.get("agent_id", "")),
+        "agent_type": safe_hook_identity_observation(
             payload.get("agent_type", ""), policy=policy
         ),
         "model": safe_hook_observation_text(
@@ -607,8 +657,11 @@ def observe_subagent_start(
 ) -> dict[str, Any]:
     """Consume one exact arm or durably record an unmanaged start incident."""
 
-    parent_session_id = str(payload.get("session_id", ""))
-    if not policy.hook_id_re.fullmatch(parent_session_id):
+    try:
+        parent_session_id = validate_hook_identity(
+            payload.get("session_id", ""), "parent session", policy=policy
+        )
+    except HarnessError:
         return {"status": "unbound", "reason_code": "invalid_parent_session"}
     mapping_path = session_path(paths, parent_session_id)
     if not mapping_path.exists():
@@ -707,18 +760,23 @@ def observe_subagent_start(
 
         observed_at = now_iso()
         current = dt.datetime.now().astimezone()
-        transport_agent_type = str(payload.get("agent_type", ""))
-        agent_id = str(payload.get("agent_id", ""))
+        try:
+            transport_agent_type = validate_hook_identity(
+                payload.get("agent_type", ""), "agent type", policy=policy
+            )
+        except HarnessError:
+            transport_agent_type = ""
+        try:
+            agent_id = validate_agent_id(payload.get("agent_id", ""), "agent id")
+        except AgentIdentityError:
+            agent_id = ""
         # Transport-honest routing observation: record the model exactly as the
         # hook payload provided it, empty when the transport did not expose one.
         observed_model = safe_hook_observation_text(
             payload.get("model", ""), policy=policy
         )
         expired_arms = expire_dispatch_arms(state, current=current)
-        valid_event = bool(
-            policy.hook_id_re.fullmatch(transport_agent_type)
-            and policy.hook_id_re.fullmatch(agent_id)
-        )
+        valid_event = bool(transport_agent_type and agent_id)
         candidates = (
             matching_armed_packets(
                 state,
@@ -885,7 +943,7 @@ def observe_subagent_start(
             "event_id": event_id,
             "hook_protocol_version": policy.hook_protocol_version,
             "parent_session_id": parent_session_id,
-            "turn_id": safe_hook_observation_text(
+            "turn_id": safe_exact_hook_observation_text(
                 payload.get("turn_id", ""), policy=policy
             ),
             "agent_id": agent_id,

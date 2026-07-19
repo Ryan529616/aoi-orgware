@@ -1049,49 +1049,80 @@ def subagent_incident_integrity_errors(
             )
         arm_slots[slot] = str(packet.get("packet_id", ""))
     for incident in incidents:
+        if not isinstance(incident, dict):
+            errors.append("spawn incident record is malformed")
+            continue
         incident_id = str(incident.get("incident_id", ""))
         if not re.fullmatch(r"spawn-[0-9a-f]{32}", incident_id):
             errors.append(f"spawn incident {incident_id!r} has an invalid id")
         if incident_id in seen:
             errors.append(f"duplicate spawn incident id {incident_id}")
         seen.add(incident_id)
+        identity_version = incident.get("incident_identity_version")
+        if identity_version is not None and not _is_exact_int(identity_version, 1):
+            errors.append(
+                f"spawn incident {incident_id} has an invalid identity schema version"
+            )
+        for field in ("parent_session_id", "agent_id"):
+            if field not in incident:
+                continue
+            identity = incident.get(field)
+            if not isinstance(identity, str) or len(identity) > 512 or any(
+                character in identity for character in ("\x00", "\n", "\r")
+            ):
+                errors.append(
+                    f"spawn incident {incident_id} has a malformed {field}"
+                )
+            elif identity_version == 1 and identity and not AGENT_ID_RE.fullmatch(identity):
+                errors.append(
+                    f"spawn incident {incident_id} has a non-canonical {field}"
+                )
         live_arms = incident.get("live_arms")
         if live_arms is not None and (
             not isinstance(live_arms, list)
             or not all(isinstance(item, dict) for item in live_arms)
         ):
             errors.append(f"spawn incident {incident_id} has a malformed live_arms snapshot")
+        incident_status = incident.get("status")
         if (
             incident.get("kind") != "unmanaged_subagent_start"
-            or incident.get("status") not in {"open", "accounted"}
+            or not isinstance(incident_status, str)
+            or incident_status not in {"open", "accounted"}
             or not _is_exact_int(
                 incident.get("hook_protocol_version"), int(HOOK_PROTOCOL_VERSION)
             )
             or not isinstance(incident.get("candidate_packet_ids"), list)
         ):
             errors.append(f"spawn incident {incident_id} has an invalid schema")
-        if incident.get("status") == "open" and incident.get("resolution") is not None:
+        if incident_status == "open" and incident.get("resolution") is not None:
             errors.append(f"open spawn incident {incident_id} carries a resolution")
-        if incident.get("status") == "accounted":
+        if incident_status == "accounted":
             resolution = incident.get("resolution")
+            disposition = (
+                resolution.get("disposition") if isinstance(resolution, dict) else None
+            )
             if (
                 not isinstance(resolution, dict)
-                or resolution.get("disposition")
+                or not isinstance(disposition, str)
+                or disposition
                 not in {"no_material_work", "work_discarded", "manual_unverified"}
             ):
                 errors.append(f"accounted spawn incident {incident_id} lacks disposition")
-            elif resolution.get("disposition_kind") is not None and (
-                resolution.get("disposition_kind")
-                not in {
+            else:
+                disposition_kind = resolution.get("disposition_kind")
+                if disposition_kind is not None and (
+                    not isinstance(disposition_kind, str)
+                    or disposition_kind
+                    not in {
                     "true_positive",
                     "false_positive_guard",
                     "benign_no_work",
                     "unverified",
-                }
-            ):
-                errors.append(
-                    f"accounted spawn incident {incident_id} has an invalid disposition kind"
-                )
+                    }
+                ):
+                    errors.append(
+                        f"accounted spawn incident {incident_id} has an invalid disposition kind"
+                    )
     return errors
 
 
@@ -1117,6 +1148,7 @@ def _require_done_reviewer_packet(
     if (
         packet.get("status") != "done"
         or packet.get("agent_role") != "reviewer"
+        or not isinstance(packet.get("agent_id"), str)
         or not str(packet.get("agent_id", "")).strip()
         or (
             packet.get("actual_role")

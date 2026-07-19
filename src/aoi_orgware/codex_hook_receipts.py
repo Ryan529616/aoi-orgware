@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import harnesslib as h
+from .agent_identity import AgentIdentityError, validate_agent_id
 from .semantic_events import SemanticEventError, canonical_json_bytes
 
 
@@ -66,6 +67,20 @@ def _canonical_validated_receipt(value: Any) -> tuple[dict[str, Any], bytes]:
     if decoded != receipt:
         raise CodexHookReceiptError("adapter validator returned a non-canonical receipt")
     return receipt, payload
+
+
+def _require_current_store_identity(receipt: Mapping[str, Any]) -> None:
+    """Keep v1 reads compatible without admitting legacy IDs as new entries."""
+
+    event_identity = receipt.get("event_identity")
+    if not isinstance(event_identity, Mapping) or "agent_id" not in event_identity:
+        return
+    try:
+        validate_agent_id(event_identity.get("agent_id"), "stored receipt agent id")
+    except AgentIdentityError as exc:
+        raise CodexHookReceiptError(
+            "new Codex receipt store entries require a canonical agent identity"
+        ) from exc
 
 
 def _event_identity_preimage(receipt: Mapping[str, Any]) -> dict[str, Any]:
@@ -322,6 +337,10 @@ def store_codex_hook_receipt(
                     "Codex hook receipt collision: same event identity has divergent sealed bytes"
                 )
             return stored
+        # Legacy v1 receipts remain readable and their exact bytes remain
+        # idempotently replayable.  Only a newly created store entry adopts the
+        # current canonical agent-identity contract.
+        _require_current_store_identity(receipt)
         records, total_bytes = _scan_store_locked(paths)
         if len(records) >= MAX_CODEX_HOOK_RECEIPT_ENTRIES:
             raise CodexHookReceiptError("receipt_store_full: entry cap is exhausted")

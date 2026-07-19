@@ -9,8 +9,10 @@ agent identities and sealed SHA-256 bindings.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
+
+from .agent_identity import AgentIdentityError, validate_agent_id
 
 
 REVIEW_INTEGRITY_VERSION = 1
@@ -74,11 +76,26 @@ def _bounded_values(value: Any, label: str) -> list[Any]:
 
 
 def _agent_id(value: Any, label: str) -> str:
+    try:
+        return validate_agent_id(value, f"{label} agent_id")
+    except AgentIdentityError as exc:
+        raise ReviewIntegrityError(str(exc)) from exc
+
+
+def _legacy_agent_id(value: Any, label: str) -> str:
+    """Read the union of original-v1 and current canonical identities."""
+
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ReviewIntegrityError(f"{label} lacks an explicit agent_id")
-    if len(value) > 256:
-        raise ReviewIntegrityError(f"{label} agent_id exceeds 256 characters")
-    return value
+    # Original v1 records admitted arbitrary trimmed text through 256 bytes.
+    # Current writers use the shared canonical grammar through 512 bytes while
+    # retaining the same v1 envelope, so replay accepts exactly that union.
+    if len(value) <= 256:
+        return value
+    try:
+        return validate_agent_id(value, f"{label} agent_id")
+    except AgentIdentityError as exc:
+        raise ReviewIntegrityError(str(exc)) from exc
 
 
 def _finding_id(value: Any, label: str) -> str:
@@ -104,6 +121,33 @@ def _packet_is_reviewer(packet: Mapping[str, Any], label: str) -> bool:
     return roles == {"reviewer"}
 
 
+def _producer_identity_set(
+    *,
+    task_owner: Any,
+    candidate_packets: Iterable[Mapping[str, Any]] = (),
+    result_packets: Iterable[Mapping[str, Any]] = (),
+    mutations: Iterable[Mapping[str, Any]] = (),
+    identity_validator: Callable[[Any, str], str],
+) -> frozenset[str]:
+    identities = {identity_validator(task_owner, "task owner")}
+    for collection_name, collection in (
+        ("candidate packet", candidate_packets),
+        ("result packet", result_packets),
+    ):
+        for index, packet in enumerate(_bounded_records(collection, collection_name), 1):
+            label = f"{collection_name} #{index}"
+            if not isinstance(packet, Mapping):
+                raise ReviewIntegrityError(f"{label} is not a record")
+            _packet_is_reviewer(packet, label)
+            identities.add(identity_validator(packet.get("agent_id"), label))
+    for index, mutation in enumerate(_bounded_records(mutations, "mutation"), 1):
+        label = f"mutation #{index}"
+        if not isinstance(mutation, Mapping):
+            raise ReviewIntegrityError(f"{label} is not a record")
+        identities.add(identity_validator(mutation.get("actor_agent_id"), label))
+    return frozenset(identities)
+
+
 def producer_identity_set(
     *,
     task_owner: Any,
@@ -116,40 +160,78 @@ def producer_identity_set(
     Every candidate/result packet is a producer regardless of its role label;
     otherwise relabeling a producer as ``reviewer`` could manufacture false
     independence. Mutation records use the unambiguous ``actor_agent_id``
-    field rather than a prose actor label.
+    field rather than a prose actor label. New builders use the shared grammar;
+    the v1 graph reader retains its original identity syntax separately.
     """
 
-    identities = {_agent_id(task_owner, "task owner")}
-    for collection_name, collection in (
-        ("candidate packet", candidate_packets),
-        ("result packet", result_packets),
-    ):
-        for index, packet in enumerate(_bounded_records(collection, collection_name), 1):
-            label = f"{collection_name} #{index}"
-            if not isinstance(packet, Mapping):
-                raise ReviewIntegrityError(f"{label} is not a record")
-            _packet_is_reviewer(packet, label)
-            identities.add(_agent_id(packet.get("agent_id"), label))
-    for index, mutation in enumerate(_bounded_records(mutations, "mutation"), 1):
-        label = f"mutation #{index}"
-        if not isinstance(mutation, Mapping):
-            raise ReviewIntegrityError(f"{label} is not a record")
-        identities.add(_agent_id(mutation.get("actor_agent_id"), label))
-    return frozenset(identities)
+    return _producer_identity_set(
+        task_owner=task_owner,
+        candidate_packets=candidate_packets,
+        result_packets=result_packets,
+        mutations=mutations,
+        identity_validator=_agent_id,
+    )
 
 
-def validate_reviewer_identity(
-    reviewer_agent_id: Any, producer_agent_ids: Iterable[str]
+def _validate_reviewer_identity(
+    reviewer_agent_id: Any,
+    producer_agent_ids: Iterable[str],
+    *,
+    identity_validator: Callable[[Any, str], str],
 ) -> str:
-    """Require a named reviewer independent from every producer identity."""
-
-    reviewer = _agent_id(reviewer_agent_id, "reviewer")
-    producers = frozenset(producer_agent_ids)
+    reviewer = identity_validator(reviewer_agent_id, "reviewer")
+    producers = frozenset(
+        identity_validator(item, "review producer")
+        for item in _bounded_values(
+            producer_agent_ids, "review producer_agent_ids"
+        )
+    )
     if reviewer in producers:
         raise ReviewIntegrityError(
             f"reviewer agent_id {reviewer!r} is a producer identity (self-review)"
         )
     return reviewer
+
+
+def validate_reviewer_identity(
+    reviewer_agent_id: Any, producer_agent_ids: Iterable[str]
+) -> str:
+    """Require a new named reviewer independent from every producer identity."""
+
+    return _validate_reviewer_identity(
+        reviewer_agent_id,
+        producer_agent_ids,
+        identity_validator=_agent_id,
+    )
+
+
+def _build_finding_fix_verification_chain(
+    *,
+    finding_id: Any,
+    candidate_snapshot_sha256: Any,
+    mutation_snapshot_sha256: Any,
+    fix_result_sha256: Any,
+    reviewer_agent_id: Any,
+    verification_sha256: Any,
+    identity_validator: Callable[[Any, str], str],
+) -> dict[str, str | int]:
+    return {
+        "review_integrity_version": REVIEW_INTEGRITY_VERSION,
+        "finding_id": _finding_id(finding_id, "chain"),
+        "candidate_snapshot_sha256": _sha256(
+            candidate_snapshot_sha256, "chain candidate snapshot"
+        ),
+        "mutation_snapshot_sha256": _sha256(
+            mutation_snapshot_sha256, "chain mutation snapshot"
+        ),
+        "fix_result_sha256": _sha256(fix_result_sha256, "chain fix result"),
+        "reviewer_agent_id": identity_validator(
+            reviewer_agent_id, "chain reviewer"
+        ),
+        "verification_sha256": _sha256(
+            verification_sha256, "chain verification"
+        ),
+    }
 
 
 def build_finding_fix_verification_chain(
@@ -163,24 +245,18 @@ def build_finding_fix_verification_chain(
 ) -> dict[str, str | int]:
     """Build the one canonical, JSON-ready binding for a resolved finding."""
 
-    return {
-        "review_integrity_version": REVIEW_INTEGRITY_VERSION,
-        "finding_id": _finding_id(finding_id, "chain"),
-        "candidate_snapshot_sha256": _sha256(
-            candidate_snapshot_sha256, "chain candidate snapshot"
-        ),
-        "mutation_snapshot_sha256": _sha256(
-            mutation_snapshot_sha256, "chain mutation snapshot"
-        ),
-        "fix_result_sha256": _sha256(fix_result_sha256, "chain fix result"),
-        "reviewer_agent_id": _agent_id(reviewer_agent_id, "chain reviewer"),
-        "verification_sha256": _sha256(
-            verification_sha256, "chain verification"
-        ),
-    }
+    return _build_finding_fix_verification_chain(
+        finding_id=finding_id,
+        candidate_snapshot_sha256=candidate_snapshot_sha256,
+        mutation_snapshot_sha256=mutation_snapshot_sha256,
+        fix_result_sha256=fix_result_sha256,
+        reviewer_agent_id=reviewer_agent_id,
+        verification_sha256=verification_sha256,
+        identity_validator=_agent_id,
+    )
 
 
-def build_review_result(
+def _build_review_result(
     *,
     reviewer_agent_id: Any,
     producer_agent_ids: Iterable[str],
@@ -189,17 +265,23 @@ def build_review_result(
     review_result_sha256: Any,
     outcome: Any,
     finding_ids: Iterable[Any],
+    identity_validator: Callable[[Any, str], str],
 ) -> dict[str, Any]:
-    """Build the mandatory review attestation, including a clean review."""
-
     producers = sorted(
         {
-            _agent_id(item, "review producer")
+            identity_validator(item, "review producer")
             for item in _bounded_values(producer_agent_ids, "review result producer_agent_ids")
         }
     )
-    reviewer = validate_reviewer_identity(reviewer_agent_id, producers)
-    if outcome not in {"clean", "findings_resolved"}:
+    reviewer = _validate_reviewer_identity(
+        reviewer_agent_id,
+        producers,
+        identity_validator=identity_validator,
+    )
+    if not isinstance(outcome, str) or outcome not in {
+        "clean",
+        "findings_resolved",
+    }:
         raise ReviewIntegrityError("review result outcome is invalid")
     findings = [
         _finding_id(item, "review result")
@@ -229,6 +311,30 @@ def build_review_result(
     }
 
 
+def build_review_result(
+    *,
+    reviewer_agent_id: Any,
+    producer_agent_ids: Iterable[str],
+    candidate_snapshot_sha256: Any,
+    mutation_snapshot_sha256: Any,
+    review_result_sha256: Any,
+    outcome: Any,
+    finding_ids: Iterable[Any],
+) -> dict[str, Any]:
+    """Build the mandatory review attestation, including a clean review."""
+
+    return _build_review_result(
+        reviewer_agent_id=reviewer_agent_id,
+        producer_agent_ids=producer_agent_ids,
+        candidate_snapshot_sha256=candidate_snapshot_sha256,
+        mutation_snapshot_sha256=mutation_snapshot_sha256,
+        review_result_sha256=review_result_sha256,
+        outcome=outcome,
+        finding_ids=finding_ids,
+        identity_validator=_agent_id,
+    )
+
+
 def validate_review_result(
     value: Mapping[str, Any], *, expected_producer_agent_ids: Iterable[str]
 ) -> dict[str, Any]:
@@ -244,13 +350,13 @@ def validate_review_result(
         raise ReviewIntegrityError("review result finding_ids must be an array")
     expected = sorted(
         {
-            _agent_id(item, "expected review producer")
+            _legacy_agent_id(item, "expected review producer")
             for item in _bounded_values(
                 expected_producer_agent_ids, "expected review producer_agent_ids"
             )
         }
     )
-    rebuilt = build_review_result(
+    rebuilt = _build_review_result(
         reviewer_agent_id=value.get("reviewer_agent_id"),
         producer_agent_ids=value["producer_agent_ids"],
         candidate_snapshot_sha256=value.get("candidate_snapshot_sha256"),
@@ -258,6 +364,7 @@ def validate_review_result(
         review_result_sha256=value.get("review_result_sha256"),
         outcome=value.get("outcome"),
         finding_ids=value["finding_ids"],
+        identity_validator=_legacy_agent_id,
     )
     if rebuilt["producer_agent_ids"] != expected:
         raise ReviewIntegrityError("review result producer set is stale or incomplete")
@@ -315,21 +422,22 @@ def review_integrity_errors(
     # Materialize once: callers may supply generators, and mutation records are
     # intentionally consumed both for producer identities and finding links.
     try:
-        candidate_packets = _bounded_records(candidate_packets, "candidate packet")
-        result_packets = _bounded_records(result_packets, "result packet")
-        mutations = _bounded_records(mutations, "mutation")
-        findings = _bounded_records(findings, "finding")
-        fix_results = _bounded_records(fix_results, "fix result")
-        verifications = _bounded_records(verifications, "verification")
-        chains = _bounded_records(chains, "review chain")
+        candidate_packets = _bounded_values(candidate_packets, "candidate packet")
+        result_packets = _bounded_values(result_packets, "result packet")
+        mutations = _bounded_values(mutations, "mutation")
+        findings = _bounded_values(findings, "finding")
+        fix_results = _bounded_values(fix_results, "fix result")
+        verifications = _bounded_values(verifications, "verification")
+        chains = _bounded_values(chains, "review chain")
     except ReviewIntegrityError as exc:
         return sorted(exc.errors)
     try:
-        producers = producer_identity_set(
+        producers = _producer_identity_set(
             task_owner=task_owner,
             candidate_packets=candidate_packets,
             result_packets=result_packets,
             mutations=mutations,
+            identity_validator=_legacy_agent_id,
         )
     except ReviewIntegrityError as exc:
         errors.extend(exc.errors)
@@ -357,24 +465,64 @@ def review_integrity_errors(
         if validated_review["finding_ids"] != sorted(expected_ids):
             errors.append("review result finding set differs from the finding graph")
         if expected_ids:
-            candidate_digests = {
-                record.get("candidate_snapshot_sha256")
-                for record in finding_by_id.values()
-            }
-            mutation_digests = {
-                record.get("mutation_snapshot_sha256")
-                for record in mutation_by_id.values()
-            }
-            if candidate_digests != {validated_review["candidate_snapshot_sha256"]}:
+            candidate_digests: set[str] = set()
+            candidate_digests_valid = True
+            for finding_id, record in sorted(finding_by_id.items()):
+                try:
+                    candidate_digests.add(
+                        _sha256(
+                            record.get("candidate_snapshot_sha256"),
+                            f"finding {finding_id}",
+                        )
+                    )
+                except ReviewIntegrityError as exc:
+                    errors.extend(exc.errors)
+                    candidate_digests_valid = False
+            mutation_digests: set[str] = set()
+            mutation_digests_valid = True
+            for finding_id, record in sorted(mutation_by_id.items()):
+                try:
+                    mutation_digests.add(
+                        _sha256(
+                            record.get("mutation_snapshot_sha256"),
+                            f"mutation {finding_id} snapshot",
+                        )
+                    )
+                except ReviewIntegrityError as exc:
+                    errors.extend(exc.errors)
+                    mutation_digests_valid = False
+            if (
+                candidate_digests_valid
+                and candidate_digests
+                != {validated_review["candidate_snapshot_sha256"]}
+            ):
                 errors.append("review result candidate snapshot differs from findings")
-            if mutation_digests != {validated_review["mutation_snapshot_sha256"]}:
+            if (
+                mutation_digests_valid
+                and mutation_digests
+                != {validated_review["mutation_snapshot_sha256"]}
+            ):
                 errors.append("review result mutation snapshot differs from mutations")
-            verification_reviewers = {
-                record.get("reviewer_agent_id")
-                for finding_id, record in verification_by_id.items()
-                if finding_id in expected_ids
-            }
-            if verification_reviewers != {validated_review["reviewer_agent_id"]}:
+            verification_reviewers: set[str] = set()
+            verification_reviewers_valid = True
+            for finding_id, record in sorted(verification_by_id.items()):
+                if finding_id not in expected_ids:
+                    continue
+                try:
+                    verification_reviewers.add(
+                        _legacy_agent_id(
+                            record.get("reviewer_agent_id"),
+                            f"verification {finding_id} reviewer",
+                        )
+                    )
+                except ReviewIntegrityError as exc:
+                    errors.extend(exc.errors)
+                    verification_reviewers_valid = False
+            if (
+                verification_reviewers_valid
+                and verification_reviewers
+                != {validated_review["reviewer_agent_id"]}
+            ):
                 errors.append(
                     "review result reviewer identity differs from verifications"
                 )
@@ -401,25 +549,35 @@ def review_integrity_errors(
             candidate_sha = _sha256(
                 finding.get("candidate_snapshot_sha256"), f"finding {finding_id}"
             )
-            finding_reviewer = _agent_id(
+            finding_reviewer = _legacy_agent_id(
                 finding.get("reviewer_agent_id"), f"finding {finding_id} reviewer"
             )
-            validate_reviewer_identity(finding_reviewer, producers)
+            _validate_reviewer_identity(
+                finding_reviewer,
+                producers,
+                identity_validator=_legacy_agent_id,
+            )
         except ReviewIntegrityError as exc:
             errors.extend(exc.errors)
             candidate_sha = None
         if mutation is not None:
             try:
-                if candidate_sha != _sha256(
+                mutation_candidate_sha = _sha256(
                     mutation.get("candidate_snapshot_sha256"),
                     f"mutation {finding_id} candidate snapshot",
+                )
+                if (
+                    candidate_sha is not None
+                    and candidate_sha != mutation_candidate_sha
                 ):
                     errors.append(f"finding {finding_id} candidate snapshot binding is tampered")
                 _sha256(
                     mutation.get("mutation_snapshot_sha256"),
                     f"mutation {finding_id} snapshot",
                 )
-                _agent_id(mutation.get("actor_agent_id"), f"mutation {finding_id}")
+                _legacy_agent_id(
+                    mutation.get("actor_agent_id"), f"mutation {finding_id}"
+                )
             except ReviewIntegrityError as exc:
                 errors.extend(exc.errors)
         if mutation is not None and fix is not None:
@@ -442,8 +600,10 @@ def review_integrity_errors(
                     f"verification {finding_id} fix result",
                 ):
                     errors.append(f"finding {finding_id} fix result binding is tampered")
-                validate_reviewer_identity(
-                    verification.get("reviewer_agent_id"), producers
+                _validate_reviewer_identity(
+                    verification.get("reviewer_agent_id"),
+                    producers,
+                    identity_validator=_legacy_agent_id,
                 )
                 _sha256(
                     verification.get("verification_sha256"),
@@ -459,17 +619,22 @@ def review_integrity_errors(
             and candidate_sha is not None
         ):
             try:
-                expected = build_finding_fix_verification_chain(
+                expected = _build_finding_fix_verification_chain(
                     finding_id=finding_id,
                     candidate_snapshot_sha256=candidate_sha,
                     mutation_snapshot_sha256=mutation.get("mutation_snapshot_sha256"),
                     fix_result_sha256=fix.get("fix_result_sha256"),
                     reviewer_agent_id=verification.get("reviewer_agent_id"),
                     verification_sha256=verification.get("verification_sha256"),
+                    identity_validator=_legacy_agent_id,
                 )
                 if set(chain) != _CHAIN_FIELDS or chain != expected:
                     errors.append(f"review chain for finding {finding_id} is tampered")
-                validate_reviewer_identity(chain.get("reviewer_agent_id"), producers)
+                _validate_reviewer_identity(
+                    chain.get("reviewer_agent_id"),
+                    producers,
+                    identity_validator=_legacy_agent_id,
+                )
             except ReviewIntegrityError as exc:
                 errors.extend(exc.errors)
     return sorted(set(errors))
