@@ -220,6 +220,18 @@ class SubagentIncidentSchemaTests(unittest.TestCase):
         base.update(overrides)
         return base
 
+    def test_malformed_incident_collection_returns_one_deterministic_error(self) -> None:
+        expected = ["subagent incidents must be an array"]
+        for malformed in (None, 7, "not-an-array", {"incident": 1}):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(
+                    pi.subagent_incident_integrity_errors(
+                        {"subagent_incidents": malformed, "packets": []},
+                        services=_services(),
+                    ),
+                    expected,
+                )
+
     def test_optional_disposition_kind_and_live_arms_are_additive(self) -> None:
         # A legacy resolution without the new fields still validates.
         self.assertEqual(

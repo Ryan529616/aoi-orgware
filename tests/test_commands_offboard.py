@@ -14,10 +14,8 @@ from unittest import mock
 
 from aoi_orgware.commands import offboard
 from aoi_orgware import codex_install_provenance as provenance
+from aoi_orgware.config import default_config_text
 from aoi_orgware.semantic_events import canonical_sha256
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -30,7 +28,7 @@ def initialize_aoi(root: Path) -> None:
 
     root.mkdir(parents=True, exist_ok=True)
     (root / "aoi.toml").write_text(
-        (REPO_ROOT / "aoi.toml").read_text(encoding="utf-8"), encoding="utf-8"
+        default_config_text("Offboard Test"), encoding="utf-8"
     )
     paths = offboard.h.get_paths(root)
     with offboard.h.state_lock(paths):

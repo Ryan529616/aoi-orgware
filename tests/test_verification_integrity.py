@@ -211,6 +211,23 @@ class SupersessionErrorsTests(unittest.TestCase):
 
 
 class RecordIntegrityErrorsTests(unittest.TestCase):
+    def test_malformed_collection_returns_one_deterministic_error(self) -> None:
+        policy = self._policy({"unit_test"})
+        expected = ["verification records must be an array"]
+        for malformed in (None, 7, "not-an-array", {"record": 1}):
+            with self.subTest(malformed=malformed):
+                state = {"verification": malformed}
+                self.assertEqual(
+                    vi.verification_record_integrity_errors(
+                        None, state, policy=policy
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    vi.verification_integrity_errors(None, state, policy=policy),
+                    expected,
+                )
+
     def _policy(self, categories: set[str]) -> vi.VerificationPolicy:
         return vi.VerificationPolicy(
             verification_categories=categories,

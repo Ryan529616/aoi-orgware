@@ -327,11 +327,14 @@ def verification_record_integrity_errors(
     """Validate individual verification records without reindexing graph edges."""
 
     errors: list[str] = []
-    records = (
-        indexed_records
-        if indexed_records is not None
-        else enumerate(state.get("verification", []), start=1)
-    )
+    records: Iterable[tuple[int, Any]]
+    if indexed_records is None:
+        state_records = state.get("verification", [])
+        if not isinstance(state_records, list):
+            return ["verification records must be an array"]
+        records = enumerate(state_records, start=1)
+    else:
+        records = indexed_records
     for index, item in records:
         label = f"verification #{index}"
         if not isinstance(item, dict):
@@ -412,6 +415,8 @@ def verification_integrity_errors(
     *,
     policy: VerificationPolicy,
 ) -> list[str]:
+    if not isinstance(state.get("verification", []), list):
+        return ["verification records must be an array"]
     errors = verification_record_integrity_errors(paths, state, policy=policy)
     errors.extend(verification_supersession_errors(state))
     return errors

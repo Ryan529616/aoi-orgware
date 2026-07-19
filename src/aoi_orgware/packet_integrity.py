@@ -1021,6 +1021,8 @@ def subagent_incident_integrity_errors(
 ) -> list[str]:
     errors: list[str] = []
     incidents = state.get("subagent_incidents", [])
+    if not isinstance(incidents, list):
+        return ["subagent incidents must be an array"]
     v5_packets = any(
         (_packet_schema_version(packet) or 0) >= 5
         for packet in state.get("packets", [])
