@@ -5475,7 +5475,12 @@ def task_summary(state: dict[str, Any]) -> dict[str, Any]:
         if lane.get("status") in {"active", "waiting", "recovering", "blocked"}
     ]
     engaged_lanes.sort(key=lambda item: str(item.get("lane_id", "")))
-    subagent_incidents = state.get("subagent_incidents", [])
+    raw_subagent_incidents = state.get("subagent_incidents", [])
+    if not isinstance(raw_subagent_incidents, list):
+        raise HarnessError("subagent incidents must be an array")
+    if not all(isinstance(item, dict) for item in raw_subagent_incidents):
+        raise HarnessError("spawn incident record is malformed")
+    subagent_incidents = cast(list[dict[str, Any]], raw_subagent_incidents)
     incidents_by_reason: dict[str, int] = {}
     false_positive_guard = 0
     for incident in subagent_incidents:

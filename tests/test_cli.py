@@ -3822,6 +3822,136 @@ class LifecycleTests(HarnessTestCase):
                 with self.assertRaisesRegex(h.HarnessError, "must be a list"):
                     h.validate_task_state(malformed)
 
+    def test_close_gate_reports_malformed_upper_consumer_collections(self) -> None:
+        self.init_task("close-malformed-upper-consumer")
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, "close-malformed-upper-consumer")
+        expectations = (
+            (
+                "verification",
+                (
+                    (None, "verification records must be an array"),
+                    (7, "verification records must be an array"),
+                    ({"not": "an array"}, "verification records must be an array"),
+                    ([None], "verification #1 is malformed"),
+                ),
+            ),
+            (
+                "subagent_incidents",
+                (
+                    (None, "subagent incidents must be an array"),
+                    (7, "subagent incidents must be an array"),
+                    ({"not": "an array"}, "subagent incidents must be an array"),
+                    ([None], "spawn incident record is malformed"),
+                ),
+            ),
+        )
+
+        for field, malformed_cases in expectations:
+            for malformed, expected_error in malformed_cases:
+                with self.subTest(field=field, malformed=repr(malformed)):
+                    candidate = copy.deepcopy(state)
+                    candidate[field] = malformed
+                    try:
+                        failures = cli_impl.close_gate(paths, candidate)
+                    except (AttributeError, TypeError) as exc:
+                        self.fail(
+                            f"close_gate leaked {type(exc).__name__} for "
+                            f"malformed {field}: {exc}"
+                        )
+                    self.assertIn(expected_error, failures)
+                    self.assertEqual(failures.count(expected_error), 1, failures)
+
+    def test_task_summary_rejects_non_array_incident_collections(self) -> None:
+        for malformed, expected_error in (
+            (None, "subagent incidents must be an array"),
+            (7, "subagent incidents must be an array"),
+            ({"not": "an array"}, "subagent incidents must be an array"),
+            ([None], "spawn incident record is malformed"),
+        ):
+            with self.subTest(malformed=repr(malformed)):
+                with self.assertRaisesRegex(
+                    h.HarnessError, f"^{expected_error}$"
+                ):
+                    h.task_summary({"subagent_incidents": malformed})
+
+    def test_cancel_gate_reports_malformed_in_memory_incident_collection(self) -> None:
+        self.init_task("cancel-malformed-incidents")
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, "cancel-malformed-incidents")
+        state["subagent_incidents"] = {"not": "an array"}
+        args = argparse.Namespace(
+            task="cancel-malformed-incidents",
+            reason="Reject malformed upper-consumer state before cancellation",
+            changed_files_disposition=None,
+            next_action=None,
+            json=True,
+        )
+
+        with mock.patch.object(cli_impl, "load_task", return_value=state):
+            with self.assertRaises(h.HarnessError) as raised:
+                cli_impl.cmd_cancel_task(args, paths)
+        self.assertIn("cancel gate failed", str(raised.exception))
+        self.assertIn("subagent incidents must be an array", str(raised.exception))
+
+    def test_doctor_reports_malformed_in_memory_incident_collection(self) -> None:
+        self.init_task("doctor-malformed-incidents")
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, "doctor-malformed-incidents")
+        state["subagent_incidents"] = None
+        captured = io.StringIO()
+
+        with (
+            mock.patch.object(cli_impl, "load_all_tasks", return_value=[state]),
+            mock.patch.object(cli_impl, "load_all_claims", return_value=[]),
+            mock.patch("sys.stdout", captured),
+        ):
+            returncode = cli_impl.cmd_doctor(
+                argparse.Namespace(task=None, json=True), paths
+            )
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(returncode, 1, payload)
+        self.assertIn(
+            "task doctor-malformed-incidents: subagent incidents must be an array",
+            payload["errors"],
+        )
+        self.assertEqual(
+            payload["errors"].count(
+                "task doctor-malformed-incidents: "
+                "subagent incidents must be an array"
+            ),
+            1,
+            payload,
+        )
+
+    def test_doctor_deduplicates_malformed_verification_records(self) -> None:
+        self.init_task("doctor-malformed-verification")
+        paths = h.get_paths(self.root)
+        base = h.load_task(paths, "doctor-malformed-verification")
+        for status in ("active", "done"):
+            with self.subTest(status=status):
+                state = copy.deepcopy(base)
+                state["status"] = status
+                state["verification"] = [None]
+                captured = io.StringIO()
+                with (
+                    mock.patch.object(cli_impl, "load_all_tasks", return_value=[state]),
+                    mock.patch.object(cli_impl, "load_all_claims", return_value=[]),
+                    mock.patch("sys.stdout", captured),
+                ):
+                    returncode = cli_impl.cmd_doctor(
+                        argparse.Namespace(task=None, json=True), paths
+                    )
+                payload = json.loads(captured.getvalue())
+                matching = [
+                    error
+                    for error in payload["errors"]
+                    if "verification #1 is malformed" in error
+                ]
+                self.assertEqual(returncode, 1, payload)
+                self.assertEqual(len(matching), 1, payload)
+
     def test_cancel_requires_needs_user_disposition(self) -> None:
         self.init_task("cancel-needs-user")
         self.cli(

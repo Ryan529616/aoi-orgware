@@ -373,10 +373,18 @@ def critical_projection(
         ],
         key=lambda item: str(item.get("escalation_id", "")),
     )
+    raw_subagent_incidents = state.get("subagent_incidents", [])
+    if not isinstance(raw_subagent_incidents, list):
+        raise HarnessError("subagent incidents must be an array")
+    subagent_incidents: list[Mapping[str, Any]] = []
+    for incident in raw_subagent_incidents:
+        if not isinstance(incident, Mapping):
+            raise HarnessError("spawn incident record is malformed")
+        subagent_incidents.append(incident)
     open_spawn_incidents = sorted(
         [
             item
-            for item in state.get("subagent_incidents", [])
+            for item in subagent_incidents
             if item.get("status") == "open"
         ],
         key=lambda item: str(item.get("incident_id", "")),

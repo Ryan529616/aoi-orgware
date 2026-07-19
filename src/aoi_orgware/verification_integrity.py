@@ -418,7 +418,11 @@ def verification_integrity_errors(
     if not isinstance(state.get("verification", []), list):
         return ["verification records must be an array"]
     errors = verification_record_integrity_errors(paths, state, policy=policy)
-    errors.extend(verification_supersession_errors(state))
+    seen = set(errors)
+    for error in verification_supersession_errors(state):
+        if error not in seen:
+            errors.append(error)
+            seen.add(error)
     return errors
 
 

@@ -228,6 +228,14 @@ class RecordIntegrityErrorsTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_malformed_record_diagnostic_is_not_duplicated(self) -> None:
+        errors = vi.verification_integrity_errors(
+            None,
+            {"verification": [None]},
+            policy=self._policy({"unit_test"}),
+        )
+        self.assertEqual(errors, ["verification #1 is malformed"])
+
     def _policy(self, categories: set[str]) -> vi.VerificationPolicy:
         return vi.VerificationPolicy(
             verification_categories=categories,

@@ -160,6 +160,31 @@ class CriticalProjectionTests(unittest.TestCase):
         self.assertEqual(payload["coordination_inbox"], [])
         self.assertFalse(payload["view_complete"])
 
+    def test_projection_rejects_malformed_incident_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tasks = Path(temporary)
+            state_path = tasks / "critical-malformed-incidents" / "state.json"
+            state_path.parent.mkdir()
+            state_path.write_text("{}\n", encoding="utf-8")
+            for malformed, expected_error in (
+                (None, "subagent incidents must be an array"),
+                (7, "subagent incidents must be an array"),
+                ({"not": "an array"}, "subagent incidents must be an array"),
+                ([None], "spawn incident record is malformed"),
+            ):
+                with self.subTest(malformed=repr(malformed)):
+                    with self.assertRaisesRegex(
+                        HarnessError, f"^{expected_error}$"
+                    ):
+                        status_cmds.critical_projection(
+                            SimpleNamespace(tasks=tasks),
+                            {
+                                "task_id": "critical-malformed-incidents",
+                                "subagent_incidents": malformed,
+                            },
+                            services=_services(),
+                        )
+
 
 class CommandBehaviorTests(unittest.TestCase):
     SEMANTIC_SHA_1 = "a" * 64

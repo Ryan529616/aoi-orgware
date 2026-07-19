@@ -1319,6 +1319,25 @@ def subagent_incident_integrity_errors(state: dict[str, Any]) -> list[str]:
     )
 
 
+def _object_records_for_derivation(
+    state: dict[str, Any], field: str
+) -> list[dict[str, Any]]:
+    """Return trusted object records only after the whole collection is shaped.
+
+    Command gates call the corresponding integrity reader before using this
+    helper.  Returning an empty list for malformed input prevents a second,
+    raw Python exception or misleading derived gate failures while preserving
+    the reader's canonical integrity diagnostic.
+    """
+
+    records = state.get(field, [])
+    if not isinstance(records, list) or not all(
+        isinstance(item, dict) for item in records
+    ):
+        return []
+    return cast(list[dict[str, Any]], records)
+
+
 def packet_recovery_integrity_errors(
     paths: HarnessPaths, state: dict[str, Any]
 ) -> list[str]:
@@ -5815,7 +5834,7 @@ def close_gate(
         )
     open_spawn_incidents = [
         str(item.get("incident_id"))
-        for item in state.get("subagent_incidents", [])
+        for item in _object_records_for_derivation(state, "subagent_incidents")
         if item.get("status") == "open"
     ]
     if open_spawn_incidents:
@@ -5825,8 +5844,12 @@ def close_gate(
         )
     worktree_errors, _ = worktree_integrity_errors(paths, state)
     failures.extend(worktree_errors)
-    verification = state.get("verification", [])
-    if intended_outcome == "achieved":
+    raw_verification = state.get("verification", [])
+    verification = _object_records_for_derivation(state, "verification")
+    verification_shape_valid = isinstance(raw_verification, list) and len(
+        verification
+    ) == len(raw_verification)
+    if intended_outcome == "achieved" and verification_shape_valid:
         if not verification:
             failures.append("no verification/evidence record")
         if not any(
@@ -5861,11 +5884,15 @@ def close_gate(
                 "verification recorded with --asserts-completion-boundary "
                 "against the CURRENT registered completion boundary"
             )
-    unaccounted = [
-        str(item.get("category"))
-        for item in verification
-        if item.get("status") not in ACCOUNTED_VERIFICATION_STATUSES
-    ]
+    unaccounted = (
+        [
+            str(item.get("category"))
+            for item in verification
+            if item.get("status") not in ACCOUNTED_VERIFICATION_STATUSES
+        ]
+        if verification_shape_valid
+        else []
+    )
     if unaccounted:
         failures.append("unaccounted verification: " + ", ".join(unaccounted))
     if not preparing_mini:
@@ -6131,7 +6158,9 @@ def cmd_cancel_task(args: argparse.Namespace, paths: HarnessPaths) -> int:
             )
         open_spawn_incidents = [
             str(item.get("incident_id"))
-            for item in state.get("subagent_incidents", [])
+            for item in _object_records_for_derivation(
+                state, "subagent_incidents"
+            )
             if item.get("status") == "open"
         ]
         if open_spawn_incidents:
@@ -6459,7 +6488,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             f"task {task_id}: {item}"
             for item in subagent_incident_integrity_errors(task)
         )
-        for incident in task.get("subagent_incidents", []):
+        for incident in _object_records_for_derivation(
+            task, "subagent_incidents"
+        ):
             if incident.get("status") == "open":
                 errors.append(
                     f"task {task_id}: open sub-agent spawn incident "
@@ -6563,8 +6594,11 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"{prefix} {task_id}: {item}"
                     for item in job_integrity_errors(paths, job_state)
                 )
+            terminal_verification = _object_records_for_derivation(
+                task, "verification"
+            )
             for verification_index, item in enumerate(
-                task.get("verification", []), start=1
+                terminal_verification, start=1
             ):
                 destination = (
                     warnings if item.get("integrity_version") != 1 else errors
@@ -6580,7 +6614,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
             supersession_records = [
                 item
-                for item in task.get("verification", [])
+                for item in terminal_verification
                 if item.get("superseded_at")
             ]
             graph_destination = (
