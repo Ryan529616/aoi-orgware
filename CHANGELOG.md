@@ -160,11 +160,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   promotion route is local Windows/WSL plus applicable authorized EDA,
   independent review, seal, install smoke, and encrypted bundle; remote CI and
   publication are forbidden/not applicable.
-- **Deterministic legacy-supersession fixture.** The multi-edge migration test
-  now makes each synthetic replacement timestamp strictly later than its
-  source before hashing. This removes a host/WSL wall-clock-step flake without
-  weakening production relationship validation. The prior exact WSL run
-  remains a recorded failure; a fresh clean-successor full run is required.
+- **Deterministic cross-process timestamp fixtures.** Synthetic verification
+  supersession now makes each replacement timestamp strictly later than its
+  source before hashing; the manual-dispatch expiry test uses a fixed valid
+  far-past window; and permit fixtures derive arm time from the persisted
+  subprocess registration plus one microsecond rather than a parent-process
+  clock. These test-only repairs remove host/WSL wall-clock-step flakes without
+  weakening production relationship, live-arm, permit, or expiry validation.
+  The prior exact WSL failures remain recorded; a fresh clean-successor full
+  run is required.
 
 ### Added
 - **Codex startup byte-state registration and strict resource timeline.**

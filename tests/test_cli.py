@@ -8713,6 +8713,18 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         first_record = state["verification"][0]
         second_record = state["verification"][1]
+        # The relationship under test is causal record ordering, not
+        # cross-process wall-clock monotonicity.  Preserve that ordering in the
+        # synthetic legacy fixture before any preimage is written or hashed.
+        first_time = h.parse_time(str(first_record.get("recorded_at", "")))
+        second_time = h.parse_time(str(second_record.get("recorded_at", "")))
+        self.assertIsNotNone(first_time)
+        self.assertIsNotNone(second_time)
+        assert first_time is not None and second_time is not None
+        if second_time <= first_time:
+            second_record["recorded_at"] = (
+                first_time + dt.timedelta(microseconds=1)
+            ).isoformat(timespec="microseconds")
         self.assertEqual(first_record["artifact_refs"][0]["snapshot_version"], 1)
 
         # Emulate two historical schema-v1 live refs. The first origin evolves;
@@ -14442,11 +14454,12 @@ class HookTests(HarnessTestCase):
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         expired = self.task_state(task_id)
         attempt = expired["packets"][0]["dispatch_attempts"][0]
-        attempt["armed_at"] = (
-            dt.datetime.now().astimezone() - dt.timedelta(minutes=2)
-        ).isoformat()
+        # This is a synthetic expired arm.  A fixed, valid far-past window
+        # avoids making expiry depend on parent/child wall-clock agreement.
+        expired_start = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        attempt["armed_at"] = expired_start.isoformat()
         attempt["expires_at"] = (
-            dt.datetime.now().astimezone() - dt.timedelta(seconds=1)
+            expired_start + dt.timedelta(minutes=1)
         ).isoformat()
         attempt["arm_authority_sha256"] = cli_impl._dispatch_attempt_authority_sha256(
             attempt
