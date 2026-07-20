@@ -1273,12 +1273,32 @@ def _references_aoi_codex_hook(command: str, *, depth: int) -> bool:
 
     if not command:
         return False
+    normalized_reference = command.lower().replace("^", "")
+    has_hook_signature = (
+        HOOK_COMMAND_HEAD in normalized_reference
+        and any(
+            flag in normalized_reference
+            for flag in (
+                "--hook-version",
+                "--project-root",
+                "--provenance-sha256",
+            )
+        )
+    )
     if len(command.encode("utf-8")) > 32 * 1024:
-        return HOOK_COMMAND_HEAD in command.lower()
+        return HOOK_COMMAND_HEAD in normalized_reference
+    # ``cmd.exe`` removes caret escapes before process creation.  Treat a
+    # caret-normalized AOI signature as owned even when tokenization leaves
+    # the caret embedded in the executable name.  This is deliberately a
+    # narrow fail-closed guard, not a general shell-equivalence engine.
+    if "^" in command and has_hook_signature:
+        return True
+    parse_failed = False
     for posix in (False, True):
         try:
             raw = shlex.split(command, posix=posix)
         except ValueError:
+            parse_failed = True
             continue
         argv = [_strip_wrapping_quotes(token) for token in raw]
         for token in argv:
@@ -1327,6 +1347,12 @@ def _references_aoi_codex_hook(command: str, *, depth: int) -> bool:
             nested = " ".join(argv[index:]).strip()
             if _references_aoi_codex_hook(nested, depth=depth + 1):
                 return True
+    # If either tokenizer rejects quoting, do not preserve a raw command that
+    # still carries a recognizable AOI executable plus an AOI hook flag as a
+    # foreign handler.  Well-formed foreign commands that merely mention the
+    # executable name (for example a Python ``print``) remain foreign.
+    if parse_failed and has_hook_signature:
+        return True
     return False
 
 

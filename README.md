@@ -149,8 +149,10 @@ reinstall may rotate only the complete exact pair reconstructed from the
 persisted validated prior provenance receipt; partial or unbound current pairs
 and individually canonical but cross-bound identities are rejected. Pair-first
 then receipt publication keeps an interrupted proof rotation fail-closed and
-resumable. Windows execution of that wrapper and Codex `/hooks` trust remain
-separate live checks.
+resumable. A bounded direct-token/known-shell detector also blocks tokenizer
+quote failures carrying an AOI signature and CMD caret-normalized AOI hook
+references; it is not a general shell parser or DLP boundary. Windows
+execution of that wrapper and Codex `/hooks` trust remain separate live checks.
 
 The expected bundle value is the lowercase canonical digest recorded in the
 bundle's `bundle_sha256` field, not a raw-file SHA-256. For the local route, the

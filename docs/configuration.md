@@ -193,6 +193,12 @@ before client mutation. AOI writes the desired pair before replacing the
 receipt, so failure in that cross-file window can be retried without treating
 the exact prior pair as unbound drift.
 
+For ownership detection, AOI inspects direct executable tokens and one bounded
+operand of a known shell. A tokenizer quote failure that still contains an AOI
+hook signature, or a CMD caret-normalized AOI executable signature, is treated
+as AOI-shaped drift and fails closed. This cooperative detector is not a
+general shell-equivalence engine, DLP, or a same-user process boundary.
+
 A public promotion receipt keeps its tag/release/PyPI semantics. A local
 `reviewed_local_install_bundle` instead has
 `proof_scope=exact_local_wheel_install_only`: it is not a promotion or release.

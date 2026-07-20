@@ -789,6 +789,38 @@ class HookMergeTests(unittest.TestCase):
             )
         )
 
+    def test_malformed_quote_and_cmd_caret_aoi_references_fail_closed(self) -> None:
+        candidates = (
+            'aoi-codex-hook --hook-version 6 "unterminated',
+            "cmd.exe /c aoi-codex-^hook.exe --hook-version 6",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                settings = {
+                    "hooks": {
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "command": candidate,
+                                        "commandWindows": candidate,
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+                before = json.dumps(settings, sort_keys=True)
+                self.assertTrue(co.references_aoi_codex_hook(candidate))
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError, "malformed or route-drifted"
+                ):
+                    co.merge_codex_hook_settings(
+                        settings,
+                        **CURRENT_HOOK_KWARGS,
+                    )
+                self.assertEqual(json.dumps(settings, sort_keys=True), before)
+
     def test_mixed_platform_ownership_is_rejected_without_data_loss(self) -> None:
         mixed = {
             "hooks": {

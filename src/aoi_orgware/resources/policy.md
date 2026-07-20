@@ -738,7 +738,10 @@ cross-bound, malformed, or otherwise current-shaped drift fails before client
 mutation. The desired pair is written before replacement-receipt publication,
 so a failure in that cross-file window remains fail-closed and rerunnable.
 Tolerant WSL parsing is legacy ownership recognition only and cannot establish
-current trust. This does not make `wsl.exe`, Codex hook trust, or the same-user
+current trust. A bounded direct-token/known-shell detector treats tokenizer
+quote failures carrying an AOI hook signature and CMD caret-normalized AOI
+executable signatures as AOI-shaped drift. It is not an exhaustive shell
+parser or DLP. This does not make `wsl.exe`, Codex hook trust, or the same-user
 host an adversarial boundary.
 
 ## Configuration drift

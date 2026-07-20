@@ -405,6 +405,16 @@ class OffboardTests(unittest.TestCase):
                     f"bash -lc '{command}'",
                     f"bash -lc '{command_windows}'",
                 ),
+                (
+                    "unclosed-quote",
+                    'aoi-codex-hook --hook-version 6 "unterminated',
+                    'aoi-codex-hook --hook-version 6 "unterminated',
+                ),
+                (
+                    "cmd-caret",
+                    "cmd.exe /c aoi-codex-^hook.exe --hook-version 6",
+                    "cmd.exe /c aoi-codex-^hook.exe --hook-version 6",
+                ),
             )
             hook_path = root / ".codex" / "hooks.json"
             for label, candidate_command, candidate_windows in pairs:

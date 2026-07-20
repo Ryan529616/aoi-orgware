@@ -100,6 +100,12 @@ unbound current-shaped drift are rejected. The hook pair is written before the
 replacement receipt so an interrupted receipt write is fail-closed and
 resumable by rerunning the same command.
 
+The malformed-reference check is deliberately bounded: it examines direct
+tokens and one known-shell operand, and fails closed for recognizable AOI hook
+signatures after tokenizer quote failure or CMD caret removal. It is not a
+general shell parser or DLP boundary; do not treat arbitrary same-user shell
+execution as governed by this detector.
+
 The local receipt/runtime binds the expected bundle SHA, a canonical external
 store, clean commit/tree and full tracked-source manifest, artifact inventory
 and rehearsal, the exact wheel path/SHA, PEP 610 `direct_url` archive path/SHA,

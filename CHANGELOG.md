@@ -41,10 +41,12 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   provenance receipt during a proof-changing rotation; mixed old/new pairs
   and individually canonical but cross-bound identities still fail. Desired
   hook bytes precede replacement-receipt publication, so a failure in that
-  cross-file window remains fail-closed and can be retried. Malformed or
-  reordered AOI-hook references block onboarding/offboarding instead of being
-  preserved as foreign. The tolerant WSL parser remains legacy ownership
-  recognition only.
+  cross-file window remains fail-closed and can be retried. A bounded
+  direct-token/known-shell detector blocks malformed or reordered AOI-hook
+  references, including tokenizer quote failure with an AOI signature and CMD
+  caret-normalized executable names, instead of preserving them as foreign.
+  It is not an exhaustive shell parser or DLP boundary. The tolerant WSL
+  parser remains legacy ownership recognition only.
 - **O7 — release promotion.** Exact artifact inventory, release manifest,
   promotion bundle, and local rehearsal contracts are covered by focused release
   tests. This is not a claim of GitHub Actions, PyPI publication/readback, or a
