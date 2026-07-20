@@ -77,6 +77,29 @@ python3 -m venv "$AOI_TOOL_ROOT"
   --json
 ```
 
+When run from a canonical WSL session, `codex-init` does not copy the Linux
+launcher into `commandWindows`. It requires consistent Microsoft-kernel,
+`WSL_DISTRO_NAME`, absolute `WSL_INTEROP`, POSIX launcher/root, and passwd-user
+signals, then writes an exact pair:
+
+- `command` directly invokes the absolute Linux `aoi-codex-hook` with the
+  project root and provenance digest;
+- `commandWindows` uses only
+  `wsl.exe --distribution <distro> --user <user> --cd <root> --exec <hook>`
+  followed by those same exact hook arguments.
+
+AOI does not accept a shell prefix or arbitrary Windows command override.
+Partial WSL signals, a native-Windows `\\wsl$`/`\\wsl.localhost` onboarding
+root, a relative inner hook, mismatched `--cd`/`--project-root`, or altered
+distro/user/root/digest fails closed. Run onboarding inside the target WSL
+distribution; do not hand-edit `.codex/hooks.json`. A proof-changing reinstall
+can rotate an existing current handler only if both of its commands exactly
+match the pair reconstructed from the persisted validated provenance receipt;
+partial old/new pairs, cross-bound identities, malformed AOI references, and
+unbound current-shaped drift are rejected. The hook pair is written before the
+replacement receipt so an interrupted receipt write is fail-closed and
+resumable by rerunning the same command.
+
 The local receipt/runtime binds the expected bundle SHA, a canonical external
 store, clean commit/tree and full tracked-source manifest, artifact inventory
 and rehearsal, the exact wheel path/SHA, PEP 610 `direct_url` archive path/SHA,
@@ -113,6 +136,11 @@ not runtime trust, and `aoi doctor --json` is only a structural check; neither
 proves that Codex executed or trusted a hook. If the MCP registry is unavailable
 for a requested integration, record that integration as **uncovered** rather
 than assuming the hook or registry path ran.
+
+For a WSL-governed project used by Windows Codex, also exercise the installed
+`commandWindows` from Windows against a disposable project and confirm a new
+adapter receipt appears in that same WSL `.aoi` state tree. This is separate
+from `/hooks` trust and from the App Server Transport Bridge canary.
 
 ## 3. Run one mini task
 

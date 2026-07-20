@@ -9464,6 +9464,25 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         records = state["verification"]
+        # The relationship under test is record ordering, not wall-clock
+        # monotonicity.  A host/WSL clock step can otherwise make two valid
+        # sequential CLI records compare equal or backwards during the long
+        # full suite.  Stabilize each synthetic legacy edge before hashing its
+        # preimages.
+        for source_number, replacement_number in ((1, 2), (3, 4)):
+            source_time = h.parse_time(
+                str(records[source_number - 1].get("recorded_at", ""))
+            )
+            replacement_time = h.parse_time(
+                str(records[replacement_number - 1].get("recorded_at", ""))
+            )
+            self.assertIsNotNone(source_time)
+            self.assertIsNotNone(replacement_time)
+            assert source_time is not None and replacement_time is not None
+            if replacement_time <= source_time:
+                records[replacement_number - 1]["recorded_at"] = (
+                    source_time + dt.timedelta(microseconds=1)
+                ).isoformat(timespec="microseconds")
         seal_inputs: list[tuple[int, int, str, str, str]] = []
         for source_number, replacement_number in ((1, 2), (3, 4)):
             source = records[source_number - 1]

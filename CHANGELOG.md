@@ -28,6 +28,23 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   receipts, and cooperative tool-path coverage reporting are covered by focused
   adapter tests. Hook installation remains distinct from runtime trust; live
   Codex `/hooks` delivery and user trust remain unproven in this checkpoint.
+  WSL onboarding now emits a direct Linux `command` plus one canonical no-shell
+  `wsl.exe --distribution ... --user ... --cd ... --exec ...`
+  `commandWindows`, both bound to the same absolute launcher, project root, and
+  provenance digest. Complete Microsoft-kernel/distro/interop/passwd signals
+  are required; partial WSL detection and native-Windows WSL UNC onboarding
+  fail before mutation. Doctor and offboard validate the complete expected
+  platform pair, so a structurally valid but wrong distro/user/route cannot be
+  accepted or silently removed. Onboarding likewise rejects missing fields and
+  non-exact current pairs. The sole current-to-current upgrade exception is an
+  exact old pair reconstructed from the currently persisted validated
+  provenance receipt during a proof-changing rotation; mixed old/new pairs
+  and individually canonical but cross-bound identities still fail. Desired
+  hook bytes precede replacement-receipt publication, so a failure in that
+  cross-file window remains fail-closed and can be retried. Malformed or
+  reordered AOI-hook references block onboarding/offboarding instead of being
+  preserved as foreign. The tolerant WSL parser remains legacy ownership
+  recognition only.
 - **O7 — release promotion.** Exact artifact inventory, release manifest,
   promotion bundle, and local rehearsal contracts are covered by focused release
   tests. This is not a claim of GitHub Actions, PyPI publication/readback, or a
@@ -134,6 +151,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   promotion route is local Windows/WSL plus applicable authorized EDA,
   independent review, seal, install smoke, and encrypted bundle; remote CI and
   publication are forbidden/not applicable.
+- **Deterministic legacy-supersession fixture.** The multi-edge migration test
+  now makes each synthetic replacement timestamp strictly later than its
+  source before hashing. This removes a host/WSL wall-clock-step flake without
+  weakening production relationship validation. The prior exact WSL run
+  remains a recorded failure; a fresh clean-successor full run is required.
 
 ### Added
 - **Codex startup byte-state registration and strict resource timeline.**

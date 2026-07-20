@@ -718,6 +718,29 @@ fail-closed deny; only non-`PreToolUse` lifecycle adapters remain fail-open.
 Hooks are procedural guardrails, not a sandbox, identity provider, or pre-spawn
 security boundary.
 
+One installed Codex handler is an exact native/Windows command pair. Native
+Windows and non-WSL POSIX use direct provenance-bound commands. Canonical WSL
+onboarding requires consistent non-Windows host, Microsoft-kernel,
+distribution, absolute interop endpoint, POSIX launcher/root, and passwd-user
+signals. It emits a direct Linux `command` plus only this no-shell Windows
+grammar:
+
+`wsl.exe --distribution "<distro>" --user "<user>" --cd "<root>" --exec "<absolute-hook>" --hook-version 6 --project-root "<same-root>" --provenance-sha256 "<digest>"`
+
+There is no arbitrary wrapper override. Partial/contradictory WSL signals,
+native-Windows WSL UNC onboarding, relative/PATH-resolved inner launchers,
+shell prefixes, mismatched cwd/root, duplicate/reordered flags, or altered
+platform identity fail closed. `doctor` and current offboarding compare the
+complete expected pair byte-for-byte. A proof-changing reinstall may rotate a
+current handler only when both existing commands byte-match the pair rebuilt
+from the currently persisted validated provenance receipt; partial old/new or
+cross-bound, malformed, or otherwise current-shaped drift fails before client
+mutation. The desired pair is written before replacement-receipt publication,
+so a failure in that cross-file window remains fail-closed and rerunnable.
+Tolerant WSL parsing is legacy ownership recognition only and cannot establish
+current trust. This does not make `wsl.exe`, Codex hook trust, or the same-user
+host an adversarial boundary.
+
 ## Configuration drift
 
 Every task records `profile_id` and the exact `aoi.toml` SHA-256. Governance

@@ -170,6 +170,29 @@ separate local pair (`--local-artifact-bundle-file` /
 `--expected-local-artifact-bundle-sha256`). Half a pair, both pairs, or neither
 fails before mutation.
 
+The installed hook is one exact platform pair. Native Windows and non-WSL
+POSIX use the same direct provenance-bound command in both fields. Canonical
+WSL onboarding instead emits a direct Linux `command` and a fixed
+`commandWindows` wrapper:
+
+`wsl.exe --distribution "<distro>" --user "<user>" --cd "<project-root>" --exec "<absolute-linux-hook>" --hook-version 6 --project-root "<same-project-root>" --provenance-sha256 "<digest>"`
+
+AOI derives distro from `WSL_DISTRO_NAME`, user from the current passwd entry,
+and requires Microsoft-kernel plus absolute `WSL_INTEROP` evidence. It offers
+no arbitrary shell/prefix override. Partial or contradictory WSL signals and
+native-Windows WSL UNC onboarding fail before mutation. Current-command
+validation compares the complete pair byte-for-byte; the tolerant WSL parser
+is retained only to identify legacy AOI-owned hooks during controlled upgrade.
+`doctor` rejects route drift, and `offboard` preserves the client files and
+fails if either or both platform commands are current-shaped but do not match
+current provenance. During an explicit proof-changing reinstall, onboarding
+may replace exactly one old pair only when it byte-matches the pair rebuilt
+from the currently persisted validated provenance receipt; a partial old/new
+pair, cross-bound identities, or any malformed/current-shaped route is rejected
+before client mutation. AOI writes the desired pair before replacing the
+receipt, so failure in that cross-file window can be retried without treating
+the exact prior pair as unbound drift.
+
 A public promotion receipt keeps its tag/release/PyPI semantics. A local
 `reviewed_local_install_bundle` instead has
 `proof_scope=exact_local_wheel_install_only`: it is not a promotion or release.

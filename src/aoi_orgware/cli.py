@@ -2120,14 +2120,35 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     Path(sys.argv[0]).resolve(),
                 )
             )
-        hook_command = codex_onboarding_impl.build_codex_hook_command(
-            provenance_receipt["codex_hook_entry_point"]["path"],
-            paths.root,
-            provenance_receipt["provenance_receipt_sha256"],
+        hook_command, hook_command_windows = (
+            codex_onboarding_impl.build_codex_hook_commands(
+                provenance_receipt["codex_hook_entry_point"]["path"],
+                paths.root,
+                provenance_receipt["provenance_receipt_sha256"],
+            )
         )
         provenance_preflight = _codex_provenance_preflight(
             paths, provenance_receipt
         )
+        previous_hook_command: str | None = None
+        previous_hook_command_windows: str | None = None
+        if (
+            provenance_preflight["changed"]
+            and provenance_preflight["previous_provenance_sha256"] is not None
+        ):
+            previous_receipt = (
+                codex_install_provenance_impl.load_codex_install_provenance_receipt(
+                    paths.root
+                )
+            )
+            previous_hook = previous_receipt["codex_hook_entry_point"]
+            previous_hook_command, previous_hook_command_windows = (
+                codex_onboarding_impl.build_codex_hook_commands(
+                    previous_hook["path"],
+                    paths.root,
+                    previous_receipt["provenance_receipt_sha256"],
+                )
+            )
     except (
         HarnessError,
         OSError,
@@ -2163,7 +2184,9 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         preflight = codex_onboarding_impl.preflight_codex_onboarding(
             paths.root,
             command=hook_command,
-            command_windows=hook_command,
+            command_windows=hook_command_windows,
+            previous_command=previous_hook_command,
+            previous_command_windows=previous_hook_command_windows,
         )
         if paths.config.is_file():
             _candidate, policy_change = (
@@ -2212,9 +2235,6 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         # did not, so take it here and retain it across the policy flip and all
         # client writes; a competing Chief/task cannot enter between stages.
         with state_lock(paths):
-            provenance_result = _install_codex_provenance_receipt(
-                paths, provenance_receipt
-            )
             paths, policy_changed = _enable_codex_hook_policy(
                 paths,
                 fresh_unauthenticated_init=created_config,
@@ -2225,7 +2245,18 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             hooks_result = codex_onboarding_impl.install_codex_hooks(
                 paths.root / ".codex" / "hooks.json",
                 command=hook_command,
-                command_windows=hook_command,
+                command_windows=hook_command_windows,
+                previous_command=previous_hook_command,
+                previous_command_windows=previous_hook_command_windows,
+            )
+            # Publish the new pair before replacing its provenance receipt.
+            # If the second write fails, rerunning accepts the already-desired
+            # pair while the still-current old receipt supplies the exact
+            # previous pair. The inverse order can strand an old pair after a
+            # receipt-only crash because no authoritative previous identity
+            # remains in the current receipt.
+            provenance_result = _install_codex_provenance_receipt(
+                paths, provenance_receipt
             )
             skill_result = codex_onboarding_impl.install_codex_user_skill(
                 user_skills_root,
@@ -7137,7 +7168,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if paths.project.codex_hooks_enabled:
         config_path = paths.root / ".codex" / "config.toml"
         hook_path = paths.root / ".codex" / "hooks.json"
-        expected_hook_command: str | None = None
+        expected_hook_commands: dict[str, str] | None = None
         try:
             codex_provenance_report = (
                 codex_install_provenance_impl.load_codex_install_provenance_receipt(
@@ -7150,13 +7181,17 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 codex_provenance_report["provenance_receipt_sha256"],
                 hook_entry["path"],
             )
-            expected_hook_command = (
-                codex_onboarding_impl.build_codex_hook_command(
+            expected_native, expected_windows = (
+                codex_onboarding_impl.build_codex_hook_commands(
                     hook_entry["path"],
                     paths.root,
                     codex_provenance_report["provenance_receipt_sha256"],
                 )
             )
+            expected_hook_commands = {
+                "command": expected_native,
+                "commandWindows": expected_windows,
+            }
         except (
             OSError,
             codex_install_provenance_impl.CodexInstallProvenanceError,
@@ -7263,7 +7298,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     for key in ("command", "commandWindows"):
                         command = str(handler.get(key, ""))
                         current = False
-                        if expected_hook_command is not None:
+                        if expected_hook_commands is not None:
                             assert codex_provenance_report is not None
                             hook_entry = codex_provenance_report[
                                 "codex_hook_entry_point"
@@ -7277,11 +7312,12 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                                         "provenance_receipt_sha256"
                                     ],
                                 )
+                                and command == expected_hook_commands[key]
                             )
                         if not current:
                             errors.append(
-                                f"{hook_path} {event} {key} must directly invoke the "
-                                "exact provenance-bound AOI Codex hook command"
+                                f"{hook_path} {event} {key} must invoke the exact "
+                                "platform-specific provenance-bound AOI Codex hook command"
                             )
 
     if paths.project.legacy_enabled:

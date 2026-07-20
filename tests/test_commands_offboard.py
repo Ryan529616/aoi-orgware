@@ -240,7 +240,7 @@ class OffboardTests(unittest.TestCase):
             launcher.parent.mkdir()
             launcher.write_bytes(b"stub")
             receipt = strict_local_v2_receipt(root, launcher)
-            command = offboard.codex.build_codex_hook_command(
+            command, command_windows = offboard.codex.build_codex_hook_commands(
                 launcher, root, receipt["provenance_receipt_sha256"]
             )
             foreign = "foreign-codex-hook --safe"
@@ -249,7 +249,14 @@ class OffboardTests(unittest.TestCase):
                 {
                     "hooks": {
                         "Stop": [
-                            {"hooks": [{"command": command}]},
+                            {
+                                "hooks": [
+                                    {
+                                        "command": command,
+                                        "commandWindows": command_windows,
+                                    }
+                                ]
+                            },
                             {"hooks": [{"command": foreign}]},
                         ]
                     }
@@ -273,7 +280,168 @@ class OffboardTests(unittest.TestCase):
             self.assertIn("AOI_KEEP", config)
             self.assertIn("FOREIGN_TOKEN", config)
 
-    def test_codex_current_handler_with_mismatched_receipt_is_preserved(self) -> None:
+    def test_codex_current_route_drift_blocks_offboard_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive = (root.parent / "offboard-archive").resolve()
+            initialize_aoi(root)
+            launcher = root / "bin" / "aoi-codex-hook.exe"
+            launcher.parent.mkdir()
+            launcher.write_bytes(b"stub")
+            receipt = strict_local_v2_receipt(root, launcher)
+            command, command_windows = offboard.codex.build_codex_hook_commands(
+                launcher, root, receipt["provenance_receipt_sha256"]
+            )
+            if command_windows.startswith("wsl.exe "):
+                drifted = command_windows.replace(
+                    '--distribution "', '--distribution "wrong-', 1
+                )
+            else:
+                drifted = command_windows.replace(
+                    receipt["provenance_receipt_sha256"], "b" * 64
+                )
+            hook_path = root / ".codex" / "hooks.json"
+            write_json(
+                hook_path,
+                {
+                    "hooks": {
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "command": command,
+                                        "commandWindows": drifted,
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+            )
+            before = hook_path.read_bytes()
+            with mock.patch.object(
+                offboard,
+                "load_codex_install_provenance_receipt",
+                side_effect=lambda _root: provenance.validate_codex_install_provenance_receipt(receipt),
+            ):
+                with self.assertRaisesRegex(
+                    offboard.OffboardError, "partial or route-drifted"
+                ):
+                    offboard.offboard(root, archive_dir=archive, dry_run=False)
+            self.assertEqual(hook_path.read_bytes(), before)
+
+    def test_codex_current_both_columns_drift_blocks_offboard_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive = (root.parent / "offboard-archive").resolve()
+            initialize_aoi(root)
+            launcher = root / "bin" / "aoi-codex-hook.exe"
+            launcher.parent.mkdir()
+            launcher.write_bytes(b"stub")
+            receipt = strict_local_v2_receipt(root, launcher)
+            command, command_windows = offboard.codex.build_codex_hook_commands(
+                launcher, root, receipt["provenance_receipt_sha256"]
+            )
+            drifted_command = command.replace(
+                receipt["provenance_receipt_sha256"], "b" * 64
+            )
+            drifted_windows = command_windows.replace(
+                receipt["provenance_receipt_sha256"], "b" * 64
+            )
+            hook_path = root / ".codex" / "hooks.json"
+            write_json(
+                hook_path,
+                {
+                    "hooks": {
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "command": drifted_command,
+                                        "commandWindows": drifted_windows,
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+            )
+            before = hook_path.read_bytes()
+            with mock.patch.object(
+                offboard,
+                "load_codex_install_provenance_receipt",
+                side_effect=lambda _root: provenance.validate_codex_install_provenance_receipt(receipt),
+            ):
+                with self.assertRaisesRegex(
+                    offboard.OffboardError, "partial or route-drifted"
+                ):
+                    offboard.offboard(root, archive_dir=archive, dry_run=False)
+            self.assertEqual(hook_path.read_bytes(), before)
+
+    def test_codex_malformed_aoi_pairs_block_offboard_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive = (root.parent / "offboard-archive").resolve()
+            initialize_aoi(root)
+            launcher = root / "bin" / "aoi-codex-hook.exe"
+            launcher.parent.mkdir()
+            launcher.write_bytes(b"stub")
+            receipt = strict_local_v2_receipt(root, launcher)
+            command, command_windows = offboard.codex.build_codex_hook_commands(
+                launcher, root, receipt["provenance_receipt_sha256"]
+            )
+            reordered_command = command.replace(
+                f'--hook-version 6 --project-root "{root}"',
+                f'--project-root "{root}" --hook-version 6',
+            )
+            reordered_windows = command_windows.replace(
+                f'--hook-version 6 --project-root "{root}"',
+                f'--project-root "{root}" --hook-version 6',
+            )
+            pairs = (
+                ("reordered", reordered_command, reordered_windows),
+                (
+                    "shell",
+                    f"bash -lc '{command}'",
+                    f"bash -lc '{command_windows}'",
+                ),
+            )
+            hook_path = root / ".codex" / "hooks.json"
+            for label, candidate_command, candidate_windows in pairs:
+                with self.subTest(label=label):
+                    write_json(
+                        hook_path,
+                        {
+                            "hooks": {
+                                "Stop": [
+                                    {
+                                        "hooks": [
+                                            {
+                                                "command": candidate_command,
+                                                "commandWindows": candidate_windows,
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        },
+                    )
+                    before = hook_path.read_bytes()
+                    with mock.patch.object(
+                        offboard,
+                        "load_codex_install_provenance_receipt",
+                        side_effect=lambda _root: provenance.validate_codex_install_provenance_receipt(receipt),
+                    ):
+                        with self.assertRaisesRegex(
+                            offboard.OffboardError,
+                            "malformed or route-drifted",
+                        ):
+                            offboard.offboard(
+                                root, archive_dir=archive, dry_run=False
+                            )
+                    self.assertEqual(hook_path.read_bytes(), before)
+
+    def test_codex_current_handler_with_mismatched_receipt_blocks_offboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             archive = (root.parent / "offboard-archive").resolve()
@@ -282,19 +450,20 @@ class OffboardTests(unittest.TestCase):
             launcher.parent.mkdir()
             launcher.write_bytes(b"stub")
             command = offboard.codex.build_codex_hook_command(launcher, root, "a" * 64)
-            write_json(root / ".codex" / "hooks.json", {"hooks": {"Stop": [{"hooks": [{"command": command}]}]}})
+            hook_path = root / ".codex" / "hooks.json"
+            write_json(hook_path, {"hooks": {"Stop": [{"hooks": [{"command": command}]}]}})
+            before = hook_path.read_bytes()
             receipt = strict_local_v2_receipt(root, launcher)
             with mock.patch.object(
                 offboard,
                 "load_codex_install_provenance_receipt",
                 side_effect=lambda _root: provenance.validate_codex_install_provenance_receipt(receipt),
             ):
-                result = offboard.offboard(root, archive_dir=archive, dry_run=False)
-            self.assertNotIn("codex.hooks.Stop", result["removed"])
-            self.assertEqual(
-                json.loads((root / ".codex" / "hooks.json").read_text(encoding="utf-8")),
-                {"hooks": {"Stop": [{"hooks": [{"command": command}]}]}},
-            )
+                with self.assertRaisesRegex(
+                    offboard.OffboardError, "partial or route-drifted"
+                ):
+                    offboard.offboard(root, archive_dir=archive, dry_run=False)
+            self.assertEqual(hook_path.read_bytes(), before)
 
     def test_link_like_parent_is_rejected_before_reading_client_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

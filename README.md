@@ -139,6 +139,19 @@ the module entry point. The package version must report `0.4.0a1`. See the
 [v0.4 quickstart](docs/quickstart.md) for both routes and the complete
 isolated-install, mini-task, status, and offboarding sequence.
 
+When onboarding from canonical WSL, AOI emits a direct Linux hook plus a
+canonical no-shell `wsl.exe --distribution ... --user ... --cd ... --exec ...`
+`commandWindows` bound to the same absolute launcher, project root, and
+provenance digest. It derives the route from consistent WSL runtime signals;
+there is no arbitrary command override. Partial signals, WSL UNC onboarding
+from native Windows, or any route drift fails closed. A proof-changing
+reinstall may rotate only the complete exact pair reconstructed from the
+persisted validated prior provenance receipt; partial or unbound current pairs
+and individually canonical but cross-bound identities are rejected. Pair-first
+then receipt publication keeps an interrupted proof rotation fail-closed and
+resumable. Windows execution of that wrapper and Codex `/hooks` trust remain
+separate live checks.
+
 The expected bundle value is the lowercase canonical digest recorded in the
 bundle's `bundle_sha256` field, not a raw-file SHA-256. For the local route, the
 bound source identity is review context: the bundle does not independently

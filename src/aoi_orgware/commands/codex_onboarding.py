@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
+import platform
 import re
 import secrets
 import shlex
@@ -909,6 +911,182 @@ def build_codex_hook_command(
     )
 
 
+def _validate_posix_absolute_path(
+    value: str | os.PathLike[str], label: str
+) -> str:
+    raw = os.fspath(value)
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or not PurePosixPath(raw).is_absolute()
+        or any(
+            character in raw
+            for character in {'"', "'", "\r", "\n", "\x00", "$", "`", "%", "!", "^"}
+        )
+    ):
+        raise CodexOnboardingError(f"{label} must be a safe absolute POSIX path")
+    return raw
+
+
+def _validate_windows_absolute_path(
+    value: str | os.PathLike[str], label: str
+) -> str:
+    raw = os.fspath(value)
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or not PureWindowsPath(raw).is_absolute()
+        or any(
+            character in raw
+            for character in {'"', "'", "\r", "\n", "\x00", "$", "`", "%", "!", "^"}
+        )
+    ):
+        raise CodexOnboardingError(f"{label} must be a safe absolute Windows path")
+    return raw
+
+
+def _validate_wsl_identity(value: str, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,127}", value)
+        or value.startswith("-")
+    ):
+        raise CodexOnboardingError(f"{label} is not a safe WSL identity")
+    return value
+
+
+def build_codex_windows_wsl_hook_command(
+    launcher: str | os.PathLike[str],
+    project_root: str | os.PathLike[str],
+    provenance_sha256: str,
+    *,
+    distribution: str,
+    user: str,
+) -> str:
+    """Build the sole trusted Windows-to-WSL hook wrapper.
+
+    The wrapper has no shell, PATH-resolved inner command, or caller-supplied
+    prefix.  ``--cd`` and ``--project-root`` are rendered from the same exact
+    validated value so current-command recognition can compare the complete
+    wrapper byte-for-byte.
+    """
+
+    launcher_text = _validate_posix_absolute_path(
+        launcher, "WSL Codex hook launcher"
+    )
+    root_text = _validate_posix_absolute_path(
+        project_root, "WSL Codex project root"
+    )
+    if not _executable_names(launcher_text) & {
+        HOOK_COMMAND_HEAD,
+        f"{HOOK_COMMAND_HEAD}.exe",
+    }:
+        raise CodexOnboardingError(
+            "WSL Codex hook launcher must name the aoi-codex-hook entry point"
+        )
+    distro_text = _validate_wsl_identity(distribution, "WSL distribution")
+    user_text = _validate_wsl_identity(user, "WSL user")
+    digest = _validate_digest(provenance_sha256, "Codex provenance SHA-256")
+    return (
+        f'wsl.exe --distribution "{distro_text}" --user "{user_text}" '
+        f'--cd "{root_text}" --exec "{launcher_text}" '
+        f'--hook-version 6 --project-root "{root_text}" '
+        f'--provenance-sha256 "{digest}"'
+    )
+
+
+def build_codex_hook_commands(
+    launcher: str | os.PathLike[str],
+    project_root: str | os.PathLike[str],
+    provenance_sha256: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+    kernel_release: str | None = None,
+    host_os_name: str | None = None,
+    wsl_user: str | None = None,
+) -> tuple[str, str]:
+    """Build the exact native and Windows hook command pair.
+
+    Production callers omit the keyword-only probes.  They exist so tests can
+    falsify every host-detection branch without accepting an operator-provided
+    command string.  Partial or contradictory WSL signals fail before any
+    onboarding publication.
+    """
+
+    env = os.environ if environment is None else environment
+    release = platform.release() if kernel_release is None else kernel_release
+    os_name = os.name if host_os_name is None else host_os_name
+    distro = env.get("WSL_DISTRO_NAME")
+    interop = env.get("WSL_INTEROP")
+    signals = (
+        distro is not None,
+        interop is not None,
+        "microsoft" in release.lower(),
+    )
+    if any(signals):
+        if os_name == "nt" or not all(signals):
+            raise CodexOnboardingError(
+                "WSL hook routing signals are partial or contradict the host"
+            )
+        assert distro is not None and interop is not None
+        _validate_posix_absolute_path(interop, "WSL interop endpoint")
+        launcher_text = _validate_posix_absolute_path(
+            launcher, "WSL Codex hook launcher"
+        )
+        root_text = _validate_posix_absolute_path(
+            project_root, "WSL Codex project root"
+        )
+        if wsl_user is None:
+            try:
+                pwd_module = importlib.import_module("pwd")
+                getpwuid = getattr(pwd_module, "getpwuid")
+                geteuid = getattr(os, "geteuid")
+                wsl_user = str(getattr(getpwuid(geteuid()), "pw_name"))
+            except (AttributeError, ImportError, KeyError, OSError, TypeError) as exc:
+                raise CodexOnboardingError(
+                    "cannot determine the exact WSL user for Windows hook routing"
+                ) from exc
+        direct = build_codex_hook_command(
+            launcher_text, root_text, provenance_sha256
+        )
+        windows = build_codex_windows_wsl_hook_command(
+            launcher_text,
+            root_text,
+            provenance_sha256,
+            distribution=distro,
+            user=wsl_user,
+        )
+        return direct, windows
+
+    if os_name == "nt":
+        raw_root = os.fspath(project_root)
+        lowered_root = raw_root.replace("/", "\\").lower()
+        if lowered_root.startswith("\\\\wsl$\\") or lowered_root.startswith(
+            "\\\\wsl.localhost\\"
+        ):
+            raise CodexOnboardingError(
+                "Windows onboarding cannot govern a WSL UNC project; "
+                "rerun from the canonical WSL session"
+            )
+        launcher_text = _validate_windows_absolute_path(
+            launcher, "Codex hook launcher"
+        )
+        root_text = _validate_windows_absolute_path(
+            project_root, "Codex project root"
+        )
+    else:
+        launcher_text = _validate_posix_absolute_path(
+            launcher, "Codex hook launcher"
+        )
+        root_text = _validate_posix_absolute_path(
+            project_root, "Codex project root"
+        )
+    direct = build_codex_hook_command(
+        launcher_text, root_text, provenance_sha256
+    )
+    return direct, direct
+
+
 def _strip_wrapping_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
@@ -994,6 +1172,164 @@ def _direct_aoi_hook_argv(value: Any) -> list[str] | None:
     return None
 
 
+def _current_wsl_hook_identity(value: Any) -> dict[str, str] | None:
+    """Parse only the one canonical current Windows-to-WSL wrapper."""
+
+    command = str(value or "").strip()
+    if not command or _contains_shell_control(command):
+        return None
+    try:
+        argv = [
+            _strip_wrapping_quotes(item)
+            for item in shlex.split(command, posix=True)
+        ]
+    except ValueError:
+        return None
+    if (
+        len(argv) != 15
+        or _executable_names(argv[0]) != {"wsl.exe"}
+        or argv[1] != "--distribution"
+        or argv[3] != "--user"
+        or argv[5] != "--cd"
+        or argv[7] != "--exec"
+        or argv[9] != "--hook-version"
+        or argv[10] != "6"
+        or argv[11] != "--project-root"
+        or argv[13] != "--provenance-sha256"
+    ):
+        return None
+    distribution, user, cwd, launcher, root, digest = (
+        argv[2],
+        argv[4],
+        argv[6],
+        argv[8],
+        argv[12],
+        argv[14],
+    )
+    if cwd != root:
+        return None
+    try:
+        canonical = build_codex_windows_wsl_hook_command(
+            launcher,
+            root,
+            digest,
+            distribution=distribution,
+            user=user,
+        )
+    except CodexOnboardingError:
+        return None
+    if command != canonical:
+        return None
+    return {
+        "distribution": distribution,
+        "user": user,
+        "launcher": launcher,
+        "project_root": root,
+        "provenance_sha256": digest,
+    }
+
+
+def _current_direct_hook_identity(value: Any) -> dict[str, str] | None:
+    """Return the identity of one exact direct current hook command."""
+
+    command = str(value or "").strip()
+    argv = _direct_aoi_hook_argv(value)
+    if (
+        argv is None
+        or len(argv) != 7
+        or not _is_absolute_path(argv[0])
+        or argv[1] != "--hook-version"
+        or argv[2] != "6"
+        or argv[3] != "--project-root"
+        or not _is_absolute_path(argv[4])
+        or argv[5] != "--provenance-sha256"
+        or not isinstance(argv[6], str)
+        or len(argv[6]) != 64
+        or bool(set(argv[6]) - _SHA256_HEX)
+    ):
+        return None
+    try:
+        canonical = build_codex_hook_command(argv[0], argv[4], argv[6])
+    except CodexOnboardingError:
+        return None
+    if command != canonical:
+        return None
+    return {
+        "launcher": argv[0],
+        "project_root": argv[4],
+        "provenance_sha256": argv[6],
+    }
+
+
+def references_aoi_codex_hook(value: Any) -> bool:
+    """Conservatively identify a command that carries an AOI hook executable."""
+
+    command = str(value or "").strip()
+    return _references_aoi_codex_hook(command, depth=0)
+
+
+def _references_aoi_codex_hook(command: str, *, depth: int) -> bool:
+    """Inspect direct tokens and one bounded known-shell command operand."""
+
+    if not command:
+        return False
+    if len(command.encode("utf-8")) > 32 * 1024:
+        return HOOK_COMMAND_HEAD in command.lower()
+    for posix in (False, True):
+        try:
+            raw = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        argv = [_strip_wrapping_quotes(token) for token in raw]
+        for token in argv:
+            if _executable_names(token) & {
+                HOOK_COMMAND_HEAD,
+                f"{HOOK_COMMAND_HEAD}.exe",
+            }:
+                return True
+        if depth >= 1 or not argv:
+            continue
+        shell_names = _executable_names(argv[0])
+        operand_indexes: list[int] = []
+        if shell_names & {
+            "bash",
+            "bash.exe",
+            "dash",
+            "dash.exe",
+            "sh",
+            "sh.exe",
+            "zsh",
+            "zsh.exe",
+        }:
+            operand_indexes = [
+                index + 1
+                for index, token in enumerate(argv[:-1])
+                if token.startswith("-") and "c" in token[1:]
+            ]
+        elif shell_names & {"cmd", "cmd.exe"}:
+            operand_indexes = [
+                index + 1
+                for index, token in enumerate(argv[:-1])
+                if token.lower() in {"/c", "/k"}
+            ]
+        elif shell_names & {
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+        }:
+            operand_indexes = [
+                index + 1
+                for index, token in enumerate(argv[:-1])
+                if token.lower() in {"-c", "-command", "-commandwithargs"}
+            ]
+        for index in operand_indexes:
+            nested = " ".join(argv[index:]).strip()
+            if _references_aoi_codex_hook(nested, depth=depth + 1):
+                return True
+    return False
+
+
 def is_aoi_codex_hook_command(
     value: Any,
     *,
@@ -1022,6 +1358,21 @@ def is_aoi_codex_hook_command(
         raise CodexOnboardingError(
             "expected launcher, project root, and provenance SHA-256 must be supplied together"
         )
+    if require_current:
+        wsl_identity = _current_wsl_hook_identity(value)
+        if wsl_identity is not None:
+            if all(item is not None for item in expected_values):
+                assert expected_launcher is not None
+                assert expected_project_root is not None
+                assert expected_provenance_sha256 is not None
+                return (
+                    wsl_identity["launcher"] == os.fspath(expected_launcher)
+                    and wsl_identity["project_root"]
+                    == os.fspath(expected_project_root)
+                    and wsl_identity["provenance_sha256"]
+                    == expected_provenance_sha256
+                )
+            return True
     argv = _direct_aoi_hook_argv(value)
     if argv is None:
         return False
@@ -1060,13 +1411,85 @@ def is_aoi_codex_hook_command(
     return True
 
 
-def _command_invokes_aoi(value: Any) -> bool:
-    # Legacy recognition is only an ownership migration capability.  A current
-    # command is separately recognized so reinstall stays idempotent without
-    # treating the legacy form as current.
-    return is_aoi_codex_hook_command(value) or is_aoi_codex_hook_command(
-        value, require_current=False
+def is_current_codex_hook_command_pair(
+    command: Any,
+    command_windows: Any,
+    *,
+    expected_launcher: str | os.PathLike[str],
+    expected_project_root: str | os.PathLike[str],
+    expected_provenance_sha256: str,
+    environment: Mapping[str, str] | None = None,
+    kernel_release: str | None = None,
+    host_os_name: str | None = None,
+    wsl_user: str | None = None,
+) -> bool:
+    """Require the complete exact platform pair for one current handler."""
+
+    expected_native, expected_windows = build_codex_hook_commands(
+        expected_launcher,
+        expected_project_root,
+        expected_provenance_sha256,
+        environment=environment,
+        kernel_release=kernel_release,
+        host_os_name=host_os_name,
+        wsl_user=wsl_user,
     )
+    return is_exact_codex_hook_command_pair(
+        command,
+        command_windows,
+        expected_command=expected_native,
+        expected_command_windows=expected_windows,
+    )
+
+
+def is_exact_codex_hook_command_pair(
+    command: Any,
+    command_windows: Any,
+    *,
+    expected_command: str,
+    expected_command_windows: str,
+) -> bool:
+    """Match one complete current handler against its exact rendered pair."""
+
+    native = str(command or "")
+    windows = str(command_windows or "")
+    if native != expected_command or windows != expected_command_windows:
+        return False
+    try:
+        _validate_codex_hook_command_pair(
+            native,
+            windows,
+            label="expected Codex hook",
+        )
+    except CodexOnboardingError:
+        return False
+    return True
+
+
+def _validate_codex_hook_command_pair(
+    command: str,
+    command_windows: str,
+    *,
+    label: str,
+) -> None:
+    """Require direct/direct equality or one identity-matched WSL wrapper."""
+
+    native = _current_direct_hook_identity(command)
+    if native is None:
+        raise CodexOnboardingError(
+            f"{label} command must be one exact direct current AOI hook"
+        )
+    if command_windows == command:
+        return
+    windows = _current_wsl_hook_identity(command_windows)
+    if windows is None or any(
+        windows[field] != native[field]
+        for field in ("launcher", "project_root", "provenance_sha256")
+    ):
+        raise CodexOnboardingError(
+            f"{label} command pair must bind one exact launcher, project root, "
+            "and provenance SHA-256"
+        )
 
 
 def _validate_hook_command(value: str, label: str) -> str:
@@ -1081,30 +1504,70 @@ def _validate_hook_command(value: str, label: str) -> str:
     return command
 
 
-def _handler_is_aoi_owned(handler: Any) -> bool:
+def _handler_is_aoi_owned(
+    handler: Any,
+    *,
+    accepted_command_pairs: tuple[tuple[str, str], ...],
+) -> bool:
     if not isinstance(handler, dict):
         return False
+    if any(
+        is_exact_codex_hook_command_pair(
+            handler.get("command"),
+            handler.get("commandWindows"),
+            expected_command=expected_command,
+            expected_command_windows=expected_command_windows,
+        )
+        for expected_command, expected_command_windows in accepted_command_pairs
+    ):
+        return True
     commands = [
         handler.get(key)
         for key in ("command", "commandWindows")
         if str(handler.get(key, "")).strip()
     ]
-    ownership = [_command_invokes_aoi(command) for command in commands]
-    if any(ownership) and not all(ownership):
+    current = [is_aoi_codex_hook_command(command) for command in commands]
+    if any(current):
+        raise CodexOnboardingError(
+            "Codex hook handler has a partial or route-drifted current AOI "
+            "command pair; restore the exact pair before wiring AOI"
+        )
+    legacy = [
+        is_aoi_codex_hook_command(command, require_current=False)
+        for command in commands
+    ]
+    if any(legacy) and not all(legacy):
         raise CodexOnboardingError(
             "Codex hook handler mixes an AOI-owned command with a foreign "
             "platform command; split or remove it before wiring AOI"
         )
-    return bool(ownership) and all(ownership)
+    if bool(legacy) and all(legacy):
+        return True
+    if any(references_aoi_codex_hook(command) for command in commands):
+        raise CodexOnboardingError(
+            "Codex hook handler has a malformed or route-drifted AOI command "
+            "pair; restore or remove it before wiring AOI"
+        )
+    return False
 
 
-def _entry_carries_aoi_hook(entry: Any) -> bool:
+def _entry_carries_aoi_hook(
+    entry: Any,
+    *,
+    accepted_command_pairs: tuple[tuple[str, str], ...],
+) -> bool:
     if not isinstance(entry, dict):
         return False
     handlers = entry.get("hooks", [])
     if not isinstance(handlers, list):
         return False
-    return any(_handler_is_aoi_owned(handler) for handler in handlers)
+    return any(
+        _handler_is_aoi_owned(
+            handler,
+            accepted_command_pairs=accepted_command_pairs,
+        )
+        for handler in handlers
+    )
 
 
 def _validate_event_entries(event: str, entries: list[Any]) -> None:
@@ -1141,11 +1604,38 @@ def _merge_codex_hook_settings_detailed(
     *,
     command: str,
     command_windows: str,
+    previous_command: str | None = None,
+    previous_command_windows: str | None = None,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     """Return merged settings plus added and upgraded AOI event lists."""
 
     command = _validate_hook_command(command, "Codex hook command")
     command_windows = _validate_hook_command(command_windows, "Codex Windows hook command")
+    _validate_codex_hook_command_pair(
+        command,
+        command_windows,
+        label="Codex hook",
+    )
+    if (previous_command is None) != (previous_command_windows is None):
+        raise CodexOnboardingError(
+            "previous Codex hook command pair must be supplied together"
+        )
+    accepted_command_pairs: tuple[tuple[str, str], ...] = (
+        (command, command_windows),
+    )
+    if previous_command is not None and previous_command_windows is not None:
+        previous_command = _validate_hook_command(
+            previous_command, "previous Codex hook command"
+        )
+        previous_command_windows = _validate_hook_command(
+            previous_command_windows, "previous Codex Windows hook command"
+        )
+        _validate_codex_hook_command_pair(
+            previous_command,
+            previous_command_windows,
+            label="previous Codex hook",
+        )
+        accepted_command_pairs += ((previous_command, previous_command_windows),)
     merged: dict[str, Any] = dict(settings)
     raw_hooks = merged.get("hooks")
     if raw_hooks is not None and not isinstance(raw_hooks, dict):
@@ -1166,7 +1656,14 @@ def _merge_codex_hook_settings_detailed(
             command=command,
             command_windows=command_windows,
         )
-        aoi_entries = [entry for entry in entries if _entry_carries_aoi_hook(entry)]
+        aoi_entries = [
+            entry
+            for entry in entries
+            if _entry_carries_aoi_hook(
+                entry,
+                accepted_command_pairs=accepted_command_pairs,
+            )
+        ]
         if aoi_entries == [desired]:
             hooks[event] = entries
             continue
@@ -1180,14 +1677,20 @@ def _merge_codex_hook_settings_detailed(
         # unrelated handler, retain that handler and its matcher/settings.
         preserved: list[Any] = []
         for entry in entries:
-            if not _entry_carries_aoi_hook(entry):
+            if not _entry_carries_aoi_hook(
+                entry,
+                accepted_command_pairs=accepted_command_pairs,
+            ):
                 preserved.append(entry)
                 continue
             handlers = entry.get("hooks", [])
             unrelated = [
                 handler
                 for handler in handlers
-                if not _handler_is_aoi_owned(handler)
+                if not _handler_is_aoi_owned(
+                    handler,
+                    accepted_command_pairs=accepted_command_pairs,
+                )
             ]
             if unrelated:
                 retained_entry = dict(entry)
@@ -1221,6 +1724,8 @@ def install_codex_hooks(
     *,
     command: str,
     command_windows: str,
+    previous_command: str | None = None,
+    previous_command_windows: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     hooks_text, hooks_snapshot = _read_safe_text(hooks_path, label="Codex hooks path")
@@ -1237,7 +1742,11 @@ def install_codex_hooks(
             )
         payload = loaded
     merged, added, updated = _merge_codex_hook_settings_detailed(
-        payload, command=command, command_windows=command_windows
+        payload,
+        command=command,
+        command_windows=command_windows,
+        previous_command=previous_command,
+        previous_command_windows=previous_command_windows,
     )
     changed = merged != payload or hooks_snapshot is None
     if changed:
@@ -1267,6 +1776,8 @@ def preflight_codex_onboarding(
     *,
     command: str,
     command_windows: str,
+    previous_command: str | None = None,
+    previous_command_windows: str | None = None,
 ) -> dict[str, Any]:
     """Validate all existing Codex client files without mutating the repo."""
 
@@ -1299,7 +1810,11 @@ def preflight_codex_onboarding(
             )
         payload = loaded
     _merged_hooks, events_added, events_updated = _merge_codex_hook_settings_detailed(
-        payload, command=command, command_windows=command_windows
+        payload,
+        command=command,
+        command_windows=command_windows,
+        previous_command=previous_command,
+        previous_command_windows=previous_command_windows,
     )
     return {
         "config_path": str(config_path),
@@ -1589,15 +2104,20 @@ __all__ = [
     "HOOK_TIMEOUT_SECONDS",
     "SESSION_START_MATCHER",
     "build_codex_hook_command",
+    "build_codex_hook_commands",
+    "build_codex_windows_wsl_hook_command",
     "enable_aoi_codex_hooks_policy",
     "install_codex_config",
     "install_codex_hooks",
     "install_codex_user_skill",
     "is_aoi_codex_hook_command",
+    "is_exact_codex_hook_command_pair",
+    "is_current_codex_hook_command_pair",
     "merge_codex_config_toml",
     "merge_codex_hook_settings",
     "preflight_codex_onboarding",
     "preflight_codex_user_skill",
+    "references_aoi_codex_hook",
     "read_verified_codex_text",
     "register_codex_onboarding_commands",
 ]

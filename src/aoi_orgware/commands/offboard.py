@@ -152,36 +152,65 @@ def _json_object(raw: bytes, label: str) -> dict[str, Any]:
 def _codex_handler_ownership(handler: dict[str, Any], root: Path) -> str:
     """Return current, legacy, or foreign without guessing current ownership."""
 
-    commands: list[str] = []
+    commands: list[tuple[str, str]] = []
     for key in ("command", "commandWindows"):
         value = handler.get(key)
         if isinstance(value, str) and value.strip():
-            commands.append(value)
+            commands.append((key, value))
     if not commands:
         return "foreign"
+    receipt: dict[str, Any] | None = None
+    hook: dict[str, Any] | None = None
     try:
         receipt = load_codex_install_provenance_receipt(root)
         hook = receipt["codex_hook_entry_point"]
-        current = [
+        current_pair = codex.is_current_codex_hook_command_pair(
+            handler.get("command"),
+            handler.get("commandWindows"),
+            expected_launcher=hook["path"],
+            expected_project_root=root,
+            expected_provenance_sha256=receipt["provenance_receipt_sha256"],
+        )
+    except (CodexInstallProvenanceError, KeyError, TypeError):
+        current_pair = False
+    if current_pair:
+        return "current"
+    if hook is not None and receipt is not None:
+        individually_current = [
             codex.is_aoi_codex_hook_command(
                 command,
                 expected_launcher=hook["path"],
                 expected_project_root=root,
                 expected_provenance_sha256=receipt["provenance_receipt_sha256"],
             )
-            for command in commands
+            for _key, command in commands
         ]
-    except (CodexInstallProvenanceError, KeyError, TypeError):
-        current = [False] * len(commands)
-    if any(current):
-        if not all(current):
-            raise OffboardError("Codex hook handler mixes current AOI and foreign platform commands")
-        return "current"
-    legacy = [codex.is_aoi_codex_hook_command(command, require_current=False) for command in commands]
+    else:
+        individually_current = [False] * len(commands)
+    if any(individually_current):
+        raise OffboardError(
+            "Codex hook handler has a partial or route-drifted current AOI command pair"
+        )
+    structurally_current = [
+        codex.is_aoi_codex_hook_command(command)
+        for _key, command in commands
+    ]
+    if any(structurally_current):
+        raise OffboardError(
+            "Codex hook handler has a partial or route-drifted current AOI command pair"
+        )
+    legacy = [
+        codex.is_aoi_codex_hook_command(command, require_current=False)
+        for _key, command in commands
+    ]
     if any(legacy):
         if not all(legacy):
             raise OffboardError("Codex hook handler mixes legacy AOI and foreign platform commands")
         return "legacy"
+    if any(codex.references_aoi_codex_hook(command) for _key, command in commands):
+        raise OffboardError(
+            "Codex hook handler has a malformed or route-drifted AOI command pair"
+        )
     return "foreign"
 
 

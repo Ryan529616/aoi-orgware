@@ -410,19 +410,217 @@ class HookMergeTests(unittest.TestCase):
                         **CURRENT_HOOK_KWARGS,
                     )
 
-    def test_distinct_exact_windows_command_is_kept(self) -> None:
+    def test_pair_rejects_individually_current_but_cross_bound_commands(self) -> None:
         windows = co.build_codex_hook_command(
             r"C:\\AOI Tools\\aoi-codex-hook.exe",
             r"C:\\work\\aoi-project",
             "b" * 64,
         )
-        merged, _ = co.merge_codex_hook_settings(
-            {},
-            command=CURRENT_HOOK_COMMAND,
-            command_windows=windows,
+        with self.assertRaisesRegex(co.CodexOnboardingError, "bind one exact"):
+            co.merge_codex_hook_settings(
+                {},
+                command=CURRENT_HOOK_COMMAND,
+                command_windows=windows,
+            )
+
+    def test_wsl_command_pair_is_canonical_and_exact(self) -> None:
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            TEST_HOOK_LAUNCHER,
+            TEST_PROJECT_ROOT,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
         )
-        handler = merged["hooks"]["Stop"][0]["hooks"][0]
-        self.assertEqual(handler["commandWindows"], windows)
+        self.assertEqual(command, CURRENT_HOOK_COMMAND)
+        self.assertEqual(
+            command_windows,
+            'wsl.exe --distribution "Ubuntu" --user "tester" '
+            '--cd "/work/aoi-project" --exec "/opt/aoi/bin/aoi-codex-hook" '
+            '--hook-version 6 --project-root "/work/aoi-project" '
+            f'--provenance-sha256 "{TEST_PROVENANCE_SHA256}"',
+        )
+        self.assertTrue(co.is_aoi_codex_hook_command(command_windows))
+        self.assertTrue(
+            co.is_current_codex_hook_command_pair(
+                command,
+                command_windows,
+                expected_launcher=TEST_HOOK_LAUNCHER,
+                expected_project_root=TEST_PROJECT_ROOT,
+                expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+                environment=environment,
+                kernel_release="6.6.0-microsoft-standard-WSL2",
+                host_os_name="posix",
+                wsl_user="tester",
+            )
+        )
+
+    def test_wsl_current_wrapper_rejects_shape_and_pair_drift(self) -> None:
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            TEST_HOOK_LAUNCHER,
+            TEST_PROJECT_ROOT,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        malformed = (
+            command_windows.replace(
+                '--cd "/work/aoi-project"', '--cd "/work/other"'
+            ),
+            command_windows.replace("--exec", "--exec --exec", 1),
+            command_windows.replace("--user", "--cd", 1),
+            command_windows + " --extra",
+            "bash -lc " + command_windows,
+        )
+        for candidate in malformed:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(co.is_aoi_codex_hook_command(candidate))
+        for old, new in (("Ubuntu", "Other"), ("tester", "other")):
+            drifted = command_windows.replace(old, new, 1)
+            self.assertTrue(co.is_aoi_codex_hook_command(drifted))
+            self.assertFalse(
+                co.is_current_codex_hook_command_pair(
+                    command,
+                    drifted,
+                    expected_launcher=TEST_HOOK_LAUNCHER,
+                    expected_project_root=TEST_PROJECT_ROOT,
+                    expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+                    environment=environment,
+                    kernel_release="6.6.0-microsoft-standard-WSL2",
+                    host_os_name="posix",
+                    wsl_user="tester",
+                )
+            )
+
+    def test_merge_rejects_partial_or_route_drifted_current_pair(self) -> None:
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            TEST_HOOK_LAUNCHER,
+            TEST_PROJECT_ROOT,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        other_digest = "b" * 64
+        cases = (
+            {"command": command},
+            {"commandWindows": command_windows},
+            {
+                "command": command,
+                "commandWindows": command_windows.replace("Ubuntu", "Other", 1),
+            },
+            {
+                "command": command,
+                "commandWindows": command_windows.replace("tester", "other", 1),
+            },
+            {
+                "command": command,
+                "commandWindows": command_windows.replace(
+                    TEST_HOOK_LAUNCHER, "/srv/aoi/aoi-codex-hook"
+                ),
+            },
+            {
+                "command": command,
+                "commandWindows": command_windows.replace(
+                    TEST_PROJECT_ROOT, "/work/other"
+                ),
+            },
+            {
+                "command": command.replace(TEST_PROVENANCE_SHA256, other_digest),
+                "commandWindows": command_windows.replace(
+                    TEST_PROVENANCE_SHA256, other_digest
+                ),
+            },
+            {
+                "command": (
+                    f'"{TEST_HOOK_LAUNCHER}" --project-root '
+                    f'"{TEST_PROJECT_ROOT}" --hook-version 6 '
+                    f'--provenance-sha256 "{TEST_PROVENANCE_SHA256}"'
+                ),
+                "commandWindows": command_windows.replace(
+                    '--distribution "Ubuntu" --user "tester"',
+                    '--user "tester" --distribution "Ubuntu"',
+                ),
+            },
+        )
+        for handler in cases:
+            with self.subTest(handler=handler):
+                settings = {
+                    "hooks": {"Stop": [{"hooks": [handler]}]},
+                    "preserve": {"sentinel": True},
+                }
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError,
+                    "(?:partial|malformed) or route-drifted",
+                ):
+                    co.merge_codex_hook_settings(
+                        settings,
+                        command=command,
+                        command_windows=command_windows,
+                    )
+                self.assertEqual(settings["preserve"], {"sentinel": True})
+
+    def test_wsl_detection_is_fail_closed_and_native_unc_is_rejected(self) -> None:
+        cases = (
+            ({"WSL_DISTRO_NAME": "Ubuntu"}, "6.6.0-linux", "posix"),
+            ({"WSL_INTEROP": "/run/WSL/1"}, "6.6.0-linux", "posix"),
+            ({}, "6.6.0-microsoft-standard-WSL2", "posix"),
+            (
+                {
+                    "WSL_DISTRO_NAME": "Ubuntu",
+                    "WSL_INTEROP": "/run/WSL/1",
+                },
+                "6.6.0-microsoft-standard-WSL2",
+                "nt",
+            ),
+        )
+        for environment, release, os_name in cases:
+            with self.subTest(environment=environment, release=release):
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError, "signals are partial|contradict"
+                ):
+                    co.build_codex_hook_commands(
+                        TEST_HOOK_LAUNCHER,
+                        TEST_PROJECT_ROOT,
+                        TEST_PROVENANCE_SHA256,
+                        environment=environment,
+                        kernel_release=release,
+                        host_os_name=os_name,
+                        wsl_user="tester",
+                    )
+        with self.assertRaisesRegex(co.CodexOnboardingError, "safe WSL identity"):
+            co.build_codex_windows_wsl_hook_command(
+                TEST_HOOK_LAUNCHER,
+                TEST_PROJECT_ROOT,
+                TEST_PROVENANCE_SHA256,
+                distribution="-Ubuntu",
+                user="tester",
+            )
+        with self.assertRaisesRegex(co.CodexOnboardingError, "WSL UNC"):
+            co.build_codex_hook_commands(
+                r"C:\AOI\aoi-codex-hook.exe",
+                r"\\wsl$\Ubuntu\home\tester\project",
+                TEST_PROVENANCE_SHA256,
+                environment={},
+                kernel_release="10.0.0",
+                host_os_name="nt",
+            )
 
     def test_existing_aoi_handler_is_upgraded_without_dropping_other_hook(self) -> None:
         old_command = "/opt/aoi-0.2.1/bin/aoi-codex-hook --hook-version 6"
@@ -545,15 +743,50 @@ class HookMergeTests(unittest.TestCase):
                 command_windows=CURRENT_HOOK_COMMAND,
             )
 
-    def test_spoofed_existing_command_is_preserved_not_claimed_as_aoi(self) -> None:
+    def test_malformed_existing_aoi_reference_blocks_onboarding(self) -> None:
         spoof = "aoi-codex-hook --hook-version 5 && echo keep-me"
-        merged, _ = co.merge_codex_hook_settings(
-            {"hooks": {"Stop": [{"hooks": [{"command": spoof}]}]}},
-            **CURRENT_HOOK_KWARGS,
+        with self.assertRaisesRegex(
+            co.CodexOnboardingError, "malformed or route-drifted"
+        ):
+            co.merge_codex_hook_settings(
+                {"hooks": {"Stop": [{"hooks": [{"command": spoof}]}]}},
+                **CURRENT_HOOK_KWARGS,
+            )
+
+    def test_known_shell_command_operands_cannot_hide_aoi_hook(self) -> None:
+        wrappers = (
+            f"bash -lc '{CURRENT_HOOK_COMMAND}'",
+            f"sh -c '{CURRENT_HOOK_COMMAND}'",
+            "cmd.exe /c 'aoi-codex-hook.exe --hook-version 6'",
+            "powershell.exe -Command '& aoi-codex-hook.exe --hook-version 6'",
         )
-        self.assertEqual(merged["hooks"]["Stop"][0]["hooks"][0]["command"], spoof)
-        self.assertEqual(
-            merged["hooks"]["Stop"][1]["hooks"][0]["command"], CURRENT_HOOK_COMMAND
+        for wrapper in wrappers:
+            with self.subTest(wrapper=wrapper):
+                self.assertTrue(co.references_aoi_codex_hook(wrapper))
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError, "malformed or route-drifted"
+                ):
+                    co.merge_codex_hook_settings(
+                        {
+                            "hooks": {
+                                "Stop": [
+                                    {
+                                        "hooks": [
+                                            {
+                                                "command": wrapper,
+                                                "commandWindows": wrapper,
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        },
+                        **CURRENT_HOOK_KWARGS,
+                    )
+        self.assertFalse(
+            co.references_aoi_codex_hook(
+                'python -c \'print("aoi-codex-hook")\''
+            )
         )
 
     def test_mixed_platform_ownership_is_rejected_without_data_loss(self) -> None:
@@ -1178,7 +1411,10 @@ class CodexInitCliTests(HarnessTestCase):
         self, *args: str, ok: bool = True
     ) -> subprocess.CompletedProcess[str]:
         self.provenance_receipt = fake_provenance_receipt(self.root)
-        self.expected_hook_command = co.build_codex_hook_command(
+        (
+            self.expected_hook_command,
+            self.expected_hook_command_windows,
+        ) = co.build_codex_hook_commands(
             self.provenance_receipt["codex_hook_entry_point"]["path"],
             self.root,
             self.provenance_receipt["provenance_receipt_sha256"],
@@ -1219,6 +1455,10 @@ class CodexInitCliTests(HarnessTestCase):
         self.assertEqual(
             hooks["hooks"]["SubagentStart"][0]["hooks"][0]["command"],
             self.expected_hook_command,
+        )
+        self.assertEqual(
+            hooks["hooks"]["SubagentStart"][0]["hooks"][0]["commandWindows"],
+            self.expected_hook_command_windows,
         )
         self.assertEqual(
             result["install_provenance"]["provenance_receipt_sha256"],
@@ -1339,6 +1579,84 @@ class CodexInitCliTests(HarnessTestCase):
         self.assertEqual(current, local)
         self.assertEqual(current["schema_version"], 2)
 
+    def test_proof_rotation_receipt_write_failure_is_resumable(self) -> None:
+        public = fake_provenance_receipt(self.root, salt="public-crash")
+        local = fake_local_provenance_receipt(self.root, salt="local-crash")
+        with mock.patch.object(
+            cli_impl.codex_install_provenance_impl,
+            "validate_codex_install_provenance",
+            return_value=public,
+        ):
+            first = self.cli_in_process(
+                "codex-init",
+                "--promotion-bundle-file",
+                str(self.root / "promotion.json"),
+                "--expected-promotion-bundle-sha256",
+                "a" * 64,
+                "--user-skills-root",
+                str(self.root / "user-skills"),
+                "--json",
+            )
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        local_args = (
+            "codex-init",
+            "--local-artifact-bundle-file",
+            str(self.root / "local.json"),
+            "--expected-local-artifact-bundle-sha256",
+            "b" * 64,
+            "--user-skills-root",
+            str(self.root / "user-skills"),
+            "--json",
+        )
+        with (
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=local,
+            ),
+            mock.patch.object(
+                cli_impl,
+                "_install_codex_provenance_receipt",
+                side_effect=OSError("receipt disk fault"),
+            ),
+        ):
+            failed = self.cli_in_process(*local_args, ok=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("rerun the same command", failed.stderr)
+        persisted = json.loads(
+            (self.root / ".aoi" / "codex-install-provenance-v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(persisted, public)
+        expected_local_pair = co.build_codex_hook_commands(
+            local["codex_hook_entry_point"]["path"],
+            self.root,
+            local["provenance_receipt_sha256"],
+        )
+        handler = json.loads(
+            (self.root / ".codex" / "hooks.json").read_text(encoding="utf-8")
+        )["hooks"]["Stop"][0]["hooks"][0]
+        self.assertEqual(
+            (handler["command"], handler["commandWindows"]),
+            expected_local_pair,
+        )
+
+        with mock.patch.object(
+            cli_impl.codex_install_provenance_impl,
+            "validate_codex_local_install_provenance",
+            return_value=local,
+        ):
+            resumed = self.cli_in_process(*local_args)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        final_receipt = json.loads(
+            (self.root / ".aoi" / "codex-install-provenance-v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(final_receipt, local)
+
     def test_fresh_policy_flip_refuses_a_chief_acquired_after_bootstrap(self) -> None:
         paths = h.get_paths(self.root)
         self.assertFalse(paths.project.codex_hooks_enabled)
@@ -1428,6 +1746,42 @@ class CodexInitCliTests(HarnessTestCase):
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         doctor = json.loads(self.cli("doctor", "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
+
+    def test_doctor_rejects_platform_command_pair_drift(self) -> None:
+        self.codex_init("--json")
+        path = self.root / ".codex" / "hooks.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        handler = payload["hooks"]["Stop"][0]["hooks"][0]
+        windows = handler["commandWindows"]
+        if windows.startswith("wsl.exe "):
+            handler["commandWindows"] = windows.replace(
+                '--distribution "', '--distribution "wrong-', 1
+            )
+        else:
+            handler["commandWindows"] = windows.replace(
+                self.provenance_receipt["provenance_receipt_sha256"],
+                "b" * 64,
+            )
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "aoi_orgware.cli", "doctor", "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        doctor = json.loads(result.stdout)
+        self.assertTrue(
+            any(
+                "Stop commandWindows must invoke the exact platform-specific"
+                in item
+                for item in doctor["errors"]
+            ),
+            doctor,
+        )
 
     def test_doctor_rejects_spoofed_aoi_command_string(self) -> None:
         self.codex_init("--json")
