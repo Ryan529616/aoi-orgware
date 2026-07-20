@@ -83,7 +83,23 @@ class PermitCliTests(HarnessTestCase):
         assert chief is not None
         self.chief = chief
         self.credential_path = Path(self.chief_credential_file)
-        self.now = datetime.now(timezone.utc)
+        migrated = semantic.projection_domain(
+            semantic.replay_events(store.load_semantic_events(self.paths, TASK))
+        )
+        registration = next(
+            row
+            for row in migrated["resource_session_registrations"]
+            if row["session_id"] == "harness-test-chief"
+        )
+        registered_at = datetime.fromisoformat(
+            str(registration["registered_at"]).replace("Z", "+00:00")
+        )
+        # Preserve the production contract's strict registration-before-arm
+        # ordering even if the wall clock steps backwards during a long suite.
+        self.now = max(
+            datetime.now(timezone.utc),
+            registered_at + timedelta(microseconds=1),
+        )
         self.command = 0
 
     def _apply_and_register_resource(self) -> None:

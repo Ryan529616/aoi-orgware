@@ -98,8 +98,9 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   races. The pinned 0.144.6 wire dialect is now enforced directly: requests and
   notifications omit `jsonrpc`, `initialized` is method-only, tagged or
   malformed error envelopes fail closed, and lifecycle digests bind exact raw
-  wire bytes. Response-derived milestones retain the actual request method and
-  cannot masquerade as lifecycle notifications. Successful initialize/thread/
+  wire bytes. Response-derived milestones retain the actual request method from
+  the contract's single event-method table and cannot masquerade as lifecycle
+  notifications. Successful initialize/thread/
   turn results are checked against the pinned 0.144.6 required shape before
   the journal callback; thread context is rebound to the sealed cwd/model/
   approval/sandbox, and the supported lifecycle subset checks pinned required

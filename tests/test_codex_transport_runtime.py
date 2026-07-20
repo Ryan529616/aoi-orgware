@@ -164,6 +164,59 @@ def test_pending_thread_start_requires_exact_request_and_unknown_is_not_retryabl
         runtime._event_for(sealed, reservation, event_id="x", sequence=1, previous=contracts.ZERO_SHA256, event_type="thread_start_send_pending", correlation={"thread_id": None, "turn_id": None, "item_id": None})
 
 
+@pytest.mark.parametrize(
+    ("event_type", "correlation", "expected_method"),
+    [
+        (
+            "initialized",
+            {"thread_id": None, "turn_id": None, "item_id": None},
+            "initialize",
+        ),
+        (
+            "thread_started",
+            {"thread_id": "thread-1", "turn_id": None, "item_id": None},
+            "thread/start",
+        ),
+        (
+            "turn_started",
+            {"thread_id": "thread-1", "turn_id": "turn-1", "item_id": None},
+            "turn/start",
+        ),
+    ],
+)
+def test_runtime_event_factory_uses_contract_response_method_mapping(
+    event_type: str,
+    correlation: dict[str, str | None],
+    expected_method: str,
+) -> None:
+    sealed = intent()
+    reservation = contracts.seal_reservation(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1,
+            "reservation_id": "r-1",
+            "launch_intent_sha256": sealed["intent_sha256"],
+            "permit_sha256": SHA_A,
+            "runtime_pin": pin(),
+            "state": "reserved",
+            "correlation": {"thread_id": None, "turn_id": None, "item_id": None},
+        }
+    )
+    event = runtime._event_for(
+        sealed,
+        reservation,
+        event_id=f"x:{event_type}",
+        sequence=1,
+        previous=contracts.ZERO_SHA256,
+        event_type=event_type,
+        correlation=correlation,
+        wire_event_sha256=SHA_B,
+        response_sha256=SHA_B,
+    )
+
+    assert event["wire_method"] == expected_method
+    assert event["wire_method"] == contracts.previous_event_method(event_type)
+
+
 def _filesystem_runtime() -> tuple[tempfile.TemporaryDirectory[str], tempfile.TemporaryDirectory[str], h.HarnessPaths, dict[str, Any], Path]:
     temp = tempfile.TemporaryDirectory()
     root = Path(temp.name)

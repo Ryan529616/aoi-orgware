@@ -950,7 +950,7 @@ def _required_correlation(event_type: str, correlation: Mapping[str, str | None]
 
 
 def previous_event_method(event_type: str) -> str:
-    """Return the request method whose response may have been lost."""
+    """Return the pinned wire method for one transport journal event type."""
 
     return _EVENT_WIRE_METHOD[event_type]
 

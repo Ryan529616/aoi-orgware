@@ -115,14 +115,7 @@ def _event_for(
     if pending or event_type == "launch_unknown":
         if request_id is None or request_bytes_sha256 is None:
             raise CodexTransportRuntimeError("request milestone needs exact request id and bytes digest")
-    method = {
-        "reserved": "aoi/reservation", "process_start_pending": "process/start", "process_started": "process/started",
-        "initialize_send_pending": "initialize", "initialized": "initialized", "thread_start_send_pending": "thread/start",
-        "thread_started": "thread/started", "turn_start_send_pending": "turn/start", "turn_started": "turn/started",
-        "interrupt_send_pending": "turn/interrupt", "interrupt_observed": "turn/interrupt", "item_started": "item/started",
-        "item_completed": "item/completed", "completed": "turn/completed", "failed": "process/exited",
-        "interrupted": "turn/interrupt", "launch_unknown": "thread/start", "runtime_unknown": "runtime/disconnected",
-    }[event_type]
+    method = contracts.previous_event_method(event_type)
     status = {"item_completed": "completed", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "unknown", "runtime_unknown": "unknown"}.get(event_type, "observed")
     state = {"reserved": "reserved", "process_start_pending": "reserved", "process_started": "reserved", "initialize_send_pending": "reserved", "initialized": "reserved", "thread_start_send_pending": "reserved", "thread_started": "thread_started", "turn_start_send_pending": "thread_started", "turn_started": "turn_started", "interrupt_send_pending": "turn_started", "interrupt_observed": "turn_started", "item_started": "turn_started", "item_completed": "turn_started", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "launch_unknown", "runtime_unknown": "runtime_unknown"}[event_type]
     try:
