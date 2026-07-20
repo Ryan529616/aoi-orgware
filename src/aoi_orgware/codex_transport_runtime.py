@@ -643,6 +643,56 @@ def _reservation_base_records(
     return records[:index + 1]
 
 
+def _has_exact_pending_reservation_binding(
+    paths: h.HarnessPaths,
+    task_id: str,
+    records: list[dict[str, Any]],
+    marker: Mapping[str, Any],
+) -> bool:
+    """Authenticate the binding-only crash witness for one issued launch.
+
+    Publishing the immutable reservation binding is the point at which an
+    otherwise fresh launch becomes recovery work.  The semantic event may not
+    yet exist if the writer crashed between the two durable publications.  A
+    different pending binding must never relax this launch's permit expiry.
+    """
+
+    try:
+        report = objects.inspect_semantic_objects(paths, task_id, records)
+    except objects.SemanticObjectError as exc:
+        raise _fail("cannot authenticate Codex reservation binding", exc) from exc
+    pending = report["pending_binding_sha256s"]
+    if not pending:
+        return False
+    expected = _sha(marker["binding_sha256"], "reservation binding SHA-256")
+    if pending != [expected]:
+        raise CodexTransportRuntimeError(
+            "pending semantic binding differs from the issued Codex reservation"
+        )
+    matches = [
+        binding
+        for binding in report["bindings"]
+        if binding["binding_sha256"] == expected
+    ]
+    if len(matches) != 1:
+        raise CodexTransportRuntimeError(
+            "issued Codex reservation binding is missing or ambiguous"
+        )
+    binding = matches[0]
+    if (
+        binding["classification"] != "pending"
+        or binding["binding_kind"] != "codex_launch_reservation"
+        or binding["binding_key"] != marker["launch_id"]
+        or binding["expected_semantic_head_sha256"]
+        != marker["expected_semantic_head_sha256"]
+        or binding["planned_event_sha256"] != marker["planned_event_sha256"]
+    ):
+        raise CodexTransportRuntimeError(
+            "pending Codex reservation binding differs from its issuance marker"
+        )
+    return True
+
+
 def _require_exact_transaction(candidate: Mapping[str, Any], rebuilt: Mapping[str, Any]) -> None:
     """Reject a controller-supplied after-image that differs from issuance."""
 
@@ -672,11 +722,16 @@ def reconstruct_issued_launch_transaction(
     intent, decision, permit, authority_contract = _issued_launch_material(
         paths, task_id, records, marker
     )
+    reservation_committed = len(records) > len(base_records)
+    binding_only_recovery = not reservation_committed and _has_exact_pending_reservation_binding(
+        paths, task_id, records, marker
+    )
     validation_time = current_time
-    if len(records) > len(base_records):
-        # The exact reservation event proves that this one-shot permit was
-        # consumed while valid.  Reconstructing its still-terminal command
-        # after expiry is recovery, not a fresh launch authorization.
+    if reservation_committed or binding_only_recovery:
+        # The exact committed event or its authenticated pending binding proves
+        # that publication of this one-shot reservation already began while
+        # valid.  Reconstructing the same still-terminal command after expiry
+        # is recovery, not a fresh launch authorization.
         expires_at = h.parse_tz_aware_time(permit.get("expires_at"))
         if expires_at is None:
             raise CodexTransportRuntimeError("issued launch permit expiry is invalid")
@@ -733,7 +788,11 @@ def reserve_codex_launch(paths: h.HarnessPaths, transaction: Mapping[str, Any], 
     records, _state, _head = _live_records(paths, task_id, event_chain)
     marker = _read_marker(paths, task_id, permit_sha256)
     base_records = _reservation_base_records(records, marker)
-    if len(records) == len(base_records):
+    binding_only_recovery = (
+        len(records) == len(base_records)
+        and _has_exact_pending_reservation_binding(paths, task_id, records, marker)
+    )
+    if len(records) == len(base_records) and not binding_only_recovery:
         intent, _decision, _permit, issued_authority = _issued_launch_material(
             paths, task_id, records, marker
         )

@@ -121,7 +121,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   fabricating `SubagentStart`; dispatch generation v2, complete ownership
   binding, a per-launch OS lock, consume/pending-time expiry checks, and
   issue-to-Popen Git/claim recapture close duplicate-launch and stale-source
-  races. The pinned 0.144.6 wire dialect is now enforced directly: requests and
+  races. If a crash lands the exact marker-bound reservation binding before its
+  semantic event, that authenticated pending binding is the sole witness that
+  allows the same still-terminal command to recover after permit expiry;
+  absent, different, or head-drifted witnesses fail closed. The pinned 0.144.6
+  wire dialect is now enforced directly: requests and
   notifications omit `jsonrpc`, `initialized` is method-only, tagged or
   malformed error envelopes fail closed, and lifecycle digests bind exact raw
   wire bytes. Response-derived milestones retain the actual request method from

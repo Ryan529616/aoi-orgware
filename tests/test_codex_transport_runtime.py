@@ -19,6 +19,7 @@ from aoi_orgware import codex_transport_contracts as contracts
 from aoi_orgware import codex_transport_runtime as runtime
 from aoi_orgware import harnesslib as h
 from aoi_orgware import semantic_events as semantic
+from aoi_orgware import semantic_objects as objects
 from aoi_orgware import semantic_store as store
 from aoi_orgware import transition_permits as permits
 from aoi_orgware.config import default_config_text
@@ -366,6 +367,204 @@ def test_filesystem_reserve_rebuilds_issued_transaction_and_replays_exactly() ->
             permit_sha256=tx["permit"]["permit_sha256"],
         )
         assert marker["launch_id"] == "launch-1"
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_filesystem_reserve_recovers_binding_only_crash_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        tx = _live_transaction(paths, chief)
+        _issue(paths, chief, credential_path, tx)
+        original_append = store.append_semantic_transition
+
+        def crash_after_binding(*args: object, **kwargs: object) -> object:
+            raise store.SemanticStoreError("simulated reservation event crash")
+
+        monkeypatch.setattr(store, "append_semantic_transition", crash_after_binding)
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(store.SemanticStoreError, match="simulated"):
+                runtime.reserve_codex_launch(
+                    paths,
+                    tx,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=NOW,
+                    packet_integrity_services=object(),  # type: ignore[arg-type]
+                )
+            report = objects.inspect_semantic_objects(
+                paths, "task-1", store.load_semantic_events(paths, "task-1")
+            )
+        assert report["pending_binding_sha256s"] == [tx["binding"]["binding_sha256"]]
+
+        monkeypatch.setattr(store, "append_semantic_transition", original_append)
+        after_expiry = datetime(2026, 7, 22, tzinfo=UTC)
+        with h.state_lock(paths, create_layout=False):
+            recovered = runtime.reserve_codex_launch(
+                paths,
+                tx,
+                store.load_semantic_events(paths, "task-1"),
+                current_time=after_expiry,
+                packet_integrity_services=object(),  # type: ignore[arg-type]
+            )
+        with h.state_lock(paths, create_layout=False):
+            replayed = runtime.reserve_codex_launch(
+                paths,
+                tx,
+                store.load_semantic_events(paths, "task-1"),
+                current_time=after_expiry,
+                packet_integrity_services=object(),  # type: ignore[arg-type]
+            )
+        assert recovered["idempotent_replay"] is False
+        assert replayed["idempotent_replay"] is True
+        assert recovered["semantic_event_sha256"] == replayed["semantic_event_sha256"]
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_filesystem_expired_reservation_requires_its_exact_crash_witness() -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        first = _live_transaction(paths, chief)
+        second = _live_transaction(
+            paths,
+            chief,
+            launch_id="launch-2",
+            command_id="reserve-2",
+            nonce="nonce-0000000002",
+        )
+        _issue(paths, chief, credential_path, first)
+        _issue(paths, chief, credential_path, second)
+        after_expiry = datetime(2026, 7, 22, tzinfo=UTC)
+
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(runtime.CodexTransportRuntimeError, match="expired"):
+                runtime.reserve_codex_launch(
+                    paths,
+                    first,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=after_expiry,
+                    packet_integrity_services=object(),  # type: ignore[arg-type]
+                )
+
+        with h.state_lock(paths, create_layout=False):
+            for wrapped in second["objects"]:
+                objects.publish_semantic_object(paths, wrapped)
+            objects.publish_semantic_binding(
+                paths,
+                second["binding"],
+                store.load_semantic_events(paths, "task-1"),
+            )
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="differs from the issued Codex reservation",
+            ):
+                runtime.reserve_codex_launch(
+                    paths,
+                    first,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=after_expiry,
+                    packet_integrity_services=object(),  # type: ignore[arg-type]
+                )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_filesystem_fresh_reservation_revalidates_canonical_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        tx = _live_transaction(paths, chief)
+        _issue(paths, chief, credential_path, tx)
+        calls: list[datetime] = []
+
+        def reject_fresh_authority(*args: object, **kwargs: object) -> object:
+            calls.append(kwargs["current_time"])  # type: ignore[arg-type]
+            raise runtime.launch_authority.CodexTransportAuthorityError(
+                "fresh authority rejected"
+            )
+
+        monkeypatch.setattr(
+            runtime.launch_authority,
+            "require_canonical_launch_authority",
+            reject_fresh_authority,
+        )
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(
+                runtime.launch_authority.CodexTransportAuthorityError,
+                match="fresh authority rejected",
+            ):
+                runtime.reserve_codex_launch(
+                    paths,
+                    tx,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=NOW,
+                    packet_integrity_services=object(),  # type: ignore[arg-type]
+                )
+            report = objects.inspect_semantic_objects(
+                paths, "task-1", store.load_semantic_events(paths, "task-1")
+            )
+        assert calls == [NOW]
+        assert report["pending_binding_sha256s"] == []
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_filesystem_pending_reservation_rejects_nonplanned_semantic_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        tx = _live_transaction(paths, chief)
+        _issue(paths, chief, credential_path, tx)
+        original_append = store.append_semantic_transition
+
+        def crash_after_binding(*args: object, **kwargs: object) -> object:
+            raise store.SemanticStoreError("simulated reservation event crash")
+
+        monkeypatch.setattr(store, "append_semantic_transition", crash_after_binding)
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(store.SemanticStoreError, match="simulated"):
+                runtime.reserve_codex_launch(
+                    paths,
+                    tx,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=NOW,
+                    packet_integrity_services=object(),  # type: ignore[arg-type]
+                )
+
+        monkeypatch.setattr(store, "append_semantic_transition", original_append)
+        with h.state_lock(paths, create_layout=False):
+            records = store.load_semantic_events(paths, "task-1")
+            drifted = semantic.projection_domain(semantic.replay_events(records))
+            drifted["unrelated"] = "after-pending-binding"
+            store.append_semantic_transition(
+                paths,
+                "task-1",
+                drifted,
+                event_type="unrelated_test",
+                command_id="unrelated-after-reservation-binding",
+                recorded_at="2026-07-20T00:02:00Z",
+                authority_ref="test",
+                expected_head_sha256=records[-1]["event_sha256"],
+            )
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="no longer the terminal semantic transition",
+            ):
+                runtime.reserve_codex_launch(
+                    paths,
+                    tx,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=datetime(2026, 7, 22, tzinfo=UTC),
+                    packet_integrity_services=object(),  # type: ignore[arg-type]
+                )
     finally:
         credential_temp.cleanup()
         temp.cleanup()
