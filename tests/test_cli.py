@@ -9154,6 +9154,14 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         source, replacement = state["verification"]
+        # Keep this synthetic legacy window safely behind every later CLI
+        # subprocess timestamp; forward-only repair can race seal ``now``.
+        causal_anchor = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        source["recorded_at"] = causal_anchor.isoformat(timespec="microseconds")
+        replacement_time = causal_anchor + dt.timedelta(microseconds=1)
+        replacement["recorded_at"] = replacement_time.isoformat(
+            timespec="microseconds"
+        )
         source_preimage_sha = cli_impl.canonical_record_sha256(source)
         replacement_current_sha = cli_impl.canonical_record_sha256(replacement)
         replacement_legacy = json.loads(json.dumps(replacement))
@@ -9171,7 +9179,9 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         )
         source["original_status"] = source["status"]
         source["status"] = "skipped"
-        source["superseded_at"] = h.now_iso()
+        source["superseded_at"] = (
+            replacement_time + dt.timedelta(microseconds=1)
+        ).isoformat(timespec="microseconds")
         source["supersession_reason"] = (
             "Legacy supersession was recorded before replacement materialization"
         )
@@ -9271,11 +9281,19 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         source, replacement = state["verification"]
+        causal_anchor = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        source["recorded_at"] = causal_anchor.isoformat(timespec="microseconds")
+        replacement_time = causal_anchor + dt.timedelta(microseconds=1)
+        replacement["recorded_at"] = replacement_time.isoformat(
+            timespec="microseconds"
+        )
         source_preimage_sha = cli_impl.canonical_record_sha256(source)
         replacement_sha = cli_impl.canonical_record_sha256(replacement)
         source["original_status"] = source["status"]
         source["status"] = "skipped"
-        source["superseded_at"] = h.now_iso()
+        source["superseded_at"] = (
+            replacement_time + dt.timedelta(microseconds=1)
+        ).isoformat(timespec="microseconds")
         source["supersession_reason"] = (
             "Legacy supersession already named a canonical replacement"
         )
@@ -9611,13 +9629,22 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             )
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        source, middle, leaf = state["verification"]
+        records = state["verification"]
+        causal_anchor = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+        canonical_times: list[dt.datetime] = []
+        for index, record in enumerate(records):
+            record_time = causal_anchor + dt.timedelta(microseconds=index)
+            record["recorded_at"] = record_time.isoformat(timespec="microseconds")
+            canonical_times.append(record_time)
+        source, middle, leaf = records
         source_preimage_sha = cli_impl.canonical_record_sha256(source)
         middle_preimage_sha = cli_impl.canonical_record_sha256(middle)
         leaf_sha = cli_impl.canonical_record_sha256(leaf)
         source["original_status"] = source["status"]
         source["status"] = "skipped"
-        source["superseded_at"] = h.now_iso()
+        source["superseded_at"] = (
+            canonical_times[1] + dt.timedelta(microseconds=1)
+        ).isoformat(timespec="microseconds")
         source["supersession_reason"] = (
             "Legacy source names a replacement that is later superseded again"
         )
