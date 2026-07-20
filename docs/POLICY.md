@@ -684,12 +684,20 @@ Chief-sealed semantic event time, not a measured wall-clock consumption
 timestamp. Process-start claims derive only from journal evidence.
 
 The pinned App Server dialect is its generated, line-delimited RPC schema, not
-a generic JSON-RPC 2.0 envelope. Exact request-response bytes may populate both
-the response and wire digest. Process/lifecycle notifications populate only a
-wire digest. A bounded synthetic controller/protocol fault has separate
-`fault_kind` and fault-evidence digest/size fields and may never be presented as
-response or wire bytes. Malformed response/error envelopes fail before response
-observation; ambiguous non-idempotent starts remain non-retryable.
+a generic JSON-RPC 2.0 envelope. Exact correlated success-response bytes may
+populate both the response and wire digest, but their `wire_method` is the
+actual request method (`initialize`, `thread/start`, `turn/start`, or
+`turn/interrupt`); they may not be labeled as similarly named lifecycle
+notifications. A method-specific success result must satisfy the pinned 0.144.6
+required shape and sealed cwd/model/approval/sandbox constraints before the
+response journal callback can publish a semantic milestone. Supported
+lifecycle notifications validate pinned Thread/Turn/item required fields and
+timestamps and populate only a wire digest. An exact rejected response may be
+bound only as fault evidence. Other bounded synthetic controller/protocol
+faults hash a finite redacted reason code and have separate `fault_kind` and
+fault-evidence digest/size fields; neither kind may be presented as response or
+wire bytes. Malformed response/error envelopes fail before response
+observation; ambiguous or rejected non-idempotent starts remain non-retryable.
 
 A terminal App Server turn remains `codex_runtime_observed`. Only a separate
 exact pre/post Git tree and claim binding may add `verified_mutation`; neither

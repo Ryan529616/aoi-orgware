@@ -19,6 +19,7 @@ from aoi_orgware.codex_app_server_stdio import (
     ProtocolViolation,
     RequestJournalEntry,
     RequestPhase,
+    ResponseSchemaViolation,
     RuntimeDisconnected,
     RuntimeEvent,
     TurnObservation,
@@ -218,6 +219,14 @@ class FakeAdapter:
         )
         if self.mode == method.replace("/", "_") + "_loss":
             raise RuntimeDisconnected(f"{method} response lost")
+        if self.mode == method.replace("/", "_") + "_schema_error":
+            rejected = b'{"id":2,"result":{"invalid":true}}\n'
+            raise ResponseSchemaViolation(
+                f"pinned {method} response schema validation failed",
+                method=method,
+                evidence_sha256=hashlib.sha256(rejected).hexdigest(),
+                evidence_size_bytes=len(rejected),
+            )
         error = self.mode == method.replace("/", "_") + "_error"
         response = (
             {"id": request_id, "error": {"code": -1, "message": "no"}}
@@ -328,6 +337,17 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
         "item_completed",
         "completed",
     ]
+    response_methods = {
+        row["event_type"]: row["wire_method"]
+        for row in result.journal
+        if row["event_type"]
+        in {"initialized", "thread_started", "turn_started"}
+    }
+    assert response_methods == {
+        "initialized": "initialize",
+        "thread_started": "thread/start",
+        "turn_started": "turn/start",
+    }
     assert sink.published == [result.terminal_receipt]
     assert adapter.closed is True
 
@@ -337,6 +357,7 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
     [
         ("process_loss", "launch_unknown", None),
         ("thread_start_loss", "launch_unknown", None),
+        ("thread_start_schema_error", "launch_unknown", None),
         ("turn_start_loss", "launch_unknown", "thread-1"),
         ("midstream_loss", "runtime_unknown", "thread-1"),
         ("thread_start_error", "failed", None),
@@ -361,12 +382,24 @@ def test_crash_and_protocol_faults_terminalize_without_resend(
         assert terminal_event["fault_kind"] in {
             "AppServerError",
             "ProtocolViolation",
+            "ResponseSchemaViolation",
             "RuntimeDisconnected",
         }
         assert terminal_event["fault_evidence_sha256"] is not None
         assert terminal_event["fault_evidence_size_bytes"] > 0
     assert all(count == 1 for count in adapter.request_count.values())
     assert adapter.closed is True
+
+
+def test_synthetic_fault_digest_distinguishes_redacted_reason_codes() -> None:
+    value, _sink, _adapter = controller()
+    timeout = value._fault_digest(RuntimeDisconnected("timed out waiting for data"))
+    eof = value._fault_digest(RuntimeDisconnected("stdout reached EOF"))
+    other_timeout = value._fault_digest(
+        RuntimeDisconnected("timed out with sensitive path C:/secret")
+    )
+    assert timeout[1] != eof[1]
+    assert timeout == other_timeout
 
 
 def test_terminal_publication_crash_retries_receipt_only() -> None:

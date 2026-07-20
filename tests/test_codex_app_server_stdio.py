@@ -17,6 +17,7 @@ from aoi_orgware.codex_app_server_stdio import (
     ProtocolViolation,
     RequestJournalEntry,
     RequestPhase,
+    ResponseSchemaViolation,
     RuntimeEvent,
     RuntimeDisconnected,
     RuntimePin,
@@ -35,6 +36,7 @@ SHA_D = "d" * 64
 _FAKE_SERVER = r'''
 import json
 import os
+import platform
 import sys
 
 scenario = os.environ.get("FAKE_SCENARIO", "normal")
@@ -77,10 +79,17 @@ if scenario == "error_bad_code":
 if scenario == "error_bad_message":
     send({"id":init["id"],"error":{"code":-32000,"message":7}})
     raise SystemExit(0)
-response(init, {
+initialize_result = {
+    "codexHome": os.path.abspath(os.environ.get("CODEX_HOME", os.getcwd())),
+    "platformFamily": "windows" if os.name == "nt" else "unix",
+    "platformOs": platform.system().lower(),
+    "userAgent": "fake-codex-app-server/0.144.6",
     "secret_present": "AOI_CHIEF_CREDENTIAL_FILE" in os.environ,
     "publication_secret_present": "GITHUB_TOKEN" in os.environ,
-})
+}
+if scenario == "invalid_initialize_response":
+    initialize_result.pop("userAgent")
+response(init, initialize_result)
 assert read() == {"method":"initialized"}
 send({"method":"remoteControl/status/changed","params":{"status":"ready"}})
 if scenario == "flood":
@@ -97,8 +106,39 @@ if scenario == "wrong_response":
 if scenario == "error_response":
     send({"id":thread["id"],"error":{"code":-32000,"message":"no"}})
     raise SystemExit(0)
-send({"method":"thread/started","params":{"thread":{"id":"thread-1"}}})
-response(thread, {"thread":{"id":"thread-1"}})
+thread_value = {
+    "cliVersion": "0.144.6",
+    "createdAt": 1,
+    "cwd": thread["params"]["cwd"],
+    "ephemeral": True,
+    "id": "thread-1",
+    "modelProvider": "openai",
+    "preview": "",
+    "sessionId": "session-1",
+    "source": "appServer",
+    "status": {"type":"idle"},
+    "turns": [],
+    "updatedAt": 1,
+}
+sandbox_type = "readOnly" if thread["params"]["sandbox"] == "read-only" else "workspaceWrite"
+sandbox = {"type":sandbox_type,"networkAccess":False}
+if sandbox_type == "workspaceWrite":
+    sandbox["writableRoots"] = [thread["params"]["cwd"]]
+thread_result = {
+    "approvalPolicy": thread["params"]["approvalPolicy"],
+    "approvalsReviewer": "user",
+    "cwd": thread["params"]["cwd"],
+    "model": thread["params"]["model"],
+    "modelProvider": "openai",
+    "sandbox": sandbox,
+    "thread": thread_value,
+}
+if scenario == "invalid_thread_response":
+    thread_result.pop("approvalsReviewer")
+if scenario == "thread_context_drift":
+    thread_result["model"] = "other-model"
+send({"method":"thread/started","params":{"thread":thread_value}})
+response(thread, thread_result)
 if scenario == "auxiliary_notifications":
     send({"method":"thread/status/changed","params":{"threadId":"thread-1","status":"active"}})
 
@@ -110,17 +150,23 @@ if scenario == "server_request":
 if scenario == "bad_notification":
     send({"method":"unknown/event","params":{}})
     raise SystemExit(0)
+turn_value = {"id":"turn-1","items":[],"status":"inProgress"}
 if scenario == "wrong_correlation":
-    send({"method":"turn/started","params":{"threadId":"other","turn":{"id":"turn-1"}}})
+    send({"method":"turn/started","params":{"threadId":"other","turn":turn_value}})
 else:
-    send({"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}})
+    send({"method":"turn/started","params":{"threadId":"thread-1","turn":turn_value}})
 if scenario == "auxiliary_wrong_thread":
     send({"method":"thread/status/changed","params":{"threadId":"other","status":"active"}})
 if scenario == "auxiliary_wrong_turn":
     send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"other","itemId":"item-1","delta":"wrong turn"}})
 if scenario == "auxiliary_item_without_turn":
     send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","itemId":"item-1","delta":"missing turn"}})
-response(turn, {"turn":{"id":"turn-1","status":"inProgress"}})
+turn_result = {"turn":turn_value}
+if scenario == "invalid_turn_response":
+    turn_result = {"turn":{"id":"turn-1","status":"inProgress"}}
+if scenario == "turn_status_drift":
+    turn_result = {"turn":{"id":"turn-1","items":[],"status":"completed"}}
+response(turn, turn_result)
 if scenario == "auxiliary_notifications":
     send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"not persisted by AOI"}})
     send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","tokenUsage":{"totalTokens":1}}})
@@ -128,14 +174,16 @@ if scenario == "interrupt_active":
     interrupt = read()
     assert "jsonrpc" not in interrupt
     response(interrupt, {})
-    send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}})
+    send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"interrupted"}}})
     raise SystemExit(0)
 if scenario == "midstream_eof":
-    send({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage"}}})
+    send({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":2,"item":{"id":"item-1","type":"agentMessage","text":"partial"}}})
     raise SystemExit(0)
 item = {"id":"item-1","type":"agentMessage","text":"ok"}
-started = {"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":item}}
-completed = {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":item}}
+started = {"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":2,"item":item}}
+completed = {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":3,"item":item}}
+if scenario == "invalid_item_notification":
+    started["params"].pop("startedAtMs")
 send(started)
 if scenario == "duplicate_conflict":
     item["text"] = "different"
@@ -143,7 +191,7 @@ if scenario == "duplicate_conflict":
 elif scenario == "duplicate_exact":
     send(started)
 send(completed)
-send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}})
+send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[item],"status":"completed"}}})
 if scenario == "interrupt":
     interrupt = read()
     assert "jsonrpc" not in interrupt
@@ -308,6 +356,25 @@ def test_pinned_notification_and_item_allowlists_match_generated_schema() -> Non
     }
     assert stdio._NOTIFICATION_METHODS == notification_methods
     assert stdio._ITEM_TYPES == item_types
+    assert stdio._THREAD_START_RESPONSE_REQUIRED == frozenset(
+        schema["definitions"]["ThreadStartResponse"]["required"]
+    )
+    assert stdio._THREAD_REQUIRED == frozenset(
+        schema["definitions"]["Thread"]["required"]
+    )
+    assert stdio._TURN_REQUIRED == frozenset(
+        schema["definitions"]["Turn"]["required"]
+    )
+    item_required = {
+        variant["properties"]["type"]["enum"][0]: frozenset(
+            variant["required"]
+        )
+        for variant in schema["definitions"]["ThreadItem"]["oneOf"]
+    }
+    assert stdio._THREAD_ITEM_REQUIRED_FIELDS == item_required
+    assert stdio._INITIALIZE_RESPONSE_REQUIRED == frozenset(
+        {"codexHome", "platformFamily", "platformOs", "userAgent"}
+    )
 
 
 def test_pinned_rpc_envelopes_do_not_define_jsonrpc_member() -> None:
@@ -330,6 +397,9 @@ def test_pinned_rpc_envelopes_do_not_define_jsonrpc_member() -> None:
     }
     assert manifest["ClientNotification.json"] == (
         "a30b3041578845b11add3d07d5a63cd3a12d5d126e87b8c591862b4aeb68d97c"
+    )
+    assert manifest["v1/InitializeResponse.json"] == (
+        "86dcd236d0576a82c85b933586dc45731260eab1b6edb3447b03f790277322b1"
     )
     assert manifest["JSONRPCResponse.json"] == (
         "94ecf5e81bdbc2af858afad0044b95c7fb4decf77d7fd7d6321324dad79eef57"
@@ -535,6 +605,71 @@ def test_malformed_error_envelope_is_rejected_before_response_observation(
         client.close()
 
 
+def test_initialize_success_response_is_schema_validated_before_observation(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    responses: list[RequestJournalEntry] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        "invalid_initialize_response",
+        on_response=responses.append,
+    )
+    client.start()
+    try:
+        with pytest.raises(ResponseSchemaViolation, match="pinned initialize") as caught:
+            client.initialize()
+        assert responses == []
+        assert len(caught.value.evidence_sha256) == 64
+        assert caught.value.evidence_size_bytes > 0
+        assert client.last_receipt is not None
+        assert client.last_receipt.phase is RequestPhase.SEND_PENDING
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "scenario", ["invalid_thread_response", "thread_context_drift"]
+)
+def test_thread_success_response_schema_and_intent_drift_fail_before_observation(
+    fake_server: Path, tmp_path: Path, scenario: str
+) -> None:
+    client = _initialized_client(fake_server, tmp_path, scenario)
+    responses: list[RequestJournalEntry] = []
+    client.on_response = responses.append
+    try:
+        with pytest.raises(ResponseSchemaViolation, match="pinned thread/start"):
+            client.start_thread_from_intent(intent=_intent(tmp_path))
+        assert responses == []
+        assert client.last_receipt is not None
+        assert client.last_receipt.phase is RequestPhase.SEND_PENDING
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "scenario", ["invalid_turn_response", "turn_status_drift"]
+)
+def test_turn_success_response_schema_fails_before_observation(
+    fake_server: Path, tmp_path: Path, scenario: str
+) -> None:
+    client = _initialized_client(fake_server, tmp_path, scenario)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        responses: list[RequestJournalEntry] = []
+        client.on_response = responses.append
+        with pytest.raises(ResponseSchemaViolation, match="pinned turn/start"):
+            client.start_turn_from_intent(
+                thread_id=thread_id, prompt="hello", intent=intent
+            )
+        assert responses == []
+        assert client.last_receipt is not None
+        assert client.last_receipt.phase is RequestPhase.SEND_PENDING
+    finally:
+        client.close()
+
+
 def test_thread_response_eof_preserves_send_pending_ambiguity(fake_server: Path, tmp_path: Path) -> None:
     client = _initialized_client(fake_server, tmp_path, "eof_thread")
     try:
@@ -586,6 +721,24 @@ def test_midstream_eof_and_duplicate_event_variants(fake_server: Path, tmp_path:
             conflicting.observe_turn(thread_id=thread_id, turn_id=turn_id, timeout_seconds=3)
     finally:
         conflicting.close()
+
+
+def test_lifecycle_notification_required_fields_follow_pinned_schema(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path, "invalid_item_notification")
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        with pytest.raises(ProtocolViolation, match="startedAtMs"):
+            turn_id = client.start_turn_from_intent(
+                thread_id=thread_id, prompt="hello", intent=intent
+            )
+            client.observe_turn(
+                thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+            )
+    finally:
+        client.close()
 
 
 def test_interrupt_is_correlated_only_while_turn_is_active(fake_server: Path, tmp_path: Path) -> None:

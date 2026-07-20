@@ -98,9 +98,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   races. The pinned 0.144.6 wire dialect is now enforced directly: requests and
   notifications omit `jsonrpc`, `initialized` is method-only, tagged or
   malformed error envelopes fail closed, and lifecycle digests bind exact raw
-  wire bytes. Journal evidence now distinguishes request responses, process/
-  notification observations, and bounded synthetic faults; a fault can never
-  claim `response_sha256` or `wire_event_sha256`. A first real read-only canary
+  wire bytes. Response-derived milestones retain the actual request method and
+  cannot masquerade as lifecycle notifications. Successful initialize/thread/
+  turn results are checked against the pinned 0.144.6 required shape before
+  the journal callback; thread context is rebound to the sealed cwd/model/
+  approval/sandbox, and the supported lifecycle subset checks pinned required
+  Thread/Turn/item fields. Journal evidence now distinguishes request
+  responses, process/notification observations, exact rejected-response fault
+  evidence, and synthetic faults with finite redacted reason codes; a fault can
+  never claim `response_sha256` or `wire_event_sha256`. A first real read-only canary
   exposed the former framing defect and failed explicitly at initialize; it was
   not retried and is not a live PASS. Local fake-runtime tests and that failed
   diagnostic canary are not release, package-install, or downstream ARISE

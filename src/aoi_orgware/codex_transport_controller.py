@@ -83,9 +83,12 @@ _PENDING_BY_METHOD = {
     "turn/interrupt": "interrupt_send_pending",
 }
 _OBSERVED_BY_METHOD = {
-    "initialize": ("initialized", "initialized"),
-    "thread/start": ("thread_started", "thread/started"),
-    "turn/start": ("turn_started", "turn/started"),
+    # These milestones are derived from correlated request responses.  Their
+    # exact bytes are not the similarly named lifecycle notifications, which
+    # remain buffered runtime events until observation.
+    "initialize": ("initialized", "initialize"),
+    "thread/start": ("thread_started", "thread/start"),
+    "turn/start": ("turn_started", "turn/start"),
     "turn/interrupt": ("interrupt_observed", "turn/interrupt"),
 }
 _TERMINAL_STATES = {
@@ -409,16 +412,60 @@ class CodexTransportController:
             )
 
     def _fault_digest(self, exc: BaseException) -> tuple[str, str, int]:
+        evidence_sha256 = getattr(exc, "evidence_sha256", None)
+        evidence_size_bytes = getattr(exc, "evidence_size_bytes", None)
+        if (
+            isinstance(evidence_sha256, str)
+            and len(evidence_sha256) == 64
+            and isinstance(evidence_size_bytes, int)
+            and not isinstance(evidence_size_bytes, bool)
+            and evidence_size_bytes > 0
+        ):
+            return type(exc).__name__, evidence_sha256, evidence_size_bytes
+        reason_code = self._fault_reason_code(exc)
         payload = json.dumps(
             {
                 "exception_type": type(exc).__name__,
                 "last_event_type": self.state.last_event_type,
+                "reason_code": reason_code,
             },
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
         ).encode("ascii")
         return type(exc).__name__, hashlib.sha256(payload).hexdigest(), len(payload)
+
+    @staticmethod
+    def _fault_reason_code(exc: BaseException) -> str:
+        """Return a finite redacted reason code without hashing exception text."""
+
+        supplied = getattr(exc, "reason_code", None)
+        if isinstance(supplied, str) and supplied in {
+            "pinned_response_schema",
+        }:
+            return supplied
+        message = str(exc).lower()
+        if isinstance(exc, RuntimeDisconnected):
+            if "timed out" in message:
+                return "timeout"
+            if "eof" in message:
+                return "eof"
+            if "write failed" in message or "stdin" in message:
+                return "write_channel"
+            return "runtime_disconnected"
+        if isinstance(exc, AppServerError):
+            if "correlation" in message:
+                return "correlation"
+            if "duplicate" in message:
+                return "duplicate_event"
+            if "unsupported" in message:
+                return "unsupported_protocol"
+            if "journal" in message or "persist" in message:
+                return "durable_callback"
+            return "app_server_fault"
+        if isinstance(exc, CodexTransportControllerError):
+            return "controller_contract"
+        return "unexpected_fault"
 
     def _terminalize_fault(self, exc: BaseException) -> None:
         state = self.state

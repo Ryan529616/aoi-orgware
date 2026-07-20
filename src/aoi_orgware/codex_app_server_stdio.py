@@ -134,6 +134,75 @@ _ITEM_TYPES: Final = frozenset(
         "contextCompaction",
     }
 )
+_INITIALIZE_RESPONSE_REQUIRED: Final = frozenset(
+    {"codexHome", "platformFamily", "platformOs", "userAgent"}
+)
+_THREAD_START_RESPONSE_REQUIRED: Final = frozenset(
+    {
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "model",
+        "modelProvider",
+        "sandbox",
+        "thread",
+    }
+)
+_THREAD_REQUIRED: Final = frozenset(
+    {
+        "cliVersion",
+        "createdAt",
+        "cwd",
+        "ephemeral",
+        "id",
+        "modelProvider",
+        "preview",
+        "sessionId",
+        "source",
+        "status",
+        "turns",
+        "updatedAt",
+    }
+)
+_TURN_REQUIRED: Final = frozenset({"id", "items", "status"})
+_THREAD_ITEM_REQUIRED_FIELDS: Final = {
+    "userMessage": frozenset({"content", "id", "type"}),
+    "hookPrompt": frozenset({"fragments", "id", "type"}),
+    "agentMessage": frozenset({"id", "text", "type"}),
+    "plan": frozenset({"id", "text", "type"}),
+    "reasoning": frozenset({"id", "type"}),
+    "commandExecution": frozenset(
+        {"command", "commandActions", "cwd", "id", "status", "type"}
+    ),
+    "fileChange": frozenset({"changes", "id", "status", "type"}),
+    "mcpToolCall": frozenset(
+        {"arguments", "id", "server", "status", "tool", "type"}
+    ),
+    "dynamicToolCall": frozenset(
+        {"arguments", "id", "status", "tool", "type"}
+    ),
+    "collabAgentToolCall": frozenset(
+        {
+            "agentsStates",
+            "id",
+            "receiverThreadIds",
+            "senderThreadId",
+            "status",
+            "tool",
+            "type",
+        }
+    ),
+    "subAgentActivity": frozenset(
+        {"agentPath", "agentThreadId", "id", "kind", "type"}
+    ),
+    "webSearch": frozenset({"id", "query", "type"}),
+    "imageView": frozenset({"id", "path", "type"}),
+    "sleep": frozenset({"durationMs", "id", "type"}),
+    "imageGeneration": frozenset({"id", "result", "status", "type"}),
+    "enteredReviewMode": frozenset({"id", "review", "type"}),
+    "exitedReviewMode": frozenset({"id", "review", "type"}),
+    "contextCompaction": frozenset({"id", "type"}),
+}
 _AOI_SECRET_ENV_PREFIXES: Final = ("AOI_CHIEF_", "AOI_ROOT_", "AOI_CREDENTIAL_")
 _AOI_SECRET_ENV_NAMES: Final = frozenset(
     {"AOI_CHIEF_SESSION_ID", "AOI_CHIEF_EPOCH", "AOI_CHIEF_CREDENTIAL_FILE"}
@@ -154,6 +223,30 @@ class RuntimeDisconnected(AppServerError):
 
 class ServerRequestDenied(ProtocolViolation):
     """The server requested approval, user input, or any other client action."""
+
+
+class ResponseSchemaViolation(ProtocolViolation):
+    """A correlated success response did not satisfy the pinned method schema.
+
+    The rejected response is not a successful response observation.  Its exact
+    bounded wire digest is carried only as fault evidence so a controller can
+    distinguish it from a lost response without publishing the raw bytes.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str,
+        evidence_sha256: str,
+        evidence_size_bytes: int,
+        reason_code: str = "pinned_response_schema",
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.evidence_sha256 = evidence_sha256
+        self.evidence_size_bytes = evidence_size_bytes
+        self.reason_code = reason_code
 
 
 class RequestPhase(str, Enum):
@@ -522,6 +615,7 @@ class CodexAppServerStdio:
                 "clientInfo": {"name": client_name, "version": client_version},
                 "capabilities": {"experimentalApi": False, "requestAttestation": False},
             },
+            validate_result=_validate_initialize_response,
         )
         self._send_notification("initialized")
         self._initialized = True
@@ -547,7 +641,13 @@ class CodexAppServerStdio:
             "ephemeral": True,
             "model": intent.model,
         }
-        response = self.request("thread/start", params)
+        response = self.request(
+            "thread/start",
+            params,
+            validate_result=lambda result: _validate_thread_start_response(
+                result, intent=intent
+            ),
+        )
         thread = _require_object(response.get("thread"), "thread/start response thread")
         thread_id = _require_string(thread.get("id"), "thread/start response thread.id")
         self._validate_buffered_events(thread_id=thread_id, turn_id=None)
@@ -597,7 +697,11 @@ class CodexAppServerStdio:
             "model": intent.model,
             "effort": intent.effort,
         }
-        response = self.request("turn/start", params)
+        response = self.request(
+            "turn/start",
+            params,
+            validate_result=_validate_turn_start_response,
+        )
         turn = _require_object(response.get("turn"), "turn/start response turn")
         turn_id = _require_string(turn.get("id"), "turn/start response turn.id")
         self._validate_buffered_events(thread_id=thread_id, turn_id=turn_id)
@@ -611,6 +715,7 @@ class CodexAppServerStdio:
         return self.request(
             "turn/interrupt",
             {"threadId": _require_string(thread_id, "thread_id"), "turnId": _require_string(turn_id, "turn_id")},
+            validate_result=_validate_turn_interrupt_response,
         )
 
     def observe_turn(self, *, thread_id: str, turn_id: str, timeout_seconds: float = 60.0) -> TurnObservation:
@@ -630,7 +735,14 @@ class CodexAppServerStdio:
                 self._turn_terminal = True
                 return TurnObservation(thread_id, turn_id, status, tuple(observed))
 
-    def request(self, method: str, params: Mapping[str, Any], *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        timeout_seconds: float = 30.0,
+        validate_result: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         if method not in _REQUEST_METHODS:
             raise ValueError(f"unsupported client request method: {method}")
         process = self._require_process()
@@ -665,7 +777,12 @@ class CodexAppServerStdio:
             except OSError as exc:
                 raise RuntimeDisconnected(f"App Server write failed during {method}") from exc
             self.last_receipt = RequestReceipt(request_id, method, RequestPhase.SEND_PENDING)
-            response = self._wait_response(request_id, deadline=time.monotonic() + timeout_seconds)
+            response = self._wait_response(
+                request_id,
+                method=method,
+                deadline=time.monotonic() + timeout_seconds,
+                validate_result=validate_result,
+            )
             self.last_receipt = RequestReceipt(request_id, method, RequestPhase.RESPONSE_RECEIVED, response)
             return response
 
@@ -688,7 +805,14 @@ class CodexAppServerStdio:
         except OSError as exc:
             raise RuntimeDisconnected(f"App Server write failed during {method}") from exc
 
-    def _wait_response(self, request_id: int, *, deadline: float) -> dict[str, Any]:
+    def _wait_response(
+        self,
+        request_id: int,
+        *,
+        method: str,
+        deadline: float,
+        validate_result: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    ) -> dict[str, Any]:
         while True:
             kind, payload = self._next_incoming(deadline)
             if kind == "notification":
@@ -705,11 +829,25 @@ class CodexAppServerStdio:
                     )
                 entry = RequestJournalEntry(
                     request_id,
-                    str(self.last_receipt.method if self.last_receipt else "unknown"),
+                    method,
                     RequestPhase.RESPONSE_RECEIVED,
                     raw,
                     hashlib.sha256(raw).hexdigest(),
                 )
+                if "error" not in message:
+                    result = _require_object(
+                        message.get("result"), "App Server response result"
+                    )
+                    if validate_result is not None:
+                        try:
+                            result = validate_result(result)
+                        except ProtocolViolation as exc:
+                            raise ResponseSchemaViolation(
+                                f"pinned {method} response schema validation failed",
+                                method=method,
+                                evidence_sha256=entry.sha256,
+                                evidence_size_bytes=len(raw),
+                            ) from exc
                 if self.on_response is not None:
                     try:
                         self.on_response(entry)
@@ -717,7 +855,7 @@ class CodexAppServerStdio:
                         raise AppServerError("response journal callback failed") from exc
                 if "error" in message:
                     raise AppServerError(f"App Server error response to request {request_id}: {message['error']!r}")
-                return _require_object(message.get("result"), "App Server response result")
+                return result
             raise ProtocolViolation(f"internal reader emitted unknown kind: {kind}")
 
     def _next_notification(self, deadline: float) -> RuntimeEvent:
@@ -883,7 +1021,9 @@ class CodexAppServerStdio:
             )
             return
         if event.method == "thread/started":
-            thread = _require_object(params.get("thread"), "thread/started thread")
+            thread = _validate_thread_object(
+                params.get("thread"), "thread/started thread"
+            )
             if _require_string(thread.get("id"), "thread/started thread.id") != thread_id:
                 raise ProtocolViolation("thread/started correlation mismatch")
             return
@@ -891,18 +1031,30 @@ class CodexAppServerStdio:
         if observed_thread != thread_id:
             raise ProtocolViolation(f"{event.method} thread correlation mismatch")
         if event.method == "turn/started":
-            turn = _require_object(params.get("turn"), "turn/started turn")
+            turn = _validate_turn_object(
+                params.get("turn"),
+                "turn/started turn",
+                allowed_statuses=frozenset({"inProgress"}),
+            )
             observed_turn = _require_string(turn.get("id"), "turn/started turn.id")
         elif event.method == "turn/completed":
-            turn = _require_object(params.get("turn"), "turn/completed turn")
+            turn = _validate_turn_object(
+                params.get("turn"),
+                "turn/completed turn",
+                allowed_statuses=frozenset(
+                    {"completed", "failed", "interrupted"}
+                ),
+            )
             observed_turn = _require_string(turn.get("id"), "turn/completed turn.id")
         else:
             observed_turn = _require_string(params.get("turnId"), f"{event.method} turnId")
-            item = _require_object(params.get("item"), f"{event.method} item")
-            item_type = _require_string(item.get("type"), f"{event.method} item.type")
-            _require_string(item.get("id"), f"{event.method} item.id")
-            if item_type not in _ITEM_TYPES:
-                raise ProtocolViolation(f"unsupported App Server item type: {item_type}")
+            _validate_thread_item(params.get("item"), f"{event.method} item")
+            timestamp_field = (
+                "startedAtMs" if event.method == "item/started" else "completedAtMs"
+            )
+            _require_integer(
+                params.get(timestamp_field), f"{event.method} {timestamp_field}"
+            )
         if turn_id is not None and observed_turn != turn_id:
             raise ProtocolViolation(f"{event.method} turn correlation mismatch")
         if turn_id is None and not allow_future_turn:
@@ -1138,6 +1290,237 @@ def _require_object(value: object, label: str) -> dict[str, Any]:
 def _require_string(value: object, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise ProtocolViolation(f"{label} must be a non-empty string")
+    return value
+
+
+def _require_fields(
+    value: Mapping[str, Any], required: frozenset[str], label: str
+) -> None:
+    missing = sorted(required - set(value))
+    if missing:
+        raise ProtocolViolation(
+            f"{label} is missing pinned required fields: {', '.join(missing)}"
+        )
+
+
+def _require_text(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ProtocolViolation(f"{label} must be a string")
+    return value
+
+
+def _require_integer(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ProtocolViolation(f"{label} must be an integer")
+    return value
+
+
+def _require_boolean(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ProtocolViolation(f"{label} must be a boolean")
+    return value
+
+
+def _require_array(value: object, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ProtocolViolation(f"{label} must be an array")
+    return value
+
+
+def _absolute_path(value: object, label: str) -> Path:
+    text = _require_string(value, label)
+    path = Path(text)
+    if not path.is_absolute():
+        raise ProtocolViolation(f"{label} must be an absolute path")
+    try:
+        return path.resolve(strict=False)
+    except OSError as exc:
+        raise ProtocolViolation(f"{label} could not be normalized") from exc
+
+
+def _require_same_path(value: object, expected: str, label: str) -> None:
+    observed_path = _absolute_path(value, label)
+    expected_path = _absolute_path(expected, f"expected {label}")
+    if os.path.normcase(str(observed_path)) != os.path.normcase(str(expected_path)):
+        raise ProtocolViolation(f"{label} differs from the sealed launch intent")
+
+
+def _validate_thread_status(value: object, label: str) -> None:
+    status = _require_object(value, label)
+    status_type = _require_string(status.get("type"), f"{label}.type")
+    if status_type not in {"notLoaded", "idle", "systemError", "active"}:
+        raise ProtocolViolation(f"{label}.type is outside the pinned schema")
+    if status_type == "active":
+        flags = _require_array(status.get("activeFlags"), f"{label}.activeFlags")
+        if any(
+            flag not in {"waitingOnApproval", "waitingOnUserInput"}
+            for flag in flags
+        ):
+            raise ProtocolViolation(f"{label}.activeFlags is outside the pinned schema")
+
+
+def _validate_thread_item(value: object, label: str) -> dict[str, Any]:
+    item = _require_object(value, label)
+    item_type = _require_string(item.get("type"), f"{label}.type")
+    try:
+        required = _THREAD_ITEM_REQUIRED_FIELDS[item_type]
+    except KeyError as exc:
+        raise ProtocolViolation(f"unsupported App Server item type: {item_type}") from exc
+    _require_fields(item, required, label)
+    _require_string(item.get("id"), f"{label}.id")
+    if "text" in required:
+        _require_text(item.get("text"), f"{label}.text")
+    return item
+
+
+def _validate_turn_object(
+    value: object,
+    label: str,
+    *,
+    allowed_statuses: frozenset[str],
+) -> dict[str, Any]:
+    turn = _require_object(value, label)
+    _require_fields(turn, _TURN_REQUIRED, label)
+    _require_string(turn.get("id"), f"{label}.id")
+    status = _require_string(turn.get("status"), f"{label}.status")
+    if status not in allowed_statuses:
+        raise ProtocolViolation(f"{label}.status is outside the expected pinned state")
+    items = _require_array(turn.get("items"), f"{label}.items")
+    for index, item in enumerate(items):
+        _validate_thread_item(item, f"{label}.items[{index}]")
+    for field in ("startedAt", "completedAt", "durationMs"):
+        if field in turn and turn[field] is not None:
+            _require_integer(turn[field], f"{label}.{field}")
+    if "itemsView" in turn and turn["itemsView"] not in {
+        "notLoaded",
+        "summary",
+        "full",
+    }:
+        raise ProtocolViolation(f"{label}.itemsView is outside the pinned schema")
+    if status == "inProgress" and turn.get("error") is not None:
+        raise ProtocolViolation(f"{label}.error must be null while in progress")
+    return turn
+
+
+def _validate_thread_object(
+    value: object,
+    label: str,
+    *,
+    expected_cwd: str | None = None,
+) -> dict[str, Any]:
+    thread = _require_object(value, label)
+    _require_fields(thread, _THREAD_REQUIRED, label)
+    _require_string(thread.get("id"), f"{label}.id")
+    _require_string(thread.get("cliVersion"), f"{label}.cliVersion")
+    _require_integer(thread.get("createdAt"), f"{label}.createdAt")
+    _require_integer(thread.get("updatedAt"), f"{label}.updatedAt")
+    _absolute_path(thread.get("cwd"), f"{label}.cwd")
+    if expected_cwd is not None:
+        _require_same_path(thread.get("cwd"), expected_cwd, f"{label}.cwd")
+    _require_boolean(thread.get("ephemeral"), f"{label}.ephemeral")
+    _require_string(thread.get("modelProvider"), f"{label}.modelProvider")
+    _require_text(thread.get("preview"), f"{label}.preview")
+    _require_string(thread.get("sessionId"), f"{label}.sessionId")
+    if thread.get("source") != "appServer":
+        raise ProtocolViolation(f"{label}.source is not the pinned appServer source")
+    _validate_thread_status(thread.get("status"), f"{label}.status")
+    turns = _require_array(thread.get("turns"), f"{label}.turns")
+    if turns:
+        raise ProtocolViolation(f"{label}.turns must be empty for thread/start")
+    return thread
+
+
+def _validate_initialize_response(value: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(value, _INITIALIZE_RESPONSE_REQUIRED, "initialize response")
+    _absolute_path(value.get("codexHome"), "initialize response codexHome")
+    _require_string(value.get("platformFamily"), "initialize response platformFamily")
+    _require_string(value.get("platformOs"), "initialize response platformOs")
+    _require_string(value.get("userAgent"), "initialize response userAgent")
+    return value
+
+
+def _validate_thread_start_response(
+    value: dict[str, Any], *, intent: SealedLaunchIntent
+) -> dict[str, Any]:
+    _require_fields(
+        value, _THREAD_START_RESPONSE_REQUIRED, "thread/start response"
+    )
+    if value.get("approvalPolicy") != "never":
+        raise ProtocolViolation(
+            "thread/start response approvalPolicy differs from sealed approval"
+        )
+    if value.get("approvalsReviewer") not in {
+        "user",
+        "auto_review",
+        "guardian_subagent",
+    }:
+        raise ProtocolViolation(
+            "thread/start response approvalsReviewer is outside the pinned schema"
+        )
+    _require_same_path(
+        value.get("cwd"), intent.cwd, "thread/start response cwd"
+    )
+    if value.get("model") != intent.model:
+        raise ProtocolViolation(
+            "thread/start response model differs from sealed launch intent"
+        )
+    model_provider = _require_string(
+        value.get("modelProvider"), "thread/start response modelProvider"
+    )
+    sandbox = _require_object(value.get("sandbox"), "thread/start response sandbox")
+    expected_type = {
+        "readOnly": "readOnly",
+        "workspaceWrite": "workspaceWrite",
+    }[intent.sandbox]
+    if sandbox.get("type") != expected_type:
+        raise ProtocolViolation(
+            "thread/start response sandbox differs from sealed launch intent"
+        )
+    if sandbox.get("networkAccess", False) is not False:
+        raise ProtocolViolation(
+            "thread/start response sandbox grants network access"
+        )
+    if expected_type == "workspaceWrite" and "writableRoots" in sandbox:
+        roots = _require_array(
+            sandbox["writableRoots"],
+            "thread/start response sandbox.writableRoots",
+        )
+        if len(roots) != 1:
+            raise ProtocolViolation(
+                "thread/start response sandbox has unexpected writable roots"
+            )
+        _require_same_path(
+            roots[0],
+            intent.cwd,
+            "thread/start response sandbox.writableRoots[0]",
+        )
+    thread = _validate_thread_object(
+        value.get("thread"),
+        "thread/start response thread",
+        expected_cwd=intent.cwd,
+    )
+    if thread["ephemeral"] is not True:
+        raise ProtocolViolation("thread/start response thread is not ephemeral")
+    if thread["modelProvider"] != model_provider:
+        raise ProtocolViolation(
+            "thread/start response modelProvider disagrees with thread"
+        )
+    return value
+
+
+def _validate_turn_start_response(value: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(value, frozenset({"turn"}), "turn/start response")
+    _validate_turn_object(
+        value.get("turn"),
+        "turn/start response turn",
+        allowed_statuses=frozenset({"inProgress"}),
+    )
+    return value
+
+
+def _validate_turn_interrupt_response(value: dict[str, Any]) -> dict[str, Any]:
+    # Pinned TurnInterruptResponse is an unconstrained object.  The envelope
+    # validator has already established that exact top-level type.
     return value
 
 
