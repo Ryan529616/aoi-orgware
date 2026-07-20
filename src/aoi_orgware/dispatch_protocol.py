@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from .agent_identity import AgentIdentityError, validate_agent_id
 from .harnesslib import (
@@ -36,6 +36,24 @@ from .harnesslib import (
 # match and validation site accepts it through an explicit branch rather than by
 # widening ``hook_id_re``.
 WILDCARD_AGENT_TYPE = "*"
+
+_DISPATCH_ATTEMPT_AUTHORITY_FIELDS = (
+    "attempt",
+    "arm_id",
+    "chief_session_id",
+    "chief_epoch",
+    "parent_session_id",
+    "parent_packet_id",
+    "expected_agent_type",
+    "plan_sha256",
+    "packet_contract_sha256",
+    "execution_selection_id",
+    "lane_snapshot",
+    "steward_snapshot",
+    "armed_at",
+    "expires_at",
+    "authority_sha256",
+)
 
 
 def _expected_type_matches(expected: Any, transport_agent_type: str) -> bool:
@@ -156,6 +174,19 @@ def _canonical_record_sha256(value: dict[str, Any]) -> str:
         value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def dispatch_attempt_authority_sha256(attempt: Mapping[str, Any]) -> str:
+    """Hash the immutable pre-dispatch authority shared by every writer.
+
+    Semantic-v2 permit consumption and the legacy CLI must produce the same
+    digest.  Keeping the preimage here avoids a second, subtly different arm
+    identity in the Bridge path.
+    """
+
+    return _canonical_record_sha256(
+        {field: attempt.get(field) for field in _DISPATCH_ATTEMPT_AUTHORITY_FIELDS}
+    )
 
 
 def active_dispatch_attempt(packet: dict[str, Any]) -> dict[str, Any]:

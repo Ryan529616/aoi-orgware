@@ -35,6 +35,37 @@ from tests.test_routing_authority import root_arm  # noqa: E402
 TASK = "task-1"
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
 
+_PACKET_IDS = {
+    "packet-first",
+    "packet-golden",
+    "packet-marker-bounds",
+    "packet-marker-tamper",
+    "packet-objects-crash",
+    "packet-objects-only",
+    "packet-pending",
+    "packet-route",
+    "packet-second",
+}
+
+
+def ready_packet(packet_id: str) -> dict[str, object]:
+    return {
+        "task_id": TASK,
+        "packet_id": packet_id,
+        "packet_contract_sha256": "a" * 64,
+        "agent_role": "explorer",
+        "status": "ready",
+        "packet_schema_version": 5,
+        "dispatch_version": 1,
+        "dispatch_provenance": "none",
+        "dispatch_attempts": [],
+        "delegation_depth": 1,
+        "parent_packet_id": "",
+        "execution_selection_id": "",
+        "lane_id": "",
+        "updated_at": "2026-07-18T12:00:00Z",
+    }
+
 
 class PermitRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -50,7 +81,18 @@ class PermitRuntimeTests(unittest.TestCase):
             h.task_dir(self.paths, TASK).mkdir(parents=True)
             store.initialize_semantic_task(
                 self.paths,
-                {"task_id": TASK, "stage": 0},
+                {
+                    "task_id": TASK,
+                    "status": "active",
+                    "stage": 0,
+                    "plan_ready": True,
+                    "plan_sha256": "b" * 64,
+                    "revision": 0,
+                    "updated_at": "2026-07-18T12:00:00Z",
+                    "checkpoint_required": False,
+                    "dispatch_model_version": 1,
+                    "packets": [ready_packet(packet_id) for packet_id in sorted(_PACKET_IDS)],
+                },
                 command_id="permit-runtime-genesis",
                 recorded_at="2026-07-18T12:00:00Z",
                 authority_ref="test",
@@ -64,6 +106,15 @@ class PermitRuntimeTests(unittest.TestCase):
             )
         self.events = store.load_semantic_events(self.paths, TASK)
         self.command = 0
+
+    @staticmethod
+    def allow_synthetic_packet_preimage(
+        _paths: h.HarnessPaths,
+        _state: dict[str, object],
+        _packet: dict[str, object],
+        _arm: dict[str, object],
+    ) -> None:
+        """Isolate permit persistence from filesystem packet-contract fixtures."""
 
     def tearDown(self) -> None:
         self.credential_temp.cleanup()
@@ -81,9 +132,10 @@ class PermitRuntimeTests(unittest.TestCase):
         technical_payload_sha256: str | None = None,
     ) -> dict[str, object]:
         self.command += 1
-        arm = root_arm(packet_id)
+        arm = root_arm(packet_id, expected_agent_type=f"agent-{packet_id}")
         arm["attempt_identity"].update(
             {
+                "arm_id": f"{packet_id}-a1",
                 "armed_at": "2026-07-18T12:00:00Z",
                 "expires_at": "2026-07-18T12:15:00Z",
             }
@@ -145,6 +197,7 @@ class PermitRuntimeTests(unittest.TestCase):
                 transaction,
                 store.load_semantic_events(self.paths, TASK),
                 current_time=current_time or NOW + timedelta(minutes=5),
+                validate_packet_arm_preimage=self.allow_synthetic_packet_preimage,
             )
         self.events = store.load_semantic_events(self.paths, TASK)
         return result
@@ -170,6 +223,7 @@ class PermitRuntimeTests(unittest.TestCase):
                 chief_epoch=self.chief["epoch"],
                 chief_token=token,
                 current_time=current_time or planned_time,
+                validate_packet_arm_preimage=self.allow_synthetic_packet_preimage,
             )
         self.events = store.load_semantic_events(self.paths, TASK)
         return result
@@ -182,10 +236,11 @@ class PermitRuntimeTests(unittest.TestCase):
                 self.paths, transaction["binding"], self.events
             )
 
-    def test_v1_marker_bytes_and_path_are_frozen(self) -> None:
+    def test_v3_transaction_and_v1_marker_bytes_and_path_are_frozen(self) -> None:
         arm = root_arm("packet-golden")
         arm["attempt_identity"].update(
             {
+                "arm_id": "packet-golden-a1",
                 "armed_at": "2026-07-18T12:00:00Z",
                 "expires_at": "2026-07-18T12:15:00Z",
             }
@@ -232,14 +287,15 @@ class PermitRuntimeTests(unittest.TestCase):
         transaction_raw = semantic.canonical_json_bytes(
             transaction, max_bytes=runtime.MAX_PERMIT_TRANSACTION_BYTES
         )
-        self.assertEqual(len(transaction_raw), 21563)
+        self.assertEqual(transaction["schema_version"], 3)
+        self.assertEqual(len(transaction_raw), 27513)
         self.assertEqual(
             hashlib.sha256(transaction_raw).hexdigest(),
-            "5de453c7ba694c287bd3b5c4e30f93dc9b5374167e38541d95de9f0a92ae0209",
+            "b7bf68d847d5c200ee5c1bda5454eb14862ca3875055472171f0b64c61aacbe0",
         )
         self.assertEqual(
             transaction["transaction_sha256"],
-            "31c7f13eb3c6eb5a3ecd80d98a34bc403d97f95b6b7b0a235126f791d53adb7a",
+            "ee4f87ccfb1384515771773cd4224d3d6c43d837b99e91eafe4d1144524a8510",
         )
         marker = runtime._create_permit_issuance(
             transaction,
@@ -253,11 +309,11 @@ class PermitRuntimeTests(unittest.TestCase):
         self.assertEqual(len(raw), 1512)
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(),
-            "c861dc401b45ff8f127a2bab21d22f2e111f30a6979905f7b749a0e589e7a031",
+            "cf6fc7179739a4d635e4aaf27d21c74fa71c72dd7f5667a40f269587baf90db2",
         )
         self.assertEqual(
             marker["issuance_sha256"],
-            "436fbc595e3d06c6ea953387da80256e3ff3f608a9f2f20ee6c5d13f942cc566",
+            "2a253513d8cba3509fa1c4d7d4d1b5326e04493dc80f3fa0329a5259df299851",
         )
         path = runtime.permit_issuance_path(
             self.paths, TASK, marker["permit_sha256"]
@@ -364,6 +420,78 @@ class PermitRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.PermitRuntimeError, "binding contract"):
             runtime.validate_permitted_arm_transaction(reordered)
 
+    def test_terminal_task_cannot_prepare_a_new_packet_arm(self) -> None:
+        current = self.events
+        closed = semantic.projection_domain(semantic.replay_events(current))
+        closed["status"] = "done"
+        self.events = [
+            semantic.create_genesis_event(
+                closed,
+                command_id="closed-task-genesis",
+                recorded_at="2026-07-18T12:00:00Z",
+                authority_ref="test",
+            )
+        ]
+        try:
+            with self.assertRaisesRegex(runtime.PermitRuntimeError, "open canonical task"):
+                self.make_transaction()
+        finally:
+            self.events = current
+
+    def test_issue_and_unreserved_consume_reapply_packet_authority_gate(self) -> None:
+        transaction = self.make_transaction()
+
+        def reject(
+            _paths: h.HarnessPaths,
+            _state: dict[str, object],
+            _packet: dict[str, object],
+            _arm: dict[str, object],
+        ) -> None:
+            raise h.HarnessError("injected packet authority failure")
+
+        with h.state_lock(self.paths, create_layout=False):
+            token, _loaded = h.load_chief_credential(
+                self.paths,
+                session_id=self.chief["session_id"],
+                epoch=self.chief["epoch"],
+                credential_file=self.credential_path,
+            )
+            with self.assertRaisesRegex(
+                runtime.PermitRuntimeError, "injected packet authority failure"
+            ):
+                runtime.issue_permitted_arm_transaction(
+                    self.paths,
+                    transaction,
+                    store.load_semantic_events(self.paths, TASK),
+                    chief_session_id=self.chief["session_id"],
+                    chief_epoch=self.chief["epoch"],
+                    chief_token=token,
+                    current_time=NOW + timedelta(minutes=1),
+                    validate_packet_arm_preimage=reject,
+                )
+        self.assertFalse(
+            runtime.permit_issuance_path(
+                self.paths,
+                TASK,
+                transaction["objects"][2]["payload"]["permit_sha256"],
+            ).exists()
+        )
+
+        self.issue(transaction)
+        with h.state_lock(self.paths, create_layout=False):
+            with self.assertRaisesRegex(
+                runtime.PermitRuntimeError, "injected packet authority failure"
+            ):
+                runtime.commit_permitted_arm_transaction(
+                    self.paths,
+                    transaction,
+                    store.load_semantic_events(self.paths, TASK),
+                    current_time=NOW + timedelta(minutes=2),
+                    validate_packet_arm_preimage=reject,
+                )
+        report = objects.inspect_semantic_objects(self.paths, TASK, self.events)
+        self.assertEqual(report["bindings"], [])
+
     def test_controller_cannot_mint_without_chief_issued_objects(self) -> None:
         transaction = self.make_transaction()
         with self.assertRaisesRegex(runtime.PermitRuntimeError, "durably issued"):
@@ -382,6 +510,7 @@ class PermitRuntimeTests(unittest.TestCase):
                     chief_epoch=self.chief["epoch"],
                     chief_token="invalid-chief-token",
                     current_time=NOW + timedelta(minutes=1),
+                    validate_packet_arm_preimage=self.allow_synthetic_packet_preimage,
                 )
         still_empty = objects.inspect_semantic_objects(self.paths, TASK, self.events)
         self.assertEqual(still_empty["objects"], [])
@@ -659,6 +788,39 @@ class PermitRuntimeTests(unittest.TestCase):
     def test_resealed_tampering_cannot_expand_the_transition(self) -> None:
         transaction = self.make_transaction()
 
+        downgraded = copy.deepcopy(transaction)
+        downgraded["schema_version"] = 1
+        downgraded["transaction_sha256"] = semantic.canonical_sha256(
+            {
+                key: value
+                for key, value in downgraded.items()
+                if key != "transaction_sha256"
+            },
+            max_bytes=runtime.MAX_PERMIT_TRANSACTION_BYTES,
+        )
+        with self.assertRaisesRegex(runtime.PermitRuntimeError, "version"):
+            runtime.validate_permitted_arm_transaction(downgraded)
+
+        omitted_packet_effect = copy.deepcopy(transaction["result_state"])
+        before = semantic.projection_domain(semantic.replay_events(self.events))
+        target_id = transaction["objects"][0]["payload"]["packet_authority"][
+            "packet_id"
+        ]
+        original_packet = next(
+            row for row in before["packets"] if row["packet_id"] == target_id
+        )
+        target_index = next(
+            index
+            for index, row in enumerate(omitted_packet_effect["packets"])
+            if row["packet_id"] == target_id
+        )
+        omitted_packet_effect["packets"][target_index] = copy.deepcopy(original_packet)
+        omitted_packet_tx = self.reseal_transaction(
+            transaction, omitted_packet_effect
+        )
+        with self.assertRaisesRegex(runtime.PermitRuntimeError, "omits"):
+            runtime.validate_permitted_arm_transaction(omitted_packet_tx)
+
         extra = copy.deepcopy(transaction["result_state"])
         extra["unrelated_write"] = {"not": "authorized"}
         widened = self.reseal_transaction(transaction, extra)
@@ -749,6 +911,7 @@ class PermitRuntimeTests(unittest.TestCase):
                     transaction,
                     store.load_semantic_events(self.paths, TASK),
                     current_time=NOW + timedelta(minutes=5),
+                    validate_packet_arm_preimage=self.allow_synthetic_packet_preimage,
                 )
 
         with ThreadPoolExecutor(max_workers=2) as pool:

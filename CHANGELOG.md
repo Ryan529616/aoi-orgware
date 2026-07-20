@@ -78,7 +78,17 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   reconciliation and no automatic resend. A completed runtime receipt remains
   `codex_runtime_observed`; Git/tree/claim materialization is a separate
   binding-backed `verified_mutation` projection and neither implies AOI task
-  completion. Reservation now atomically consumes one exact packet arm without
+  completion. A migrated semantic-v2 task can now reach that arm without a
+  legacy write: `packet-arm-prepare` emits standalone transaction schema v3,
+  Chief issuance applies the complete core packet, parent/root-session, and
+  canonical resource event/receipt/registration authority gate; first
+  unreserved no-Chief consumption repeats it and commits routing, permit
+  projection, and canonical `ready -> armed` packet state in one semantic CAS.
+  Before that first commit, terminal tasks, missing packet delta roots,
+  stale/tampered authority, and old-schema substitution fail closed. Exact
+  committed replay is historical event/projection recovery, not renewed packet
+  or launch authorization; cohort schema v2 remains separate. Bridge
+  reservation then atomically consumes one exact packet arm without
   fabricating `SubagentStart`; dispatch generation v2, complete ownership
   binding, a per-launch OS lock, consume/pending-time expiry checks, and
   issue-to-Popen Git/claim recapture close duplicate-launch and stale-source

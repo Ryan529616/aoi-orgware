@@ -293,6 +293,26 @@ trusted protocol-v6 hook can only consume one exact current arm or write an
 incident; it cannot create packets, choose an ambiguous candidate, resolve an
 incident, or obtain Chief authority.
 
+For a migrated semantic-v2 task, standalone packet activation uses detached
+transaction schema v3. `packet-arm-prepare` binds one canonical `ready` packet,
+routing arm, transition decision, one-shot permit, exact semantic head, and the
+resulting routing, permit, and packet delta roots. Chief issuance and the first
+unreserved consumption both apply the complete core packet contract, open-task,
+approved-plan, parent/root-session mapping, canonical current resource event,
+bound receipt, exact session registration, topology, resource-envelope, and
+skill-canary authority gate.
+The no-Chief consumer then commits routing authority, permit projection, and
+canonical `ready -> armed` state in one semantic compare-and-append. A terminal
+task can never be armed. Cohort transaction schema v2 remains separate and does
+not claim this standalone packet-owning transition.
+
+An exact replay of an already committed arm is historical ledger/projection
+recovery, not a new authorization. It may return the one prior event before
+rechecking mutable external packet-contract bytes because it consumes no new
+permit and creates no new arm. Packet/receipt tamper still blocks initial
+issuance, first unreserved consumption, and every later Bridge authority
+transition; a committed replay cannot by itself launch Codex or complete work.
+
 A start whose agent identity matches an already-dispatched packet from the
 same parent session is a resume of that packet's thread, recorded on the
 packet, not a new unmanaged agent; the same identity under a different parent
@@ -633,7 +653,8 @@ one-shot permit, exact canonical packet-arm authority, and pinned Codex
 executable/version/schema binding. `run` receives only the permit SHA and
 issuance marker. It must not receive or retain a reusable Chief credential.
 
-Permit consumption is one semantic compare-and-append: the exact arm becomes
+The Bridge accepts only that canonical armed packet. Launch-permit consumption
+is one further semantic compare-and-append: the exact arm becomes
 `transport_reserved`, the packet becomes bridge-owned `dispatched`, and a
 sealed ownership object binds the task, packet contract, arm, launch, intent,
 permit, reservation, and routing authority. This transition upgrades packet

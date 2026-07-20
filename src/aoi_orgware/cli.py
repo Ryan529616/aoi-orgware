@@ -27,7 +27,7 @@ import tomllib
 import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, cast
+from typing import Any, Iterable, Mapping, cast
 
 from . import __version__
 from . import codex_install_provenance as codex_install_provenance_impl
@@ -43,6 +43,7 @@ from . import job_integrity as job_integrity_impl
 from . import packet_integrity as packet_integrity_impl
 from . import portfolio_integrity as portfolio_integrity_impl
 from . import resource_governance as resource_governance_impl
+from . import routing_authority as routing_authority_impl
 from . import release_runtime as release_runtime_impl
 from . import semantic_store as semantic_store_impl
 from . import skill_lifecycle as skill_lifecycle_impl
@@ -213,6 +214,7 @@ from .commands.semantic import (
     cmd_cohort_round_prepare,
     cmd_cohort_round_preview,
     cmd_cohort_show,
+    cmd_packet_arm_prepare,
     cmd_permit_consume,
     cmd_permit_issue,
     cmd_semantic_head,
@@ -3731,26 +3733,74 @@ def _record_core_dispatch_model_version(state: dict[str, Any]) -> None:
 
 
 def _dispatch_attempt_authority_sha256(attempt: dict[str, Any]) -> str:
-    immutable_fields = (
-        "attempt",
-        "arm_id",
-        "chief_session_id",
-        "chief_epoch",
-        "parent_session_id",
-        "parent_packet_id",
-        "expected_agent_type",
-        "plan_sha256",
-        "packet_contract_sha256",
-        "execution_selection_id",
-        "lane_snapshot",
-        "steward_snapshot",
-        "armed_at",
-        "expires_at",
-        "authority_sha256",
+    return dispatch_protocol_impl.dispatch_attempt_authority_sha256(attempt)
+
+
+def _validate_packet_arm_preimage(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    packet: dict[str, Any],
+    arm: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Apply the complete core authority gate before any packet arm is issued."""
+
+    authority_errors = packet_authority_integrity_errors(
+        paths, state, packet, require_origin=True
     )
-    return canonical_record_sha256(
-        {field: copy.deepcopy(attempt.get(field)) for field in immutable_fields}
+    if authority_errors:
+        raise HarnessError(
+            "packet authority is missing or tampered: "
+            + "; ".join(authority_errors)
+        )
+    selection = _validate_packet_activation_topology(state, packet)
+    _validate_packet_resource_envelope(
+        state,
+        packet,
+        selection,
+        enforce_active_limit=True,
     )
+    _validate_skill_canary_work_unit_binding(
+        state,
+        str(packet.get("skill_release_id", "")),
+        str(packet.get("skill_canary_event_id", "")),
+        require_live_canary=True,
+    )
+    if arm is not None:
+        try:
+            checked_arm = routing_authority_impl.validate_arm_authority(arm)
+        except routing_authority_impl.RoutingAuthorityError as exc:
+            raise HarnessError(f"detached packet arm authority is invalid: {exc}") from exc
+        parent_session_id = str(checked_arm["parent_authority"]["session_id"])
+        require_root_session(paths, state, parent_session_id)
+        resource_errors = resource_config_integrity_errors(paths, state)
+        if resource_errors:
+            raise HarnessError(
+                "detached packet arm resource authority is invalid: "
+                + "; ".join(resource_errors[:3])
+            )
+        current_event = resource_governance_impl.current_applied_resource_event(state)
+        event_snapshot = checked_arm["resource_authority"]["event_snapshot"]
+        if current_event is None or current_event != event_snapshot:
+            raise HarnessError(
+                "detached packet arm does not bind the canonical current resource event"
+            )
+        registrations = state.get("resource_session_registrations")
+        registration = checked_arm["session_registration"]
+        if not isinstance(registrations, list):
+            raise HarnessError(
+                "detached packet arm requires canonical resource session registrations"
+            )
+        matches = [
+            row
+            for row in registrations
+            if isinstance(row, dict)
+            and row.get("session_id") == registration["session_id"]
+        ]
+        if len(matches) != 1 or matches[0] != registration:
+            raise HarnessError(
+                "detached packet arm does not bind one exact canonical session registration"
+            )
+    return selection
 
 
 def _active_dispatch_attempt(packet: dict[str, Any]) -> dict[str, Any]:
@@ -3878,27 +3928,7 @@ def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "an armed packet already occupies this parent-session/agent-type slot: "
                 + ", ".join(collisions)
             )
-        authority_errors = packet_authority_integrity_errors(
-            paths, state, packet, require_origin=True
-        )
-        if authority_errors:
-            raise HarnessError(
-                "packet authority is missing or tampered: "
-                + "; ".join(authority_errors)
-            )
-        selection = _validate_packet_activation_topology(state, packet)
-        _validate_packet_resource_envelope(
-            state,
-            packet,
-            selection,
-            enforce_active_limit=True,
-        )
-        _validate_skill_canary_work_unit_binding(
-            state,
-            str(packet.get("skill_release_id", "")),
-            str(packet.get("skill_canary_event_id", "")),
-            require_live_canary=True,
-        )
+        selection = _validate_packet_arm_preimage(paths, state, packet)
         if parent is not None:
             ensure_subagent_parent_mapping_unlocked(paths, state, parent)
         attempt_number = len(packet["dispatch_attempts"]) + 1
@@ -7576,6 +7606,7 @@ def build_parser(
             "cohort_round_prepare": cmd_cohort_round_prepare,
             "cohort_round_preview": cmd_cohort_round_preview,
             "cohort_show": cmd_cohort_show,
+            "packet_arm_prepare": cmd_packet_arm_prepare,
             "permit_consume": cmd_permit_consume,
             "permit_issue": cmd_permit_issue,
             "semantic_head": cmd_semantic_head,
@@ -8062,6 +8093,7 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "integrity-verify",
     "permit-consume",
     "permit-issue",
+    "packet-arm-prepare",
     "release-manifest-observe",
     "release-abandon-pending",
     "release-promote",

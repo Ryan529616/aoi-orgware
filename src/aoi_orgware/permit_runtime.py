@@ -22,9 +22,10 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import cohorts
+from . import dispatch_protocol
 from . import harnesslib as h
 from . import permit_projection as permit_projection_contract
 from . import routing_authority as authority
@@ -32,11 +33,16 @@ from . import routing_persistence as routing
 from . import semantic_events as semantic
 from . import semantic_objects as objects
 from . import semantic_store as store
+from . import state_lookup
 from . import transition_permits as permits
 
 
 PERMIT_RUNTIME_SCHEMA_VERSION = permit_projection_contract.PERMIT_RUNTIME_SCHEMA_VERSION
-PERMIT_TRANSACTION_SCHEMA_VERSION = 1
+# Version 3 is the first standalone arm transaction whose semantic CAS owns
+# both routing/permit namespaces and the canonical packet ready->armed state.
+# Version 2 is already the cohort transaction wire id; the old routing-only
+# standalone v1 must never be accepted as the stronger packet-owning contract.
+PERMIT_TRANSACTION_SCHEMA_VERSION = 3
 PERMIT_ISSUANCE_SCHEMA_VERSION = 1
 COHORT_PERMIT_TRANSACTION_SCHEMA_VERSION = 2
 COHORT_PERMIT_ISSUANCE_SCHEMA_VERSION = 2
@@ -154,6 +160,30 @@ _COHORT_ROUTE_FIELDS = {
     "routing_authority_sha256",
     "outcome_slot_sha256",
 }
+_PACKET_ARM_REQUIRED_DELTA_ROOTS = {
+    routing.ROUTING_NAMESPACE_KEY,
+    PERMIT_NAMESPACE_KEY,
+    "packets",
+}
+_PACKET_ARM_ALLOWED_DELTA_ROOTS = _PACKET_ARM_REQUIRED_DELTA_ROOTS | {
+    "checkpoint_required",
+    "dispatch_model_version",
+    "revision",
+    "updated_at",
+}
+_PACKET_ARM_MAX_SECONDS = 15 * 60
+
+
+class ValidatePacketArmPreimage(Protocol):
+    """Composition-root gate shared with the legacy packet-arm command."""
+
+    def __call__(
+        self,
+        paths: h.HarnessPaths,
+        state: dict[str, Any],
+        packet: dict[str, Any],
+        arm: Mapping[str, Any],
+    ) -> dict[str, Any] | None: ...
 
 
 class PermitRuntimeError(h.HarnessError):
@@ -229,12 +259,21 @@ def _validate_arm_consumption_window(
         raise PermitRuntimeError("routing arm is not live at permit consumption")
 
 
-def _validate_delta_scope(payload: Mapping[str, Any]) -> None:
+def _validate_delta_scope(
+    payload: Mapping[str, Any], *, require_packet_state: bool
+) -> None:
     delta = payload.get("delta") if isinstance(payload, dict) else None
     operations = delta.get("operations") if isinstance(delta, dict) else None
     if not isinstance(operations, list) or not operations:
         raise PermitRuntimeError("permit transaction delta is invalid")
-    allowed = {routing.ROUTING_NAMESPACE_KEY, PERMIT_NAMESPACE_KEY}
+    required = (
+        _PACKET_ARM_REQUIRED_DELTA_ROOTS
+        if require_packet_state
+        else {routing.ROUTING_NAMESPACE_KEY, PERMIT_NAMESPACE_KEY}
+    )
+    allowed = (
+        _PACKET_ARM_ALLOWED_DELTA_ROOTS if require_packet_state else required
+    )
     roots: set[str] = set()
     for operation in operations:
         path = operation.get("path") if isinstance(operation, dict) else None
@@ -246,8 +285,242 @@ def _validate_delta_scope(payload: Mapping[str, Any]) -> None:
         ):
             raise PermitRuntimeError("permit transaction delta exceeds its namespaces")
         roots.add(path[0])
-    if roots != allowed:
-        raise PermitRuntimeError("permit transaction delta omits a required namespace")
+    if not required.issubset(roots):
+        raise PermitRuntimeError(
+            "permit transaction delta omits routing, permit, or canonical packet state"
+        )
+
+
+def _packet_by_id(state: Mapping[str, Any], packet_id: str) -> dict[str, Any]:
+    packets = state.get("packets")
+    if not isinstance(packets, list):
+        raise PermitRuntimeError("semantic packet collection is malformed")
+    matches = [
+        packet
+        for packet in packets
+        if isinstance(packet, dict) and packet.get("packet_id") == packet_id
+    ]
+    if len(matches) != 1:
+        raise PermitRuntimeError(
+            f"permitted arm requires one canonical packet {packet_id!r}"
+        )
+    return matches[0]
+
+
+def _canonical_packet_authority(
+    state: Mapping[str, Any], packet: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "task_id": state.get("task_id"),
+        "packet_id": packet.get("packet_id"),
+        "packet_contract_sha256": packet.get("packet_contract_sha256"),
+        "task_plan_sha256": state.get("plan_sha256"),
+        "delegation_depth": packet.get("delegation_depth", 1),
+        "parent_packet_id": packet.get("parent_packet_id", ""),
+        "agent_role": packet.get("agent_role"),
+    }
+
+
+def _canonical_attempt_from_arm(
+    state: Mapping[str, Any],
+    packet: Mapping[str, Any],
+    arm: Mapping[str, Any],
+    *,
+    expected_attempt_number: int | None = None,
+) -> dict[str, Any]:
+    attempts = packet.get("dispatch_attempts")
+    if not isinstance(attempts, list) or any(
+        not isinstance(row, dict) for row in attempts
+    ):
+        raise PermitRuntimeError("canonical packet dispatch attempts are malformed")
+    identity = arm["attempt_identity"]
+    attempt_number = (
+        len(attempts) + 1
+        if expected_attempt_number is None
+        else expected_attempt_number
+    )
+    packet_id = str(packet.get("packet_id", ""))
+    if identity != {
+        "attempt": attempt_number,
+        "arm_id": f"{packet_id}-a{attempt_number}",
+        "armed_at": identity.get("armed_at"),
+        "expires_at": identity.get("expires_at"),
+    }:
+        raise PermitRuntimeError(
+            "routing arm attempt identity is not the next canonical packet attempt"
+        )
+    armed_at = _instant(identity["armed_at"], "routing arm start")
+    expires_at = _instant(identity["expires_at"], "routing arm expiry")
+    if expires_at <= armed_at or (
+        expires_at - armed_at
+    ).total_seconds() > _PACKET_ARM_MAX_SECONDS:
+        raise PermitRuntimeError("routing arm lifetime is invalid")
+    chief = arm["chief_authority"]
+    parent = arm["parent_authority"]
+    transport = arm["transport_authority"]
+    attempt: dict[str, Any] = {
+        "attempt": attempt_number,
+        "arm_id": identity["arm_id"],
+        "status": "armed",
+        "chief_session_id": chief["session_id"],
+        "chief_epoch": chief["epoch"],
+        "parent_session_id": parent["session_id"],
+        "parent_packet_id": packet.get("parent_packet_id", ""),
+        "expected_agent_type": transport["expected_agent_type"],
+        "plan_sha256": state.get("plan_sha256"),
+        "packet_contract_sha256": packet.get("packet_contract_sha256"),
+        "execution_selection_id": "",
+        "lane_snapshot": {},
+        "steward_snapshot": {},
+        "armed_at": identity["armed_at"],
+        "expires_at": identity["expires_at"],
+        "authority_sha256": chief["authority_sha256"],
+        "observation": None,
+        "closed_at": "",
+        "reason": "",
+    }
+    attempt["arm_authority_sha256"] = (
+        dispatch_protocol.dispatch_attempt_authority_sha256(attempt)
+    )
+    return attempt
+
+
+def _require_standalone_packet_arm_preimage(
+    state: Mapping[str, Any], packet: Mapping[str, Any], arm: Mapping[str, Any]
+) -> None:
+    try:
+        state_lookup.require_open_task(dict(state), "arm packet for")
+    except h.HarnessError as exc:
+        raise _fail("permitted arm requires an open canonical task", exc) from exc
+    if (
+        state.get("plan_ready") is not True
+        or not isinstance(state.get("plan_sha256"), str)
+        or not _SHA256.fullmatch(str(state.get("plan_sha256")))
+    ):
+        raise PermitRuntimeError("permitted arm requires one approved canonical plan")
+    if arm["packet_authority"] != _canonical_packet_authority(state, packet):
+        raise PermitRuntimeError(
+            "routing arm packet authority differs from canonical task state"
+        )
+    if (
+        packet.get("status") != "ready"
+        or packet.get("packet_schema_version") != 5
+        or packet.get("dispatch_version") != 1
+        or packet.get("dispatch_provenance") != "none"
+    ):
+        raise PermitRuntimeError(
+            "permitted standalone arm requires one ready packet schema-v5 preimage"
+        )
+    if packet.get("delegation_depth", 1) != 1:
+        raise PermitRuntimeError("standalone Codex MVP supports depth-one packets only")
+    if packet.get("execution_selection_id", "") or packet.get("lane_id", ""):
+        raise PermitRuntimeError(
+            "standalone Codex MVP does not accept cohort or lane-selected packets"
+        )
+    attempts = packet.get("dispatch_attempts")
+    if not isinstance(attempts, list) or any(
+        not isinstance(row, dict) for row in attempts
+    ):
+        raise PermitRuntimeError("canonical packet dispatch attempts are malformed")
+    if any(row.get("status") == "armed" for row in attempts):
+        raise PermitRuntimeError("canonical packet already has an active arm")
+    expected_parent = arm["parent_authority"]["session_id"]
+    expected_type = arm["transport_authority"]["expected_agent_type"]
+    wildcard = dispatch_protocol.WILDCARD_AGENT_TYPE
+    packets = state.get("packets")
+    assert isinstance(packets, list)
+    for other in packets:
+        if not isinstance(other, dict) or other is packet or other.get("status") != "armed":
+            continue
+        try:
+            active = dispatch_protocol.active_dispatch_attempt(other)
+        except h.HarnessError as exc:
+            raise _fail("canonical armed packet is malformed", exc) from exc
+        if active.get("parent_session_id") != expected_parent:
+            continue
+        other_type = active.get("expected_agent_type")
+        if expected_type == wildcard or other_type == wildcard or other_type == expected_type:
+            raise PermitRuntimeError(
+                "canonical parent-session/agent-type slot is already armed"
+            )
+
+
+def _advance_canonical_packet_arm(
+    projection: Mapping[str, Any],
+    arm: Mapping[str, Any],
+    *,
+    recorded_at: str,
+) -> dict[str, Any]:
+    state = _clone(semantic.projection_domain(projection))
+    packet_id = arm["packet_authority"]["packet_id"]
+    packet = _packet_by_id(state, packet_id)
+    _require_standalone_packet_arm_preimage(state, packet, arm)
+    recorded = _instant(recorded_at, "permitted arm recorded_at")
+    identity = arm["attempt_identity"]
+    if not (
+        _instant(identity["armed_at"], "routing arm start")
+        <= recorded
+        <= _instant(identity["expires_at"], "routing arm expiry")
+    ):
+        raise PermitRuntimeError("permitted arm event lies outside its arm window")
+    attempt = _canonical_attempt_from_arm(state, packet, arm)
+    packet["dispatch_attempts"].append(attempt)
+    packet["status"] = "armed"
+    packet["updated_at"] = recorded_at
+    state["dispatch_model_version"] = (
+        2
+        if state.get("dispatch_model_version") == 2
+        or any(
+            isinstance(row, dict) and row.get("dispatch_version") == 2
+            for row in state["packets"]
+        )
+        else 1
+    )
+    revision = state.get("revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        raise PermitRuntimeError("canonical task revision is invalid")
+    state["revision"] = revision + 1
+    state["updated_at"] = recorded_at
+    state["checkpoint_required"] = True
+    return state
+
+
+def _validate_canonical_packet_arm_result(
+    state: Mapping[str, Any], arm: Mapping[str, Any], *, recorded_at: str
+) -> None:
+    packet = _packet_by_id(state, arm["packet_authority"]["packet_id"])
+    if packet.get("status") != "armed" or packet.get("updated_at") != recorded_at:
+        raise PermitRuntimeError("permit transaction canonical packet is not armed")
+    try:
+        attempt = dispatch_protocol.active_dispatch_attempt(packet)
+    except h.HarnessError as exc:
+        raise _fail("permit transaction active arm is invalid", exc) from exc
+    attempts = packet.get("dispatch_attempts")
+    identity = arm["attempt_identity"]
+    if (
+        arm["packet_authority"] != _canonical_packet_authority(state, packet)
+        or not isinstance(attempts, list)
+        or len(attempts) != identity["attempt"]
+    ):
+        raise PermitRuntimeError(
+            "permit transaction packet/attempt authority is not canonical"
+        )
+    expected_attempt = _canonical_attempt_from_arm(
+        state,
+        packet,
+        arm,
+        expected_attempt_number=identity["attempt"],
+    )
+    if attempt != expected_attempt:
+        raise PermitRuntimeError(
+            "permit transaction active attempt differs from routing authority"
+        )
+    if (
+        state.get("checkpoint_required") is not True
+        or state.get("updated_at") != recorded_at
+        or state.get("dispatch_model_version") not in {1, 2}
+    ):
+        raise PermitRuntimeError("permit transaction task metadata is invalid")
 
 
 def _require_bounded_json(value: Any, maximum: int, label: str) -> None:
@@ -1775,7 +2048,12 @@ def prepare_permitted_arm_transaction(
         checked_permit,
         effect["routing_entry"],
     )
-    result_state = _advance_permit_projection(effect["result_state"], identity, receipt)
+    armed_state = _advance_canonical_packet_arm(
+        effect["result_state"],
+        arm,
+        recorded_at=recorded_at,
+    )
+    result_state = _advance_permit_projection(armed_state, identity, receipt)
     authority_ref = f"permit:{checked_permit['permit_sha256']}"
     try:
         planned = semantic.create_transition_event(
@@ -1862,7 +2140,7 @@ def validate_permitted_arm_transaction(value: Mapping[str, Any]) -> dict[str, An
     except semantic.SemanticEventError as exc:
         raise _fail("permit transaction planned event is invalid", exc) from exc
     authority_ref = f"permit:{permit['permit_sha256']}"
-    _validate_delta_scope(semantics["payload"])
+    _validate_delta_scope(semantics["payload"], require_packet_state=True)
     recorded = _instant(planned["recorded_at"], "permit event recorded_at")
     if not (
         _instant(group["arm"]["attempt_identity"]["armed_at"], "routing arm start")
@@ -1889,6 +2167,11 @@ def validate_permitted_arm_transaction(value: Mapping[str, Any]) -> dict[str, An
     result_state = semantic.projection_domain(item["result_state"])
     if result_state.get("task_id") != task_id:
         raise PermitRuntimeError("permit transaction result belongs to another task")
+    _validate_canonical_packet_arm_result(
+        result_state,
+        group["arm"],
+        recorded_at=item["recorded_at"],
+    )
     if semantic.canonical_sha256(result_state) != binding["result_projection_sha256"]:
         raise PermitRuntimeError("permit transaction result projection digest is invalid")
     route_namespace = routing.routing_namespace_from_projection(result_state)
@@ -2112,7 +2395,7 @@ def validate_permitted_cohort_transaction(
         semantics = semantic.command_semantics(planned)
     except semantic.SemanticEventError as exc:
         raise _fail("cohort permit transaction planned event is invalid", exc) from exc
-    _validate_delta_scope(semantics["payload"])
+    _validate_delta_scope(semantics["payload"], require_packet_state=False)
     authority_ref = f"permit:{permit['permit_sha256']}"
     recorded = _instant(planned["recorded_at"], "cohort permit event recorded_at")
     if recorded > _instant(permit["expires_at"], "cohort permit expiry"):
@@ -2243,6 +2526,7 @@ def issue_permitted_arm_transaction(
     chief_epoch: int,
     chief_token: str,
     current_time: datetime,
+    validate_packet_arm_preimage: ValidatePacketArmPreimage,
 ) -> dict[str, Any]:
     """Chief-fenced durable issuance; no lifecycle event is committed here.
 
@@ -2314,6 +2598,14 @@ def issue_permitted_arm_transaction(
         for row in generic["bindings"]
     ):
         raise PermitRuntimeError("permit consumption already has a binding")
+    preimage = semantic.projection_domain(replayed)
+    target_packet = _packet_by_id(
+        preimage, group["arm"]["packet_authority"]["packet_id"]
+    )
+    try:
+        validate_packet_arm_preimage(paths, preimage, target_packet, group["arm"])
+    except h.HarnessError as exc:
+        raise _fail("permitted arm packet authority is invalid", exc) from exc
     rebuilt = prepare_permitted_arm_transaction(
         task_id=tx["task_id"],
         event_chain=records,
@@ -2834,6 +3126,7 @@ def commit_permitted_arm_transaction(
     event_chain: Iterable[Mapping[str, Any]],
     *,
     current_time: datetime,
+    validate_packet_arm_preimage: ValidatePacketArmPreimage,
 ) -> dict[str, Any]:
     """Commit or recover one permitted packet.arm semantic transaction."""
 
@@ -2883,6 +3176,15 @@ def commit_permitted_arm_transaction(
             "idempotent_replay": True,
             "permit_report": report,
         }
+    if existing is None:
+        preimage = semantic.projection_domain(replayed)
+        target_packet = _packet_by_id(
+            preimage, group["arm"]["packet_authority"]["packet_id"]
+        )
+        try:
+            validate_packet_arm_preimage(paths, preimage, target_packet, group["arm"])
+        except h.HarnessError as exc:
+            raise _fail("permitted arm packet authority is invalid", exc) from exc
     rebuilt = prepare_permitted_arm_transaction(
         task_id=tx["task_id"],
         event_chain=records,

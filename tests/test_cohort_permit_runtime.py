@@ -38,6 +38,34 @@ class CohortPermitFixture:
         self.paths = h.get_paths(self.root)
         h.task_dir(self.paths, TASK).mkdir(parents=True)
         self.domain = execution_selection_domain()
+        self.domain.update(
+            {
+                "status": "active",
+                "plan_ready": True,
+                "revision": 0,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "checkpoint_required": False,
+                "dispatch_model_version": 1,
+            }
+        )
+        self.domain["packets"].append(
+            {
+                "task_id": TASK,
+                "packet_id": "packet-standalone",
+                "packet_contract_sha256": "a" * 64,
+                "agent_role": "explorer",
+                "status": "ready",
+                "packet_schema_version": 5,
+                "dispatch_version": 1,
+                "dispatch_provenance": "none",
+                "dispatch_attempts": [],
+                "delegation_depth": 1,
+                "parent_packet_id": "",
+                "execution_selection_id": "",
+                "lane_id": "",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        )
         self.events = [
             semantic.create_genesis_event(
                 self.domain,
@@ -211,11 +239,11 @@ class CohortPermitFixture:
         arm = root_arm(
             "packet-standalone",
             expected_agent_type="explorer",
-            execution_selection_id="selection-1",
         )
         arm["chief_authority"] = copy.deepcopy(self.arms[0]["chief_authority"])
         arm["attempt_identity"].update(
             {
+                "arm_id": "packet-standalone-a1",
                 "armed_at": "2026-01-01T00:00:03Z",
                 "expires_at": "2026-01-01T00:10:03Z",
             }
@@ -270,6 +298,9 @@ class CohortPermitFixture:
                 chief_epoch=1,
                 chief_token="test-only-token",
                 current_time=datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc),
+                validate_packet_arm_preimage=(
+                    lambda _paths, _state, _packet, _arm: None
+                ),
             )
 
     def commit(self, transaction: dict, *, current_time: datetime | None = None) -> dict:

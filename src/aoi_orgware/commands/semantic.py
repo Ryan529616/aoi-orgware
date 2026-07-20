@@ -21,6 +21,8 @@ from .. import semantic_store as store
 
 COHORT_ROUND_REQUEST_SCHEMA_VERSION = 1
 MAX_COHORT_ROUND_REQUEST_BYTES = 2 * 1024 * 1024
+PACKET_ARM_REQUEST_SCHEMA_VERSION = 1
+MAX_PACKET_ARM_REQUEST_BYTES = permit_runtime.MAX_PERMIT_TRANSACTION_BYTES
 
 
 def _emit(payload: Any, as_json: bool) -> None:
@@ -138,6 +140,24 @@ def _load_cohort_round_request(
         or len(arms) > cohorts.MAX_CONCURRENCY
     ):
         raise h.HarnessError(f"{label} values are invalid")
+    return decoded
+
+
+def _load_packet_arm_request(raw_path: str) -> dict[str, Any]:
+    label = "packet arm request"
+    decoded = _load_canonical_json_artifact(
+        raw_path,
+        label=label,
+        maximum=MAX_PACKET_ARM_REQUEST_BYTES,
+    )
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"schema_version", "decision", "permit", "arm"}
+        or not isinstance(decoded.get("schema_version"), int)
+        or isinstance(decoded.get("schema_version"), bool)
+        or decoded.get("schema_version") != PACKET_ARM_REQUEST_SCHEMA_VERSION
+    ):
+        raise h.HarnessError(f"{label} schema is invalid")
     return decoded
 
 
@@ -317,6 +337,13 @@ def cmd_permit_issue(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
         == permit_runtime.COHORT_PERMIT_TRANSACTION_SCHEMA_VERSION
         else permit_runtime.issue_permitted_arm_transaction
     )
+    kwargs: dict[str, Any] = {}
+    if issue is permit_runtime.issue_permitted_arm_transaction:
+        from .. import cli as core_cli
+
+        kwargs["validate_packet_arm_preimage"] = (
+            core_cli._validate_packet_arm_preimage
+        )
     result = issue(
         paths,
         transaction,
@@ -325,6 +352,7 @@ def cmd_permit_issue(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
         chief_epoch=epoch,
         chief_token=token,
         current_time=datetime.now(timezone.utc),
+        **kwargs,
     )
     _emit(result, args.json)
     return 0
@@ -341,11 +369,19 @@ def cmd_permit_consume(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
             == permit_runtime.COHORT_PERMIT_TRANSACTION_SCHEMA_VERSION
             else permit_runtime.commit_permitted_arm_transaction
         )
+        kwargs: dict[str, Any] = {}
+        if commit is permit_runtime.commit_permitted_arm_transaction:
+            from .. import cli as core_cli
+
+            kwargs["validate_packet_arm_preimage"] = (
+                core_cli._validate_packet_arm_preimage
+            )
         result = commit(
             paths,
             transaction,
             store.load_semantic_events(paths, task_id),
             current_time=datetime.now(timezone.utc),
+            **kwargs,
         )
         head = store.semantic_head(paths, task_id)
     event = result["event"]
@@ -385,6 +421,29 @@ def cmd_cohort_round_preview(
         arms=request["arms"],
     )
     _emit(result, args.json)
+    return 0
+
+
+def cmd_packet_arm_prepare(
+    args: argparse.Namespace, paths: h.HarnessPaths
+) -> int:
+    """Emit one detached packet-owning semantic-v2 arm transaction."""
+
+    task_id = h.validate_id(args.task, "task id")
+    request = _load_packet_arm_request(args.request_file)
+    transaction = permit_runtime.prepare_permitted_arm_transaction(
+        task_id=task_id,
+        event_chain=store.load_semantic_events(paths, task_id),
+        decision=request["decision"],
+        permit=request["permit"],
+        arm=request["arm"],
+        command_id=args.command_id,
+        recorded_at=args.recorded_at,
+    )
+    _write_canonical_stdout(
+        transaction,
+        maximum=permit_runtime.MAX_PERMIT_TRANSACTION_BYTES,
+    )
     return 0
 
 
@@ -588,6 +647,16 @@ def register_semantic_commands(
     consume.add_argument("--transaction-file", required=True)
     add_json_argument(consume)
     consume.set_defaults(handler=handlers["permit_consume"])
+
+    arm_prepare = sub.add_parser(
+        "packet-arm-prepare",
+        help="emit one canonical detached packet-owning arm transaction",
+    )
+    arm_prepare.add_argument("--task", required=True)
+    arm_prepare.add_argument("--request-file", required=True)
+    arm_prepare.add_argument("--command-id", required=True)
+    arm_prepare.add_argument("--recorded-at", required=True)
+    arm_prepare.set_defaults(handler=handlers["packet_arm_prepare"])
 
     preview = sub.add_parser(
         "cohort-round-preview",
