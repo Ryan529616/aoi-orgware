@@ -26,6 +26,7 @@ from aoi_orgware.codex_app_server_stdio import (
 from aoi_orgware.codex_transport_controller import (
     CodexTransportController,
     CodexTransportControllerError,
+    _runtime_event_bytes,
 )
 
 
@@ -111,6 +112,9 @@ def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, An
             "request_id": None,
             "request_bytes_sha256": None,
             "response_sha256": None,
+            "fault_kind": None,
+            "fault_evidence_sha256": None,
+            "fault_evidence_size_bytes": None,
             "correlation": correlation(),
         }
     )
@@ -119,12 +123,33 @@ def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, An
 
 def runtime_event(method: str, params: Mapping[str, Any]) -> RuntimeEvent:
     raw = json.dumps(
-        {"jsonrpc": "2.0", "method": method, "params": dict(params)},
+        {"method": method, "params": dict(params)},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-    return RuntimeEvent(method, dict(params), hashlib.sha256(raw).hexdigest())
+    return RuntimeEvent(method, dict(params), hashlib.sha256(raw).hexdigest(), raw)
+
+
+def test_controller_rejects_unpinned_or_divergent_runtime_event_bytes() -> None:
+    params = {"threadId": "thread-1"}
+    tagged = json.dumps(
+        {"jsonrpc": "2.0", "method": "warning", "params": params},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    with pytest.raises(CodexTransportControllerError, match="unpinned jsonrpc"):
+        _runtime_event_bytes(
+            RuntimeEvent(
+                "warning", params, hashlib.sha256(tagged).hexdigest(), tagged
+            )
+        )
+    exact = json.dumps(
+        {"method": "warning", "params": params}, separators=(",", ":")
+    ).encode("utf-8")
+    with pytest.raises(CodexTransportControllerError, match="fields differ"):
+        _runtime_event_bytes(
+            RuntimeEvent("warning", {"threadId": "other"}, hashlib.sha256(exact).hexdigest(), exact)
+        )
 
 
 class Sink:
@@ -179,7 +204,7 @@ class FakeAdapter:
         self._next_id += 1
         self.request_count[method] = self.request_count.get(method, 0) + 1
         request_raw = json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}},
+            {"id": request_id, "method": method, "params": {}},
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
         self.on_send_pending(
@@ -195,9 +220,9 @@ class FakeAdapter:
             raise RuntimeDisconnected(f"{method} response lost")
         error = self.mode == method.replace("/", "_") + "_error"
         response = (
-            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -1, "message": "no"}}
+            {"id": request_id, "error": {"code": -1, "message": "no"}}
             if error
-            else {"jsonrpc": "2.0", "id": request_id, "result": dict(result)}
+            else {"id": request_id, "result": dict(result)}
         )
         response_raw = json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
         self.on_response(
@@ -325,6 +350,21 @@ def test_crash_and_protocol_faults_terminalize_without_resend(
     result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
     assert result.terminal_state == terminal
     assert result.terminal_receipt["correlation"]["thread_id"] == thread_id
+    terminal_event = result.journal[-1]
+    if mode == "thread_start_error":
+        assert terminal_event["wire_event_sha256"] is not None
+        assert terminal_event["response_sha256"] == terminal_event["wire_event_sha256"]
+        assert terminal_event["fault_kind"] is None
+    else:
+        assert terminal_event["wire_event_sha256"] is None
+        assert terminal_event["response_sha256"] is None
+        assert terminal_event["fault_kind"] in {
+            "AppServerError",
+            "ProtocolViolation",
+            "RuntimeDisconnected",
+        }
+        assert terminal_event["fault_evidence_sha256"] is not None
+        assert terminal_event["fault_evidence_size_bytes"] > 0
     assert all(count == 1 for count in adapter.request_count.values())
     assert adapter.closed is True
 

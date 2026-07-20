@@ -699,10 +699,13 @@ def test_filesystem_milestone_and_terminal_publication_recover_exactly(
             previous=journal[-1]["event_sha256"],
             event_type="failed",
             correlation={"thread_id": None, "turn_id": None, "item_id": None},
-            wire_event_sha256=SHA_B,
-            response_sha256=SHA_B,
+            fault_kind="RuntimeDisconnected",
+            fault_evidence_sha256=SHA_B,
+            fault_evidence_size_bytes=19,
             payload_size_bytes=19,
         )
+        assert failed["wire_event_sha256"] is None
+        assert failed["response_sha256"] is None
         with h.state_lock(paths, create_layout=False):
             committed_failed = runtime.record_milestone(
                 paths,

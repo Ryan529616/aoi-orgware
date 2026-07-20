@@ -41,7 +41,19 @@ def _correlation(thread: str | None = None, turn: str | None = None) -> dict[str
 def _event(intent_sha: str, reservation_sha: str, records: list[dict[str, object]], event_type: str, state: str, correlation: dict[str, str | None]) -> list[dict[str, object]]:
     sequence = len(records) + 1
     pending = event_type.endswith("_pending")
-    observed = event_type not in {"reserved"} and not pending
+    response_observed = event_type in {
+        "initialized",
+        "thread_started",
+        "turn_started",
+        "interrupt_observed",
+    }
+    wire_observed = response_observed or event_type in {
+        "process_started",
+        "item_started",
+        "item_completed",
+        "completed",
+        "interrupted",
+    }
     raw: dict[str, object] = {
         "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
         "event_id": f"event-{sequence}", "sequence": sequence,
@@ -49,12 +61,15 @@ def _event(intent_sha: str, reservation_sha: str, records: list[dict[str, object
         "launch_intent_sha256": intent_sha, "reservation_sha256": reservation_sha,
         "event_type": event_type, "state": state,
         "wire_method": contracts._EVENT_WIRE_METHOD[event_type],
-        "wire_event_sha256": SHA_A if observed else None,
+        "wire_event_sha256": SHA_A if wire_observed else None,
         "payload_size_bytes": 0 if event_type == "reserved" else 41,
         "item_type": None, "status": contracts._EVENT_WIRE_STATUS[event_type],
         "request_id": f"request-{sequence}" if pending else None,
         "request_bytes_sha256": SHA_B if pending else None,
-        "response_sha256": SHA_C if observed else None,
+        "response_sha256": SHA_A if response_observed else None,
+        "fault_kind": None,
+        "fault_evidence_sha256": None,
+        "fault_evidence_size_bytes": None,
         "correlation": correlation,
     }
     return contracts.append_transport_journal_event(records, contracts.seal_journal_event(raw))

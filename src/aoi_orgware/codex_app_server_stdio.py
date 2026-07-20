@@ -157,7 +157,7 @@ class ServerRequestDenied(ProtocolViolation):
 
 
 class RequestPhase(str, Enum):
-    """Durable crash markers for a single non-idempotent JSON-RPC request."""
+    """Durable crash markers for one non-idempotent App Server request."""
 
     BEFORE_SEND = "before_send"
     SEND_PENDING = "send_pending"
@@ -253,6 +253,7 @@ class RuntimeEvent:
     method: str
     params: dict[str, Any]
     sha256: str
+    wire_bytes: bytes
 
 
 @dataclass(frozen=True)
@@ -280,9 +281,9 @@ def _strict_json_object(raw: bytes) -> dict[str, Any]:
     try:
         value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
-        raise ProtocolViolation("malformed JSON-RPC line") from exc
+        raise ProtocolViolation("malformed App Server protocol line") from exc
     if not isinstance(value, dict):
-        raise ProtocolViolation("JSON-RPC message must be an object")
+        raise ProtocolViolation("App Server protocol message must be an object")
     return value
 
 
@@ -522,7 +523,7 @@ class CodexAppServerStdio:
                 "capabilities": {"experimentalApi": False, "requestAttestation": False},
             },
         )
-        self._send_notification("initialized", {})
+        self._send_notification("initialized")
         self._initialized = True
         return response
 
@@ -638,10 +639,13 @@ class CodexAppServerStdio:
         with self._request_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
-            message = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)}
+            # The pinned 0.144.6 generated ClientRequest schema and live
+            # runtime use the App Server's line-delimited RPC envelope.  It
+            # deliberately has no JSON-RPC ``jsonrpc`` member.
+            message = {"id": request_id, "method": method, "params": dict(params)}
             encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
             if len(encoded) > self.max_line_bytes:
-                raise ValueError("outgoing JSON-RPC request exceeds line limit")
+                raise ValueError("outgoing App Server request exceeds line limit")
             self.last_receipt = RequestReceipt(request_id, method, RequestPhase.BEFORE_SEND)
             pending_entry = RequestJournalEntry(
                 request_id,
@@ -665,13 +669,19 @@ class CodexAppServerStdio:
             self.last_receipt = RequestReceipt(request_id, method, RequestPhase.RESPONSE_RECEIVED, response)
             return response
 
-    def _send_notification(self, method: str, params: Mapping[str, Any]) -> None:
+    def _send_notification(self, method: str) -> None:
+        if method != "initialized":
+            raise ValueError(f"unsupported client notification method: {method}")
         process = self._require_process()
         if process.stdin is None:
             raise RuntimeDisconnected("App Server stdin is unavailable")
-        payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": dict(params)}, separators=(",", ":")).encode("utf-8") + b"\n"
+        # ClientNotification.json for the pinned runtime defines initialized
+        # as the exact method-only notification shape.
+        payload = json.dumps({"method": method}, separators=(",", ":")).encode(
+            "utf-8"
+        ) + b"\n"
         if len(payload) > self.max_line_bytes:
-            raise ValueError("outgoing JSON-RPC notification exceeds line limit")
+            raise ValueError("outgoing App Server notification exceeds line limit")
         try:
             process.stdin.write(payload)
             process.stdin.flush()
@@ -682,7 +692,8 @@ class CodexAppServerStdio:
         while True:
             kind, payload = self._next_incoming(deadline)
             if kind == "notification":
-                self._record_notification(payload, buffer=True)
+                message, raw = payload
+                self._record_notification(message, raw, buffer=True)
                 continue
             if kind == "server_request":
                 raise ServerRequestDenied(_server_request_message(payload))
@@ -706,7 +717,7 @@ class CodexAppServerStdio:
                         raise AppServerError("response journal callback failed") from exc
                 if "error" in message:
                     raise AppServerError(f"App Server error response to request {request_id}: {message['error']!r}")
-                return _require_object(message.get("result"), "JSON-RPC response result")
+                return _require_object(message.get("result"), "App Server response result")
             raise ProtocolViolation(f"internal reader emitted unknown kind: {kind}")
 
     def _next_notification(self, deadline: float) -> RuntimeEvent:
@@ -715,7 +726,8 @@ class CodexAppServerStdio:
         while True:
             kind, payload = self._next_incoming(deadline)
             if kind == "notification":
-                event = self._record_notification(payload, buffer=False)
+                message, raw = payload
+                event = self._record_notification(message, raw, buffer=False)
                 if event is not None:
                     return event
                 continue
@@ -794,8 +806,10 @@ class CodexAppServerStdio:
             self._reader_error = ProtocolViolation("App Server reader queue/backpressure limit exceeded")
 
     def _classify_incoming(self, message: dict[str, Any], raw: bytes) -> tuple[str, Any]:
-        if message.get("jsonrpc") != "2.0":
-            raise ProtocolViolation("JSON-RPC version must be exactly '2.0'")
+        if "jsonrpc" in message:
+            raise ProtocolViolation(
+                "pinned App Server 0.144.6 framing must not contain jsonrpc"
+            )
         if "method" in message:
             method = _require_string(message["method"], "incoming method")
             params = message.get("params", {})
@@ -804,22 +818,36 @@ class CodexAppServerStdio:
                 return ("server_request", message)
             if method not in _NOTIFICATION_METHODS:
                 raise ProtocolViolation(f"unsupported App Server notification method: {method}")
-            return ("notification", message)
+            return ("notification", (message, raw))
         if "id" not in message:
-            raise ProtocolViolation("JSON-RPC message is neither request, notification, nor response")
+            raise ProtocolViolation(
+                "App Server message is neither request, notification, nor response"
+            )
         if not isinstance(message["id"], int) or isinstance(message["id"], bool):
             raise ProtocolViolation("response id must be an integer")
         if "result" not in message and "error" not in message:
-            raise ProtocolViolation("JSON-RPC response has neither result nor error")
+            raise ProtocolViolation("App Server response has neither result nor error")
         if "result" in message and "error" in message:
-            raise ProtocolViolation("JSON-RPC response contains both result and error")
+            raise ProtocolViolation("App Server response contains both result and error")
+        if "error" in message:
+            error = _require_object(message["error"], "App Server response error")
+            code = error.get("code")
+            if not isinstance(code, int) or isinstance(code, bool):
+                raise ProtocolViolation("App Server response error.code must be an integer")
+            if not isinstance(error.get("message"), str):
+                raise ProtocolViolation("App Server response error.message must be text")
         return ("response", (message, raw))
 
-    def _record_notification(self, message: dict[str, Any], *, buffer: bool) -> RuntimeEvent | None:
+    def _record_notification(
+        self,
+        message: dict[str, Any],
+        raw: bytes,
+        *,
+        buffer: bool,
+    ) -> RuntimeEvent | None:
         method = _require_string(message.get("method"), "notification method")
         params = _require_object(message.get("params"), "notification params")
-        canonical = json.dumps(message, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        event = RuntimeEvent(method, params, hashlib.sha256(canonical).hexdigest())
+        event = RuntimeEvent(method, params, hashlib.sha256(raw).hexdigest(), raw)
         identity = _event_identity(event)
         previous = self._seen_events.get(identity)
         if previous is not None:

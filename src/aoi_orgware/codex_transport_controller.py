@@ -143,15 +143,19 @@ def _correlation(
 
 
 def _runtime_event_bytes(event: RuntimeEvent) -> bytes:
-    raw = json.dumps(
-        {"jsonrpc": "2.0", "method": event.method, "params": event.params},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+    raw = event.wire_bytes
+    message = _strict_object(raw)
+    if "jsonrpc" in message:
+        raise CodexTransportControllerError(
+            "App Server event wire bytes use an unpinned jsonrpc envelope"
+        )
+    if message.get("method") != event.method or message.get("params") != event.params:
+        raise CodexTransportControllerError(
+            "App Server event fields differ from its exact wire bytes"
+        )
     if hashlib.sha256(raw).hexdigest() != event.sha256:
         raise CodexTransportControllerError(
-            "App Server event digest differs from its canonical bytes"
+            "App Server event digest differs from its exact wire bytes"
         )
     return raw
 
@@ -208,6 +212,9 @@ class CodexTransportController:
         request_id: str | None = None,
         request_bytes_sha256: str | None = None,
         item_type: str | None = None,
+        fault_kind: str | None = None,
+        fault_evidence_sha256: str | None = None,
+        fault_evidence_size_bytes: int | None = None,
     ) -> dict[str, Any]:
         sequence = len(self.journal) + 1
         raw = {
@@ -227,6 +234,9 @@ class CodexTransportController:
             "request_id": request_id,
             "request_bytes_sha256": request_bytes_sha256,
             "response_sha256": response_sha256,
+            "fault_kind": fault_kind,
+            "fault_evidence_sha256": fault_evidence_sha256,
+            "fault_evidence_size_bytes": fault_evidence_size_bytes,
             "correlation": dict(correlation),
         }
         try:
@@ -286,7 +296,6 @@ class CodexTransportController:
                 correlation=_correlation(),
                 payload_size_bytes=len(entry.payload_bytes),
                 wire_event_sha256=entry.sha256,
-                response_sha256=entry.sha256,
             )
         )
 
@@ -395,12 +404,11 @@ class CodexTransportController:
                     correlation=correlation,
                     payload_size_bytes=len(raw),
                     wire_event_sha256=event.sha256,
-                    response_sha256=event.sha256,
                     item_type=item_type,
                 )
             )
 
-    def _fault_digest(self, exc: BaseException) -> tuple[str, int]:
+    def _fault_digest(self, exc: BaseException) -> tuple[str, str, int]:
         payload = json.dumps(
             {
                 "exception_type": type(exc).__name__,
@@ -410,13 +418,14 @@ class CodexTransportController:
             separators=(",", ":"),
             ensure_ascii=True,
         ).encode("ascii")
-        return hashlib.sha256(payload).hexdigest(), len(payload)
+        return type(exc).__name__, hashlib.sha256(payload).hexdigest(), len(payload)
 
     def _terminalize_fault(self, exc: BaseException) -> None:
         state = self.state
         if state.state in _TERMINAL_STATES:
             return
         last = self.journal[-1]
+        fault_kind, digest, size = self._fault_digest(exc)
         if state.last_event_type in {
             "process_start_pending",
             "thread_start_send_pending",
@@ -427,13 +436,15 @@ class CodexTransportController:
                     "launch_unknown",
                     wire_method=last["wire_method"],
                     correlation=state.correlation,
-                    payload_size_bytes=last["payload_size_bytes"],
+                    payload_size_bytes=size,
                     request_id=state.last_request_id,
                     request_bytes_sha256=state.last_request_bytes_sha256,
+                    fault_kind=fault_kind,
+                    fault_evidence_sha256=digest,
+                    fault_evidence_size_bytes=size,
                 )
             )
             return
-        digest, size = self._fault_digest(exc)
         if state.state == "turn_started" or state.last_event_type == "interrupt_send_pending":
             event_type = "runtime_unknown"
             method = "runtime/disconnected"
@@ -446,8 +457,9 @@ class CodexTransportController:
                 wire_method=method,
                 correlation=state.correlation,
                 payload_size_bytes=size,
-                wire_event_sha256=digest,
-                response_sha256=digest,
+                fault_kind=fault_kind,
+                fault_evidence_sha256=digest,
+                fault_evidence_size_bytes=size,
             )
         )
 

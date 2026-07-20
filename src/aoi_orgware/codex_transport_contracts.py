@@ -96,6 +96,15 @@ _WIRE_METHODS = frozenset(
     }
 )
 _WIRE_STATUSES = frozenset({"observed", "completed", "failed", "interrupted", "unknown"})
+_FAULT_KINDS = frozenset(
+    {
+        "AppServerError",
+        "CodexTransportControllerError",
+        "ProtocolViolation",
+        "RuntimeDisconnected",
+        "ServerRequestDenied",
+    }
+)
 _EVENT_WIRE_METHOD = {
     "reserved": "aoi/reservation",
     "process_start_pending": "process/start",
@@ -209,6 +218,9 @@ _EVENT_FIELDS = {
     "request_id",
     "request_bytes_sha256",
     "response_sha256",
+    "fault_kind",
+    "fault_evidence_sha256",
+    "fault_evidence_size_bytes",
     "correlation",
 }
 _TERMINAL_FIELDS = {
@@ -746,23 +758,116 @@ def _event_base(value: Any) -> dict[str, Any]:
     request_bytes_sha256 = _optional_sha256(item["request_bytes_sha256"], "request_bytes_sha256")
     response_sha256 = _optional_sha256(item["response_sha256"], "response_sha256")
     wire_event_sha256 = _optional_sha256(item["wire_event_sha256"], "wire_event_sha256")
+    fault_kind = _optional_text(item["fault_kind"], "fault_kind")
+    fault_evidence_sha256 = _optional_sha256(
+        item["fault_evidence_sha256"], "fault_evidence_sha256"
+    )
+    fault_size_value = item["fault_evidence_size_bytes"]
+    fault_evidence_size_bytes = (
+        None
+        if fault_size_value is None
+        else _nonnegative_bounded_int(
+            fault_size_value,
+            "fault_evidence_size_bytes",
+            MAX_WIRE_PAYLOAD_BYTES,
+        )
+    )
+    fault_fields = (
+        fault_kind,
+        fault_evidence_sha256,
+        fault_evidence_size_bytes,
+    )
+    if any(value is not None for value in fault_fields) != all(
+        value is not None for value in fault_fields
+    ):
+        _fail("fault evidence fields must be all present or all absent")
+    has_fault = fault_kind is not None
+    if has_fault and fault_kind not in _FAULT_KINDS:
+        _fail("fault_kind is invalid")
+    if has_fault and fault_evidence_size_bytes == 0:
+        _fail("fault evidence must bind nonempty bytes")
+    if has_fault and event_type not in {"failed", "launch_unknown", "runtime_unknown"}:
+        _fail("non-fault event cannot claim fault evidence")
     pending = event_type.endswith("_pending")
     request_bound = pending or event_type == "launch_unknown"
     if request_bound != (request_id is not None and request_bytes_sha256 is not None):
         _fail("request-bound event must have exactly one request id/bytes digest")
     if not request_bound and (request_id is not None or request_bytes_sha256 is not None):
         _fail("non-request event cannot claim request bytes")
-    if pending and (response_sha256 is not None or wire_event_sha256 is not None):
-        _fail("send-pending event cannot claim a response/event digest")
-    if event_type == "launch_unknown" and (response_sha256 is not None or wire_event_sha256 is not None):
-        _fail("launch_unknown cannot claim a response/event digest")
-    if not pending and event_type not in {"reserved", "launch_unknown"} and (
-        response_sha256 is None or wire_event_sha256 is None
+    if pending and (
+        response_sha256 is not None or wire_event_sha256 is not None or has_fault
     ):
-        _fail("observed runtime event requires response and event digests")
+        _fail("send-pending event cannot claim response, event, or fault evidence")
+    if event_type == "launch_unknown" and (
+        response_sha256 is not None or wire_event_sha256 is not None or not has_fault
+    ):
+        _fail("launch_unknown requires fault evidence and cannot claim response/event bytes")
+    response_events = {
+        "initialized",
+        "thread_started",
+        "turn_started",
+        "interrupt_observed",
+    }
+    wire_only_events = {
+        "process_started",
+        "item_started",
+        "item_completed",
+        "completed",
+        "interrupted",
+    }
+    if event_type in response_events:
+        if (
+            response_sha256 is None
+            or wire_event_sha256 is None
+            or response_sha256 != wire_event_sha256
+            or has_fault
+        ):
+            _fail("request response event requires one exact response/wire digest")
+    if event_type in wire_only_events:
+        if wire_event_sha256 is None or response_sha256 is not None or has_fault:
+            _fail("wire observation requires an event digest but no response/fault claim")
+    if event_type == "runtime_unknown" and (
+        not has_fault or response_sha256 is not None or wire_event_sha256 is not None
+    ):
+        _fail("runtime_unknown requires fault evidence only")
+    if event_type == "failed":
+        if wire_method == "turn/completed":
+            valid_failed_evidence = (
+                wire_event_sha256 is not None
+                and response_sha256 is None
+                and not has_fault
+            )
+        elif wire_method == "process/exited":
+            valid_failed_evidence = (
+                has_fault
+                and wire_event_sha256 is None
+                and response_sha256 is None
+            )
+        else:
+            exact_error_response = (
+                wire_event_sha256 is not None
+                and response_sha256 == wire_event_sha256
+                and not has_fault
+            )
+            request_fault = (
+                has_fault
+                and wire_event_sha256 is None
+                and response_sha256 is None
+            )
+            valid_failed_evidence = exact_error_response or request_fault
+        if not valid_failed_evidence:
+            _fail("failed event evidence does not match its wire/fault source")
     if event_type == "reserved" and any(
         candidate is not None
-        for candidate in (request_id, request_bytes_sha256, response_sha256, wire_event_sha256)
+        for candidate in (
+            request_id,
+            request_bytes_sha256,
+            response_sha256,
+            wire_event_sha256,
+            fault_kind,
+            fault_evidence_sha256,
+            fault_evidence_size_bytes,
+        )
     ):
         _fail("reserved event cannot claim wire bytes")
     payload_size_bytes = _nonnegative_bounded_int(
@@ -772,6 +877,8 @@ def _event_base(value: Any) -> dict[str, Any]:
         _fail("reserved event must have zero wire payload size")
     if event_type != "reserved" and payload_size_bytes == 0:
         _fail("runtime event must bind a nonzero wire payload size")
+    if has_fault and payload_size_bytes != fault_evidence_size_bytes:
+        _fail("fault payload size differs from fault evidence size")
     return {
         "contract_type": CODEX_TRANSPORT_JOURNAL_EVENT_V1,
         "event_id": _text(item["event_id"], "event_id"),
@@ -789,6 +896,9 @@ def _event_base(value: Any) -> dict[str, Any]:
         "request_id": request_id,
         "request_bytes_sha256": request_bytes_sha256,
         "response_sha256": response_sha256,
+        "fault_kind": fault_kind,
+        "fault_evidence_sha256": fault_evidence_sha256,
+        "fault_evidence_size_bytes": fault_evidence_size_bytes,
         "correlation": _correlation(item["correlation"]),
     }
 

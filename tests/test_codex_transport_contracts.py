@@ -98,7 +98,23 @@ def event(
 ) -> dict[str, object]:
     pending = event_type.endswith("_pending")
     unknown = event_type == "launch_unknown"
-    observed = event_type != "reserved" and not pending and not unknown
+    method = str(changes.get("wire_method", contracts._EVENT_WIRE_METHOD[event_type]))
+    response_observed = event_type in {
+        "initialized",
+        "thread_started",
+        "turn_started",
+        "interrupt_observed",
+    } or (event_type == "failed" and method not in {"process/exited", "turn/completed"})
+    wire_observed = response_observed or event_type in {
+        "process_started",
+        "item_started",
+        "item_completed",
+        "completed",
+        "interrupted",
+    } or (event_type == "failed" and method == "turn/completed")
+    fault_observed = event_type in {"launch_unknown", "runtime_unknown"} or (
+        event_type == "failed" and method == "process/exited"
+    )
     value: dict[str, object] = {
         "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
         "event_id": event_id,
@@ -108,14 +124,17 @@ def event(
         "reservation_sha256": reservation_sha,
         "event_type": event_type,
         "state": state,
-        "wire_method": contracts._EVENT_WIRE_METHOD[event_type],
-        "wire_event_sha256": SHA_A if observed else None,
+        "wire_method": method,
+        "wire_event_sha256": SHA_A if wire_observed else None,
         "payload_size_bytes": 0 if event_type == "reserved" else 42,
         "item_type": "agent_message" if event_type in {"item_started", "item_completed"} else None,
         "status": contracts._EVENT_WIRE_STATUS[event_type],
         "request_id": f"request-{sequence}" if pending or unknown else None,
         "request_bytes_sha256": SHA_B if pending or unknown else None,
-        "response_sha256": SHA_C if observed else None,
+        "response_sha256": SHA_A if response_observed else None,
+        "fault_kind": "RuntimeDisconnected" if fault_observed else None,
+        "fault_evidence_sha256": SHA_D if fault_observed else None,
+        "fault_evidence_size_bytes": 42 if fault_observed else None,
         "correlation": runtime,
     }
     value.update(changes)
@@ -239,6 +258,23 @@ def test_full_crash_safe_milestone_journal_and_wire_falsification() -> None:
     bad_wire = event(intent_sha, reservation_sha, event_id="bad-2", sequence=10, prev=records[-1]["event_sha256"], event_type="completed", state="completed", runtime=correlation("thread-1", "turn-1"), wire_method="thread/start")
     with pytest.raises(contracts.CodexTransportContractError, match="wire metadata"):
         contracts.seal_journal_event(bad_wire)
+    mislabeled_fault = event(
+        intent_sha,
+        reservation_sha,
+        event_id="bad-3",
+        sequence=10,
+        prev=records[-1]["event_sha256"],
+        event_type="failed",
+        state="failed",
+        runtime=correlation("thread-1", "turn-1"),
+        fault_kind=None,
+        fault_evidence_sha256=None,
+        fault_evidence_size_bytes=None,
+        wire_event_sha256=SHA_A,
+        response_sha256=SHA_A,
+    )
+    with pytest.raises(contracts.CodexTransportContractError, match="evidence"):
+        contracts.seal_journal_event(mislabeled_fault)
 
 
 def test_thread_and_turn_start_response_loss_are_terminal_and_non_retryable() -> None:

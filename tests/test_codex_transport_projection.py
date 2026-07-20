@@ -100,7 +100,20 @@ def sealed_event(
     sequence = len(journal) + 1
     pending = event_type.endswith("_pending")
     unknown = event_type == "launch_unknown"
-    observed = event_type != "reserved" and not pending and not unknown
+    response_observed = event_type in {
+        "initialized",
+        "thread_started",
+        "turn_started",
+        "interrupt_observed",
+    }
+    wire_observed = response_observed or event_type in {
+        "process_started",
+        "item_started",
+        "item_completed",
+        "completed",
+        "interrupted",
+    }
+    fault_observed = event_type in {"launch_unknown", "runtime_unknown", "failed"}
     return contracts.seal_journal_event(
         {
             "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
@@ -114,7 +127,7 @@ def sealed_event(
             "event_type": event_type,
             "state": state,
             "wire_method": contracts._EVENT_WIRE_METHOD[event_type],
-            "wire_event_sha256": SHA_A if observed else None,
+            "wire_event_sha256": SHA_A if wire_observed else None,
             "payload_size_bytes": 0 if event_type == "reserved" else 42,
             "item_type": (
                 "agent_message"
@@ -128,7 +141,10 @@ def sealed_event(
             "request_bytes_sha256": (
                 request_bytes_sha256 or SHA_B if pending or unknown else None
             ),
-            "response_sha256": SHA_C if observed else None,
+            "response_sha256": SHA_A if response_observed else None,
+            "fault_kind": "RuntimeDisconnected" if fault_observed else None,
+            "fault_evidence_sha256": SHA_C if fault_observed else None,
+            "fault_evidence_size_bytes": 42 if fault_observed else None,
             "correlation": runtime,
         }
     )

@@ -327,12 +327,12 @@ def _issue_args(value: BridgeFixture) -> list[str]:
 
 def _runtime_event(method: str, params: Mapping[str, Any]) -> RuntimeEvent:
     raw = json.dumps(
-        {"jsonrpc": "2.0", "method": method, "params": dict(params)},
+        {"method": method, "params": dict(params)},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-    return RuntimeEvent(method, dict(params), hashlib.sha256(raw).hexdigest())
+    return RuntimeEvent(method, dict(params), hashlib.sha256(raw).hexdigest(), raw)
 
 
 class FakeAdapter:
@@ -361,7 +361,7 @@ class FakeAdapter:
         self._next_id += 1
         self.request_count[method] = self.request_count.get(method, 0) + 1
         request = json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}},
+            {"id": request_id, "method": method, "params": {}},
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
         self.on_send_pending(
@@ -376,7 +376,7 @@ class FakeAdapter:
         if self.mode == "thread_start_loss" and method == "thread/start":
             raise RuntimeDisconnected("thread/start response lost")
         response = json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "result": dict(result)},
+            {"id": request_id, "result": dict(result)},
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
         self.on_response(

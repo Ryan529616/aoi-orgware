@@ -264,6 +264,9 @@ class SemanticObjectTests(unittest.TestCase):
                 "request_id": None,
                 "request_bytes_sha256": None,
                 "response_sha256": None,
+                "fault_kind": None,
+                "fault_evidence_sha256": None,
+                "fault_evidence_size_bytes": None,
                 "correlation": {"thread_id": None, "turn_id": None, "item_id": None},
             }
         )

@@ -53,83 +53,100 @@ def read():
     return json.loads(line)
 
 def response(request, result):
-    send({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    send({"id": request["id"], "result": result})
 
 init = read()
+assert "jsonrpc" not in init
 if scenario == "malformed":
-    sys.stdout.write('{"jsonrpc":"2.0","id":1,"result":{},"result":{}}\n')
+    sys.stdout.write('{"id":1,"result":{},"result":{}}\n')
     sys.stdout.flush()
     raise SystemExit(0)
 if scenario == "oversize":
     sys.stdout.write("x" * 4096 + "\n")
     sys.stdout.flush()
     raise SystemExit(0)
+if scenario == "jsonrpc_envelope":
+    send({"jsonrpc":"2.0","id":init["id"],"result":{}})
+    raise SystemExit(0)
+if scenario == "error_not_object":
+    send({"id":init["id"],"error":"bad"})
+    raise SystemExit(0)
+if scenario == "error_bad_code":
+    send({"id":init["id"],"error":{"code":True,"message":"bad"}})
+    raise SystemExit(0)
+if scenario == "error_bad_message":
+    send({"id":init["id"],"error":{"code":-32000,"message":7}})
+    raise SystemExit(0)
 response(init, {
     "secret_present": "AOI_CHIEF_CREDENTIAL_FILE" in os.environ,
     "publication_secret_present": "GITHUB_TOKEN" in os.environ,
 })
-read()  # initialized
-send({"jsonrpc":"2.0","method":"remoteControl/status/changed","params":{"status":"ready"}})
+assert read() == {"method":"initialized"}
+send({"method":"remoteControl/status/changed","params":{"status":"ready"}})
 if scenario == "flood":
     for _ in range(128):
-        send({"jsonrpc":"2.0","method":"warning","params":{"message":"flood"}})
+        send({"method":"warning","params":{"message":"flood"}})
 
 thread = read()
+assert "jsonrpc" not in thread
 if scenario == "eof_thread":
     raise SystemExit(0)
 if scenario == "wrong_response":
-    send({"jsonrpc":"2.0","id":999,"result":{}})
+    send({"id":999,"result":{}})
     raise SystemExit(0)
 if scenario == "error_response":
-    send({"jsonrpc":"2.0","id":thread["id"],"error":{"code":-32000,"message":"no"}})
+    send({"id":thread["id"],"error":{"code":-32000,"message":"no"}})
     raise SystemExit(0)
-send({"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-1"}}})
+send({"method":"thread/started","params":{"thread":{"id":"thread-1"}}})
 response(thread, {"thread":{"id":"thread-1"}})
 if scenario == "auxiliary_notifications":
-    send({"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"thread-1","status":"active"}})
+    send({"method":"thread/status/changed","params":{"threadId":"thread-1","status":"active"}})
 
 turn = read()
+assert "jsonrpc" not in turn
 if scenario == "server_request":
-    send({"jsonrpc":"2.0","id":55,"method":"tool/requestUserInput","params":{}})
+    send({"id":55,"method":"tool/requestUserInput","params":{}})
     raise SystemExit(0)
 if scenario == "bad_notification":
-    send({"jsonrpc":"2.0","method":"unknown/event","params":{}})
+    send({"method":"unknown/event","params":{}})
     raise SystemExit(0)
 if scenario == "wrong_correlation":
-    send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"other","turn":{"id":"turn-1"}}})
+    send({"method":"turn/started","params":{"threadId":"other","turn":{"id":"turn-1"}}})
 else:
-    send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}})
+    send({"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}})
 if scenario == "auxiliary_wrong_thread":
-    send({"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"other","status":"active"}})
+    send({"method":"thread/status/changed","params":{"threadId":"other","status":"active"}})
 if scenario == "auxiliary_wrong_turn":
-    send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"other","itemId":"item-1","delta":"wrong turn"}})
+    send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"other","itemId":"item-1","delta":"wrong turn"}})
 if scenario == "auxiliary_item_without_turn":
-    send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","itemId":"item-1","delta":"missing turn"}})
+    send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","itemId":"item-1","delta":"missing turn"}})
 response(turn, {"turn":{"id":"turn-1","status":"inProgress"}})
 if scenario == "auxiliary_notifications":
-    send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"not persisted by AOI"}})
-    send({"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","tokenUsage":{"totalTokens":1}}})
+    send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"not persisted by AOI"}})
+    send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","tokenUsage":{"totalTokens":1}}})
 if scenario == "interrupt_active":
     interrupt = read()
+    assert "jsonrpc" not in interrupt
     response(interrupt, {})
-    send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}})
+    send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}})
     raise SystemExit(0)
 if scenario == "midstream_eof":
-    send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage"}}})
+    send({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage"}}})
     raise SystemExit(0)
 item = {"id":"item-1","type":"agentMessage","text":"ok"}
-started = {"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":item}}
-completed = {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":item}}
+started = {"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":item}}
+completed = {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":item}}
 send(started)
 if scenario == "duplicate_conflict":
     item["text"] = "different"
-    send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":item}})
+    send({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":item}})
 elif scenario == "duplicate_exact":
     send(started)
 send(completed)
-send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}})
+send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}})
 if scenario == "interrupt":
     interrupt = read()
+    assert "jsonrpc" not in interrupt
     response(interrupt, {})
 '''
 
@@ -293,6 +310,32 @@ def test_pinned_notification_and_item_allowlists_match_generated_schema() -> Non
     assert stdio._ITEM_TYPES == item_types
 
 
+def test_pinned_rpc_envelopes_do_not_define_jsonrpc_member() -> None:
+    root = (
+        Path(contracts.__file__).resolve().parent
+        / "resources"
+        / "codex_app_server"
+        / "0.144.6"
+    )
+    schema = json.loads(
+        (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
+    )
+    for definition in ("ClientRequest", "ServerNotification"):
+        for variant in schema["definitions"][definition]["oneOf"]:
+            assert "jsonrpc" not in variant["properties"]
+            assert "jsonrpc" not in variant["required"]
+    manifest = {
+        entry["path"]: entry["sha256"]
+        for entry in json.loads((root / "schema-manifest.json").read_bytes())
+    }
+    assert manifest["ClientNotification.json"] == (
+        "a30b3041578845b11add3d07d5a63cd3a12d5d126e87b8c591862b4aeb68d97c"
+    )
+    assert manifest["JSONRPCResponse.json"] == (
+        "94ecf5e81bdbc2af858afad0044b95c7fb4decf77d7fd7d6321324dad79eef57"
+    )
+
+
 def test_lifecycle_buffers_event_before_response_and_records_aggregate(fake_server: Path, tmp_path: Path) -> None:
     pending: list[RequestJournalEntry] = []
     process_entries: list[ProcessJournalEntry] = []
@@ -310,6 +353,15 @@ def test_lifecycle_buffers_event_before_response_and_records_aggregate(fake_serv
         observation = client.observe_turn(thread_id=thread_id, turn_id=turn_id, timeout_seconds=3)
         assert observation.terminal_status == "completed"
         assert [event.method for event in observation.events][-1] == "turn/completed"
+        assert all(event.wire_bytes.endswith(b"\n") for event in observation.events)
+        assert all(
+            hashlib.sha256(event.wire_bytes).hexdigest() == event.sha256
+            for event in observation.events
+        )
+        assert all(
+            "jsonrpc" not in json.loads(event.wire_bytes)
+            for event in observation.events
+        )
         assert client.event_count == 6  # remote, thread, turn, item start/completed, terminal
         assert len(client.event_digest) == 64
         assert len(client.stderr_digest) == 64
@@ -327,6 +379,9 @@ def test_lifecycle_buffers_event_before_response_and_records_aggregate(fake_serv
             for entry in pending
             if entry.method in {"thread/start", "turn/start"}
         }
+        assert all(
+            "jsonrpc" not in json.loads(entry.wire_bytes) for entry in pending
+        )
         assert sent["thread/start"] == {
             "cwd": tmp_path.resolve().as_posix(),
             "approvalPolicy": "never",
@@ -413,7 +468,7 @@ def test_scoped_auxiliary_notification_correlation_fails_closed(
 
 def test_auxiliary_event_identity_binds_explicit_correlation_ids() -> None:
     def event(params: dict[str, object]) -> RuntimeEvent:
-        return RuntimeEvent("item/agentMessage/delta", params, "a" * 64)
+        return RuntimeEvent("item/agentMessage/delta", params, "a" * 64, b"wire")
 
     first = stdio._event_identity(
         event(
@@ -447,6 +502,35 @@ def test_malformed_duplicate_key_or_oversize_stdout_fails_closed(fake_server: Pa
     try:
         with pytest.raises(ProtocolViolation):
             client.initialize()
+    finally:
+        client.close()
+
+
+def test_jsonrpc_tagged_envelope_is_rejected_against_pinned_framing(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _client(fake_server, tmp_path, "jsonrpc_envelope")
+    client.start()
+    try:
+        with pytest.raises(ProtocolViolation, match="must not contain jsonrpc"):
+            client.initialize()
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "scenario", ["error_not_object", "error_bad_code", "error_bad_message"]
+)
+def test_malformed_error_envelope_is_rejected_before_response_observation(
+    fake_server: Path, tmp_path: Path, scenario: str
+) -> None:
+    responses: list[RequestJournalEntry] = []
+    client = _client(fake_server, tmp_path, scenario, on_response=responses.append)
+    client.start()
+    try:
+        with pytest.raises(ProtocolViolation, match="response error"):
+            client.initialize()
+        assert responses == []
     finally:
         client.close()
 

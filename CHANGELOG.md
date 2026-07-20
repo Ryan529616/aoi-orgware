@@ -95,8 +95,16 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   fabricating `SubagentStart`; dispatch generation v2, complete ownership
   binding, a per-launch OS lock, consume/pending-time expiry checks, and
   issue-to-Popen Git/claim recapture close duplicate-launch and stale-source
-  races. Local fake-runtime tests are not live App Server, release,
-  package-install, or downstream ARISE evidence.
+  races. The pinned 0.144.6 wire dialect is now enforced directly: requests and
+  notifications omit `jsonrpc`, `initialized` is method-only, tagged or
+  malformed error envelopes fail closed, and lifecycle digests bind exact raw
+  wire bytes. Journal evidence now distinguishes request responses, process/
+  notification observations, and bounded synthetic faults; a fault can never
+  claim `response_sha256` or `wire_event_sha256`. A first real read-only canary
+  exposed the former framing defect and failed explicitly at initialize; it was
+  not retried and is not a live PASS. Local fake-runtime tests and that failed
+  diagnostic canary are not release, package-install, or downstream ARISE
+  evidence.
 - **Local-files confidentiality profile (implementation candidate; promotion
   pending).** `mode = "local_files"` means model context allowed and governed
   file publication denied. Local Git and local CAS/evidence remain available;

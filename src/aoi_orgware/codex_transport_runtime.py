@@ -104,6 +104,8 @@ def _event_for(
     wire_event_sha256: str | None = None, response_sha256: str | None = None,
     request_id: str | None = None, request_bytes_sha256: str | None = None,
     item_type: str | None = None, payload_size_bytes: int | None = None,
+    fault_kind: str | None = None, fault_evidence_sha256: str | None = None,
+    fault_evidence_size_bytes: int | None = None,
 ) -> dict[str, Any]:
     pending = event_type.endswith("_pending")
     if event_type == "reserved":
@@ -113,8 +115,6 @@ def _event_for(
     if pending or event_type == "launch_unknown":
         if request_id is None or request_bytes_sha256 is None:
             raise CodexTransportRuntimeError("request milestone needs exact request id and bytes digest")
-    elif event_type != "reserved" and (wire_event_sha256 is None or response_sha256 is None):
-        raise CodexTransportRuntimeError("observed milestone needs response and wire-event digests")
     method = {
         "reserved": "aoi/reservation", "process_start_pending": "process/start", "process_started": "process/started",
         "initialize_send_pending": "initialize", "initialized": "initialized", "thread_start_send_pending": "thread/start",
@@ -133,7 +133,10 @@ def _event_for(
             "event_type": event_type, "state": state, "wire_method": method,
             "wire_event_sha256": wire_event_sha256, "payload_size_bytes": size, "item_type": item_type,
             "status": status, "request_id": request_id, "request_bytes_sha256": request_bytes_sha256,
-            "response_sha256": response_sha256, "correlation": dict(correlation),
+            "response_sha256": response_sha256, "fault_kind": fault_kind,
+            "fault_evidence_sha256": fault_evidence_sha256,
+            "fault_evidence_size_bytes": fault_evidence_size_bytes,
+            "correlation": dict(correlation),
         })
     except contracts.CodexTransportContractError as exc:
         raise _fail("Codex transport milestone is invalid", exc) from exc
