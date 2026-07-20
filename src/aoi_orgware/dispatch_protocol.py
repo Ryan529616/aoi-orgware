@@ -82,6 +82,20 @@ class DispatchProtocolPolicy:
             raise ValueError("dispatch provenance must be a non-empty label")
 
 
+def _record_dispatch_model_version(
+    state: dict[str, Any], policy: DispatchProtocolPolicy
+) -> None:
+    """Never downgrade a task that already contains transport model v2."""
+
+    has_transport_v2 = any(
+        isinstance(packet, dict) and packet.get("dispatch_version") == 2
+        for packet in state.get("packets", [])
+    )
+    state["dispatch_model_version"] = (
+        2 if has_transport_v2 else policy.dispatch_model_version
+    )
+
+
 class PacketById(Protocol):
     def __call__(
         self, state: dict[str, Any], packet_id: str
@@ -360,7 +374,7 @@ def record_subagent_incident(
         "hook_protocol_version": policy.hook_protocol_version,
         "resolution": None,
     }
-    state["dispatch_model_version"] = policy.dispatch_model_version
+    _record_dispatch_model_version(state, policy)
     state.setdefault("subagent_incidents", []).append(incident)
     return incident
 
@@ -834,7 +848,7 @@ def observe_subagent_start(
                         "observed_at": observed_at,
                     }
                 )
-                state["dispatch_model_version"] = policy.dispatch_model_version
+                _record_dispatch_model_version(state, policy)
                 bump_task(state)
                 write_task(paths, state)
                 index_refreshed = services.refresh_index_after_commit(paths)
@@ -894,7 +908,7 @@ def observe_subagent_start(
                             "observed_at": observed_at,
                         }
                     )
-                    state["dispatch_model_version"] = policy.dispatch_model_version
+                    _record_dispatch_model_version(state, policy)
                     bump_task(state)
                     write_task(paths, state)
                     index_refreshed = services.refresh_index_after_commit(paths)
@@ -967,7 +981,7 @@ def observe_subagent_start(
         packet["dispatch_recorded_at"] = observed_at
         packet["agent_id"] = agent_id
         packet["updated_at"] = observed_at
-        state["dispatch_model_version"] = policy.dispatch_model_version
+        _record_dispatch_model_version(state, policy)
         parent_mapping_deferred = False
         if int(packet.get("delegation_depth", 1)) == 1:
             try:

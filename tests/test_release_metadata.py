@@ -93,6 +93,15 @@ class ReleaseMetadataTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             dist_verify.build_parser().parse_args([])
 
+    def test_release_verifier_requires_bridge_entry_point_and_pinned_resources(self) -> None:
+        self.assertIn("aoi-codex-bridge", dist_verify.CONSOLE_SCRIPTS)
+        expected = {
+            "aoi_orgware/resources/codex_app_server/0.144.6/runtime-pin.json",
+            "aoi_orgware/resources/codex_app_server/0.144.6/schema-manifest.json",
+            "aoi_orgware/resources/codex_app_server/0.144.6/codex_app_server_protocol.v2.schemas.json",
+        }
+        self.assertTrue(expected.issubset(dist_verify.REQUIRED_PACKAGE_FILES))
+
     def test_release_verifier_scrubs_ambient_python_and_pip_configuration(self) -> None:
         with mock.patch.dict(
             dist_verify.os.environ,

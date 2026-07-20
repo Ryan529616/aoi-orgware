@@ -342,21 +342,28 @@ Steward-brief, and close-gate error. See
 
 ### Codex hook provenance and mutation receipts (v0.4)
 
-The optional Codex adapter records bounded, sealed observations; it does not
-turn hook delivery into a security boundary. Installation provenance binds the
+The optional Codex adapter records bounded, sealed observations and can deny a
+governed request on supported `PreToolUse` handlers; it does not turn hook
+delivery into a security boundary. Installation provenance binds the
 resolved hook launcher, package version and distribution metadata, the promoted
 wheel identity, generated launcher, and a bounded manifest of every non-cache
-runtime package file checked against `RECORD`. Pip-generated, hashless
+runtime package file checked against `RECORD`. The unpublished local schema-v2
+route additionally requires and rechecks the installed `aoi-codex-bridge`
+entry point, launcher, optional generated script, and transport CLI module.
+Its clean source manifest includes ordinary tracked dotfiles and
+dot-directories; safe leading-dot paths are not confused with traversal or
+absolute paths.
+Pip-generated, hashless
 `__pycache__/*.pyc` files are an explicit cooperative-runtime exclusion; other
 files under `__pycache__` are rejected. At hook execution, AOI's provenance
 validator rechecks that receipt against the invoked launcher and current
 installed package bytes, and `doctor` reports any mismatch.
 Editable/source-checkout installs, link traversal, `.pth` shadows, mixed
 site-package resolution, entry-point mismatch, and any covered package or
-launcher drift are rejected by that validator. Before a hook event has been
-parsed and identified, however, the top-level hook adapter remains fail-open;
-only identified `PreToolUse` processing failures use the fixed deny response.
-This is not a pre-import or OS security boundary. A `RECORD`/installed-package comparison is not always a
+launcher drift are rejected by that validator. Any internal `PreToolUse` fault
+returns the fixed deny response (fail-closed); only non-`PreToolUse` lifecycle
+adapters remain fail-open. This is not a pre-import or OS security boundary. A
+`RECORD`/installed-package comparison is not always a
 cryptographic proof that the original wheel archive was installed: without a
 matching `direct_url` archive digest the receipt reports only its weaker
 package-and-installer mapping.
@@ -365,12 +372,16 @@ PreToolUse and PostToolUse correlate only the exact stable triple
 `(session_id, turn_id, tool_use_id)`; optional agent/event fields are
 attribution, not correlation authority. The PreToolUse receipt records parser,
 input digest, sorted targets, session mapping, claim snapshot and the decision.
-It deliberately keeps provider, profile, and sandbox verification
-`unavailable`. PostToolUse binds that pre-receipt digest plus input and response
-digests, targets, and completion observation. A mutation is verified only when
-it has paired, distinct before/after SHA-256 values; otherwise it remains
-`unavailable`. Thus PreToolUse is a cooperative decision and PostToolUse is an
-observation/receipt, never prevention, rollback, or a general write monitor.
+For supported Codex tool handlers, a deny is synchronous before tool execution;
+the local `codex-cli 0.144.0` canary proved this for Bash. It deliberately keeps
+provider, profile, and sandbox verification `unavailable`, and does not prove
+coverage for every tool handler. PostToolUse binds that pre-receipt digest plus
+input and response digests, targets, and completion observation. A mutation is
+verified only when it has paired, distinct before/after SHA-256 values;
+otherwise it remains `unavailable`. PreToolUse is therefore a narrow,
+cooperative supported-tool gate; PostToolUse is an observation/receipt. Neither
+is rollback, a general write monitor, or a collaboration pre-spawn gate:
+spawning remains governed by the arm and later `SubagentStart` accounting.
 
 Receipts are canonical, create-only records keyed by receipt type and event
 identity under the AOI state lock. The store accepts at most 1,024 records and
@@ -381,12 +392,96 @@ parseable paths can be `covered`, `unclaimed`, or `uncovered`. An unavailable
 MCP registry is explicitly **uncovered**, not trusted or implicitly covered.
 
 Close/doctor mutation snapshots bind NUL-safe Git status, including untracked,
-renamed, case-only, and deleted paths, to the live task claims. The required-v1
-integrity ledger binds candidate/post-fix snapshots, findings, fixes, reviewer
-results, and independent verification before its terminal seal. Those records
-are cooperative evidence: reviewer identity must differ from recorded producer
-identities, but it is not authenticated human identity or protection from a
-same-OS-user writer that bypasses AOI.
+renamed, case-only, and deleted paths, to the live task claims. New
+`integrity-adopt` creates `required_v2`. `required_v1` is a frozen, read-only
+compatibility reader: its candidate-only seal and sealed contracts do not
+change. Any unsealed valid v1 contract, including a valid empty record set, may
+explicitly migrate through `integrity-upgrade-v2`, preserving a canonical v1 CAS
+source receipt and all its finding obligations.
+
+The `required_v2` ledger is one sequence of records with continuous
+`integrity_seq`. A snapshot content SHA identifies observed bytes and may recur;
+its record SHA uniquely identifies that observation/attempt. Every graph edge
+uses the record SHA. Seal targets one exact terminal snapshot record, whose
+final clean review has an exact basis of `PASS` re-verifications for every prior
+finding's latest fix on that same attempt. Those records are cooperative
+evidence: reviewer identity must differ from recorded producer identities, but
+it is not authenticated human identity or protection from a same-OS-user writer
+that bypasses AOI.
+
+## Local-files confidentiality boundary
+
+`local_files` is an AOI publication policy, not a model-isolation claim. Model
+context remains allowed, while governed Git/file/artifact/package/attachment
+publication is denied. State/CAS/receipts remain local. Exact external export
+uses a one-shot Chief permit and never hands reusable Chief credentials to the
+consumer.
+
+The doctor and launch-time checks share the same storage classifier. Confirmed
+network or common sync roots fail closed. Windows drive-letter paths use
+`GetDriveTypeW` and DOS-device inspection so mapped drives cannot masquerade as
+local; missing roots, metadata failure, SUBST aliases, and link/reparse
+traversal are separately labelled unverified and also fail a confirmed-local
+gate. File-URI percent decoding precedes drive classification, and the generic
+Windows reparse attribute is inspected at each existing path ancestor.
+Caller-visible drive classification precedes resolution; the resolved target is
+then checked separately, so DOS-device aliases cannot disappear at the trust
+boundary. Malformed URLs are fail-closed invalid findings.
+Environment checks cover a finite set of known credential names and
+cannot prove that an unlisted secret is absent. This does not intercept an
+ungoverned same-user shell and does not replace OS DLP. Profile-selected
+promotion makes remote CI mandatory only for a publication-enabled route; it
+is forbidden/not applicable for `local_files`.
+
+
+## Optional Codex Transport Bridge
+
+`aoi-codex-bridge` is an optional stdlib-only adapter, not a second AOI state
+model and not a resident scheduler. `issue` is Chief-fenced and writes an
+immutable issuance marker. `run` receives only its exact permit SHA, starts at
+most one local pinned App Server process over stdio, and persists a milestone
+before each uncertain process/request boundary. `inspect` is read-only.
+`verify-mutation` is a separate Git/CAS/claim evidence transition.
+
+The reservation transition atomically consumes the exact canonical packet arm
+without inventing a hook observation. The attempt becomes
+`transport_reserved`; the packet becomes bridge-owned `dispatched`; and a
+content-addressed ownership object binds packet contract, arm, launch, intent,
+permit, reservation, and routing authority. Packet/task dispatch generation
+v2 makes the new wire semantics explicit and downgrade-detectable. A known
+runtime terminal has one packet mapping (`completed/done`, `failed/failed`, or
+`interrupted/cancelled`); unknown launch/runtime outcomes remain nonterminal at
+the packet layer until reconciled. Completed, failed, and interrupted terminal
+receipts require every started item to have completed; `runtime_unknown` may
+retain an outstanding item as explicit incomplete-stream evidence.
+
+A Chief-created per-launch OS lock covers reserve/load, controller execution,
+and terminal publication. It supplies cooperative same-platform at-most-one
+process ownership for one launch id; semantic packet/head CAS arbitrates
+different launch ids contending for one arm. Neither mechanism is adversarial
+same-user isolation or cross-Windows/WSL mutual exclusion.
+
+The `process_start_pending` callback is the durable runtime-process
+authorization boundary. It revalidates permit/arm expiry, the complete live
+ownership and dispatch generation, fresh namespace state, `local_files`
+storage, and the writable Git/claim pre-image immediately before commit. The
+same milestone authorizes the bounded exact-binary version probe and subsequent
+App Server Popen; neither child may execute before it. After pending commits,
+failure becomes `launch_unknown` and no invocation may automatically start a
+replacement process. `reservation_effective_at` is a sealed semantic event
+time, not observed consumption wall time. CLI start fields are derived only
+from the durable journal; `app_server_start_durably_observed` deliberately does
+not infer an unpersisted physical Popen.
+
+The runtime projection preserves the original `codex_runtime_observed`
+terminal receipt. A writable turn can gain a second, binding-backed
+`verified_mutation` record only after exact pre/post Git endpoints, tree
+objects, and claim coverage materialize from CAS. The mutation index is a
+separate semantic namespace; neither receipt changes the AOI task completion
+state. A start request with an uncertain response becomes `launch_unknown` and
+cannot be resent. A known active turn lost mid-stream becomes
+`runtime_unknown`. `turn/interrupt` acknowledgement remains nonterminal until
+the correlated `turn/completed` notification arrives.
 
 ## Known v0.3 alpha boundaries
 

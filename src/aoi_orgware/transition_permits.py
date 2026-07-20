@@ -27,13 +27,19 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 # preserve a path-like or URI-like lifecycle target.
 _LIFECYCLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{16,128}")
-_PERMITTED_ACTIONS = frozenset({"packet.arm", "cohort.advance"})
+_PERMITTED_ACTIONS = frozenset({"packet.arm", "cohort.advance", "codex.launch"})
 _PACKET_ARM_PARAMETER_FIELDS = {
     "packet_id",
     "packet_schema_version",
     "routing_authority_sha256",
 }
 _COHORT_ADVANCE_PARAMETER_FIELDS = {"cohort_id", "cohort_sha256", "wave_index"}
+_CODEX_LAUNCH_PARAMETER_FIELDS = {
+    "launch_id",
+    "launch_intent_sha256",
+    "packet_id",
+    "routing_binding",
+}
 _MAX_WAVE_INDEX = 1_000_000
 _DECISION_BASE_FIELDS = {
     "schema_version",
@@ -127,6 +133,75 @@ def _bounded_int(value: Any, label: str, *, maximum: int) -> int:
     return value
 
 
+def _routing_binding(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _fail("parameters.routing_binding schema is invalid")
+    item = dict(value)
+    kind = item.get("kind")
+    common_fields = {
+        "kind",
+        "routing_authority_sha256",
+        "transport",
+        "parent_session_id",
+        "expected_agent_type",
+    }
+    if kind == "standalone":
+        fields = common_fields
+    elif kind == "cohort":
+        fields = common_fields | {
+            "cohort_id",
+            "cohort_sha256",
+            "wave_index",
+            "transport_slot_sha256",
+        }
+    else:
+        _fail("parameters.routing_binding.kind is invalid")
+    if set(item) != fields:
+        _fail("parameters.routing_binding schema is invalid")
+    if item["transport"] != "codex":
+        _fail("parameters.routing_binding.transport must be codex")
+    parent_session_id = _lifecycle_id(
+        item["parent_session_id"], "parameters.routing_binding.parent_session_id"
+    )
+    expected_agent_type = item["expected_agent_type"]
+    if expected_agent_type != "*":
+        expected_agent_type = _lifecycle_id(
+            expected_agent_type, "parameters.routing_binding.expected_agent_type"
+        )
+    result: dict[str, Any] = {
+        "kind": kind,
+        "routing_authority_sha256": _sha256(
+            item["routing_authority_sha256"],
+            "parameters.routing_binding.routing_authority_sha256",
+        ),
+        "transport": "codex",
+        "parent_session_id": parent_session_id,
+        "expected_agent_type": expected_agent_type,
+    }
+    if kind == "cohort":
+        result.update(
+            {
+                "cohort_id": _lifecycle_id(
+                    item["cohort_id"], "parameters.routing_binding.cohort_id"
+                ),
+                "cohort_sha256": _sha256(
+                    item["cohort_sha256"],
+                    "parameters.routing_binding.cohort_sha256",
+                ),
+                "wave_index": _bounded_int(
+                    item["wave_index"],
+                    "parameters.routing_binding.wave_index",
+                    maximum=_MAX_WAVE_INDEX,
+                ),
+                "transport_slot_sha256": _sha256(
+                    item["transport_slot_sha256"],
+                    "parameters.routing_binding.transport_slot_sha256",
+                ),
+            }
+        )
+    return result
+
+
 def _exact_int(value: Any, label: str, *, expected: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value != expected:
         _fail(f"{label} is invalid")
@@ -163,6 +238,20 @@ def _parameters(action: str, value: Any, target_ids: list[str]) -> dict[str, Any
                 item["wave_index"], "parameters.wave_index", maximum=_MAX_WAVE_INDEX
             ),
         }
+    if action == "codex.launch":
+        if set(item) != _CODEX_LAUNCH_PARAMETER_FIELDS:
+            _fail("codex.launch parameters schema is invalid")
+        launch_id = _lifecycle_id(item["launch_id"], "parameters.launch_id")
+        if target_ids != [launch_id]:
+            _fail("codex.launch target_ids must name parameters.launch_id")
+        return {
+            "launch_id": launch_id,
+            "launch_intent_sha256": _sha256(
+                item["launch_intent_sha256"], "parameters.launch_intent_sha256"
+            ),
+            "packet_id": _lifecycle_id(item["packet_id"], "parameters.packet_id"),
+            "routing_binding": _routing_binding(item["routing_binding"]),
+        }
     _fail("action is invalid")
 
 
@@ -194,15 +283,19 @@ def _decision_base(value: Any) -> dict[str, Any]:
     )
     action = _action(item["action"])
     target_ids = _target_ids(item["target_ids"])
+    parameters = _parameters(action, item["parameters"], target_ids)
+    technical_payload_sha256 = _sha256(
+        item["technical_payload_sha256"], "technical_payload_sha256"
+    )
+    if action == "codex.launch" and technical_payload_sha256 != parameters["launch_intent_sha256"]:
+        _fail("codex.launch technical_payload_sha256 must match parameters.launch_intent_sha256")
     return {
         "schema_version": DECISION_SCHEMA_VERSION,
         "task_id": _lifecycle_id(item["task_id"], "task_id"),
         "action": action,
         "target_ids": target_ids,
-        "parameters": _parameters(action, item["parameters"], target_ids),
-        "technical_payload_sha256": _sha256(
-            item["technical_payload_sha256"], "technical_payload_sha256"
-        ),
+        "parameters": parameters,
+        "technical_payload_sha256": technical_payload_sha256,
     }
 
 

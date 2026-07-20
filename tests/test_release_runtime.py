@@ -208,7 +208,7 @@ def _observation(manifest: dict[str, object]) -> dict[str, object]:
 
 
 @pytest.fixture()
-def release_env() -> object:
+def release_env(monkeypatch: pytest.MonkeyPatch) -> object:
     with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as credentials:
         root = Path(temp)
         root.joinpath("aoi.toml").write_text(default_config_text("Release runtime"), encoding="utf-8")
@@ -230,6 +230,20 @@ def release_env() -> object:
                 credential_home=credential_home,
                 now=NOW,
             )
+        # Production deliberately checks that the Chief lease is live at
+        # commit time.  Freeze only that wall-clock observation so these
+        # fixed-time transaction vectors remain hermetic after 2026-07-19.
+        live_summary = h.chief_authority_summary
+
+        def frozen_summary(
+            current_paths: h.HarnessPaths, *, now: datetime | None = None
+        ) -> dict[str, object]:
+            return live_summary(
+                current_paths,
+                now=now or NOW.replace(minute=4),
+            )
+
+        monkeypatch.setattr(h, "chief_authority_summary", frozen_summary)
         yield {
             "paths": paths,
             "chief": chief,

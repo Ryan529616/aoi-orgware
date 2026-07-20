@@ -45,8 +45,9 @@ _RECEIPT_FIELDS_WITH_INSTALL_MAPPING = _RECEIPT_FIELDS | {
 _LOCAL_RECEIPT_FIELDS = {
     "schema_version", "install_proof", "distribution_name", "package_version",
     "installed_metadata_sha256", "metadata_path", "package_root",
-    "console_entry_point", "codex_hook_entry_point",
-    "codex_hook_generated_script", "package_runtime_manifest",
+    "console_entry_point", "codex_hook_entry_point", "codex_bridge_entry_point",
+    "codex_hook_generated_script", "codex_bridge_generated_script",
+    "package_runtime_manifest",
     "hook_protocol_version", "install_wheel_artifact",
     "installed_distribution_identity", "installed_mapping_strength",
     "installed_mapping_evidence", "installed_record",
@@ -76,6 +77,7 @@ _INSTALLED_MAPPING_STRENGTHS = frozenset({
 })
 _AOI_CONSOLE_TARGET = "aoi_orgware.cli:main"
 _AOI_HOOK_TARGET = "aoi_orgware.codex_hook:main"
+_AOI_BRIDGE_TARGET = "aoi_orgware.codex_transport_cli:main"
 
 
 class CodexInstallProvenanceError(ValueError):
@@ -681,11 +683,19 @@ def _local_install_contract(
     if wheel_path.name != wheel["name"] or len(wheel_raw) != wheel["size_bytes"] or _sha256(wheel_raw) != wheel["sha256"]:
         _fail("local installation wheel bytes differ from proof")
     if not isinstance(interfaces, Mapping) or set(interfaces) != {
-        "installed_metadata_sha256", "console_entry_point", "codex_hook_entry_point", "hook_protocol_version",
+        "installed_metadata_sha256",
+        "console_entry_point",
+        "codex_hook_entry_point",
+        "codex_bridge_entry_point",
+        "hook_protocol_version",
     }:
         _fail("local installation bundle interface contract is invalid")
     _digest(interfaces.get("installed_metadata_sha256"), "local installation METADATA SHA-256")
-    for field, target in (("console_entry_point", _AOI_CONSOLE_TARGET), ("codex_hook_entry_point", _AOI_HOOK_TARGET)):
+    for field, target in (
+        ("console_entry_point", _AOI_CONSOLE_TARGET),
+        ("codex_hook_entry_point", _AOI_HOOK_TARGET),
+        ("codex_bridge_entry_point", _AOI_BRIDGE_TARGET),
+    ):
         entry = interfaces[field]
         if not isinstance(entry, Mapping) or set(entry) != {"name", "target"} or not isinstance(entry.get("name"), str) or entry.get("target") != target:
             _fail("local installation bundle entry-point contract is invalid")
@@ -775,13 +785,17 @@ def validate_codex_local_install_provenance(
     metadata_sha = _verify_recorded(metadata_path, record, "installed METADATA")
     if metadata_sha != interfaces["installed_metadata_sha256"]:
         _fail("installed METADATA digest differs from local proof interface")
-    console, hook = interfaces["console_entry_point"], interfaces["codex_hook_entry_point"]
+    console = interfaces["console_entry_point"]
+    hook = interfaces["codex_hook_entry_point"]
+    bridge = interfaces["codex_bridge_entry_point"]
     _entry_point(dist, console["name"], console["target"], "console")
     _entry_point(dist, hook["name"], hook["target"], "Codex hook")
+    _entry_point(dist, bridge["name"], bridge["target"], "Codex bridge")
     package = importlib.import_module("aoi_orgware")
     version_module = importlib.import_module("aoi_orgware._version")
     cli_module = importlib.import_module("aoi_orgware.cli")
     hook_module = importlib.import_module("aoi_orgware.codex_hook")
+    bridge_module = importlib.import_module("aoi_orgware.codex_transport_cli")
     if package.__file__ is None:
         _fail("runtime package has no file")
     package_root = _canonical_existing(Path(package.__file__).parent, "runtime package root", directory=True)
@@ -789,7 +803,12 @@ def validate_codex_local_install_provenance(
         _fail("runtime package is source-checkout or cross-site shadowed")
     _under(package_root, prefix, "runtime package")
     _verify_recorded(package_root / "__init__.py", record, "runtime package initializer")
-    for module, relative, label in ((version_module, "_version.py", "runtime version module"), (cli_module, "cli.py", "runtime CLI module"), (hook_module, "codex_hook.py", "runtime hook module")):
+    for module, relative, label in (
+        (version_module, "_version.py", "runtime version module"),
+        (cli_module, "cli.py", "runtime CLI module"),
+        (hook_module, "codex_hook.py", "runtime hook module"),
+        (bridge_module, "codex_transport_cli.py", "runtime Codex bridge module"),
+    ):
         module_file = module.__file__
         if module_file is None or _canonical_existing(module_file, label) != package_root / relative:
             _fail(f"{label} is package-shadowed")
@@ -801,8 +820,17 @@ def validate_codex_local_install_provenance(
     package_manifest = _runtime_package_manifest(package_root, record)
     console_path, console_sha, _console_script, _console_script_sha = _launcher(prefix, console["name"], console["target"], invoked_console, record, "console launcher")
     hook_path, hook_sha, hook_script, hook_script_sha = _launcher(prefix, hook["name"], hook["target"], None, record, "Codex hook launcher")
+    bridge_path, bridge_sha, bridge_script, bridge_script_sha = _launcher(
+        prefix,
+        bridge["name"],
+        bridge["target"],
+        None,
+        record,
+        "Codex bridge launcher",
+    )
     _under(console_path, prefix, "console launcher")
     _under(hook_path, prefix, "Codex hook launcher")
+    _under(bridge_path, prefix, "Codex bridge launcher")
     base = {
         "schema_version": 2,
         "install_proof": {
@@ -819,6 +847,8 @@ def validate_codex_local_install_provenance(
         "console_entry_point": {"name": console["name"], "target": console["target"], "path": str(console_path), "record_sha256": console_sha},
         "codex_hook_entry_point": {"name": hook["name"], "target": hook["target"], "path": str(hook_path), "record_sha256": hook_sha},
         "codex_hook_generated_script": {"path": str(hook_script) if hook_script is not None else None, "record_sha256": hook_script_sha},
+        "codex_bridge_entry_point": {"name": bridge["name"], "target": bridge["target"], "path": str(bridge_path), "record_sha256": bridge_sha},
+        "codex_bridge_generated_script": {"path": str(bridge_script) if bridge_script is not None else None, "record_sha256": bridge_script_sha},
         "package_runtime_manifest": package_manifest, "hook_protocol_version": 6,
         "install_wheel_artifact": dict(contract["wheel"]),
         "installed_distribution_identity": {"name": dist.metadata["Name"], "version": dist.version, "metadata_sha256": metadata_sha},
@@ -855,7 +885,11 @@ def _validate_local_install_provenance_receipt(receipt: Mapping[str, Any]) -> di
     _digest(item["installed_metadata_sha256"], "installed METADATA SHA-256")
     if item["hook_protocol_version"] != 6:
         _fail("local Codex install provenance receipt hook protocol is invalid")
-    for field, target in (("console_entry_point", _AOI_CONSOLE_TARGET), ("codex_hook_entry_point", _AOI_HOOK_TARGET)):
+    for field, target in (
+        ("console_entry_point", _AOI_CONSOLE_TARGET),
+        ("codex_hook_entry_point", _AOI_HOOK_TARGET),
+        ("codex_bridge_entry_point", _AOI_BRIDGE_TARGET),
+    ):
         entry = item[field]
         if not isinstance(entry, Mapping) or set(entry) != _ENTRY_RECEIPT_FIELDS:
             _fail("local Codex install provenance receipt entry point is invalid")
@@ -863,14 +897,15 @@ def _validate_local_install_provenance_receipt(receipt: Mapping[str, Any]) -> di
             _fail("local Codex install provenance receipt entry point is invalid")
         _absolute_receipt_path(entry["path"], f"local install receipt {field} path")
         _digest(entry["record_sha256"], "entry point RECORD SHA-256")
-    script = item["codex_hook_generated_script"]
-    if not isinstance(script, Mapping) or set(script) != _SCRIPT_RECEIPT_FIELDS or (script.get("path") is None) != (script.get("record_sha256") is None):
-        _fail("local Codex install provenance receipt generated script is invalid")
-    if script["path"] is not None:
-        if not isinstance(script["path"], str) or not script["path"]:
+    for field in ("codex_hook_generated_script", "codex_bridge_generated_script"):
+        script = item[field]
+        if not isinstance(script, Mapping) or set(script) != _SCRIPT_RECEIPT_FIELDS or (script.get("path") is None) != (script.get("record_sha256") is None):
             _fail("local Codex install provenance receipt generated script is invalid")
-        _absolute_receipt_path(script["path"], "local install receipt generated script path")
-        _digest(script["record_sha256"], "generated script RECORD SHA-256")
+        if script["path"] is not None:
+            if not isinstance(script["path"], str) or not script["path"]:
+                _fail("local Codex install provenance receipt generated script is invalid")
+            _absolute_receipt_path(script["path"], f"local install receipt {field} path")
+            _digest(script["record_sha256"], "generated script RECORD SHA-256")
     package_manifest = item["package_runtime_manifest"]
     if not isinstance(package_manifest, Mapping) or set(package_manifest) != _PACKAGE_MANIFEST_RECEIPT_FIELDS or not isinstance(package_manifest.get("count"), int) or isinstance(package_manifest["count"], bool) or not 0 < package_manifest["count"] <= _MAX_PACKAGE_RUNTIME_FILES:
         _fail("local Codex install provenance receipt package manifest is invalid")
@@ -1072,6 +1107,18 @@ def verify_runtime_hook_provenance(project_root: str | os.PathLike[str], expecte
         _fail("current runtime package manifest differs from provenance receipt")
     if _verify_recorded(named, record, "recorded Codex hook launcher") != _digest(hook["record_sha256"], "recorded hook SHA-256"):
         _fail("current Codex hook launcher differs from provenance receipt")
+    bridge: Mapping[str, Any] | None = None
+    bridge_named: Path | None = None
+    if item["schema_version"] == 2:
+        bridge = item["codex_bridge_entry_point"]
+        bridge_named = _canonical_existing(
+            bridge["path"], "recorded Codex bridge launcher"
+        )
+        _require_executable(bridge_named, "recorded Codex bridge launcher")
+        if _verify_recorded(
+            bridge_named, record, "recorded Codex bridge launcher"
+        ) != _digest(bridge["record_sha256"], "recorded bridge SHA-256"):
+            _fail("current Codex bridge launcher differs from provenance receipt")
     script = item["codex_hook_generated_script"]
     if script["path"] is not None:
         script_path = _canonical_existing(script["path"], "recorded Codex hook generated script")
@@ -1080,6 +1127,30 @@ def verify_runtime_hook_provenance(project_root: str | os.PathLike[str], expecte
         if _generated_script(script_path, hook["target"], record, "Codex hook launcher") != _digest(script["record_sha256"], "recorded generated script SHA-256"):
             _fail("current Codex hook generated script differs from provenance receipt")
     if item["schema_version"] == 2:
+        if bridge is None or bridge_named is None:
+            _fail("local Codex bridge receipt entry is unavailable")
+        bridge_script = item["codex_bridge_generated_script"]
+        if bridge_script["path"] is not None:
+            bridge_script_path = _canonical_existing(
+                bridge_script["path"], "recorded Codex bridge generated script"
+            )
+            if (
+                bridge_script_path.parent != bridge_named.parent
+                or bridge_script_path.name != f"{bridge['name']}-script.py"
+            ):
+                _fail("recorded Codex bridge generated script path is invalid")
+            if _generated_script(
+                bridge_script_path,
+                bridge["target"],
+                record,
+                "Codex bridge launcher",
+            ) != _digest(
+                bridge_script["record_sha256"],
+                "recorded bridge generated script SHA-256",
+            ):
+                _fail(
+                    "current Codex bridge generated script differs from provenance receipt"
+                )
         proof = item["install_proof"]
         _bundle, contract, bundle_path = _local_install_contract(
             proof["bundle_path"], proof["bundle_sha256"]

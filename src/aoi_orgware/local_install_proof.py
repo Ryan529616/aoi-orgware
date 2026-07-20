@@ -31,7 +31,7 @@ _OID = {"sha1": re.compile(r"[0-9a-f]{40}\Z"), "sha256": re.compile(r"[0-9a-f]{6
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\Z")
 _VERSION = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$', re.MULTILINE)
 _HOOK = re.compile(r'^HOOK_PROTOCOL_VERSION\s*=\s*["\'](\d+)["\']\s*$', re.MULTILINE)
-_SAFE_REL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+-]{0,511}\Z")
+_SAFE_REL = re.compile(r"[A-Za-z0-9.][A-Za-z0-9._/@+-]{0,511}\Z")
 _SAFE_REVIEWER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
 
 
@@ -97,7 +97,7 @@ def _timestamp(value: Any, label: str) -> str:
 
 def _safe_relative(value: Any, label: str) -> str:
     value = _text(value, label, limit=512)
-    if "\\" in value or _SAFE_REL.fullmatch(value) is None:
+    if value in {".", ".."} or "\\" in value or _SAFE_REL.fullmatch(value) is None:
         _fail(f"{label} is not a safe relative path")
     parsed = PurePosixPath(value)
     if parsed.is_absolute() or ".." in parsed.parts or str(parsed) != value:
@@ -471,7 +471,7 @@ def _wheel_interface(wheel_raw: bytes, *, version: str) -> dict[str, Any]:
         metadata[key] = member_value
     if metadata.get("Name") != "aoi-orgware" or metadata.get("Version") != version:
         _fail("wheel METADATA does not bind package identity")
-    required = {"aoi = aoi_orgware.cli:main", "aoi-codex-hook = aoi_orgware.codex_hook:main", "aoi-claude-hook = aoi_orgware.claude_hook:main"}
+    required = {"aoi = aoi_orgware.cli:main", "aoi-codex-hook = aoi_orgware.codex_hook:main", "aoi-codex-bridge = aoi_orgware.codex_transport_cli:main", "aoi-claude-hook = aoi_orgware.claude_hook:main"}
     in_console = False; found: list[str] = []
     for line in entries_text.splitlines():
         stripped = line.strip()
@@ -583,7 +583,7 @@ def _validate_subject(value: Mapping[str, Any]) -> dict[str, Any]:
     _rehearsal(rehearsal["report"], source, manifest, lock["raw_sha256"], inventory)
     interface = _object(item["wheel_interface"], {"metadata_sha256", "entry_points_sha256", "record_sha256", "cli_sha256", "hook_protocol_version", "entry_points"}, "subject wheel interface")
     for key in ("metadata_sha256", "entry_points_sha256", "record_sha256", "cli_sha256"): _sha(interface[key], f"subject wheel {key}")
-    expected_entries = sorted(["aoi = aoi_orgware.cli:main", "aoi-codex-hook = aoi_orgware.codex_hook:main", "aoi-claude-hook = aoi_orgware.claude_hook:main"])
+    expected_entries = sorted(["aoi = aoi_orgware.cli:main", "aoi-codex-hook = aoi_orgware.codex_hook:main", "aoi-codex-bridge = aoi_orgware.codex_transport_cli:main", "aoi-claude-hook = aoi_orgware.claude_hook:main"])
     if interface["hook_protocol_version"] != 6 or interface["entry_points"] != expected_entries: _fail("subject wheel interface is invalid")
     _sha(item["subject_sha256"], "subject sha256")
     if _digest({key: item[key] for key in item if key != "subject_sha256"}) != item["subject_sha256"]: _fail("subject digest does not match")
@@ -713,7 +713,39 @@ def local_install_contract(bundle: Mapping[str, Any], *, bundle_path: Path | Non
         if stored != item: _fail("bundle_path does not contain these canonical bundle bytes")
     root = subject["artifact_store_root"]; source = subject["source"]
     wheel = next(entry for entry in subject["inventory"]["artifacts"] if str(entry["name"]).endswith(".whl"))
-    return {"bundle_sha256": item["bundle_sha256"], "artifact_store_root": root, "source_commit_oid": source["head"], "source_tree_oid": source["tree"], "source_manifest_sha256": source["source_manifest"]["raw_sha256"], "rehearsal_report_sha256": subject["rehearsal"]["raw_sha256"], "inventory_sha256": subject["inventory"]["inventory_sha256"], "distribution_name": "aoi-orgware", "package_version": source["package_version"], "wheel": {"path": str(Path(root) / wheel["path"]), "name": wheel["name"], "size_bytes": wheel["size_bytes"], "sha256": wheel["sha256"]}, "interfaces": {"installed_metadata_sha256": subject["wheel_interface"]["metadata_sha256"], "console_entry_point": {"name": "aoi", "target": "aoi_orgware.cli:main"}, "codex_hook_entry_point": {"name": "aoi-codex-hook", "target": "aoi_orgware.codex_hook:main"}, "hook_protocol_version": 6}}
+    return {
+        "bundle_sha256": item["bundle_sha256"],
+        "artifact_store_root": root,
+        "source_commit_oid": source["head"],
+        "source_tree_oid": source["tree"],
+        "source_manifest_sha256": source["source_manifest"]["raw_sha256"],
+        "rehearsal_report_sha256": subject["rehearsal"]["raw_sha256"],
+        "inventory_sha256": subject["inventory"]["inventory_sha256"],
+        "distribution_name": "aoi-orgware",
+        "package_version": source["package_version"],
+        "wheel": {
+            "path": str(Path(root) / wheel["path"]),
+            "name": wheel["name"],
+            "size_bytes": wheel["size_bytes"],
+            "sha256": wheel["sha256"],
+        },
+        "interfaces": {
+            "installed_metadata_sha256": subject["wheel_interface"]["metadata_sha256"],
+            "console_entry_point": {
+                "name": "aoi",
+                "target": "aoi_orgware.cli:main",
+            },
+            "codex_hook_entry_point": {
+                "name": "aoi-codex-hook",
+                "target": "aoi_orgware.codex_hook:main",
+            },
+            "codex_bridge_entry_point": {
+                "name": "aoi-codex-bridge",
+                "target": "aoi_orgware.codex_transport_cli:main",
+            },
+            "hook_protocol_version": 6,
+        },
+    }
 
 
 build_subject = create_subject

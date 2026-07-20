@@ -309,14 +309,18 @@ Hook consumption records the transport-specific provenance
 (`codex_subagent_start_observed` or `claude_subagent_start_observed`) and the
 actual event identity. This proves only that the permit existed before AOI
 observed the start. Codex creates the sub-agent before `SubagentStart`, and hook
-output cannot terminate that agent; the Claude Code adapter additionally denies
-a governed spawn at `PreToolUse` unless the exact arm still passes full Chief,
-digest, topology, lane, and resource-authority validation before the sub-agent
-exists, but non-cooperating or workflow-orchestrated spawns still reach
-`SubagentStart` unblocked. Like every client hook path, an unexpected adapter
-exception remains fail-open and is not a security boundary; classified mapping,
-arm, and authority failures deny normally. A start with no unique valid arm
-therefore
+output cannot terminate that agent. For supported Codex tool handlers,
+`PreToolUse` can synchronously deny a governed tool request before invocation;
+the local `codex-cli 0.144.0` canary confirmed this for Bash. That is a narrow
+tool gate, not a collaboration pre-spawn gate: handler coverage is not complete,
+and agent spawning still relies on the prior arm plus `SubagentStart` accounting.
+The Claude Code adapter can likewise deny its governed pre-tool requests, but
+neither adapter turns non-cooperating or workflow-orchestrated spawning into a
+pre-spawn hard block. For any `PreToolUse` event, any internal adapter fault
+returns the fixed deny response (fail-closed); only non-`PreToolUse`
+lifecycle adapters remain fail-open. This is not a security boundary;
+classified mapping, arm, and authority failures deny normally. A start with no
+unique valid arm therefore
 creates an idempotent open `unmanaged_subagent_start` incident and instructs the
 agent to stop without material work. Open incidents are visible in checkpoints,
 are doctor errors, and block close/cancel until the Chief records one of the
@@ -576,14 +580,104 @@ preference, irreversible state, or unresolved high-confidence dissent. The user
 need not approve each implementation step, but the organization must not invent
 the user's preferences.
 
+## Local-files confidentiality
+
+The optional `local_files` profile means **model context allowed, file
+publication denied**. It does not promise that the model provider cannot see
+prompt or project context, and it is not DLP, an air gap, or an offline-model
+profile. Fully offline/self-hosted execution is a separate future profile.
+
+Local Git remains normal: branch, status, diff, commit, local bundles, local
+CAS, receipts, and seals are allowed. AOI-managed Git push/LFS upload, remote
+CI, GitHub Release, package publication, external artifact storage, and
+attachment/connector publication fail closed. An intentional export requires a
+Chief-issued one-shot permit bound to the exact task/state head, destination,
+content SHA-256 and size, purpose, nonce, and expiry. The exporter receives no
+reusable Chief credential, and permit consumption is authorization only; it
+does not claim that AOI performed or observed an upload.
+
+Under this profile, `doctor` reports effective fetch/push URLs, URL rewrites,
+LFS endpoints, remote workflow files, local/synchronized artifact storage,
+known publish-credential variable names or helpers without values, and
+authenticated push/export receipts. Credential-name matching is a finite
+detector, not secret discovery; an unlisted credential can remain invisible.
+Confirmed external or synchronized publication paths are errors. Windows drive
+letters are checked with `GetDriveTypeW` and DOS-device alias inspection:
+mapped drives are network paths, while a missing root, metadata failure, SUBST
+alias, or link/reparse traversal is explicitly unverified and fails the
+confirmed-local storage/launch gate. File-URI paths are strictly percent-decoded
+before drive classification, and the generic Windows reparse attribute is
+checked in addition to symlink/junction helpers. Caller-visible and resolved
+drives are both classified so resolving a path cannot erase a DOS-device alias;
+malformed URLs become redacted invalid findings. Latent workflow detection remains a
+warning rather than proof that the workflow ran.
+Bridge issue, pre-reserve, and process-pending boundaries also preflight the AOI
+artifact/CAS root and any writable cwd. A confirmed network/sync root is denied
+before state publication or Popen; unverified locality is also denied without
+being mislabeled confirmed danger. This is a bounded AOI-managed enforcement
+slice; a same-user process or ungoverned shell can still bypass it.
+
+Promotion is profile-aware. A publication-enabled profile may require exact
+final-SHA remote-main CI. `local_files` forbids that route and instead requires
+an exact local commit/tree, complete Windows and WSL suites, applicable
+authorized local EDA evidence only when the project completion boundary names
+it, independent review, integrity-v2 seal, package/isolated-install smoke, an
+encrypted local bundle, and then stop. A remote PASS from another profile or
+older SHA is historical only.
+
+## Optional Codex Transport Bridge
+
+`aoi-codex-bridge` is a separate, stdlib-only finite adapter; AOI core remains
+dependency-free. Chief-fenced `issue` publishes an immutable launch intent,
+one-shot permit, exact canonical packet-arm authority, and pinned Codex
+executable/version/schema binding. `run` receives only the permit SHA and
+issuance marker. It must not receive or retain a reusable Chief credential.
+
+Permit consumption is one semantic compare-and-append: the exact arm becomes
+`transport_reserved`, the packet becomes bridge-owned `dispatched`, and a
+sealed ownership object binds the task, packet contract, arm, launch, intent,
+permit, reservation, and routing authority. This transition upgrades packet
+and task dispatch generation to v2 and does not fabricate `SubagentStart`, an
+agent id, thread id, turn id, or runtime observation. Ordinary packet lifecycle
+commands cannot cancel or re-dispatch a nonterminal bridge owner. Known runtime
+terminals map exactly to packet status (`completed -> done`, `failed -> failed`,
+`interrupted -> cancelled`); `launch_unknown` and `runtime_unknown` cannot
+become terminal packets until explicit reconciliation proves a new verdict.
+
+One Chief-created per-launch OS lock serializes the complete controller
+lifetime for a cooperative AOI platform lock domain. Same-arm/different-launch
+competition is resolved separately by the packet/head semantic CAS. The lock
+is not adversarial same-user protection and does not promise cross-Windows/WSL
+mutual exclusion.
+
+Immediately before the durable `process_start_pending` milestone, AOI
+revalidates the earlier permit/arm expiry, exact live ownership and dispatch-v2
+markers, fresh reserved namespace, confidentiality storage boundary, and any
+writable pre-Git/claim endpoint. That durable pending milestone authorizes the
+bounded exact-binary `--version` probe and the following App Server Popen; no
+child process executes before it. A crash after it is `launch_unknown` and must
+never trigger an automatic restart. `reservation_effective_at` is the
+Chief-sealed semantic event time, not a measured wall-clock consumption
+timestamp. Process-start claims derive only from journal evidence.
+
+A terminal App Server turn remains `codex_runtime_observed`. Only a separate
+exact pre/post Git tree and claim binding may add `verified_mutation`; neither
+receipt implies packet or task completion. `turn/interrupt` acknowledgement
+is nonterminal until correlated `turn/completed` arrives.
+
 ## Optional Codex hooks
 
 Hooks are disabled by default. When explicitly enabled, installed, and trusted
 through Codex `/hooks`, they can restore checkpoints, warn about lifecycle
 violations, consume Chief-issued one-time packet arms, and record task-local
-unmanaged-start incidents. All other hook failures remain fail-open. Hooks are
-procedural guardrails and narrow dispatch observers, not a sandbox, identity
-provider, or pre-spawn security boundary.
+unmanaged-start incidents. For supported tool handlers, `PreToolUse` can also
+synchronously deny a governed tool request before it executes; the Bash canary
+proves that narrow path only. Tool-handler coverage is not complete, and
+collaboration spawn is not a pre-spawn hook path: it remains governed by an arm
+and later `SubagentStart` accounting. Any internal `PreToolUse` fault is
+fail-closed deny; only non-`PreToolUse` lifecycle adapters remain fail-open.
+Hooks are procedural guardrails, not a sandbox, identity provider, or pre-spawn
+security boundary.
 
 ## Configuration drift
 
@@ -600,15 +694,38 @@ known AOI-managed predecessor policies; an unrecognized/custom policy requires
 `--replace-policy-sha256 <exact-current-digest>` after review. Existing task
 records are never silently reinterpreted.
 
-## v0.4 integrity adoption and offboarding
+## v0.4 integrity adoption, upgrade, and offboarding
 
-An eligible task may adopt the one-way `required_v1` integrity contract with an
-exact baseline head. After adoption, candidate and post-fix mutation snapshots,
-findings, fixes, review results, and review-verification records are bounded
-and content-addressed. A terminal seal binds the latest candidate snapshot,
-latest review result, and the current live-claim scope digest; incomplete,
-stale, tampered, duplicate, or self-reviewing graphs fail closed. A sealed
-integrity contract is immutable.
+New eligible tasks use `integrity-adopt` to create the one-way `required_v2`
+integrity contract with an exact baseline head. `required_v1` is historical and
+frozen: its validator, candidate-only seal semantics, and sealed-task readback
+remain unchanged. A sealed v1 contract is immutable, read-only, and cannot be
+reinterpreted or upgraded.
+
+Any unsealed, valid v1 contract, including a valid empty record set, may use the
+explicit one-way `integrity-upgrade-v2` migration. It must supply the expected
+canonical v1 contract digest. The migration preserves the canonical source v1
+contract as a task-local CAS artifact and writes a receipt that binds its
+schema/mode, digest, task, worktree, baseline, anchor record, and every
+outstanding finding obligation. The frozen v1 validator continues to validate
+that source artifact on later v2 read, doctor, and close paths; no migration may
+silently reinterpret, drop, or weaken a v1 obligation.
+
+`required_v2` is one unified ordered record ledger. Every record has a
+continuous `integrity_seq` and a unique record SHA. A mutation snapshot's
+content SHA may legitimately repeat when the same bytes are observed again,
+but each observation has a distinct record SHA/attempt identity. Review,
+finding, fix, verification, migration, and seal edges therefore use record
+identity, never a snapshot content SHA as a unique key.
+
+Review is iterative: a review with findings creates obligations; each finding's
+latest fix must be independently reverified `PASS` against the exact terminal
+snapshot attempt. The final review is one clean review of that terminal attempt
+before seal. Its review basis must contain exactly the current passing
+verification record for every prior finding—no omissions, substitutions, or
+stale attempts. A terminal seal binds that exact snapshot-record SHA, final
+clean-review SHA, and current live-claim scope digest. Incomplete, stale,
+tampered, duplicate, self-reviewing, or out-of-order graphs fail closed.
 
 The mutation snapshot is a NUL-safe Git observation that includes tracked,
 untracked, rename, case-only, and deletion states. It is compared with the

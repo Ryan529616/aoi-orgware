@@ -1268,6 +1268,7 @@ class TaskLifecycleCommandRegistryTests(unittest.TestCase):
         "start_mini",
         "finish_mini",
         "approve_plan",
+        "plan_update",
         "bind_session",
         "unbind_session",
         "import_legacy",
@@ -1331,6 +1332,18 @@ class TaskLifecycleCommandRegistryTests(unittest.TestCase):
         )
         self.assertIs(args.handler, handlers["finish_mini"])
         self.assertEqual(args.mode, "local-only")
+
+    def test_registry_injects_handler_and_requires_plan_update_cas_args(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "plan-update", "--task", "T1", "--source", "C:/candidate.md",
+                "--expected-source-sha256", "a" * 64,
+                "--expected-current-plan-sha256", "b" * 64,
+                "--reason", "replace stale plan",
+            ]
+        )
+        self.assertIs(args.handler, handlers["plan_update"])
 
     def test_registry_uses_injected_vocab_for_claim_status_choices(self) -> None:
         parser, handlers = self.parser()

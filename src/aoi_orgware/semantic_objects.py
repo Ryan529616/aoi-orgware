@@ -26,6 +26,14 @@ BINDING_SCHEMA_VERSION = 1
 MAX_OBJECT_BYTES = 512 * 1024
 MAX_SMALL_OBJECT_BYTES = 64 * 1024
 MAX_COHORT_OBJECT_BYTES = 128 * 1024
+# Transport payloads are strict, hash-only (apart from the audited cwd/model
+# fields in the launch intent).  Their contract records cap at 64 KiB; allow
+# room for the immutable semantic-object wrapper without giving them the
+# generic 512 KiB ceiling.
+MAX_CODEX_LAUNCH_INTENT_OBJECT_BYTES = 96 * 1024
+MAX_CODEX_LAUNCH_AUTHORITY_OBJECT_BYTES = 96 * 1024
+MAX_CODEX_TRANSPORT_RECEIPT_OBJECT_BYTES = 96 * 1024
+MAX_CODEX_MUTATION_VERIFICATION_OBJECT_BYTES = 16 * 1024
 MAX_BINDING_BYTES = 64 * 1024
 MAX_OBJECTS_PER_TASK = 16_384
 MAX_BINDINGS_PER_TASK = 16_384
@@ -56,6 +64,10 @@ OBJECT_TYPES = frozenset(
         "release_observation",
         "promotion_receipt",
         "release_promotion_intent",
+        "codex_launch_intent",
+        "codex_launch_authority",
+        "codex_transport_receipt",
+        "codex_mutation_verification",
     }
 )
 SMALL_OBJECT_TYPES = frozenset(
@@ -69,6 +81,9 @@ BINDING_KINDS = frozenset(
         "permit_consumption",
         "cohort_advance",
         "release_promotion",
+        "codex_launch_reservation",
+        "codex_transport_milestone",
+        "codex_mutation_verification",
     }
 )
 
@@ -168,6 +183,7 @@ _RELEASE_AUTHORITY_REF = re.compile(
 _RELEASE_ABANDON_AUTHORITY_REF = re.compile(
     r"chief:([A-Za-z0-9._-]{1,128}):e([1-9][0-9]*):release-abandon:([0-9a-f]{64})"
 )
+_CODEX_TRANSPORT_RECEIPT_FIELDS = frozenset({"receipt_kind", "receipt"})
 
 
 class SemanticObjectError(h.HarnessError):
@@ -277,6 +293,7 @@ def _object_base(
     task_id = h.validate_id(task_id, "task id")
     identity = _validate_text(object_identity, "object identity", MAX_OBJECT_IDENTITY_CHARS)
     payload_copy = _clone(payload, max_bytes=MAX_OBJECT_BYTES)
+    payload_copy = _validate_transport_payload(object_type, task_id, payload_copy)
     return {
         "schema_version": OBJECT_SCHEMA_VERSION,
         "object_type": object_type,
@@ -285,6 +302,69 @@ def _object_base(
         "payload": payload_copy,
         "payload_sha256": _sha(payload_copy, max_bytes=MAX_OBJECT_BYTES),
     }
+
+
+def _validate_transport_payload(object_type: str, task_id: str, payload: Any) -> Any:
+    """Return a closed transport payload, or the generic payload for v0.3 types.
+
+    Semantic objects are intentionally generic for the pre-v0.4 object types.
+    These new transport registrations are different: they carry execution
+    authority/evidence, so they must be validated as the closed pure-contract
+    records.  In particular, raw prompts, assistant output, tool output, and
+    arbitrary App Server JSON cannot enter AOI merely through a registered
+    object type.
+    """
+
+    if object_type not in {
+        "codex_launch_intent",
+        "codex_launch_authority",
+        "codex_transport_receipt",
+        "codex_mutation_verification",
+    }:
+        return payload
+
+    # This is a stdlib-only, pure contract dependency; it neither launches
+    # Codex nor gives semantic-object storage a controller/Chief credential.
+    from . import codex_transport_contracts as transport
+
+    try:
+        if object_type == "codex_launch_intent":
+            normalized = transport.validate_launch_intent(payload)
+            if normalized["task_id"] != task_id:
+                raise SemanticObjectError("Codex launch intent task identity does not match object")
+            return normalized
+
+        if object_type == "codex_launch_authority":
+            normalized = transport.validate_launch_authority(payload)
+            if normalized["task_id"] != task_id:
+                raise SemanticObjectError(
+                    "Codex launch authority task identity does not match object"
+                )
+            return normalized
+
+        if object_type == "codex_transport_receipt":
+            if not isinstance(payload, dict) or set(payload) != _CODEX_TRANSPORT_RECEIPT_FIELDS:
+                raise SemanticObjectError("Codex transport receipt schema is invalid")
+            kind = payload["receipt_kind"]
+            validators = {
+                "reservation": transport.validate_reservation,
+                "journal_event": transport.validate_journal_event,
+                "terminal": transport.validate_terminal_receipt,
+            }
+            if not isinstance(kind, str) or kind not in validators:
+                raise SemanticObjectError("Codex transport receipt kind is invalid")
+            return {"receipt_kind": kind, "receipt": validators[kind](payload["receipt"])}
+
+        # This only validates a closed set of structural CAS references.  It
+        # deliberately does not materialize those references, reconstruct Git
+        # snapshots, assess claim coverage, or promote a task: those are
+        # controller/Chief responsibilities.  Equal pre/post tree hashes are
+        # valid when an observed working-tree change does not move HEAD/tree.
+        return transport.validate_mutation_verification_payload(payload)
+    except SemanticObjectError:
+        raise
+    except transport.CodexTransportContractError as exc:
+        raise SemanticObjectError(f"Codex transport payload is invalid: {exc}") from exc
 
 
 def create_semantic_object(
@@ -530,6 +610,14 @@ def _read_private_json(path: Path, label: str, *, maximum: int) -> dict[str, Any
 def _object_limit(object_type: str) -> int:
     if object_type == "cohort_plan":
         return MAX_COHORT_OBJECT_BYTES
+    if object_type == "codex_launch_intent":
+        return MAX_CODEX_LAUNCH_INTENT_OBJECT_BYTES
+    if object_type == "codex_launch_authority":
+        return MAX_CODEX_LAUNCH_AUTHORITY_OBJECT_BYTES
+    if object_type == "codex_transport_receipt":
+        return MAX_CODEX_TRANSPORT_RECEIPT_OBJECT_BYTES
+    if object_type == "codex_mutation_verification":
+        return MAX_CODEX_MUTATION_VERIFICATION_OBJECT_BYTES
     return MAX_SMALL_OBJECT_BYTES if object_type in SMALL_OBJECT_TYPES else MAX_OBJECT_BYTES
 
 

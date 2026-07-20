@@ -489,6 +489,81 @@ class EvidenceGateIntegrityWiringTests(HarnessTestCase):
         )
 
 
+class CodexTransportDispatchGenerationTests(HarnessTestCase):
+    def _errors(self, packet: dict, *, model_version: int) -> list[str]:
+        paths = h.get_paths(self.root)
+        state = {
+            "task_id": "transport-generation",
+            "dispatch_model_version": model_version,
+            "subagent_incidents": [],
+            "packets": [packet],
+        }
+        with (
+            mock.patch.object(pi, "packet_lock_integrity_errors", return_value=[]),
+            mock.patch.object(
+                pi, "packet_resource_envelope_integrity_errors", return_value=[]
+            ),
+            mock.patch.object(pi, "packet_contract_integrity_error", return_value=None),
+            mock.patch.object(pi, "packet_input_integrity_errors", return_value=[]),
+            mock.patch.object(pi, "packet_command_integrity_error", return_value=None),
+            mock.patch.object(pi, "packet_result_integrity_errors", return_value=[]),
+        ):
+            return pi.packet_integrity_errors(
+                paths, state, services=_services()
+            ) + pi.subagent_incident_integrity_errors(
+                state, services=_services()
+            )
+
+    @staticmethod
+    def _packet(*, dispatch_version: int, provenance: str) -> dict:
+        return {
+            "packet_id": "transport-packet",
+            "packet_schema_version": 5,
+            "dispatch_schema_origin": "native_v5",
+            "dispatch_version": dispatch_version,
+            "dispatch_provenance": provenance,
+            "dispatch_attempts": [],
+            "status": "dispatched",
+            "agent_id": "" if provenance == "codex_app_server_reserved" else "/root/agent",
+            "packet_mode": "read_only",
+            "packet_purpose": "work",
+        }
+
+    def test_transport_packet_and_task_generation_cannot_downgrade(self) -> None:
+        errors = self._errors(
+            self._packet(
+                dispatch_version=1,
+                provenance="codex_app_server_reserved",
+            ),
+            model_version=1,
+        )
+        self.assertTrue(any("was downgraded" in item for item in errors), errors)
+
+        errors = self._errors(
+            self._packet(
+                dispatch_version=2,
+                provenance="codex_app_server_reserved",
+            ),
+            model_version=1,
+        )
+        self.assertTrue(
+            any("dispatch_model_version=2" in item for item in errors), errors
+        )
+
+    def test_non_transport_packet_cannot_claim_transport_generation(self) -> None:
+        errors = self._errors(
+            self._packet(
+                dispatch_version=2,
+                provenance="manual_unverified",
+            ),
+            model_version=2,
+        )
+        self.assertTrue(
+            any("non-transport dispatch cannot claim model v2" in item for item in errors),
+            errors,
+        )
+
+
 class CliFactoryWiringTests(unittest.TestCase):
     def test_cli_factory_wires_the_composition_root_callables(self) -> None:
         services = cli_impl._packet_integrity_services()

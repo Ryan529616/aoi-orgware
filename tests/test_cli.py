@@ -37,6 +37,7 @@ from aoi_orgware import evidence_artifacts as evidence_artifacts_impl  # noqa: E
 from aoi_orgware import git_plumbing as git_plumbing_impl  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import integrity_records as integrity_records_impl  # noqa: E402
+from aoi_orgware import integrity_records_v2 as integrity_records_v2_impl  # noqa: E402
 from aoi_orgware import semantic_events as semantic_events_impl  # noqa: E402
 
 
@@ -13195,7 +13196,7 @@ class V5FeatureTests(HarnessTestCase):
         first_adopt = json.loads(self.cli(*adopt_arguments).stdout)
         self.assertFalse(first_adopt["idempotent_replay"])
         adopted = h.load_task(h.get_paths(self.root), "semantic-integrity")
-        self.assertEqual(adopted["integrity_contract"]["mode"], "required_v1")
+        self.assertEqual(adopted["integrity_contract"]["mode"], "required_v2")
         adopted_baseline = adopted["integrity_contract"]["baseline_head"]
 
         # Omitting --baseline-head observes Git HEAD only on first execution.
@@ -13246,8 +13247,8 @@ class V5FeatureTests(HarnessTestCase):
             "integrity-review",
             "--task",
             "semantic-integrity",
-            "--snapshot-sha256",
-            str(candidate["snapshot_sha256"]),
+            "--snapshot-record-sha256",
+            str(candidate["snapshot_record_sha256"]),
             "--reviewer-agent-id",
             "independent-reviewer",
             "--result-artifact",
@@ -13271,8 +13272,8 @@ class V5FeatureTests(HarnessTestCase):
             "integrity-review",
             "semantic-integrity-review",
             "2099-01-01T00:00:02+00:00",
-            "--snapshot-sha256",
-            str(candidate["snapshot_sha256"]),
+            "--snapshot-record-sha256",
+            str(candidate["snapshot_record_sha256"]),
             "--reviewer-agent-id",
             "independent-reviewer",
             "--result-artifact",
@@ -13287,10 +13288,526 @@ class V5FeatureTests(HarnessTestCase):
         )
         sealed = h.load_task(h.get_paths(self.root), "semantic-integrity")
         self.assertIsNotNone(sealed["integrity_contract"]["seal"])
-        self.assertEqual(sealed["integrity_contract"]["snapshots"][0]["covered_claim_tokens"], [])
+        snapshots = [
+            record
+            for record in sealed["integrity_contract"]["records"]
+            if record["record_type"] == "snapshot"
+        ]
+        self.assertEqual(snapshots[0]["covered_claim_tokens"], [])
         doctor = json.loads(
             self.cli("doctor", "--task", "semantic-integrity", "--json").stdout
         )
+        self.assertTrue(doctor["ok"], doctor)
+
+    def test_integrity_v2_seal_uses_its_terminal_record_for_live_bytes(self) -> None:
+        """A prior candidate must never become the sealed live-byte target."""
+
+        task_id = "integrity-v2-terminal"
+        self.init_task(task_id)
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "integrity-v2-fixture",
+            "--owner",
+            "test-root",
+            "--kind",
+            "implementation",
+            "--lock",
+            "repo:file:.harness-test-root",
+            "--intent",
+            "Cover distinct v2 snapshot attempts",
+            "--validation",
+            "seal uses its terminal snapshot record rather than an older candidate",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        self.cli("integrity-adopt", "--task", task_id)
+        self.root.joinpath(".harness-test-root").write_text(
+            "first candidate\n", encoding="utf-8"
+        )
+        first = json.loads(
+            self.cli(
+                "integrity-snapshot", "--task", task_id, "--purpose", "candidate", "--json"
+            ).stdout
+        )
+        self.root.joinpath(".harness-test-root").write_text(
+            "terminal candidate\n", encoding="utf-8"
+        )
+        terminal = json.loads(
+            self.cli(
+                "integrity-snapshot", "--task", task_id, "--purpose", "candidate", "--json"
+            ).stdout
+        )
+        self.assertNotEqual(
+            first["snapshot_record_sha256"], terminal["snapshot_record_sha256"]
+        )
+        review_artifact = Path(self.backup_temp.name) / "integrity-v2-terminal-review.json"
+        review_artifact.write_bytes(b'{"outcome":"clean"}\n')
+        review_digest = hashlib.sha256(review_artifact.read_bytes()).hexdigest()
+        self.cli(
+            "integrity-review",
+            "--task",
+            task_id,
+            "--snapshot-record-sha256",
+            str(terminal["snapshot_record_sha256"]),
+            "--reviewer-agent-id",
+            "independent-reviewer",
+            "--result-artifact",
+            f"{review_artifact}={review_digest}",
+            "--outcome",
+            "clean",
+        )
+        self.cli("integrity-seal", "--task", task_id)
+        paths = h.get_paths(self.root)
+        sealed = h.load_task(paths, task_id)
+        contract = sealed["integrity_contract"]
+        self.assertEqual(contract["mode"], "required_v2")
+        self.assertEqual(
+            contract["seal"]["terminal_snapshot_record_sha256"],
+            terminal["snapshot_record_sha256"],
+        )
+        self.assertEqual(
+            cli_impl._integrity_runtime_errors(
+                paths, sealed, require_current_snapshot=True
+            ),
+            [],
+        )
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertTrue(json.loads(doctor.stdout)["ok"], doctor.stdout)
+
+        # This recreates the earlier candidate bytes.  A runtime that chose
+        # the first/last candidate by content rather than the seal's exact
+        # record SHA would incorrectly accept it.
+        self.root.joinpath(".harness-test-root").write_text(
+            "first candidate\n", encoding="utf-8"
+        )
+        errors = cli_impl._integrity_runtime_errors(
+            paths, sealed, require_current_snapshot=True
+        )
+        self.assertTrue(
+            any("sealed integrity v2 terminal snapshot" in item for item in errors),
+            errors,
+        )
+
+    def test_cancel_preserves_valid_unsealed_integrity_contract(self) -> None:
+        """Cancellation closes task state without fabricating a terminal seal."""
+
+        paths = h.get_paths(self.root)
+        baseline = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+        self.init_task("cancel-unsealed-v1")
+        v1_state = h.load_task(paths, "cancel-unsealed-v1")
+        v1_state["integrity_contract"] = integrity_records_impl.build_integrity_contract(
+            baseline_head=baseline,
+            adopted_at="2099-01-01T00:00:00+00:00",
+        )
+        h.write_task(paths, v1_state)
+
+        self.init_task("cancel-unsealed-v2")
+        self.cli("integrity-adopt", "--task", "cancel-unsealed-v2")
+
+        for task_id, mode in (("cancel-unsealed-v1", "required_v1"), ("cancel-unsealed-v2", "required_v2")):
+            with self.subTest(task_id=task_id):
+                self.cli(
+                    "set-delivery",
+                    "--task",
+                    task_id,
+                    "--mode",
+                    "none",
+                    "--detail",
+                    "Cancellation has no delivery artifact.",
+                )
+                self.cli(
+                    "cancel-task",
+                    "--task",
+                    task_id,
+                    "--reason",
+                    "The bounded integrity canary was intentionally cancelled.",
+                )
+                cancelled = h.load_task(paths, task_id)
+                self.assertEqual(cancelled["status"], "cancelled")
+                self.assertEqual(cancelled["phase"], "closing")
+                self.assertEqual(cancelled["integrity_contract"]["mode"], mode)
+                self.assertIsNone(cancelled["integrity_contract"]["seal"])
+                self.assertEqual(h.checkpoint_matches(paths, cancelled), (True, "current"))
+
+        done_without_seal = h.load_task(paths, "cancel-unsealed-v1")
+        done_without_seal["status"] = "done"
+        with self.assertRaisesRegex(h.HarnessError, "requires a seal"):
+            h.write_task(paths, done_without_seal)
+
+    def test_integrity_runtime_keeps_v1_frozen_and_rejects_unknown_headers(self) -> None:
+        task_id = "integrity-v1-frozen"
+        self.init_task(task_id)
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, task_id)
+        baseline = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        state["integrity_contract"] = integrity_records_impl.build_integrity_contract(
+            baseline_head=baseline,
+            adopted_at="2099-01-01T00:00:00+00:00",
+        )
+        h.write_task(paths, state)
+        frozen = h.load_task(paths, task_id)
+        self.assertEqual(frozen["integrity_contract"]["mode"], "required_v1")
+        self.assertEqual(
+            cli_impl._integrity_runtime_errors(
+                paths,
+                frozen,
+                require_current_snapshot=False,
+                require_complete=False,
+            ),
+            [],
+        )
+        doctor = self.cli("doctor", "--task", task_id, "--json")
+        self.assertTrue(json.loads(doctor.stdout)["ok"], doctor.stdout)
+
+        sealed_task_id = "integrity-v1-sealed"
+        self.init_task(sealed_task_id)
+        sealed_state = h.load_task(paths, sealed_task_id)
+        sealed_snapshot = git_plumbing_impl.task_mutation_snapshot(
+            sealed_task_id, self.root, baseline
+        )
+        sealed_coverage = git_plumbing_impl.task_mutation_snapshot_claim_coverage(
+            sealed_snapshot, h.claims_owned_by_task(paths, sealed_task_id)
+        )
+        sealed_artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            sealed_task_id,
+            semantic_events_impl.canonical_json_bytes(sealed_snapshot),
+            label="frozen v1 sealed snapshot",
+            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        sealed_contract = integrity_records_impl.append_snapshot(
+            integrity_records_impl.build_integrity_contract(
+                baseline_head=baseline,
+                adopted_at="2099-01-01T00:00:00+00:00",
+            ),
+            integrity_records_impl.build_snapshot_record(
+                task_id=sealed_task_id,
+                worktree=sealed_snapshot["worktree"],
+                baseline_head=sealed_snapshot["baseline_head"],
+                current_head=sealed_snapshot["current_head"],
+                artifact=sealed_artifact,
+                snapshot_sha256=sealed_snapshot["snapshot_sha256"],
+                claim_scope_sha256=sealed_coverage["claim_scope_sha256"],
+                covered_claim_tokens=sealed_coverage["covered_claim_tokens"],
+                purpose="candidate",
+                producer_agent_ids=["test-root"],
+            ),
+        )
+        review_artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            sealed_task_id,
+            b'{"outcome":"clean"}\n',
+            label="frozen v1 sealed review",
+            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        sealed_contract = integrity_records_impl.append_review_result(
+            sealed_contract,
+            integrity_records_impl.build_review_result_record(
+                snapshot_sha256=sealed_contract["snapshots"][0]["snapshot_sha256"],
+                reviewer_agent_id="independent-reviewer",
+                producer_agent_ids=["test-root"],
+                result_artifact=review_artifact,
+                outcome="clean",
+                finding_ids=[],
+            ),
+        )
+        sealed_state["integrity_contract"] = integrity_records_impl.seal_integrity_contract(
+            sealed_contract,
+            integrity_records_impl.build_integrity_seal(
+                latest_candidate_snapshot_sha256=sealed_contract["snapshots"][0][
+                    "snapshot_sha256"
+                ],
+                latest_review_result_record_sha256=sealed_contract["review_results"][0][
+                    "record_sha256"
+                ],
+                claim_scope_sha256=sealed_contract["snapshots"][0][
+                    "claim_scope_sha256"
+                ],
+                sealed_at="2099-01-01T00:00:01+00:00",
+            ),
+        )
+        h.write_task(paths, sealed_state)
+        sealed_readback = h.load_task(paths, sealed_task_id)
+        self.assertEqual(sealed_readback["integrity_contract"]["mode"], "required_v1")
+        self.assertIsNotNone(sealed_readback["integrity_contract"]["seal"])
+        sealed_doctor = self.cli("doctor", "--task", sealed_task_id, "--json")
+        self.assertTrue(json.loads(sealed_doctor.stdout)["ok"], sealed_doctor.stdout)
+
+        unknown = copy.deepcopy(frozen)
+        unknown["integrity_contract"]["schema_version"] = 99
+        # This deliberately bypasses the writer: admission itself rejects an
+        # unknown header, and doctor must also fail closed for a forged file.
+        h.task_state_path(paths, task_id).write_text(
+            json.dumps(unknown), encoding="utf-8"
+        )
+        rejected = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        self.assertTrue(
+            any(
+                "task integrity contract header invalid" in item
+                for item in json.loads(rejected.stdout)["errors"]
+            ),
+            rejected.stdout,
+        )
+
+    def test_integrity_v2_migration_rejects_tampered_v1_cas_source(self) -> None:
+        task_id = "integrity-v2-migration-cas"
+        self.init_task(task_id)
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, task_id)
+        baseline = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        snapshot = git_plumbing_impl.task_mutation_snapshot(
+            task_id, self.root, baseline
+        )
+        coverage = git_plumbing_impl.task_mutation_snapshot_claim_coverage(
+            snapshot, h.claims_owned_by_task(paths, task_id)
+        )
+        self.assertTrue(coverage["covered"])
+        artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            task_id,
+            semantic_events_impl.canonical_json_bytes(snapshot),
+            label="v1 migration source snapshot",
+            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        v1_contract = integrity_records_impl.build_integrity_contract(
+            baseline_head=baseline,
+            adopted_at="2099-01-01T00:00:00+00:00",
+        )
+        v1_snapshot = integrity_records_impl.build_snapshot_record(
+            task_id=task_id,
+            worktree=snapshot["worktree"],
+            baseline_head=snapshot["baseline_head"],
+            current_head=snapshot["current_head"],
+            artifact=artifact,
+            snapshot_sha256=snapshot["snapshot_sha256"],
+            claim_scope_sha256=coverage["claim_scope_sha256"],
+            covered_claim_tokens=coverage["covered_claim_tokens"],
+            purpose="candidate",
+            producer_agent_ids=["test-root"],
+        )
+        state["integrity_contract"] = integrity_records_impl.append_snapshot(
+            v1_contract, v1_snapshot
+        )
+        h.write_task(paths, state)
+        source_bytes = semantic_events_impl.canonical_json_bytes(
+            state["integrity_contract"]
+        )
+        self.cli(
+            "integrity-upgrade-v2",
+            "--task",
+            task_id,
+            "--expected-v1-contract-sha256",
+            hashlib.sha256(source_bytes).hexdigest(),
+        )
+        migrated = h.load_task(paths, task_id)["integrity_contract"]
+        self.assertEqual(migrated["mode"], "required_v2")
+        receipt = migrated["migration_receipt"]
+        source_ref = receipt["source_contract_artifact"]
+        source_blob = h.task_dir(paths, task_id) / source_ref["path"]
+        source_blob.write_bytes(b"tampered v1 source\n")
+        rejected = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        self.assertTrue(
+            any(
+                "compact v2 integrity source artifact" in item
+                for item in json.loads(rejected.stdout)["errors"]
+            ),
+            rejected.stdout,
+        )
+
+    def test_integrity_v2_migration_rejects_self_consistent_prefix_remap(
+        self,
+    ) -> None:
+        """A valid v2 prefix may not change what the v1 source mapped to."""
+
+        task_id = "integrity-v2-migration-remap"
+        self.init_task(task_id)
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, task_id)
+        baseline = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        snapshot = git_plumbing_impl.task_mutation_snapshot(
+            task_id, self.root, baseline
+        )
+        coverage = git_plumbing_impl.task_mutation_snapshot_claim_coverage(
+            snapshot, h.claims_owned_by_task(paths, task_id)
+        )
+        artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            task_id,
+            semantic_events_impl.canonical_json_bytes(snapshot),
+            label="v1 remap source snapshot",
+            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        v1_contract = integrity_records_impl.build_integrity_contract(
+            baseline_head=baseline,
+            adopted_at="2099-01-01T00:00:00+00:00",
+        )
+        v1_snapshot = integrity_records_impl.build_snapshot_record(
+            task_id=task_id,
+            worktree=snapshot["worktree"],
+            baseline_head=snapshot["baseline_head"],
+            current_head=snapshot["current_head"],
+            artifact=artifact,
+            snapshot_sha256=snapshot["snapshot_sha256"],
+            claim_scope_sha256=coverage["claim_scope_sha256"],
+            covered_claim_tokens=coverage["covered_claim_tokens"],
+            purpose="candidate",
+            producer_agent_ids=["test-root"],
+        )
+        state["integrity_contract"] = integrity_records_impl.append_snapshot(
+            v1_contract, v1_snapshot
+        )
+        h.write_task(paths, state)
+        source_bytes = semantic_events_impl.canonical_json_bytes(
+            state["integrity_contract"]
+        )
+        self.cli(
+            "integrity-upgrade-v2",
+            "--task",
+            task_id,
+            "--expected-v1-contract-sha256",
+            hashlib.sha256(source_bytes).hexdigest(),
+        )
+
+        tampered_state = h.load_task(paths, task_id)
+        contract = tampered_state["integrity_contract"]
+        # Compact v2 stores no derived prefix in task state; the immutable v1
+        # CAS is the sole prefix source.  A self-consistent forged receipt
+        # must still fail when doctor materializes that source.
+        self.assertEqual(contract["records"], [])
+        receipt = contract["migration_receipt"]
+        receipt["migrated_records_sha256"] = "f" * 64
+        receipt["record_sha256"] = integrity_records_v2_impl.integrity_record_sha256(
+            receipt
+        )
+        h.task_state_path(paths, task_id).write_text(
+            json.dumps(tampered_state), encoding="utf-8"
+        )
+
+        rejected = subprocess.run(
+            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(rejected.returncode, 1, rejected.stderr)
+        self.assertTrue(
+            any(
+                "migration receipt prefix digest/count does not match source CAS"
+                in item
+                for item in json.loads(rejected.stdout)["errors"]
+            ),
+            rejected.stdout,
+        )
+
+    def test_integrity_v2_upgrade_compacts_valid_v1_source_over_one_mebibyte(self) -> None:
+        """A valid large frozen v1 prefix is held only in CAS after upgrade."""
+
+        task_id = "integrity-v2-large-source"
+        self.init_task(task_id)
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, task_id)
+        baseline = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True, text=True, capture_output=True,
+        ).stdout.strip()
+        v1_contract = integrity_records_impl.build_integrity_contract(
+            baseline_head=baseline, adopted_at="2099-01-01T00:00:00+00:00",
+        )
+        # Twenty-two genuine Git snapshots, each with bounded producer
+        # identities, make a runtime-valid frozen source exceed 1 MiB.  Empty
+        # commits keep the baseline mutation path set empty while making every
+        # snapshot digest and CAS artifact distinct.
+        producers = [
+            f"test-producer-{index:03d}-" + ("x" * 490)
+            for index in range(100)
+        ]
+        snapshots = []
+        for index in range(22):
+            subprocess.run(
+                [
+                    "git", "-C", str(self.root), "commit", "--allow-empty",
+                    "-m", f"large source {index}",
+                ],
+                check=True, text=True, capture_output=True,
+            )
+            snapshot = git_plumbing_impl.task_mutation_snapshot(task_id, self.root, baseline)
+            coverage = git_plumbing_impl.task_mutation_snapshot_claim_coverage(
+                snapshot, h.claims_owned_by_task(paths, task_id)
+            )
+            artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+                paths, task_id, semantic_events_impl.canonical_json_bytes(snapshot),
+                label=f"large v1 migration source snapshot {index}",
+                max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+            )
+            snapshots.append(integrity_records_impl.build_snapshot_record(
+                task_id=task_id, worktree=snapshot["worktree"],
+                baseline_head=snapshot["baseline_head"], current_head=snapshot["current_head"],
+                artifact=artifact, snapshot_sha256=snapshot["snapshot_sha256"],
+                claim_scope_sha256=coverage["claim_scope_sha256"],
+                covered_claim_tokens=coverage["covered_claim_tokens"], purpose="candidate",
+                producer_agent_ids=producers,
+            ))
+        v1_contract["snapshots"] = snapshots
+        state["integrity_contract"] = v1_contract
+        h.write_task(paths, state)
+        source_bytes = semantic_events_impl.canonical_json_bytes(v1_contract)
+        self.assertGreater(len(source_bytes), 1024 * 1024)
+        self.cli(
+            "integrity-upgrade-v2", "--task", task_id,
+            "--expected-v1-contract-sha256", hashlib.sha256(source_bytes).hexdigest(),
+        )
+        compact = h.load_task(paths, task_id)["integrity_contract"]
+        self.assertEqual(compact["records"], [])
+        self.assertGreater(
+            compact["migration_receipt"]["source_contract_artifact"]["size_bytes"],
+            1024 * 1024,
+        )
+        doctor = json.loads(self.cli("doctor", "--task", task_id, "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
 
     def test_doctor_rejects_self_consistent_integrity_snapshot_with_uncovered_path(self) -> None:
@@ -13337,9 +13854,9 @@ class V5FeatureTests(HarnessTestCase):
             task_id,
             semantic_events_impl.canonical_json_bytes(snapshot),
             label="injected integrity mutation snapshot",
-            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+            max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
         )
-        record = integrity_records_impl.build_snapshot_record(
+        record = integrity_records_v2_impl.build_snapshot_record(
             task_id=task_id,
             worktree=snapshot["worktree"],
             baseline_head=snapshot["baseline_head"],
@@ -13351,7 +13868,7 @@ class V5FeatureTests(HarnessTestCase):
             purpose="candidate",
             producer_agent_ids=["test-root"],
         )
-        state["integrity_contract"] = integrity_records_impl.append_snapshot(
+        state["integrity_contract"] = integrity_records_v2_impl.append_snapshot(
             state["integrity_contract"], record
         )
         h.write_task(paths, state)
@@ -13417,9 +13934,9 @@ class V5FeatureTests(HarnessTestCase):
             task_id,
             semantic_events_impl.canonical_json_bytes(snapshot),
             label="injected post-fix binding snapshot",
-            max_bytes=integrity_records_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+            max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
         )
-        record = integrity_records_impl.build_snapshot_record(
+        record = integrity_records_v2_impl.build_snapshot_record(
             task_id=task_id,
             worktree=snapshot["worktree"],
             baseline_head=snapshot["baseline_head"],
@@ -13431,7 +13948,7 @@ class V5FeatureTests(HarnessTestCase):
             purpose="post_fix",
             producer_agent_ids=["test-root"],
         )
-        state["integrity_contract"] = integrity_records_impl.append_snapshot(
+        state["integrity_contract"] = integrity_records_v2_impl.append_snapshot(
             state["integrity_contract"], record
         )
         h.write_task(paths, state)

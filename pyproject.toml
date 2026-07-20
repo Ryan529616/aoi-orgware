@@ -38,6 +38,7 @@ Changelog = "https://github.com/Ryan529616/aoi-orgware/blob/main/CHANGELOG.md"
 [project.scripts]
 aoi = "aoi_orgware.cli:main"
 aoi-codex-hook = "aoi_orgware.codex_hook:main"
+aoi-codex-bridge = "aoi_orgware.codex_transport_cli:main"
 aoi-claude-hook = "aoi_orgware.claude_hook:main"
 
 [tool.pytest.ini_options]

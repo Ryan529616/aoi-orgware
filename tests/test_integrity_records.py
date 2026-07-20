@@ -430,7 +430,7 @@ class IntegrityRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "integrity contract"):
             validate_task_state(adopted)
 
-    def test_draft_loads_before_review_but_close_requires_completion(self) -> None:
+    def test_draft_loads_before_review_but_done_requires_completion(self) -> None:
         state = {
             "schema_version": 1, "profile_id": "test", "config_sha256": "a" * 64,
             "task_id": TASK_ID, "status": "active", "phase": "planning", "profile": "full",
@@ -440,6 +440,8 @@ class IntegrityRecordTests(unittest.TestCase):
         state["integrity_contract"] = append(state["integrity_contract"], "snapshots", candidate())
         validate_task_state(state)
         state["phase"] = "closing"
+        validate_task_state(state)
+        state["status"] = "done"
         with self.assertRaisesRegex(HarnessError, "mandatory review"):
             validate_task_state(state)
 
@@ -499,7 +501,6 @@ class IntegrityRecordTests(unittest.TestCase):
             ),
         )
         self.assertEqual(ir.integrity_contract_errors(contract, require_complete=True), [])
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,7 +38,7 @@ def _write_wheel(path: Path, *, with_record: bool = True) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         prefix = "aoi_orgware-0.4.0a1.dist-info"
         archive.writestr(f"{prefix}/METADATA", "Metadata-Version: 2.1\nName: aoi-orgware\nVersion: 0.4.0a1\n")
-        archive.writestr(f"{prefix}/entry_points.txt", "[console_scripts]\naoi = aoi_orgware.cli:main\naoi-codex-hook = aoi_orgware.codex_hook:main\naoi-claude-hook = aoi_orgware.claude_hook:main\n")
+        archive.writestr(f"{prefix}/entry_points.txt", "[console_scripts]\naoi = aoi_orgware.cli:main\naoi-codex-hook = aoi_orgware.codex_hook:main\naoi-codex-bridge = aoi_orgware.codex_transport_cli:main\naoi-claude-hook = aoi_orgware.claude_hook:main\n")
         if with_record:
             archive.writestr(f"{prefix}/RECORD", "aoi_orgware/cli.py,,\n")
         archive.writestr("aoi_orgware/cli.py", 'HOOK_PROTOCOL_VERSION = "6"\n')
@@ -48,6 +48,9 @@ def _write_wheel(path: Path, *, with_record: bool = True) -> None:
 def prepared(tmp_path: Path) -> tuple[Path, Path]:
     source, store = tmp_path / "source", tmp_path / "store"
     (source / "src/aoi_orgware").mkdir(parents=True); (source / "requirements").mkdir(); (store / "dist").mkdir(parents=True); (store / "evidence").mkdir()
+    (source / ".github/workflows").mkdir(parents=True)
+    (source / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+    (source / ".github/workflows/test.yml").write_text("name: test\n", encoding="utf-8")
     (source / "src/aoi_orgware/_version.py").write_text('__version__ = "0.4.0a1"\n', encoding="utf-8")
     (source / "README.md").write_text("fixture\n", encoding="utf-8")
     (source / "requirements/release-tools.lock").write_text("tool==1\n", encoding="utf-8")
@@ -70,11 +73,20 @@ def _bundle(source: Path, store: Path) -> tuple[dict[str, Any], Path]:
 
 def test_subject_bundle_loader_contract_and_source_recheck(prepared: tuple[Path, Path]) -> None:
     source, store = prepared; bundle, path = _bundle(source, store)
+    manifest_paths = {
+        item["path"]
+        for item in proof.create_source_manifest(source)["files"]
+    }
+    assert {".gitignore", ".github/workflows/test.yml"} <= manifest_paths
     assert proof.verify_bundle(source_root=source, store_root=store, bundle=bundle, expected_sha256=bundle["bundle_sha256"])["ok"] is True
     loaded = proof.load_local_install_bundle(path, bundle["bundle_sha256"])
     contract = proof.local_install_contract(loaded, bundle_path=path)
     assert contract["artifact_store_root"] == str(store.resolve())
     assert contract["wheel"]["path"] == str((store / "dist/aoi_orgware-0.4.0a1-py3-none-any.whl").resolve())
+    assert contract["interfaces"]["codex_bridge_entry_point"] == {
+        "name": "aoi-codex-bridge",
+        "target": "aoi_orgware.codex_transport_cli:main",
+    }
     source.rename(source.with_name("source-not-present"))
     assert proof.load_local_install_bundle(path, bundle["bundle_sha256"])["bundle_sha256"] == bundle["bundle_sha256"]
     with pytest.raises(proof.LocalInstallProofError, match="differs from expected"):
@@ -151,7 +163,7 @@ def test_wheel_interface_bounds_are_checked_before_extraction(prepared: tuple[Pa
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         prefix = "aoi_orgware-0.4.0a1.dist-info"
         archive.writestr(f"{prefix}/METADATA", "Metadata-Version: 2.1\nName: aoi-orgware\nVersion: 0.4.0a1\n")
-        archive.writestr(f"{prefix}/entry_points.txt", "[console_scripts]\naoi = aoi_orgware.cli:main\naoi-codex-hook = aoi_orgware.codex_hook:main\naoi-claude-hook = aoi_orgware.claude_hook:main\n")
+        archive.writestr(f"{prefix}/entry_points.txt", "[console_scripts]\naoi = aoi_orgware.cli:main\naoi-codex-hook = aoi_orgware.codex_hook:main\naoi-codex-bridge = aoi_orgware.codex_transport_cli:main\naoi-claude-hook = aoi_orgware.claude_hook:main\n")
         archive.writestr(f"{prefix}/RECORD", b"x" * (4 * 1024 * 1024 + 1))
         archive.writestr("aoi_orgware/cli.py", 'HOOK_PROTOCOL_VERSION = "6"\n')
     _write_inventory(store)

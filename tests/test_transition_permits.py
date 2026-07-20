@@ -74,6 +74,27 @@ def sealed_decision(**changes: object) -> dict[str, object]:
     return seal_transition_decision(decision_base(**changes))
 
 
+def launch_parameters(**changes: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "launch_id": "launch-1",
+        "launch_intent_sha256": SHA_D,
+        "packet_id": "packet-1",
+        "routing_binding": {
+            "kind": "cohort",
+            "routing_authority_sha256": SHA_C,
+            "transport": "codex",
+            "parent_session_id": "chief-session-1",
+            "expected_agent_type": "worker",
+            "cohort_id": "cohort-1",
+            "cohort_sha256": SHA_A,
+            "wave_index": 0,
+            "transport_slot_sha256": SHA_B,
+        },
+    }
+    value.update(changes)
+    return value
+
+
 def consume(permit: dict[str, object], **changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "task_id": "task-1",
@@ -86,6 +107,21 @@ def consume(permit: dict[str, object], **changes: object) -> dict[str, object]:
             "packet_schema_version": 6,
             "routing_authority_sha256": SHA_C,
         },
+        "chief_authority": {"session_id": "chief-session-1", "epoch": 7},
+        "current_time": NOW,
+    }
+    value.update(changes)
+    return validate_transition_consumption(permit, **value)  # type: ignore[arg-type]
+
+
+def consume_launch(permit: dict[str, object], decision_sha256: str, **changes: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "task_id": "task-1",
+        "semantic_head_sha256": SHA_A,
+        "decision_sha256": decision_sha256,
+        "action": "codex.launch",
+        "target_ids": ["launch-1"],
+        "parameters": launch_parameters(),
         "chief_authority": {"session_id": "chief-session-1", "epoch": 7},
         "current_time": NOW,
     }
@@ -261,7 +297,11 @@ def test_expiry_head_and_decision_drift_are_rejected() -> None:
 
 
 def test_chief_session_id_uses_the_bounded_canonical_lifecycle_grammar() -> None:
-    assert sealed(chief_authority={"session_id": "s" * 128, "epoch": 7})["chief_authority"]["session_id"] == "s" * 128
+    authority = sealed(chief_authority={"session_id": "s" * 128, "epoch": 7})[
+        "chief_authority"
+    ]
+    assert isinstance(authority, dict)
+    assert authority["session_id"] == "s" * 128
     for unsafe_session_id in ("C:/credentials/chief.json", "chief/session", "chief:session", "s" * 129):
         with pytest.raises(TransitionPermitError, match="chief_authority.session_id is invalid"):
             sealed(chief_authority={"session_id": unsafe_session_id, "epoch": 7})
@@ -293,6 +333,86 @@ def test_replay_marker_and_consumption_identity_are_distinct_and_one_shot() -> N
         consume(first, consumed_identities=[identity])
     with pytest.raises(TransitionPermitError, match="replay marker was already consumed"):
         consume(first, consumed_replay_markers=[marker])
+
+
+def test_codex_launch_permit_is_exact_one_shot_and_binds_launch_intent() -> None:
+    parameters = launch_parameters()
+    decision = sealed_decision(
+        action="codex.launch",
+        target_ids=["launch-1"],
+        parameters=parameters,
+        technical_payload_sha256=SHA_D,
+    )
+    permit = sealed(
+        decision_sha256=decision["decision_sha256"],
+        action="codex.launch",
+        target_ids=["launch-1"],
+        parameters=parameters,
+    )
+    decision_sha256 = decision["decision_sha256"]
+    assert isinstance(decision_sha256, str)
+
+    assert validate_decision_permit_pair(decision, permit) == {
+        "decision": decision,
+        "permit": permit,
+    }
+    accepted = consume_launch(permit, decision_sha256)
+    consumption_identity = accepted["consumption_identity"]
+    assert isinstance(consumption_identity, str)
+    with pytest.raises(TransitionPermitError, match="identity was already consumed"):
+        consume_launch(
+            permit,
+            decision_sha256,
+            consumed_identities=[consumption_identity],
+        )
+    with pytest.raises(TransitionPermitError, match="permit is expired"):
+        consume_launch(
+            permit,
+            decision_sha256,
+            current_time=datetime(2026, 7, 18, 4, 5, tzinfo=timezone.utc),
+        )
+    with pytest.raises(TransitionPermitError, match="semantic head"):
+        consume_launch(permit, decision_sha256, semantic_head_sha256=SHA_C)
+
+    with pytest.raises(TransitionPermitError, match="technical_payload_sha256 must match"):
+        sealed_decision(
+            action="codex.launch",
+            target_ids=["launch-1"],
+            parameters=parameters,
+            technical_payload_sha256=SHA_A,
+        )
+    with pytest.raises(TransitionPermitError, match="target_ids must name"):
+        sealed(
+            decision_sha256=decision_sha256,
+            action="codex.launch",
+            target_ids=["packet-1"],
+            parameters=parameters,
+        )
+    for extra_field in ("prompt", "cwd", "credential", "receipt_path"):
+        with pytest.raises(TransitionPermitError, match="parameters schema"):
+            sealed(
+                decision_sha256=decision_sha256,
+                action="codex.launch",
+                target_ids=["launch-1"],
+                parameters={**parameters, extra_field: "unsafe-extra"},
+            )
+
+    standalone = launch_parameters(
+        routing_binding={
+            "kind": "standalone",
+            "routing_authority_sha256": SHA_C,
+            "transport": "codex",
+            "parent_session_id": "chief-session-1",
+            "expected_agent_type": "worker",
+        }
+    )
+    standalone_decision = sealed_decision(
+        action="codex.launch",
+        target_ids=["launch-1"],
+        parameters=standalone,
+        technical_payload_sha256=SHA_D,
+    )
+    assert standalone_decision["parameters"] == standalone
 
 
 @pytest.mark.parametrize(
@@ -347,6 +467,8 @@ def test_only_enumerated_action_specific_permit_shapes_are_accepted() -> None:
         target_ids=["cohort-1"],
         parameters={"cohort_id": "cohort-1", "cohort_sha256": SHA_D, "wave_index": 2},
     )
-    assert cohort["parameters"]["wave_index"] == 2
+    cohort_parameters = cohort["parameters"]
+    assert isinstance(cohort_parameters, dict)
+    assert cohort_parameters["wave_index"] == 2
     with pytest.raises(TransitionPermitError, match="parameters schema"):
         sealed(action="cohort.advance", target_ids=["cohort-1"], parameters={"cohort_id": "cohort-1", "cohort_sha256": SHA_D, "wave_index": 2, "reason": "text"})

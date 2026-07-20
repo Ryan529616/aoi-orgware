@@ -31,12 +31,14 @@ from typing import Any, Iterable, cast
 
 from . import __version__
 from . import codex_install_provenance as codex_install_provenance_impl
+from . import confidentiality as confidentiality_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import evidence_artifacts as evidence_artifacts_impl
 from .agent_identity import AgentIdentityError, AGENT_ID_RE, validate_agent_id
 from . import execution_topology as execution_topology_impl
 from . import integrity_records as integrity_records_impl
+from . import integrity_records_v2 as integrity_records_v2_impl
 from . import job_integrity as job_integrity_impl
 from . import packet_integrity as packet_integrity_impl
 from . import portfolio_integrity as portfolio_integrity_impl
@@ -133,6 +135,11 @@ from .commands.coordination import (
     register_coordination_commands,
     register_cross_lane_commands,
 )
+from .commands.confidentiality import (
+    cmd_external_export_permit_consume,
+    cmd_external_export_permit_issue,
+    register_confidentiality_commands,
+)
 from .commands.execution_selection import (
     ExecutionSelectionCmdServices,
     cmd_execution_brief_record,
@@ -150,13 +157,14 @@ from .commands.improvement import (
     cmd_skill_release_record,
     register_improvement_commands,
 )
-from .commands.integrity import (
+from .commands.integrity_v2 import (
     cmd_integrity_adopt,
     cmd_integrity_fix,
     cmd_integrity_review,
     cmd_integrity_seal,
     cmd_integrity_show,
     cmd_integrity_snapshot,
+    cmd_integrity_upgrade_v2,
     cmd_integrity_verify,
     register_integrity_commands,
 )
@@ -243,6 +251,7 @@ from .commands.task_lifecycle import (
     cmd_pilot_init,
     cmd_pilot_summary,
     cmd_pilot_validate,
+    cmd_plan_update,
     cmd_release_claim,
     cmd_retarget_task,
     cmd_retire_risk,
@@ -469,6 +478,15 @@ ROLE_TIER_MAP = {
 }
 TERMINAL_PACKET_STATUSES = PACKET_STATUSES - ACTIVE_PACKET_STATUSES
 EXECUTING_PACKET_STATUSES = {"armed", "dispatched"}
+_CODEX_TRANSPORT_PACKET_TERMINAL_STATUS = {
+    "completed": "done",
+    "failed": "failed",
+    "interrupted": "cancelled",
+}
+_CODEX_TRANSPORT_UNRESOLVED_TERMINAL_STATES = {
+    "launch_unknown",
+    "runtime_unknown",
+}
 NATIVE_V5_PACKET_CONTRACT_MARKER = "- AOI dispatch schema origin: `native_v5`"
 HELPER_SPAWN_BUDGET_CONTRACT_PREFIX = "- AOI helper spawn budget:"
 VERIFICATION_CATEGORIES = {
@@ -491,6 +509,34 @@ VERIFICATION_CATEGORIES = {
     "delivery_check",
     "engineering_inference",
 }
+
+
+def _require_codex_transport_packet_terminal_status(
+    launch_state: str, packet_status: str
+) -> None:
+    """Keep runtime terminal meaning distinct from the packet lifecycle.
+
+    Unknown launch/runtime outcomes require explicit reconciliation and cannot
+    be collapsed into any terminal packet verdict.  Known outcomes have one
+    exact packet-status mapping; a technical result such as rejection belongs
+    in ``typed_outcome`` rather than by contradicting the runtime state.
+    """
+
+    if launch_state in _CODEX_TRANSPORT_UNRESOLVED_TERMINAL_STATES:
+        raise HarnessError(
+            f"Codex transport launch is {launch_state}; reconcile the exact "
+            "launch before recording any terminal packet status"
+        )
+    expected_status = _CODEX_TRANSPORT_PACKET_TERMINAL_STATUS.get(launch_state)
+    if expected_status is None:
+        raise HarnessError(
+            f"Codex transport launch state {launch_state!r} is not a terminal verdict"
+        )
+    if packet_status != expected_status:
+        raise HarnessError(
+            f"Codex transport launch state {launch_state!r} requires packet "
+            f"status {expected_status!r}, not {packet_status!r}"
+        )
 CLOSE_QUALIFYING_CATEGORIES = VERIFICATION_CATEGORIES - {
     "engineering_inference",
     "historical_terminal_readback",
@@ -681,7 +727,10 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
 # Permit consumption is an explicit no-Chief project mutation.  It is not
 # read-only: the command may publish one already Chief-issued exact semantic
 # transition, and its handler therefore owns the normal project state lock.
-CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS = {"permit-consume"}
+CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS = {
+    "external-export-permit-consume",
+    "permit-consume",
+}
 CHIEF_STANDALONE_READ_ONLY_COMMANDS = {
     "config-check",
     "pilot-validate",
@@ -2036,6 +2085,11 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         raise HarnessError(
             "Codex install provenance preflight failed before mutation: supply "
             "exactly one complete proof pair: promoted release or reviewed local install"
+        )
+    if public_complete:
+        confidentiality_impl.require_publication_action_allowed(
+            paths.project.confidentiality,
+            "release_publish",
         )
     try:
         if public_complete:
@@ -3662,6 +3716,20 @@ def _upgrade_packet_dispatch_schema(packet: dict[str, Any]) -> None:
     packet["dispatch_schema_origin"] = "legacy_v4_migration"
 
 
+def _record_core_dispatch_model_version(state: dict[str, Any]) -> None:
+    """Record core v1 without downgrading an existing transport-v2 task."""
+
+    state["dispatch_model_version"] = (
+        2
+        if state.get("dispatch_model_version") == 2
+        or any(
+            isinstance(packet, dict) and packet.get("dispatch_version") == 2
+            for packet in state.get("packets", [])
+        )
+        else 1
+    )
+
+
 def _dispatch_attempt_authority_sha256(attempt: dict[str, Any]) -> str:
     immutable_fields = (
         "attempt",
@@ -3864,7 +3932,7 @@ def cmd_packet_arm(args: argparse.Namespace, paths: HarnessPaths) -> int:
         packet["dispatch_attempts"].append(attempt)
         packet["status"] = "armed"
         packet["updated_at"] = armed_at
-        state["dispatch_model_version"] = 1
+        _record_core_dispatch_model_version(state)
         state.setdefault("subagent_incidents", [])
         bump_task(state)
         write_task(paths, state)
@@ -4583,7 +4651,7 @@ def cmd_create_packet(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
         atomic_write_text(destination, text)
         packet_contract_sha256 = sha256_file(destination)
-        state["dispatch_model_version"] = 1
+        _record_core_dispatch_model_version(state)
         state.setdefault("subagent_incidents", [])
         state.setdefault("packets", []).append(
             {
@@ -4750,7 +4818,7 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     _adopt_legacy_execution_provenance_for_v4_migration(state)
                 _upgrade_packet_dispatch_schema(packet)
             if (_packet_schema_version(packet) or 0) >= 5:
-                state["dispatch_model_version"] = 1
+                _record_core_dispatch_model_version(state)
                 state.setdefault("subagent_incidents", [])
             if previous_status == "armed":
                 _validate_current_dispatch_arm(
@@ -4805,6 +4873,60 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             existing_agent_value if isinstance(existing_agent_value, str) else ""
         )
         existing_agent_is_canonical = bool(AGENT_ID_RE.fullmatch(existing_agent))
+        transport_owned = (
+            packet.get("dispatch_provenance")
+            == packet_integrity_impl.CODEX_TRANSPORT_DISPATCH_PROVENANCE
+        )
+        if transport_owned and args.status in TERMINAL_PACKET_STATUSES:
+            # A transport-owned packet remains exclusively owned until its
+            # exact launch reaches a terminal runtime state.  A generic packet
+            # update cannot cancel/rebind a live App Server launch behind the
+            # controller's back.
+            from . import codex_transport_contracts as codex_contracts
+            from . import codex_transport_projection as codex_projection
+
+            try:
+                ownership = codex_contracts.validate_packet_transport_ownership(
+                    packet.get("transport_ownership")
+                )
+                namespace = (
+                    codex_projection.codex_transport_namespace_from_projection(
+                        state
+                    )
+                )
+                launch_row = namespace["launches"].get(ownership["launch_id"])
+            except (
+                codex_contracts.CodexTransportContractError,
+                codex_projection.CodexTransportProjectionError,
+                KeyError,
+                TypeError,
+            ) as exc:
+                raise HarnessError(
+                    f"Codex transport packet ownership cannot be authenticated: {exc}"
+                ) from exc
+            if not isinstance(launch_row, dict) or launch_row.get("state") not in {
+                "completed",
+                "failed",
+                "interrupted",
+                "launch_unknown",
+                "runtime_unknown",
+            }:
+                raise HarnessError(
+                    "Codex transport-owned packet cannot become terminal while "
+                    "its launch is nonterminal; interrupt or reconcile the exact "
+                    "bridge launch first"
+                )
+            _require_codex_transport_packet_terminal_status(
+                str(launch_row["state"]), args.status
+            )
+        if transport_owned and supplied_agent:
+            raise HarnessError(
+                "Codex transport-owned packet cannot fabricate a SubagentStart agent id"
+            )
+        if transport_owned and args.status == "dispatched":
+            raise HarnessError(
+                "Codex transport-owned packet lifecycle is controlled by its exact bridge launch"
+            )
         if (
             existing_agent
             and supplied_agent
@@ -4818,9 +4940,9 @@ def cmd_packet_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             else ""
         )
         agent_id = reusable_existing_agent or supplied_agent
-        if args.status == "dispatched" and not agent_id:
+        if args.status == "dispatched" and not agent_id and not transport_owned:
             raise HarnessError("dispatched packet requires --agent-id")
-        if previous_status == "dispatched" and not agent_id:
+        if previous_status == "dispatched" and not agent_id and not transport_owned:
             raise HarnessError("terminal packet transition requires the dispatched agent id")
         actual_pair = bool(args.actual_role) or bool(args.actual_model_tier)
         if actual_pair and not (args.actual_role and args.actual_model_tier):
@@ -5485,6 +5607,10 @@ def prepare_delivery(
     detail = require_text(args.detail, "delivery detail")
     commit = args.commit or ""
     if args.mode == "pushed":
+        confidentiality_impl.require_publication_action_allowed(
+            paths.project.confidentiality,
+            "git_push",
+        )
         if not COMMIT_RE.fullmatch(commit):
             raise HarnessError("pushed delivery requires a 7-64 hex --commit")
         if not args.remote or not args.remote_ref:
@@ -5574,7 +5700,7 @@ def _integrity_contract_required(paths: HarnessPaths, state: dict[str, Any]) -> 
     return "integrity_contract" in state
 
 
-def _integrity_runtime_errors(
+def _integrity_runtime_errors_v1(
     paths: HarnessPaths,
     state: dict[str, Any],
     *,
@@ -5697,6 +5823,220 @@ def _integrity_runtime_errors(
     ) as exc:
         return [f"integrity runtime: {exc}"]
     return []
+
+
+def _integrity_v2_record_artifact_fields(record: dict[str, Any]) -> tuple[str, ...]:
+    """Return the immutable artifact references carried by one v2 record."""
+
+    record_type = record.get("record_type")
+    if not isinstance(record_type, str):
+        return ()
+    artifact_fields: dict[str, tuple[str, ...]] = {
+        "snapshot": ("artifact",),
+        "review_result": ("result_artifact",),
+        "fix": ("fix_artifact",),
+        "review_verification": ("verification_artifact",),
+    }
+    return artifact_fields.get(record_type, ())
+
+
+def _integrity_runtime_errors_v2(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    contract: dict[str, Any],
+    *,
+    require_current_snapshot: bool,
+    require_complete: bool,
+) -> list[str]:
+    """Verify v2's ordered graph, CAS references, and sealed live target.
+
+    Unlike v1, a v2 draft deliberately has no implicit ``candidate`` target:
+    only a sealed contract selects a snapshot whose bytes must still match the
+    worktree.  This prevents an earlier same-content candidate from becoming a
+    misleading terminal anchor.
+    """
+
+    task_id = str(state.get("task_id", ""))
+    try:
+        source_v1_contract: dict[str, Any] | None = None
+        receipt = contract.get("migration_receipt")
+        if receipt is not None:
+            if not isinstance(receipt, dict):
+                raise HarnessError("integrity v2 migration receipt is not an object")
+            source_artifact = receipt.get("source_contract_artifact")
+            if not isinstance(source_artifact, dict):
+                raise HarnessError("integrity v2 migration receipt has no source v1 contract artifact")
+            source_bytes = evidence_artifacts_impl.verify_generated_artifact_blob(
+                paths,
+                task_id,
+                source_artifact,
+                label="integrity v2 migration source v1 contract",
+                max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_MIGRATION_SOURCE_BYTES,
+            )
+            source = json.loads(source_bytes.decode("utf-8"))
+            if not isinstance(source, dict) or source_bytes != canonical_json_bytes(
+                source,
+                max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_MIGRATION_SOURCE_BYTES,
+            ):
+                raise HarnessError("integrity v2 migration source v1 contract is not canonical JSON")
+            source_digest = hashlib.sha256(source_bytes).hexdigest()
+            if source_artifact.get("sha256") != source_digest or source_artifact.get("size_bytes") != len(source_bytes):
+                raise HarnessError("integrity v2 migration source v1 CAS reference differs from canonical bytes")
+            source_errors = integrity_records_impl.integrity_contract_errors(
+                source,
+                task_id=task_id,
+                worktree=state.get("worktree"),
+                require_complete=False,
+            )
+            if source_errors:
+                raise HarnessError("integrity v2 migration source v1 contract invalid: " + "; ".join(source_errors))
+            source_v1_contract = source
+
+        errors = integrity_records_v2_impl.integrity_contract_errors(
+            contract,
+            task_id=task_id,
+            worktree=state.get("worktree"),
+            require_complete=require_complete,
+            source_v1_contract=source_v1_contract,
+        )
+        if errors:
+            return [f"integrity contract: {error}" for error in errors]
+
+        effective_records = (
+            integrity_records_v2_impl.materialize_effective_integrity_records(
+                contract, source_v1_contract
+            )
+            if source_v1_contract is not None
+            else contract.get("records")
+        )
+        if not isinstance(effective_records, list):
+            return ["integrity contract: v2 records collection is missing"]
+        claims = load_all_claims(paths)
+        snapshots_by_sha: dict[str, tuple[dict[str, Any], bytes]] = {}
+        sealed = contract.get("seal") is not None
+        for index, raw_record in enumerate(effective_records, start=1):
+            if not isinstance(raw_record, dict):
+                raise HarnessError(f"integrity v2 record {index} is not an object")
+            record = raw_record
+            for field in _integrity_v2_record_artifact_fields(record):
+                value = record.get(field)
+                if not isinstance(value, dict):
+                    raise HarnessError(f"integrity v2 record {index} {field} is missing")
+                evidence_artifacts_impl.verify_generated_artifact_blob(
+                    paths,
+                    task_id,
+                    value,
+                    label=f"integrity v2 record {index} {field}",
+                    max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+                )
+            if record.get("record_type") != "snapshot":
+                continue
+            snapshot_bytes = evidence_artifacts_impl.verify_generated_artifact_blob(
+                paths,
+                task_id,
+                record["artifact"],
+                label=f"integrity v2 snapshot record {index} artifact",
+                max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+            )
+            snapshot = json.loads(snapshot_bytes.decode("utf-8"))
+            if snapshot_bytes != canonical_json_bytes(
+                snapshot,
+                max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+            ):
+                raise HarnessError(f"integrity v2 snapshot record {index} artifact is not canonical JSON")
+            snapshot_task_id, _mutation_paths = validate_task_mutation_snapshot(snapshot)
+            if snapshot_task_id != task_id or snapshot.get("task_id") != record.get("task_id"):
+                raise HarnessError(f"integrity v2 snapshot record {index} task binding differs from its artifact")
+            if snapshot.get("worktree") != record.get("worktree") or record.get("worktree") != state.get("worktree"):
+                raise HarnessError(f"integrity v2 snapshot record {index} worktree binding differs from its artifact")
+            if snapshot.get("baseline_head") != record.get("baseline_head") or record.get("baseline_head") != contract.get("baseline_head"):
+                raise HarnessError(f"integrity v2 snapshot record {index} baseline binding differs from its artifact")
+            if snapshot.get("current_head") != record.get("current_head"):
+                raise HarnessError(f"integrity v2 snapshot record {index} current-head binding differs from its artifact")
+            if snapshot.get("snapshot_sha256") != record.get("snapshot_sha256"):
+                raise HarnessError(f"integrity v2 snapshot record {index} digest differs from its artifact")
+            validate_task_mutation_snapshot_claim_scope(
+                snapshot,
+                record["covered_claim_tokens"],
+                record["claim_scope_sha256"],
+                claims,
+                sealed=sealed,
+            )
+            record_sha = record.get("record_sha256")
+            if not isinstance(record_sha, str):
+                raise HarnessError(f"integrity v2 snapshot record {index} has no record SHA-256")
+            snapshots_by_sha[record_sha] = (record, snapshot_bytes)
+
+        if require_current_snapshot and sealed:
+            seal = contract.get("seal")
+            if not isinstance(seal, dict):
+                raise HarnessError("integrity v2 seal is not an object")
+            target_sha = seal.get("terminal_snapshot_record_sha256")
+            target = snapshots_by_sha.get(target_sha) if isinstance(target_sha, str) else None
+            if target is None:
+                raise HarnessError("integrity v2 seal terminal snapshot record is unavailable")
+            _target_record, target_bytes = target
+            current = task_mutation_snapshot(
+                task_id,
+                state_worktree(paths, state),
+                str(contract["baseline_head"]),
+            )
+            current_bytes = canonical_json_bytes(
+                current,
+                max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+            )
+            if current_bytes != target_bytes:
+                raise HarnessError(
+                    "sealed integrity v2 terminal snapshot is not byte-identical to current Git task mutation snapshot"
+                )
+    except (
+        HarnessError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+        SemanticEventError,
+        integrity_records_v2_impl.IntegrityRecordError,
+    ) as exc:
+        return [f"integrity runtime: {exc}"]
+    return []
+
+
+def _integrity_runtime_errors(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    require_current_snapshot: bool,
+    require_complete: bool = True,
+) -> list[str]:
+    """Dispatch an integrity contract by its exact frozen schema header."""
+
+    required = _integrity_contract_required(paths, state)
+    contract = state.get("integrity_contract")
+    if not isinstance(contract, dict):
+        return ["required integrity_contract is missing"] if required else []
+    header = (contract.get("schema_version"), contract.get("mode"))
+    if header == (
+        integrity_records_impl.INTEGRITY_CONTRACT_SCHEMA_VERSION,
+        integrity_records_impl.INTEGRITY_CONTRACT_MODE,
+    ):
+        return _integrity_runtime_errors_v1(
+            paths,
+            state,
+            require_current_snapshot=require_current_snapshot,
+            require_complete=require_complete,
+        )
+    if header == (
+        integrity_records_v2_impl.INTEGRITY_CONTRACT_SCHEMA_VERSION,
+        integrity_records_v2_impl.INTEGRITY_CONTRACT_MODE,
+    ):
+        return _integrity_runtime_errors_v2(
+            paths,
+            state,
+            contract,
+            require_current_snapshot=require_current_snapshot,
+            require_complete=require_complete,
+        )
+    return ["task integrity contract header invalid"]
 
 
 def close_gate(
@@ -6950,6 +7290,44 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     f"{relative} ({record.classification})"
                 )
 
+    confidentiality_report: dict[str, Any]
+    if paths.project.confidentiality.local_files:
+        try:
+            confidentiality_report = confidentiality_impl.inspect_confidentiality(
+                root=paths.root,
+                state_dir=paths.harness,
+                policy=paths.project.confidentiality,
+                config_sha256=paths.project.sha256,
+                tasks=tasks,
+            )
+        except (OSError, HarnessError) as exc:
+            confidentiality_report = {
+                "schema_version": 1,
+                "mode": paths.project.confidentiality.mode,
+                "errors": [str(exc)],
+                "warnings": [],
+            }
+            errors.append(f"confidentiality inspection failed: {exc}")
+        else:
+            errors.extend(
+                f"confidentiality: {item}"
+                for item in confidentiality_report["errors"]
+            )
+            warnings.extend(
+                f"confidentiality: {item}"
+                for item in confidentiality_report["warnings"]
+            )
+    else:
+        confidentiality_report = {
+            "schema_version": 1,
+            "mode": paths.project.confidentiality.mode,
+            "model_context": paths.project.confidentiality.model_context,
+            "guarantee": "standard_publication_policy",
+            "boundary": "local_files_enforcement_not_active",
+            "errors": [],
+            "warnings": [],
+        }
+
     if not paths.config.is_file():
         errors.append(f"AOI configuration is missing: {paths.config}")
     if os.name == "nt":
@@ -6976,6 +7354,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "codex_install_provenance": codex_provenance_report,
         "codex_hook_receipts": codex_hook_receipt_report,
         "codex_hook_delivery": codex_hook_delivery,
+        "confidentiality": confidentiality_report,
         "temporary_files": [
             record.as_dict(paths) for record in temporary_records
         ],
@@ -7159,6 +7538,9 @@ def build_parser(
             "approve_plan": functools.partial(
                 cmd_approve_plan, services=task_lifecycle_services
             ),
+            "plan_update": functools.partial(
+                cmd_plan_update, services=task_lifecycle_services
+            ),
             "bind_session": functools.partial(
                 cmd_bind_session, services=task_lifecycle_services
             ),
@@ -7203,6 +7585,15 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    register_confidentiality_commands(
+        argparse_subparsers,
+        handlers={
+            "external_export_permit_consume": cmd_external_export_permit_consume,
+            "external_export_permit_issue": cmd_external_export_permit_issue,
+        },
+        add_json_argument=add_json_argument,
+    )
+
     register_integrity_commands(
         argparse_subparsers,
         handlers={
@@ -7213,6 +7604,7 @@ def build_parser(
             "integrity_verify": cmd_integrity_verify,
             "integrity_seal": cmd_integrity_seal,
             "integrity_show": cmd_integrity_show,
+            "integrity_upgrade_v2": cmd_integrity_upgrade_v2,
         },
         add_json_argument=add_json_argument,
     )
@@ -7657,6 +8049,8 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "cohort-round-preview",
     "cohort-show",
     "doctor",
+    "external-export-permit-consume",
+    "external-export-permit-issue",
     "inspect-legacy",
     "integrity-adopt",
     "integrity-fix",
@@ -7664,6 +8058,7 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "integrity-seal",
     "integrity-show",
     "integrity-snapshot",
+    "integrity-upgrade-v2",
     "integrity-verify",
     "permit-consume",
     "permit-issue",

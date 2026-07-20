@@ -85,6 +85,7 @@ from ..harnesslib import (
     HarnessError,
     HarnessPaths,
     acquire_chief_authority,
+    _read_regular_file_snapshot,
     admit_new_claim_locks,
     atomic_create_bytes,
     atomic_create_text,
@@ -94,6 +95,7 @@ from ..harnesslib import (
     baselines_for_locks,
     bootstrap_chief_state_lock,
     bump_task,
+    canonicalize_no_link_traversal,
     checkpoint_matches,
     chief_authority_summary,
     claim_path,
@@ -104,6 +106,7 @@ from ..harnesslib import (
     find_conflicts,
     get_paths,
     import_legacy,
+    is_semantic_v2_task,
     legacy_pending_path,
     load_chief_authority,
     load_chief_credential,
@@ -170,6 +173,7 @@ _HANDLER_NAMES = frozenset(
         "start_mini",
         "finish_mini",
         "approve_plan",
+        "plan_update",
         "bind_session",
         "unbind_session",
         "import_legacy",
@@ -186,6 +190,8 @@ _HANDLER_NAMES = frozenset(
         "retire_risk",
     }
 )
+
+PLAN_UPDATE_MAX_BYTES = 1_048_576
 
 
 class _StateLock(Protocol):
@@ -284,6 +290,108 @@ def require_text(value: str, label: str) -> str:
     return stripped
 
 
+def _required_sha256(value: str, label: str) -> str:
+    digest = value.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise HarnessError(f"{label} must be an exact SHA-256 hex digest")
+    return digest
+
+
+def _plan_scope_fields(text: str) -> dict[str, str]:
+    """Parse the immutable scope fields the plan must mirror exactly."""
+
+    values: dict[str, str] = {}
+    for plan_label, state_key in (
+        ("Title", "title"),
+        ("Objective", "objective"),
+        ("Completion boundary", "completion_boundary"),
+    ):
+        if re.search(rf"(?m)^- {re.escape(plan_label)}:.*\n[ \t]+\S", text):
+            raise HarnessError(f"plan {plan_label} must be a single-line field")
+        matches = re.findall(
+            rf"(?m)^- {re.escape(plan_label)}:\s*(.+?)\s*$", text
+        )
+        if len(matches) != 1:
+            raise HarnessError(
+                f"plan must contain exactly one non-empty '- {plan_label}:' field"
+            )
+        values[state_key] = require_text(matches[0], f"plan {plan_label}")
+    return values
+
+
+def _require_plan_scope_matches_state(text: str, state: Mapping[str, Any]) -> None:
+    for key, plan_value in _plan_scope_fields(text).items():
+        state_value = require_text(str(state.get(key, "")), key.replace("_", " "))
+        if plan_value != state_value:
+            label = key.replace("_", " ")
+            raise HarnessError(
+                f"plan {label} does not match current task state; use plan-update "
+                "with a plan that mirrors the registered scope"
+            )
+
+
+def _read_plan_update_source(paths: HarnessPaths, source_value: str) -> tuple[bytes, str]:
+    source = canonicalize_no_link_traversal(Path(source_value), "plan update source")
+    state_root = canonicalize_no_link_traversal(paths.harness, "AOI state root")
+    try:
+        source.relative_to(state_root)
+    except ValueError:
+        pass
+    else:
+        raise HarnessError("plan update source may not be inside AOI state")
+    _identity, payload = _read_regular_file_snapshot(
+        source, "plan update source", max_bytes=PLAN_UPDATE_MAX_BYTES
+    )
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError("plan update source must be valid UTF-8") from exc
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def _plan_revision_artifact(paths: HarnessPaths, task_id: str, digest: str) -> Path:
+    return task_dir(paths, task_id) / "plan-revision-blobs" / digest[:2] / digest
+
+
+def _cache_plan_revision_bytes(
+    paths: HarnessPaths, task_id: str, payload: bytes, digest: str
+) -> Path:
+    artifact = _plan_revision_artifact(paths, task_id, digest)
+    if artifact.exists():
+        _identity, existing = _read_regular_file_snapshot(
+            artifact, "plan revision artifact", max_bytes=PLAN_UPDATE_MAX_BYTES
+        )
+        if existing != payload:
+            raise HarnessError("plan revision artifact digest collision or tampering")
+        return artifact
+    atomic_create_bytes(artifact, payload)
+    return artifact
+
+
+def _read_plan_revision_artifact(
+    paths: HarnessPaths, task_id: str, pending: Mapping[str, Any]
+) -> bytes:
+    digest = _required_sha256(str(pending.get("after_plan_sha256", "")), "pending plan SHA-256")
+    artifact = _plan_revision_artifact(paths, task_id, digest)
+    if pending.get("artifact_path") != artifact.relative_to(task_dir(paths, task_id)).as_posix():
+        raise HarnessError("pending plan revision artifact path is not canonical")
+    _identity, payload = _read_regular_file_snapshot(
+        artifact, "pending plan revision artifact", max_bytes=PLAN_UPDATE_MAX_BYTES
+    )
+    if len(payload) != pending.get("size_bytes") or hashlib.sha256(payload).hexdigest() != digest:
+        raise HarnessError("pending plan revision artifact is missing or tampered")
+    return payload
+
+
+def _plan_snapshot(path: Path, label: str) -> tuple[bytes, str]:
+    _identity, payload = _read_regular_file_snapshot(path, label, max_bytes=PLAN_UPDATE_MAX_BYTES)
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError(f"{label} must be valid UTF-8") from exc
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
 def _extend_unique(state: dict[str, Any], key: str, values: Iterable[str]) -> None:
     destination = state.setdefault(key, [])
     for value in values:
@@ -330,6 +438,15 @@ def _config_summary(config: ProjectConfig, source: Path) -> dict[str, Any]:
         "required_receipt_components": list(config.required_receipt_components),
         "high_risk_paths": list(config.high_risk_paths),
         "external_lock_namespace": config.external_lock_namespace,
+        "confidentiality": {
+            "mode": config.confidentiality.mode,
+            "model_context": config.confidentiality.model_context,
+            "git_push": config.confidentiality.git_push,
+            "remote_ci": config.confidentiality.remote_ci,
+            "artifact_upload": config.confidentiality.artifact_upload,
+            "external_export": config.confidentiality.external_export,
+            "local_cas": config.confidentiality.local_cas,
+        },
         "hooks_enabled": config.codex_hooks_enabled,
         "legacy_enabled": config.legacy_enabled,
         "config_sha256": config.sha256,
@@ -1193,7 +1310,13 @@ def cmd_approve_plan(args: argparse.Namespace, paths: HarnessPaths, *, services:
         state = load_task(paths, args.task)
         require_open_task(state, "approve plan for")
         source = services.plan_path(paths, state)
-        text = source.read_text(encoding="utf-8")
+        _identity, payload = _read_regular_file_snapshot(
+            source, "task plan", max_bytes=PLAN_UPDATE_MAX_BYTES
+        )
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HarnessError("task plan must be valid UTF-8") from exc
         unresolved = [
             marker
             for marker in ("Replace this line", "[TODO", "{{TASK_ID}}", "{{OBJECTIVE}}")
@@ -1205,9 +1328,10 @@ def cmd_approve_plan(args: argparse.Namespace, paths: HarnessPaths, *, services:
             )
         if len(text.strip()) < 400:
             raise HarnessError("plan is too short; record evidence, work breakdown, and verification")
+        _require_plan_scope_matches_state(text, state)
         if not state.get("worktree"):
             state.update(git_metadata(paths.root))
-        digest = sha256_file(source)
+        digest = hashlib.sha256(payload).hexdigest()
         previous_digest = str(state.get("plan_sha256", ""))
         has_dispatched_work = bool(state.get("packets") or state.get("jobs"))
         coverage_note = ""
@@ -1239,6 +1363,141 @@ def cmd_approve_plan(args: argparse.Namespace, paths: HarnessPaths, *, services:
         write_task(paths, state)
         write_index(paths)
     emit({"task_id": args.task, "plan_sha256": digest, "plan_ready": True}, args.json)
+    return 0
+
+
+def cmd_plan_update(
+    args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices
+) -> int:
+    """Replace a task plan through a bounded, digest-bound Chief transition."""
+
+    expected_source = _required_sha256(
+        args.expected_source_sha256, "expected source SHA-256"
+    )
+    expected_current = _required_sha256(
+        args.expected_current_plan_sha256, "expected current plan SHA-256"
+    )
+    reason = require_text(args.reason, "plan update reason")
+    with state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "update plan for")
+        if "_semantic" in state or is_semantic_v2_task(paths, str(state["task_id"])):
+            raise HarnessError("plan-update is unsupported for semantic-v2 tasks")
+        destination = services.plan_path(paths, state)
+        pending = state.get("plan_update_pending")
+        if pending is not None:
+            if not isinstance(pending, dict):
+                raise HarnessError("pending plan update is malformed")
+            if (
+                pending.get("before_plan_sha256") != expected_current
+                or pending.get("after_plan_sha256") != expected_source
+                or pending.get("reason") != reason
+            ):
+                raise HarnessError("a divergent plan-update is pending; exact retry required")
+            payload = _read_plan_revision_artifact(paths, str(state["task_id"]), pending)
+            source_digest = expected_source
+            current_payload, current_digest = _plan_snapshot(destination, "current task plan")
+            if current_digest == expected_current:
+                # Recheck the destination's identity and bytes immediately
+                # before replacement; an external writer cannot be overwritten
+                # based on an earlier digest observation.
+                _fresh, fresh_digest = _plan_snapshot(destination, "current task plan")
+                if fresh_digest != expected_current:
+                    raise HarnessError("current plan changed before pending update could publish")
+                atomic_write_bytes(destination, payload)
+            elif current_digest != expected_source or current_payload != payload:
+                raise HarnessError("pending plan update destination diverged; manual reconciliation required")
+            # Receipt semantics retain the pre-update digest even when the
+            # retry observes the already-published after-image.
+            current_digest = expected_current
+        else:
+            current_payload, current_digest = _plan_snapshot(destination, "current task plan")
+            if current_digest != expected_current:
+                # A completed exact retry is intentionally a no-op, rather
+                # than a dead-end after a crash during receipt publication.
+                revisions = state.get("plan_revisions", [])
+                if (
+                    current_digest == expected_source
+                    and isinstance(revisions, list)
+                    and any(
+                        isinstance(item, dict)
+                        and item.get("before_plan_sha256") == expected_current
+                        and item.get("after_plan_sha256") == expected_source
+                        and item.get("reason") == reason
+                        for item in revisions
+                    )
+                ):
+                    emit(
+                        {
+                            "task_id": args.task,
+                            "idempotent": True,
+                            "plan_ready": bool(state.get("plan_ready")),
+                        },
+                        args.json,
+                    )
+                    return 0
+                raise HarnessError(
+                    "current plan SHA-256 does not match --expected-current-plan-sha256"
+                )
+            payload, source_digest = _read_plan_update_source(paths, args.source)
+            if source_digest != expected_source:
+                raise HarnessError(
+                    "plan update source SHA-256 does not match --expected-source-sha256"
+                )
+            if source_digest == current_digest:
+                raise HarnessError("plan update changes nothing; source matches current plan")
+            artifact = _cache_plan_revision_bytes(paths, str(state["task_id"]), payload, source_digest)
+            pending = {
+                "before_plan_sha256": current_digest,
+                "after_plan_sha256": source_digest,
+                "reason": reason,
+                "artifact_path": artifact.relative_to(task_dir(paths, str(state["task_id"]))).as_posix(),
+                "size_bytes": len(payload),
+                "prepared_at": now_iso(),
+            }
+            # Durable invalidation comes before the irreversible plan-file
+            # side effect.  Any crash therefore leaves the task unapproved.
+            state["plan_ready"] = False
+            state["plan_update_pending"] = pending
+            bump_task(state)
+            write_task(paths, state)
+            write_index(paths)
+            _fresh, fresh_digest = _plan_snapshot(destination, "current task plan")
+            if fresh_digest != expected_current:
+                raise HarnessError("current plan changed before update could publish")
+            atomic_write_bytes(destination, payload)
+        _published, published_digest = _plan_snapshot(destination, "published task plan")
+        if published_digest != expected_source:
+            raise HarnessError("published task plan digest differs from pending plan update")
+        revision_entry = {
+            "at": now_iso(),
+            "reason": reason,
+            "before_plan_sha256": current_digest,
+            "after_plan_sha256": source_digest,
+            "revision": int(state.get("revision", 0)) + 1,
+        }
+        state["plan_ready"] = False
+        state.pop("plan_update_pending", None)
+        state.setdefault("plan_revisions", []).append(revision_entry)
+        state.setdefault("facts", []).append(
+            f"Task plan replaced from {current_digest} to {source_digest}: {reason}"
+        )
+        bump_task(state, checkpoint_required=False)
+        state["checkpoint_revision"] = state["revision"]
+        state["checkpoint_required"] = False
+        checkpoint = services.commit_checkpoint(paths, state)
+        write_index(paths)
+    emit(
+        {
+            "task_id": args.task,
+            "plan_ready": False,
+            "before_plan_sha256": current_digest,
+            "after_plan_sha256": source_digest,
+            "revision": revision_entry["revision"],
+            "checkpoint": str(checkpoint),
+        },
+        args.json,
+    )
     return 0
 
 
@@ -2145,6 +2404,18 @@ def register_task_lifecycle_commands(
     parser.set_defaults(handler=handlers["approve_plan"])
 
     parser = subparsers.add_parser(
+        "plan-update",
+        help="replace one task plan from a bounded, digest-bound external source",
+    )
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--expected-source-sha256", required=True)
+    parser.add_argument("--expected-current-plan-sha256", required=True)
+    parser.add_argument("--reason", required=True)
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["plan_update"])
+
+    parser = subparsers.add_parser(
         "retarget-task",
         help="re-anchor an open task's title/objective/completion boundary",
     )
@@ -2298,6 +2569,7 @@ __all__ = [
     "cmd_init_task",
     "cmd_start_mini",
     "cmd_approve_plan",
+    "cmd_plan_update",
     "cmd_bind_session",
     "cmd_import_legacy",
     "cmd_check_locks",

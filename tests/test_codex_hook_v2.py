@@ -90,12 +90,19 @@ def _strict_local_v2_runtime(project: Path):
         (dist / "METADATA").write_text(
             "Name: aoi-orgware\nVersion: 1.2.3\n", encoding="utf-8"
         )
-        package_files = ("__init__.py", "_version.py", "cli.py", "codex_hook.py")
+        package_files = (
+            "__init__.py",
+            "_version.py",
+            "cli.py",
+            "codex_hook.py",
+            "codex_transport_cli.py",
+        )
         for name in package_files:
             (package / name).write_text("# reviewed wheel\n", encoding="utf-8")
         for name, target in (
             ("aoi", "aoi_orgware.cli:main"),
             ("aoi-codex-hook", "aoi_orgware.codex_hook:main"),
+            ("aoi-codex-bridge", "aoi_orgware.codex_transport_cli:main"),
         ):
             _write_launcher(prefix, name, target)
         store = root / "reviewed-store"
@@ -153,6 +160,10 @@ def _strict_local_v2_runtime(project: Path):
                     "name": "aoi-codex-hook",
                     "target": "aoi_orgware.codex_hook:main",
                 },
+                "codex_bridge_entry_point": {
+                    "name": "aoi-codex-bridge",
+                    "target": "aoi_orgware.codex_transport_cli:main",
+                },
                 "hook_protocol_version": 6,
             },
             "artifact_store_root": str(store),
@@ -172,6 +183,11 @@ def _strict_local_v2_runtime(project: Path):
                 name="aoi-codex-hook",
                 value="aoi_orgware.codex_hook:main",
             ),
+            SimpleNamespace(
+                group="console_scripts",
+                name="aoi-codex-bridge",
+                value="aoi_orgware.codex_transport_cli:main",
+            ),
         ]
         fake_distribution = SimpleNamespace(
             _path=dist,
@@ -189,6 +205,9 @@ def _strict_local_v2_runtime(project: Path):
             "aoi_orgware.cli": SimpleNamespace(__file__=str(package / "cli.py")),
             "aoi_orgware.codex_hook": SimpleNamespace(
                 __file__=str(package / "codex_hook.py")
+            ),
+            "aoi_orgware.codex_transport_cli": SimpleNamespace(
+                __file__=str(package / "codex_transport_cli.py")
             ),
         }
 

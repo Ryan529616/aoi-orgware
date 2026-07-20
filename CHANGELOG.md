@@ -37,25 +37,75 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   `proof_scope=exact_local_wheel_install_only`, not a release or promotion.
   It cross-binds a caller-approved bundle SHA and external store with clean
   source commit/tree/manifest, inventory/rehearsal, exact wheel bytes, PEP 610
-  archive evidence, installed `RECORD`, and runtime bytes. It does not claim a
-  tag, GitHub Release, PyPI publication, or live Codex `/hooks` trust. The
+  archive evidence, installed `RECORD`, and runtime bytes. Its local schema-v2
+  receipt now also requires and rechecks the `aoi-codex-bridge` entry point,
+  launcher, optional generated script, and transport CLI module. Full tracked
+  source manifests accept safe dotfiles and dot-directories such as
+  `.gitignore` and `.github/`, while still rejecting traversal and noncanonical
+  paths. It does not claim a tag, GitHub Release, PyPI publication, or live
+  Codex `/hooks` trust. The
   source identity is reviewed context, not an independent source-to-wheel,
   builder-toolchain, or test-execution attestation; the test summary is
   explicitly caller-supplied.
-- **O8 — integrity and adoption (implemented; promotion still pending).** The
-  one-way, eligible-task `required_v1` adoption contract, seven integrity
-  commands, claim-bound mutation snapshots, review/fix/verification chains,
-  exact retry, close seal, concise status, and preview-first offboarding are
-  implemented. The complete WSL pytest collection passed `1,312` tests with
-  `28` platform skips; Windows `unittest discover` passed `1,102` tests with
-  `28` skips, supplemented by final pytest coverage for free-function
-  provenance/workflow and host-native onboarding paths. A later shared-agent-ID
-  follow-up passed its focused integrity/dispatch/routing suites on Windows and
-  WSL; the pushed GitHub matrix remains its full-suite acceptance gate.
-  `required_v1` is not a mandatory semantic-v2 genesis field. Push and live
-  canary are still open; no GitHub Actions, PyPI, tag, or live-client result is claimed. Manual
-  reviewer identity remains a cooperative assertion, and unavailable MCP
-  registry paths are reported as uncovered.
+- **O8 — integrity v2 and adoption (implementation candidate; promotion
+  pending).** New `integrity-adopt` creates `required_v2`. `required_v1` is
+  frozen and read-only for compatibility: its validator, candidate-only seal
+  semantics, and sealed contracts remain unchanged. Any unsealed valid v1
+  contract, including a valid empty record set, may make the explicit
+  `integrity-upgrade-v2` transition with an expected canonical v1-contract
+  digest; its receipt retains
+  the canonical v1 CAS source and every finding obligation rather than silently
+  reinterpreting history.
+  `required_v2` uses one ordered `integrity_seq` ledger. Snapshot content SHA
+  may repeat, while record SHA/attempt identity is unique and is used by every
+  review, finding, fix, verification, and seal edge. A terminal seal requires
+  an exact final clean review and a complete basis of current `PASS`
+  re-verifications for every prior finding on its exact terminal attempt.
+  The post-fix dogfood dead-end (duplicate content SHA) and v1
+  verification loop-variable bug were recorded as P1 findings. Exact
+  post-commit independent review and seal, GitHub CI, local bundle, and
+  installed-package validation remain pending; no promotion, release, or
+  downstream installation/execution result is claimed. Manual reviewer identity
+  remains a cooperative assertion, and unavailable MCP registry paths are
+  reported as uncovered.
+- **O9 — optional Codex Transport Bridge (implementation candidate; promotion
+  pending).** The dependency-free core now ships a separate finite
+  `aoi-codex-bridge` entry point for one packet/thread/turn over local App
+  Server stdio. Chief issuance binds an exact one-shot permit, stable Codex
+  `0.144.6` executable/schema set, prompt/cwd/model/effort/sandbox, and—when
+  writable—a pre-turn Git endpoint preserved in task CAS. Runtime milestones
+  are semantic transactions with explicit `launch_unknown`/`runtime_unknown`
+  reconciliation and no automatic resend. A completed runtime receipt remains
+  `codex_runtime_observed`; Git/tree/claim materialization is a separate
+  binding-backed `verified_mutation` projection and neither implies AOI task
+  completion. Reservation now atomically consumes one exact packet arm without
+  fabricating `SubagentStart`; dispatch generation v2, complete ownership
+  binding, a per-launch OS lock, consume/pending-time expiry checks, and
+  issue-to-Popen Git/claim recapture close duplicate-launch and stale-source
+  races. Local fake-runtime tests are not live App Server, release,
+  package-install, or downstream ARISE evidence.
+- **Local-files confidentiality profile (implementation candidate; promotion
+  pending).** `mode = "local_files"` means model context allowed and governed
+  file publication denied. Local Git and local CAS/evidence remain available;
+  push/LFS upload, remote CI, release/package publication, artifact upload,
+  and attachment/connector publication fail closed. Exact external export
+  requires a Chief one-shot destination/content/purpose/expiry permit. Doctor
+  reports remotes, rewrites, LFS, workflows, sync/network storage,
+  publish-credential names/helpers, and receipts without exposing credential
+  values. The Bridge enforces storage/cwd preflight at issue, pre-reserve, and
+  process pending and requests `networkAccess=false`. Windows mapped drives are
+  rejected through volume/DOS-device inspection; missing roots, aliases, and
+  reparse uncertainty also fail confirmed-local gates. Percent-encoded `file:`
+  drives and generic Windows reparse attributes cannot bypass that classifier;
+  lexical and resolved drives are both checked so SUBST identity survives the
+  trust decision, and malformed URLs become structured invalid findings.
+  Terminal transport
+  receipts cannot close while an item remains started, except that
+  `runtime_unknown` preserves it as incomplete evidence. This is not DLP, an air
+  gap, or a claim that model providers cannot see prompt/context. The active
+  promotion route is local Windows/WSL plus applicable authorized EDA,
+  independent review, seal, install smoke, and encrypted bundle; remote CI and
+  publication are forbidden/not applicable.
 
 ### Added
 - **Codex startup byte-state registration and strict resource timeline.**
@@ -358,9 +408,10 @@ evidence).
 
 - First public PyPI release. It rolls up the internal 0.2.1 and 0.2.2 alpha
   milestones in addition to the onboarding and integrity changes above.
-- The hook adapter remains a cooperative, fail-open procedural guardrail, not a
-  security sandbox. Workflow-orchestrated spawns bypass `PreToolUse`; the
-  `SubagentStart` observation still accounts for them.
+- The hook adapter remains a cooperative procedural guardrail, not a security
+  sandbox. Any internal `PreToolUse` failure is fail-closed deny; only
+  non-`PreToolUse` lifecycle adapters are fail-open. Workflow-orchestrated
+  spawns bypass this tool gate, and `SubagentStart` still accounts for them.
 - Codex onboarding does not install Codex, edit global `CODEX_HOME` settings,
   or bypass hook trust. Existing AOI projects require the Chief credential and
   no active task before the configuration digest can change.

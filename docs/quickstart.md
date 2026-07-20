@@ -50,7 +50,9 @@ Run this from the Git repository to govern. The bundle expected SHA is the
 caller's trust anchor: use the canonical digest recorded in the bundle's
 `bundle_sha256` field, not the raw JSON file SHA-256, and do not infer it from
 installed metadata. Use the exact installed `aoi.exe` launcher: provenance
-validates its `sys.argv[0]` identity.
+validates its `sys.argv[0]` identity. The same local schema-v2 proof also
+verifies the installed `aoi-codex-hook` and `aoi-codex-bridge` entry points,
+launchers, generated scripts when present, modules, and `RECORD` bindings.
 
 ```powershell
 & $aoiLauncher codex-init `
@@ -79,7 +81,10 @@ The local receipt/runtime binds the expected bundle SHA, a canonical external
 store, clean commit/tree and full tracked-source manifest, artifact inventory
 and rehearsal, the exact wheel path/SHA, PEP 610 `direct_url` archive path/SHA,
 and installed `RECORD` plus runtime bytes. A manual reviewer remains a
-cooperative assertion; the expected bundle SHA is the caller trust anchor. It
+cooperative assertion. The tracked-source manifest includes safe dotfiles such
+as `.gitignore` and paths under `.github/`; traversal and noncanonical paths
+remain invalid. The
+expected bundle SHA is the caller trust anchor. It
 does not establish a tag, GitHub Release, PyPI publication, or live Codex
 `/hooks` trust. The clean source identity is reviewed context; this local
 bundle does not independently attest that the wheel was built from that source,
@@ -145,25 +150,170 @@ machine contract. A manually entered reviewer identity is a cooperative
 assertion, not independent authentication. Do not represent it as proof that a
 different person, model, or runtime performed the review.
 
-## 4. Adopt integrity for an eligible material task
+## 4. Adopt or upgrade integrity for an eligible material task
 
-`required_v1` is a one-time choice for an eligible task, not a field that every
-semantic-v2 task receives at genesis. Make the decision before the final review
-and while the task's claims are still live. The material-task sequence is
-`integrity-adopt`, `integrity-snapshot`, `integrity-review`, optional
-`integrity-fix` plus a post-fix snapshot and `integrity-verify`, then
-`integrity-seal`; `integrity-show` is read-only.
+New eligible tasks use `integrity-adopt` to create `required_v2` directly from
+an exact baseline head:
 
-The candidate snapshot compares every task-local Git mutation path with the
-live claim scope. Seal recaptures the worktree and requires byte identity with
-the latest candidate and its exact live claim tokens. Only then may the normal
-claim-release/terminal task close sequence proceed. A latest-candidate review
-is mandatory; any retry must match the recorded semantic intent exactly rather
-than creating a fresh snapshot. Reviewer IDs are cooperative and must differ
-from recorded producer IDs; they do not authenticate an independent human or
-runtime.
+```powershell
+& $aoiLauncher integrity-adopt `
+  --task <task-id> `
+  --baseline-head <exact-baseline-head> `
+  --json
+```
 
-## 5. Offboard without deleting evidence
+`required_v1` is frozen, read-only compatibility for existing contracts: its
+validator, candidate-only seal, and sealed contracts remain unchanged. Do not
+attempt to migrate or reinterpret a sealed v1 task. Any unsealed, valid v1
+contract—including one with an empty record set—moves to `required_v2` through
+the explicit command with the expected canonical v1 digest:
+
+```powershell
+& $aoiLauncher integrity-upgrade-v2 `
+  --task <task-id> `
+  --expected-v1-contract-sha256 <canonical-v1-contract-sha256> `
+  --json
+```
+
+The upgrade receipt retains the canonical v1 CAS artifact and every existing
+finding obligation; it does not silently reinterpret v1 evidence. New v2 work
+uses record SHA as the attempt handle. Snapshot content SHA may repeat when the
+Git bytes repeat, but the returned snapshot record SHA and `integrity_seq` are
+unique.
+
+Each `--result-artifact`, `--fix-artifact`, and `--verification-artifact` value
+uses the exact grammar `<absolute-path>=<sha256>`; the path must exist and the
+digest must be its declared SHA-256.
+
+```powershell
+# Capture one exact candidate attempt and record its finding review.
+& $aoiLauncher integrity-snapshot --task <task-id> --purpose candidate --json
+& $aoiLauncher integrity-review `
+  --task <task-id> `
+  --snapshot-record-sha256 <candidate-snapshot-record-sha256> `
+  --reviewer-agent-id <independent-reviewer-agent-id> `
+  --result-artifact <absolute-path>=<sha256> `
+  --outcome findings `
+  --finding-id <finding-id> `
+  --json
+
+# For each finding, capture a post-fix attempt, bind the fix, and reverify it.
+& $aoiLauncher integrity-snapshot --task <task-id> --purpose post_fix --json
+& $aoiLauncher integrity-fix `
+  --task <task-id> `
+  --finding-id <finding-id> `
+  --post-fix-snapshot-record-sha256 <post-fix-snapshot-record-sha256> `
+  --fix-artifact <absolute-path>=<sha256> `
+  --json
+& $aoiLauncher integrity-verify `
+  --task <task-id> `
+  --finding-id <finding-id> `
+  --fix-record-sha256 <fix-record-sha256> `
+  --verification-snapshot-record-sha256 <terminal-snapshot-record-sha256> `
+  --reviewer-agent-id <independent-reviewer-agent-id> `
+  --verification-artifact <absolute-path>=<sha256> `
+  --outcome pass `
+  --json
+
+# The exact terminal attempt then receives its final clean review.
+& $aoiLauncher integrity-review `
+  --task <task-id> `
+  --snapshot-record-sha256 <terminal-snapshot-record-sha256> `
+  --reviewer-agent-id <independent-reviewer-agent-id> `
+  --result-artifact <absolute-path>=<sha256> `
+  --outcome clean `
+  --json
+
+& $aoiLauncher integrity-seal `
+  --task <task-id> `
+  --json
+```
+
+Review may iterate and record more findings. Before `integrity-seal`, the exact
+terminal attempt must receive the final clean review. Its review basis must list
+the current `PASS` verification for every prior finding's latest fix on that
+same attempt. Seal then recaptures the worktree and requires byte and live-claim
+scope identity with that exact terminal record. Retries preserve the recorded
+semantic intent rather than creating a fresh attempt. Reviewer IDs are
+cooperative and must differ from recorded producer IDs; they do not authenticate
+an independent human or runtime.
+
+## 5. Select local-files confidentiality when publication is forbidden
+
+Use this profile when Codex may see project context but project files, Git
+objects, artifacts, EDA outputs, packages, or attachments must remain local:
+
+```toml
+[confidentiality]
+mode = "local_files"
+model_context = "allowed"
+git_push = "deny"
+remote_ci = "deny"
+artifact_upload = "deny"
+external_export = "permit_required"
+local_cas = true
+```
+
+Local branch/status/diff/commit and local evidence remain allowed. Run
+`aoi doctor --json` before governed work and resolve every confirmed external
+remote/LFS/sync-root/known-publish-credential error. Credential matching is a
+finite known-name check, not proof that no unlisted secret exists. A Windows
+mapped drive is denied as network storage. Missing drive metadata, SUBST
+aliases, and link/reparse traversal are labelled unverified and also block a
+confirmed-local gate. Percent-encoded `file:` paths and generic Windows reparse
+attributes are included. AOI checks both the caller-visible drive and resolved
+target and reports malformed URLs as invalid; workflow-file presence remains a
+separate warning. Do
+not treat this mode as an air gap: model context is allowed. Do not run push, remote CI, GitHub
+Release, package publish, artifact upload, or connector/attachment publication.
+An approved external export must use the exact one-shot export-permit commands;
+the receipt proves authorization/consumption, not an observed upload.
+
+For promotion, stop after the exact local commit/tree, complete Windows and WSL
+tests, applicable authorized local EDA only when required, independent review,
+integrity-v2 seal, package/isolated-install smoke, and encrypted local bundle.
+Remote-main CI is not an alternative under this profile.
+
+
+## 6. Optional one-turn Codex bridge
+
+Most users should let an AOI-aware agent prepare the sealed intent, decision,
+permit, and prompt. The transport is intentionally separate from ordinary
+`aoi` lifecycle commands:
+
+```powershell
+aoi-codex-bridge --root <project> issue `
+  --task <task-id> --launch-id <launch-id> `
+  --intent-file <sealed-intent.json> `
+  --decision-file <sealed-decision.json> `
+  --permit-file <sealed-permit.json> `
+  --command-id <stable-command-id> `
+  --recorded-at <timezone-aware-time> `
+  --chief-session-id <chief-session> --chief-epoch <epoch> `
+  --chief-credential-file <absolute-external-credential-file> --json
+
+aoi-codex-bridge --root <project> run `
+  --task <task-id> --permit-sha256 <permit-sha256> `
+  --prompt-file <exact-utf8-prompt-file> --json
+```
+
+`run` deliberately has no Chief credential option. For `workspaceWrite`,
+`issue` also requires `--pre-git-endpoint-file`; after a completed runtime turn,
+`verify-mutation` separately records the post-image and claim evidence. A
+completed turn is not task completion. If `inspect` reports `launch_unknown`,
+do not rerun the launch; reconcile the task evidence instead.
+
+The bridge consumes the packet arm atomically and does not fabricate a
+`SubagentStart` identity. It uses one per-launch OS lock, checks the earlier
+permit/arm expiry and exact packet ownership at `process_start_pending`. That
+milestone precedes and authorizes both the exact-binary version probe and the
+App Server Popen; the bridge never restarts after it becomes durable. Under
+`local_files`, known sync/network AOI state roots and writable cwd paths are
+rejected before Popen, as are mapped Windows drives and paths whose Windows
+volume/reparse locality cannot be confirmed. `reservation_effective_at` is a Chief-planned semantic
+time, not measured wall-clock consumption.
+
+## 7. Offboard without deleting evidence
 
 Offboarding first performs a dry run. Choose an absolute archive directory
 outside the repository. Apply only after the preview is correct and AOI state

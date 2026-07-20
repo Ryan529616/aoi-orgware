@@ -12,6 +12,7 @@ import sys
 from typing import Any
 
 from .. import harnesslib as h
+from .. import confidentiality
 from .. import release_artifacts
 from .. import release_manifest
 from .. import release_runtime
@@ -154,6 +155,10 @@ def _chief_identity(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_release_promote(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
+    confidentiality.require_publication_action_allowed(
+        paths.project.confidentiality,
+        "release_publish",
+    )
     task_id = h.validate_id(args.task, "task id")
     observation_result = _read_canonical_json(
         args.observation_result_file,

@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .. import confidentiality
 from ..git_plumbing import FULL_COMMIT_RE, state_worktree
 from ..harnesslib import (
     HarnessError,
@@ -347,6 +348,11 @@ def cmd_finish_mini(
 ) -> int:
     """Complete a verified mini task through its existing lifecycle gates."""
 
+    if args.mode == "pushed":
+        confidentiality.require_publication_action_allowed(
+            paths.project.confidentiality,
+            "git_push",
+        )
     request = _request_payload(args)
     request_sha256 = _request_sha256(request)
     with state_lock(paths):

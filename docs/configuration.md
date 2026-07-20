@@ -112,6 +112,54 @@ enabled = false
 
 The full default file is available at `examples/aoi.toml`.
 
+## Confidentiality profile
+
+The default is `mode = "standard"`. IC/EDA projects that allow model context
+but prohibit project-file publication use the exact strict profile:
+
+```toml
+[confidentiality]
+mode = "local_files"
+model_context = "allowed"
+git_push = "deny"
+remote_ci = "deny"
+artifact_upload = "deny"
+external_export = "permit_required"
+local_cas = true
+```
+
+For `local_files`, all seven values are one closed contract; permissive or
+unknown combinations are rejected. Local Git operations remain allowed.
+AOI-managed push/LFS upload, remote CI, release/package publication, artifact
+upload, and connector/attachment publication are denied. External export is
+available only through an exact Chief one-shot permit, and AOI records
+authorization/consumption without claiming that it uploaded the bytes.
+
+`doctor` classifies external remotes and rewrites, LFS endpoints, workflow
+files, synchronized/network artifact roots, known publish credential
+names/helpers, and push/export receipts. Credential matching is a finite
+known-name detector and cannot prove that an unlisted secret is absent.
+Confirmed contradictions fail. On Windows, drive letters are checked with
+`GetDriveTypeW` and DOS-device alias inspection. Mapped drives fail as network
+storage; missing roots, metadata failures, SUBST aliases, and link/reparse
+traversal are labelled unverified and fail the confirmed-local gate. `file:` URI
+paths are strictly percent-decoded before classification, and generic Windows
+reparse attributes are checked beyond symlink/junction helpers. Both lexical
+and resolved drives are classified, and malformed URLs are reported as redacted
+invalid destinations instead of aborting doctor. The
+optional Codex bridge
+rechecks the artifact/CAS root at issue, pre-reserve, and process-pending, and
+also checks a `workspaceWrite` cwd. Its child sandbox requests
+`networkAccess=false`; the model-service control channel is not represented
+as arbitrary workload network permission.
+
+This profile does not claim that a model provider cannot receive prompt or
+context. Use a future offline/self-hosted profile for that different threat
+model. Promotion under `local_files` selects complete local Windows/WSL,
+applicable authorized EDA, independent review, integrity seal, install smoke,
+and encrypted local bundle evidence; remote-main CI/publication is forbidden,
+not missing.
+
 ## Codex v0.4 adapter boundary
 
 `codex-init` records the exact resolved AOI hook launcher and installed-package
@@ -142,10 +190,10 @@ scripts, and a bounded non-cache runtime-package manifest checked against
 wheel `RECORD`. Pip-generated, hashless `__pycache__/*.pyc` files are excluded;
 other files under `__pycache__` are rejected. At hook execution, AOI's
 provenance validator revalidates the persisted receipt, invoked launcher, and
-covered installed package bytes, and `doctor` reports drift. The top-level
-adapter is still fail-open before it can parse and identify the hook event;
-only an identified `PreToolUse` internal failure produces the fixed deny
-response. This cooperative hook is not a pre-import or OS security boundary.
+covered installed package bytes, and `doctor` reports drift. Any internal
+`PreToolUse` failure produces the fixed deny response (fail-closed); only
+non-`PreToolUse` lifecycle adapters are fail-open. This cooperative hook is not
+a pre-import or OS security boundary.
 `RECORD` verifies covered installed payloads; it proves the original wheel
 archive only when the stronger matching archive-digest evidence is available.
 
@@ -168,14 +216,25 @@ supported parseable paths can be cooperatively gated. An unavailable MCP
 registry, unsupported tool, or ambiguous target is `uncovered`, never treated
 as a covered integration.
 
-The v0.4 integrity surface is adopted one way as `required_v1`. It records
-candidate and post-fix Git mutation snapshots against live claims, then binds
-findings, fixes, review results, and independent review verification into a
-terminal seal. Reviewer identities must not equal producer identities, but this
-is a cooperative identity rule, not authentication or a same-user security
-boundary. Offboarding likewise changes only AOI-owned client wiring after
-preimage-drift checks and an archive/receipt; it preserves the AOI state as an
-inert archive unless the user takes a separate explicit action.
+The v0.4 integrity surface makes new `integrity-adopt` contracts `required_v2`.
+`required_v1` remains frozen and read-only for compatibility. Any unsealed valid
+v1 contract, including a valid empty record set, may make the explicit
+`integrity-upgrade-v2` transition with its expected canonical v1-contract
+digest; sealed v1 contracts remain v1.
+`required_v2` uses one ordered `integrity_seq` ledger: content SHA
+may repeat for identical snapshots, while record SHA identifies each distinct
+attempt and every graph edge. The migration receipt retains the canonical v1
+CAS source and all pre-existing finding obligations, which remain validated by
+the v1 reader; it is not a silent reinterpretation.
+
+For v2 seal, every prior finding's latest fix must have an independent `PASS`
+verification on the exact terminal snapshot attempt, and the final clean review
+must name that exact verification basis. Reviewer identities must not equal
+producer identities, but this is a cooperative identity rule, not authentication
+or a same-user security boundary. Offboarding likewise changes only AOI-owned
+client wiring after preimage-drift checks and an archive/receipt; it preserves
+the AOI state as an inert archive unless the user takes a separate explicit
+action.
 
 ## Interrupted publication and initialization
 

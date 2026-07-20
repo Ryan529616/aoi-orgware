@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import codex_transport_contracts as codex_transport
 from .agent_identity import AGENT_ID_RE
 from .evidence_artifacts import (
     COMMAND_ARTIFACT_MAX_BYTES,
@@ -58,6 +59,9 @@ NATIVE_V5_PACKET_CONTRACT_MARKER = "- AOI dispatch schema origin: `native_v5`"
 HELPER_SPAWN_BUDGET_CONTRACT_PREFIX = "- AOI helper spawn budget:"
 HELPER_SPAWN_BUDGET_MAX = 8
 DISPATCH_WILDCARD_AGENT_TYPE = "*"
+CODEX_TRANSPORT_ATTEMPT_STATUS = "transport_reserved"
+CODEX_TRANSPORT_DISPATCH_PROVENANCE = "codex_app_server_reserved"
+CODEX_TRANSPORT_DISPATCH_MODEL_VERSION = 2
 HOOK_PROTOCOL_VERSION = "6"
 HOOK_ID_RE = AGENT_ID_RE
 DISPATCH_ARM_MAX_SECONDS = 15 * 60
@@ -68,6 +72,7 @@ HOOK_OBSERVED_DISPATCH_PROVENANCES = {
 DISPATCH_PROVENANCES = {
     "none",
     *HOOK_OBSERVED_DISPATCH_PROVENANCES,
+    CODEX_TRANSPORT_DISPATCH_PROVENANCE,
     "manual_unverified",
 }
 EXACT_COMMAND_NORMALIZATION_V1 = "terminal-whitespace-lf-v1"
@@ -733,15 +738,43 @@ def packet_integrity_errors(
         if status not in PACKET_STATUSES:
             errors.append(f"packet {packet_id} has invalid status {status!r}")
             continue
-        if status == "dispatched" and not packet.get("agent_id"):
+        if (
+            status == "dispatched"
+            and not packet.get("agent_id")
+            and packet.get("dispatch_provenance")
+            != CODEX_TRANSPORT_DISPATCH_PROVENANCE
+        ):
             errors.append(f"packet {packet_id} is dispatched without an agent id")
         if schema_version is not None and schema_version >= 5:
+            dispatch_version = packet.get("dispatch_version")
             if (
-                not _is_exact_int(packet.get("dispatch_version"), 1)
+                not (
+                    _is_exact_int(dispatch_version, 1)
+                    or _is_exact_int(
+                        dispatch_version,
+                        CODEX_TRANSPORT_DISPATCH_MODEL_VERSION,
+                    )
+                )
                 or packet.get("dispatch_provenance") not in DISPATCH_PROVENANCES
                 or not isinstance(packet.get("dispatch_attempts"), list)
             ):
                 errors.append(f"packet {packet_id} dispatch schema is invalid")
+            if (
+                packet.get("dispatch_provenance")
+                == CODEX_TRANSPORT_DISPATCH_PROVENANCE
+                and dispatch_version != CODEX_TRANSPORT_DISPATCH_MODEL_VERSION
+            ):
+                errors.append(
+                    f"packet {packet_id} Codex transport dispatch model was downgraded"
+                )
+            if (
+                packet.get("dispatch_provenance")
+                != CODEX_TRANSPORT_DISPATCH_PROVENANCE
+                and dispatch_version != 1
+            ):
+                errors.append(
+                    f"packet {packet_id} non-transport dispatch cannot claim model v2"
+                )
             if packet.get("dispatched_at"):
                 errors.append(
                     f"packet {packet_id} v5 must not claim an unobserved dispatched_at"
@@ -772,6 +805,7 @@ def packet_integrity_errors(
                 if attempt_status not in {
                     "armed",
                     "consumed",
+                    CODEX_TRANSPORT_ATTEMPT_STATUS,
                     "disarmed",
                     "expired",
                 }:
@@ -908,6 +942,34 @@ def packet_integrity_errors(
                             errors.append(
                                 f"packet {packet_id} consumed dispatch attempt {attempt_index} observation lost identity integrity"
                             )
+                elif attempt_status == CODEX_TRANSPORT_ATTEMPT_STATUS:
+                    ownership = attempt.get("transport_ownership")
+                    try:
+                        checked_ownership = (
+                            codex_transport.validate_packet_transport_ownership(
+                                ownership
+                            )
+                        )
+                    except (
+                        codex_transport.CodexTransportContractError,
+                        TypeError,
+                    ):
+                        checked_ownership = None
+                    if (
+                        observation is not None
+                        or parse_time(closed_at) is None
+                        or reason
+                        or checked_ownership is None
+                        or checked_ownership.get("task_id") != state.get("task_id")
+                        or checked_ownership.get("packet_id") != packet_id
+                        or checked_ownership.get("arm_id") != attempt.get("arm_id")
+                        or checked_ownership.get("reservation_effective_at")
+                        != closed_at
+                    ):
+                        errors.append(
+                            f"packet {packet_id} transport-reserved dispatch attempt "
+                            f"{attempt_index} lacks exact ownership evidence"
+                        )
                 elif (
                     observation is not None
                     or parse_time(closed_at) is None
@@ -927,11 +989,13 @@ def packet_integrity_errors(
                     f"packet {packet_id} records dispatch timing without dispatch provenance"
                 )
             if status == "dispatched" and provenance not in (
-                HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
+                HOOK_OBSERVED_DISPATCH_PROVENANCES
+                | {"manual_unverified", CODEX_TRANSPORT_DISPATCH_PROVENANCE}
             ):
                 errors.append(f"packet {packet_id} dispatched state lacks provenance")
             if status in {"done", "failed"} and provenance not in (
-                HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
+                HOOK_OBSERVED_DISPATCH_PROVENANCES
+                | {"manual_unverified", CODEX_TRANSPORT_DISPATCH_PROVENANCE}
             ):
                 errors.append(f"packet {packet_id} terminal work lacks dispatch provenance")
             if "typed_outcome" in packet:
@@ -991,6 +1055,49 @@ def packet_integrity_errors(
                         errors.append(
                             f"packet {packet_id} observed dispatch lost packet/observation binding"
                         )
+            if provenance == CODEX_TRANSPORT_DISPATCH_PROVENANCE:
+                transport_attempts = [
+                    attempt
+                    for attempt in attempts
+                    if isinstance(attempt, dict)
+                    and attempt.get("status") == CODEX_TRANSPORT_ATTEMPT_STATUS
+                ]
+                packet_ownership = packet.get("transport_ownership")
+                try:
+                    checked_packet_ownership = (
+                        codex_transport.validate_packet_transport_ownership(
+                            packet_ownership
+                        )
+                    )
+                except (
+                    codex_transport.CodexTransportContractError,
+                    TypeError,
+                ):
+                    checked_packet_ownership = None
+                if (
+                    len(transport_attempts) != 1
+                    or checked_packet_ownership is None
+                    or transport_attempts[0].get("transport_ownership")
+                    != checked_packet_ownership
+                    or checked_packet_ownership.get("task_id")
+                    != state.get("task_id")
+                    or checked_packet_ownership.get("packet_id") != packet_id
+                    or dispatch_recorded_at
+                    != checked_packet_ownership.get("reservation_effective_at")
+                    or packet.get("agent_id")
+                    or packet.get("manual_unverified_reason")
+                ):
+                    errors.append(
+                        f"packet {packet_id} Codex transport dispatch lost exact ownership binding"
+                    )
+            elif packet.get("transport_ownership") is not None or any(
+                isinstance(attempt, dict)
+                and attempt.get("status") == CODEX_TRANSPORT_ATTEMPT_STATUS
+                for attempt in attempts
+            ):
+                errors.append(
+                    f"packet {packet_id} carries Codex transport ownership without its provenance"
+                )
             if provenance in (
                 HOOK_OBSERVED_DISPATCH_PROVENANCES | {"manual_unverified"}
             ) and not packet.get("agent_id"):
@@ -1027,8 +1134,22 @@ def subagent_incident_integrity_errors(
         (_packet_schema_version(packet) or 0) >= 5
         for packet in state.get("packets", [])
     )
-    if (incidents or v5_packets) and state.get("dispatch_model_version") != 1:
-        errors.append("dispatch v1 records require dispatch_model_version=1")
+    packet_versions = {
+        packet.get("dispatch_version")
+        for packet in state.get("packets", [])
+        if (_packet_schema_version(packet) or 0) >= 5
+    }
+    expected_model_version = (
+        CODEX_TRANSPORT_DISPATCH_MODEL_VERSION
+        if CODEX_TRANSPORT_DISPATCH_MODEL_VERSION in packet_versions
+        else 1
+    )
+    if (
+        incidents or v5_packets
+    ) and state.get("dispatch_model_version") != expected_model_version:
+        errors.append(
+            f"dispatch records require dispatch_model_version={expected_model_version}"
+        )
     seen: set[str] = set()
     arm_slots: dict[tuple[str, str], str] = {}
     for packet in state.get("packets", []):

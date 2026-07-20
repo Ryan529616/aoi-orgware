@@ -76,6 +76,23 @@ NON_CLOSE_QUALIFYING_EVIDENCE = frozenset(
 
 
 @dataclass(frozen=True)
+class ConfidentialityConfig:
+    """Project publication policy; this is not a model-context isolation claim."""
+
+    mode: str
+    model_context: str
+    git_push: str
+    remote_ci: str
+    artifact_upload: str
+    external_export: str
+    local_cas: bool
+
+    @property
+    def local_files(self) -> bool:
+        return self.mode == "local_files"
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     root: Path
     name: str
@@ -92,6 +109,7 @@ class ProjectConfig:
     capacity_recommendation_only: bool
     codex_hooks_enabled: bool
     codex_role_profiles: dict[str, str]
+    confidentiality: ConfidentialityConfig
     legacy_enabled: bool
     sha256: str
 
@@ -236,7 +254,8 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
         raise ValueError(f"invalid {source}: {exc}") from exc
     allowed = {
         "schema_version", "profile_id", "state_dir", "project", "organization",
-        "roles", "evidence", "receipts", "policy", "hooks", "codex", "legacy",
+        "roles", "evidence", "receipts", "policy", "hooks", "codex",
+        "confidentiality", "legacy",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -348,6 +367,75 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
                 f"codex.profiles.{role} must be a valid Codex profile name"
             )
         codex_role_profiles[role] = profile
+    confidentiality_table = _table(payload, "confidentiality")
+    _reject_unknown(
+        confidentiality_table,
+        {
+            "mode",
+            "model_context",
+            "git_push",
+            "remote_ci",
+            "artifact_upload",
+            "external_export",
+            "local_cas",
+        },
+        "confidentiality",
+    )
+    mode = confidentiality_table.get("mode", "standard")
+    if mode not in {"standard", "local_files"}:
+        raise ValueError(
+            "confidentiality.mode must be 'standard' or 'local_files'"
+        )
+    restrictive = mode == "local_files"
+    confidentiality = ConfidentialityConfig(
+        mode=mode,
+        model_context=confidentiality_table.get("model_context", "allowed"),
+        git_push=confidentiality_table.get(
+            "git_push", "deny" if restrictive else "allow"
+        ),
+        remote_ci=confidentiality_table.get(
+            "remote_ci", "deny" if restrictive else "allow"
+        ),
+        artifact_upload=confidentiality_table.get(
+            "artifact_upload", "deny" if restrictive else "allow"
+        ),
+        external_export=confidentiality_table.get(
+            "external_export", "permit_required" if restrictive else "allow"
+        ),
+        local_cas=confidentiality_table.get("local_cas", True),
+    )
+    exact_local_files = ConfidentialityConfig(
+        mode="local_files",
+        model_context="allowed",
+        git_push="deny",
+        remote_ci="deny",
+        artifact_upload="deny",
+        external_export="permit_required",
+        local_cas=True,
+    )
+    if restrictive and confidentiality != exact_local_files:
+        raise ValueError(
+            "confidentiality.mode local_files requires model_context='allowed', "
+            "git_push='deny', remote_ci='deny', artifact_upload='deny', "
+            "external_export='permit_required', and local_cas=true"
+        )
+    if not restrictive:
+        if confidentiality.model_context != "allowed":
+            raise ValueError("confidentiality.model_context must be 'allowed'")
+        if confidentiality.git_push not in {"allow", "deny"}:
+            raise ValueError("confidentiality.git_push must be 'allow' or 'deny'")
+        if confidentiality.remote_ci not in {"allow", "deny"}:
+            raise ValueError("confidentiality.remote_ci must be 'allow' or 'deny'")
+        if confidentiality.artifact_upload not in {"allow", "deny"}:
+            raise ValueError(
+                "confidentiality.artifact_upload must be 'allow' or 'deny'"
+            )
+        if confidentiality.external_export not in {"allow", "permit_required"}:
+            raise ValueError(
+                "confidentiality.external_export must be 'allow' or 'permit_required'"
+            )
+        if not isinstance(confidentiality.local_cas, bool):
+            raise ValueError("confidentiality.local_cas must be true or false")
     legacy = _table(payload, "legacy")
     _reject_unknown(legacy, {"enabled"}, "legacy")
     return ProjectConfig(
@@ -366,6 +454,7 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
         capacity_recommendation_only=recommendation_only,
         codex_hooks_enabled=_boolean(hooks, "enabled", "hooks.codex.enabled"),
         codex_role_profiles=codex_role_profiles,
+        confidentiality=confidentiality,
         legacy_enabled=_boolean(legacy, "enabled", "legacy.enabled"),
         sha256=hashlib.sha256(raw).hexdigest(),
     )

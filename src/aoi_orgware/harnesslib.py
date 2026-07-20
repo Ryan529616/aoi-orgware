@@ -173,6 +173,7 @@ TASK_OBJECT_LIST_FIELDS = {
     "needs_user_escalations",
     "override_requests",
     "packets",
+    "plan_revisions",
     "resource_config_events",
     "resource_session_registrations",
     "skill_adoption_events",
@@ -180,6 +181,7 @@ TASK_OBJECT_LIST_FIELDS = {
     "subagent_incidents",
     "verification",
 }
+PLAN_REVISION_MAX_ENTRIES = 256
 
 
 class HarnessError(RuntimeError):
@@ -3158,7 +3160,7 @@ def load_task(paths: HarnessPaths, task_id: str) -> dict[str, Any]:
             raise HarnessError(
                 f"task {task_id} has a semantic projection without its event ledger"
             )
-    validate_task_state(state, task_state_path(paths, task_id))
+    validate_task_state(state, task_state_path(paths, task_id), paths=paths)
     if state.get("task_id") != task_id:
         raise HarnessError(f"task state identity does not match requested task {task_id}")
     if state.get("profile_id") != paths.project.profile_id:
@@ -3246,7 +3248,57 @@ def _validate_mini_finish_record(
         raise HarnessError(f"mini finish receipt digest is invalid{where}")
 
 
-def validate_task_state(state: dict[str, Any], source: Path | None = None) -> None:
+def _compact_v2_source_contract(
+    paths: HarnessPaths, state: dict[str, Any], contract: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Read a compact-v2 migration source only through its task-local CAS path."""
+
+    from .integrity_records_v2 import (
+        MAX_INTEGRITY_MIGRATION_SOURCE_BYTES,
+        integrity_contract_source_required,
+    )
+
+    if not integrity_contract_source_required(contract):
+        return None
+    receipt = contract.get("migration_receipt")
+    if not isinstance(receipt, dict):
+        raise HarnessError("compact v2 integrity contract has no migration receipt")
+    artifact = receipt.get("source_contract_artifact")
+    if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256", "size_bytes"}:
+        raise HarnessError("compact v2 integrity source artifact reference is invalid")
+    digest = artifact.get("sha256")
+    size = artifact.get("size_bytes")
+    task_id = str(state.get("task_id", ""))
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise HarnessError("compact v2 integrity source artifact digest is invalid")
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_INTEGRITY_MIGRATION_SOURCE_BYTES:
+        raise HarnessError("compact v2 integrity source artifact size is invalid")
+    expected = task_dir(paths, task_id) / "results" / "artifact-blobs" / digest[:2] / digest
+    if artifact.get("path") != expected.relative_to(task_dir(paths, task_id)).as_posix():
+        raise HarnessError("compact v2 integrity source artifact path is not canonical")
+    _identity, raw = _read_regular_file_snapshot(
+        expected, "compact v2 integrity source artifact",
+        max_bytes=MAX_INTEGRITY_MIGRATION_SOURCE_BYTES,
+    )
+    if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+        raise HarnessError("compact v2 integrity source artifact is missing or tampered")
+    try:
+        source = json.loads(raw.decode("utf-8"))
+        canonical = json.dumps(
+            source, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HarnessError(f"compact v2 integrity source artifact is invalid JSON: {exc}") from exc
+    if not isinstance(source, dict) or raw != canonical:
+        raise HarnessError("compact v2 integrity source artifact is not canonical JSON")
+    return source
+
+
+def validate_task_state(
+    state: dict[str, Any], source: Path | None = None,
+    *, paths: HarnessPaths | None = None,
+) -> None:
     where = f" in {source}" if source else ""
     schema_version = state.get("schema_version")
     if (
@@ -3308,6 +3360,54 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
         if any(not isinstance(item, expected_type) for item in value):
             kind = "objects" if expected_type is dict else "strings"
             raise HarnessError(f"task field {field!r} must contain only {kind}{where}")
+    revisions = state.get("plan_revisions", [])
+    if len(revisions) > PLAN_REVISION_MAX_ENTRIES:
+        raise HarnessError(f"task plan revisions exceed {PLAN_REVISION_MAX_ENTRIES}{where}")
+    previous_plan_revision = 0
+    for index, item in enumerate(revisions, start=1):
+        if set(item) != {
+            "at", "reason", "before_plan_sha256", "after_plan_sha256", "revision"
+        }:
+            raise HarnessError(f"task plan revision {index} has invalid fields{where}")
+        if (
+            not isinstance(item["at"], str)
+            or not item["at"].strip()
+            or not isinstance(item["reason"], str)
+            or not item["reason"].strip()
+            or len(item["reason"]) > 4000
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item["before_plan_sha256"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item["after_plan_sha256"]))
+            or item["before_plan_sha256"] == item["after_plan_sha256"]
+            or isinstance(item["revision"], bool)
+            or not isinstance(item["revision"], int)
+            or item["revision"] <= previous_plan_revision
+            or item["revision"] > revision
+        ):
+            raise HarnessError(f"task plan revision {index} is invalid{where}")
+        previous_plan_revision = item["revision"]
+    pending = state.get("plan_update_pending")
+    if pending is not None:
+        if not isinstance(pending, dict) or set(pending) != {
+            "before_plan_sha256", "after_plan_sha256", "reason", "artifact_path", "size_bytes", "prepared_at"
+        }:
+            raise HarnessError(f"task pending plan update has invalid fields{where}")
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", str(pending["before_plan_sha256"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(pending["after_plan_sha256"]))
+            or pending["before_plan_sha256"] == pending["after_plan_sha256"]
+            or not isinstance(pending["reason"], str)
+            or not pending["reason"].strip()
+            or len(pending["reason"]) > 4000
+            or not isinstance(pending["artifact_path"], str)
+            or not re.fullmatch(r"plan-revision-blobs/[0-9a-f]{2}/[0-9a-f]{64}", pending["artifact_path"])
+            or not isinstance(pending["size_bytes"], int)
+            or isinstance(pending["size_bytes"], bool)
+            or not 0 < pending["size_bytes"] <= 1_048_576
+            or not isinstance(pending["prepared_at"], str)
+            or not pending["prepared_at"].strip()
+            or pending["artifact_path"].rsplit("/", 1)[-1] != pending["after_plan_sha256"]
+        ):
+            raise HarnessError(f"task pending plan update is invalid{where}")
     if "delivery" in state and not isinstance(state["delivery"], dict):
         raise HarnessError(f"task field 'delivery' must be an object{where}")
     registration_version_present = (
@@ -3326,19 +3426,55 @@ def validate_task_state(state: dict[str, Any], source: Path | None = None) -> No
             f"unsupported resource session registration schema{where}"
         )
     # Adoption is one-way but legacy projections intentionally remain readable.
-    # Keep this import local: integrity_records is a pure schema layer and must
-    # not create a harness import cycle.
+    # Keep versioned integrity-record imports local: their pure schema layers
+    # must not create a harness import cycle.
     if "integrity_contract" in state:
-        from .integrity_records import integrity_contract_errors
+        contract = state["integrity_contract"]
+        if (
+            not isinstance(contract, dict)
+            or isinstance(contract.get("schema_version"), bool)
+            or not isinstance(contract.get("schema_version"), int)
+            or not isinstance(contract.get("mode"), str)
+        ):
+            raise HarnessError(f"task integrity contract header invalid{where}")
 
-        contract_errors = integrity_contract_errors(
-            state["integrity_contract"],
-            task_id=state.get("task_id"),
-            worktree=state.get("worktree"),
-            require_complete=(
-                state.get("status") == "done" or state.get("phase") == "closing"
+        if (
+            contract["schema_version"] == 1
+            and contract["mode"] == "required_v1"
+        ):
+            from .integrity_records import integrity_contract_errors
+        elif (
+            contract["schema_version"] == 2
+            and contract["mode"] == "required_v2"
+        ):
+            from .integrity_records_v2 import (
+                integrity_contract_errors,
+                integrity_contract_source_required,
+            )
+        else:
+            raise HarnessError(f"task integrity contract header invalid{where}")
+
+        source_v1_contract: dict[str, Any] | None = None
+        if (
+            contract["schema_version"] == 2
+            and contract["mode"] == "required_v2"
+            and integrity_contract_source_required(contract)
+        ):
+            if paths is None:
+                raise HarnessError(
+                    f"compact-v2-capable task validation requires harness paths{where}"
+                )
+            source_v1_contract = _compact_v2_source_contract(paths, state, contract)
+        validation_kwargs: dict[str, Any] = {
+            "task_id": state.get("task_id"),
+            "worktree": state.get("worktree"),
+            "require_complete": (
+                state.get("status") == "done" or contract.get("seal") is not None
             ),
-        )
+        }
+        if contract["schema_version"] == 2 and contract["mode"] == "required_v2":
+            validation_kwargs["source_v1_contract"] = source_v1_contract
+        contract_errors = integrity_contract_errors(contract, **validation_kwargs)
         if contract_errors:
             raise HarnessError(
                 f"task integrity contract is invalid{where}: "
@@ -3363,7 +3499,7 @@ def write_task(paths: HarnessPaths, state: dict[str, Any]) -> None:
             "semantic-v2 task requires an explicit semantic transition writer; "
             "legacy write_task is disabled"
         )
-    validate_task_state(state)
+    validate_task_state(state, paths=paths)
     atomic_write_json(task_state_path(paths, task_id), state)
 
 
@@ -4196,7 +4332,7 @@ def load_all_tasks(paths: HarnessPaths) -> list[dict[str, Any]]:
                 raise HarnessError(
                     f"task {directory.name} has a semantic projection without its event ledger"
                 )
-            validate_task_state(state, state_path)
+            validate_task_state(state, state_path, paths=paths)
             if state.get("task_id") != directory.name:
                 raise HarnessError(
                     f"task state identity does not match directory: {state_path}"

@@ -183,6 +183,24 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
     prefix = root / "test-promoted-install"
     site_root = _test_site_root(prefix)
     dist_info = site_root / "aoi_orgware-0.4.0a1.dist-info"
+    scripts = _test_scripts(prefix)
+    bridge = _test_launcher(scripts, "aoi-codex-bridge")
+    bridge_script: Path | None = None
+    if os.name == "nt":
+        bridge.write_bytes(f"bridge-{salt}".encode())
+        bridge_script = scripts / "aoi-codex-bridge-script.py"
+        bridge_script.write_text(
+            "from aoi_orgware.codex_transport_cli import main\n",
+            encoding="utf-8",
+        )
+    else:
+        bridge.write_text(
+            "#!/usr/bin/env python3\n"
+            "from aoi_orgware.codex_transport_cli import main\n"
+            "main()\n",
+            encoding="utf-8",
+        )
+        bridge.chmod(0o755)
     store_root = root / "reviewed-local-artifact-store"
     store_root.mkdir(parents=True, exist_ok=True)
     bundle = store_root / "aoi-local-install.json"
@@ -204,10 +222,31 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         encoding="utf-8",
     )
     record = dist_info / "RECORD"
+    extra_record_rows = [
+        f"{os.path.relpath(bridge, site_root).replace('\\', '/')},"
+        + "sha256="
+        + base64.urlsafe_b64encode(hashlib.sha256(bridge.read_bytes()).digest())
+        .decode("ascii")
+        .rstrip("=")
+        + f",{bridge.stat().st_size}",
+    ]
+    if bridge_script is not None:
+        extra_record_rows.append(
+            f"{os.path.relpath(bridge_script, site_root).replace('\\', '/')},"
+            + "sha256="
+            + base64.urlsafe_b64encode(
+                hashlib.sha256(bridge_script.read_bytes()).digest()
+            )
+            .decode("ascii")
+            .rstrip("=")
+            + f",{bridge_script.stat().st_size}"
+        )
     record.write_text(
         record.read_text(encoding="utf-8").replace(
             "\n" + os.path.relpath(record, site_root).replace("\\", "/") + ",,\n",
             "\n"
+            + "\n".join(extra_record_rows)
+            + "\n"
             + f"{os.path.relpath(direct_url, site_root).replace('\\', '/')},"
             + "sha256="
             + base64.urlsafe_b64encode(
@@ -243,6 +282,22 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         "console_entry_point": public["console_entry_point"],
         "codex_hook_entry_point": public["codex_hook_entry_point"],
         "codex_hook_generated_script": public["codex_hook_generated_script"],
+        "codex_bridge_entry_point": {
+            "name": "aoi-codex-bridge",
+            "target": "aoi_orgware.codex_transport_cli:main",
+            "path": str(bridge.resolve()),
+            "record_sha256": hashlib.sha256(bridge.read_bytes()).hexdigest(),
+        },
+        "codex_bridge_generated_script": (
+            {
+                "path": str(bridge_script.resolve()),
+                "record_sha256": hashlib.sha256(
+                    bridge_script.read_bytes()
+                ).hexdigest(),
+            }
+            if bridge_script is not None
+            else {"path": None, "record_sha256": None}
+        ),
         "package_runtime_manifest": public["package_runtime_manifest"],
         "hook_protocol_version": 6,
         "install_wheel_artifact": {

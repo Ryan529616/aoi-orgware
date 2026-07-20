@@ -9,14 +9,23 @@ unretirable prose, and cancelled tasks could disown recorded mutations.
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
+import hashlib
 import json
+import os
+import re
 import sys
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from harness_case import HarnessTestCase  # noqa: E402
+from aoi_orgware import cli as cli_impl  # noqa: E402
+from aoi_orgware import harnesslib as h  # noqa: E402
+from aoi_orgware.commands import task_lifecycle as lifecycle_cmds  # noqa: E402
 
 
 class CloseOutcomeTests(HarnessTestCase):
@@ -167,6 +176,85 @@ class RetargetTests(HarnessTestCase):
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         return json.loads(state_path.read_text(encoding="utf-8"))
 
+    def _update_plan_to_current_scope(self, task_id: str) -> None:
+        state = self._state(task_id)
+        destination = self.root / ".aoi" / "tasks" / task_id / "plan.md"
+        candidate = destination.read_text(encoding="utf-8")
+        for label, key in (
+            ("Title", "title"),
+            ("Objective", "objective"),
+            ("Completion boundary", "completion_boundary"),
+        ):
+            candidate = re.sub(
+                rf"(?m)^- {re.escape(label)}:.*$",
+                f"- {label}: {state[key]}",
+                candidate,
+            )
+        source = Path(self.backup_temp.name) / f"{task_id}-revised-plan.md"
+        source.write_text(candidate, encoding="utf-8")
+        self.cli(
+            "plan-update",
+            "--task",
+            task_id,
+            "--source",
+            str(source),
+            "--expected-source-sha256",
+            hashlib.sha256(source.read_bytes()).hexdigest(),
+            "--expected-current-plan-sha256",
+            hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "--reason",
+            "Replace the stale plan with the retargeted registered scope",
+        )
+
+    def test_plan_update_file_and_scope_falsification_boundaries(self) -> None:
+        self.init_task("retarget-plan-boundaries")
+        paths = h.get_paths(self.root)
+        destination = self.root / ".aoi" / "tasks" / "retarget-plan-boundaries" / "plan.md"
+        outside = Path(self.backup_temp.name)
+        inside = self.root / ".aoi" / "candidate.md"
+        inside.write_text("inside state", encoding="utf-8")
+        with self.assertRaisesRegex(h.HarnessError, "inside AOI state"):
+            lifecycle_cmds._read_plan_update_source(paths, str(inside))
+        oversized = outside / "oversized-plan.md"
+        oversized.write_bytes(b"x" * (lifecycle_cmds.PLAN_UPDATE_MAX_BYTES + 1))
+        with self.assertRaisesRegex(h.HarnessError, "exceeds"):
+            lifecycle_cmds._read_plan_update_source(paths, str(oversized))
+        invalid = outside / "invalid-utf8.md"
+        invalid.write_bytes(b"\xff")
+        with self.assertRaisesRegex(h.HarnessError, "valid UTF-8"):
+            lifecycle_cmds._read_plan_update_source(paths, str(invalid))
+        with self.assertRaisesRegex(h.HarnessError, "regular"):
+            lifecycle_cmds._read_plan_update_source(paths, str(outside))
+        linked = outside / "linked-plan.md"
+        try:
+            os.symlink(destination, linked)
+        except OSError:
+            linked = None
+        if linked is not None:
+            with self.assertRaisesRegex(h.HarnessError, "symlink|junction"):
+                lifecycle_cmds._read_plan_update_source(paths, str(linked))
+        hardlink = outside / "hardlinked-plan.md"
+        os.link(destination, hardlink)
+        with self.assertRaisesRegex(h.HarnessError, "regular"):
+            lifecycle_cmds._read_plan_update_source(paths, str(hardlink))
+        with self.assertRaisesRegex(h.HarnessError, "regular"):
+            lifecycle_cmds._plan_snapshot(outside, "nonregular destination")
+
+        state = self._state("retarget-plan-boundaries")
+        plan = destination.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(h.HarnessError, "exactly one"):
+            lifecycle_cmds._plan_scope_fields(plan.replace("- Title:", "- Missing:"))
+        with self.assertRaisesRegex(h.HarnessError, "exactly one"):
+            lifecycle_cmds._plan_scope_fields(plan + f"\n- Title: {state['title']}\n")
+        with self.assertRaisesRegex(h.HarnessError, "single-line"):
+            lifecycle_cmds._plan_scope_fields(
+                plan.replace(f"- Objective: {state['objective']}", "- Objective: one\n  two")
+            )
+        with self.assertRaisesRegex(h.HarnessError, "does not match current task state"):
+            lifecycle_cmds._require_plan_scope_matches_state(
+                plan.replace(state["objective"], "different objective"), state
+            )
+
     def test_retarget_records_revision_and_forces_replan(self) -> None:
         self.init_task("retarget-a")
         self.cli(
@@ -203,6 +291,16 @@ class RetargetTests(HarnessTestCase):
             ok=False,
         )
         self.assertIn("plan", failed.stderr.lower())
+        stale = self.cli(
+            "approve-plan",
+            "--task",
+            "retarget-a",
+            "--note",
+            "Plan re-approved against the retargeted completion boundary",
+            ok=False,
+        )
+        self.assertIn("does not match current task state", stale.stderr)
+        self._update_plan_to_current_scope("retarget-a")
         self.cli(
             "approve-plan",
             "--task",
@@ -235,6 +333,7 @@ class RetargetTests(HarnessTestCase):
             "--reason",
             "boundary re-anchored after measurement",
         )
+        self._update_plan_to_current_scope("retarget-d")
         self.cli(
             "approve-plan",
             "--task",
@@ -281,6 +380,115 @@ class RetargetTests(HarnessTestCase):
             "done",
         )
         self.assertEqual(self._state("retarget-d")["outcome"], "achieved")
+
+    def test_plan_update_binds_source_current_digest_and_reapproval(self) -> None:
+        self.init_task("retarget-plan-update")
+        destination = self.root / ".aoi" / "tasks" / "retarget-plan-update" / "plan.md"
+        before = destination.read_bytes()
+        source = Path(self.backup_temp.name) / "candidate-plan.md"
+        source.write_bytes(before + b"\n<!-- bounded plan revision -->\n")
+        source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        current_digest = hashlib.sha256(before).hexdigest()
+        rejected = self.cli(
+            "plan-update",
+            "--task",
+            "retarget-plan-update",
+            "--source",
+            str(source),
+            "--expected-source-sha256",
+            "0" * 64,
+            "--expected-current-plan-sha256",
+            current_digest,
+            "--reason",
+            "Wrong source digest must not publish bytes",
+            ok=False,
+        )
+        self.assertIn("source SHA-256", rejected.stderr)
+        self.assertEqual(destination.read_bytes(), before)
+        rejected = self.cli(
+            "plan-update",
+            "--task",
+            "retarget-plan-update",
+            "--source",
+            str(source),
+            "--expected-source-sha256",
+            source_digest,
+            "--expected-current-plan-sha256",
+            "f" * 64,
+            "--reason",
+            "Wrong current digest must not publish bytes",
+            ok=False,
+        )
+        self.assertIn("current plan SHA-256", rejected.stderr)
+        self.assertEqual(destination.read_bytes(), before)
+        self.cli(
+            "plan-update",
+            "--task",
+            "retarget-plan-update",
+            "--source",
+            str(source),
+            "--expected-source-sha256",
+            source_digest,
+            "--expected-current-plan-sha256",
+            current_digest,
+            "--reason",
+            "Record the exact bounded plan revision before re-approval",
+        )
+        state = self._state("retarget-plan-update")
+        self.assertFalse(state["plan_ready"])
+        self.assertEqual(state["plan_revisions"][-1]["before_plan_sha256"], current_digest)
+        self.assertEqual(state["plan_revisions"][-1]["after_plan_sha256"], source_digest)
+        self.assertEqual(state["checkpoint_revision"], state["revision"])
+        self.cli(
+            "approve-plan",
+            "--task",
+            "retarget-plan-update",
+            "--note",
+            "Re-approved after the digest-bound plan revision",
+        )
+
+    def test_plan_update_exact_retry_recovers_each_post_prepare_crash_boundary(self) -> None:
+        self.init_task("retarget-plan-retry")
+        destination = self.root / ".aoi" / "tasks" / "retarget-plan-retry" / "plan.md"
+        source = Path(self.backup_temp.name) / "retry-plan.md"
+        source.write_bytes(destination.read_bytes() + b"\n<!-- retry-safe -->\n")
+        args = argparse.Namespace(
+            task="retarget-plan-retry", source=str(source),
+            expected_source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            expected_current_plan_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
+            reason="prove exact retry finalizes a durable pending revision", json=False,
+        )
+        paths = h.get_paths(self.root)
+        services = cli_impl._task_lifecycle_cmd_services()
+        with mock.patch.object(lifecycle_cmds, "atomic_write_bytes", side_effect=OSError("injected pre-publish crash")):
+            with self.assertRaisesRegex(OSError, "pre-publish"):
+                lifecycle_cmds.cmd_plan_update(args, paths, services=services)
+        pending = h.load_task(paths, "retarget-plan-retry")
+        self.assertFalse(pending["plan_ready"])
+        self.assertIn("plan_update_pending", pending)
+        lifecycle_cmds.cmd_plan_update(args, paths, services=services)
+        self.assertNotIn("plan_update_pending", h.load_task(paths, "retarget-plan-retry"))
+
+        self.init_task("retarget-plan-retry-after-publish")
+        destination = self.root / ".aoi" / "tasks" / "retarget-plan-retry-after-publish" / "plan.md"
+        source = Path(self.backup_temp.name) / "retry-after-publish-plan.md"
+        source.write_bytes(destination.read_bytes() + b"\n<!-- retry-after-publish -->\n")
+        after_args = argparse.Namespace(
+            task="retarget-plan-retry-after-publish", source=str(source),
+            expected_source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            expected_current_plan_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
+            reason="prove exact retry finalizes after the plan side effect", json=False,
+        )
+        failing_services = dataclasses.replace(
+            services, commit_checkpoint=mock.Mock(side_effect=OSError("injected post-publish crash"))
+        )
+        with self.assertRaisesRegex(OSError, "post-publish"):
+            lifecycle_cmds.cmd_plan_update(after_args, paths, services=failing_services)
+        pending = h.load_task(paths, "retarget-plan-retry-after-publish")
+        self.assertIn("plan_update_pending", pending)
+        self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), after_args.expected_source_sha256)
+        lifecycle_cmds.cmd_plan_update(after_args, paths, services=services)
+        self.assertNotIn("plan_update_pending", h.load_task(paths, "retarget-plan-retry-after-publish"))
 
     def test_retarget_rejects_noop(self) -> None:
         self.init_task("retarget-b")

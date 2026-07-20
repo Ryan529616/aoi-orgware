@@ -152,7 +152,9 @@ class ServicesFactoryWiringTests(unittest.TestCase):
     def test_single_source_helpers_are_the_cli_resident_objects(self) -> None:
         # These helpers stay defined in cli (single source of truth: they feed
         # the CLI-resident packet/topology/portfolio wiring and the keep-list
-        # projection).  The relocated family must consume the *same* objects.
+        # projection).  New execution-brief writes deliberately use the strict
+        # identity helper; historical portfolio readback retains the legacy
+        # compatibility helper.
         services = cli_impl._execution_selection_cmd_services()
         self.assertIs(
             services.build_execution_resource_envelope,
@@ -166,7 +168,7 @@ class ServicesFactoryWiringTests(unittest.TestCase):
             cli_impl._execution_brief_coverage_error,
         )
         self.assertIs(
-            services.steward_packet_binding, cli_impl._steward_packet_binding
+            services.steward_packet_binding, cli_impl._new_steward_packet_binding
         )
         self.assertIs(
             services.selection_terminal_packet_bindings,

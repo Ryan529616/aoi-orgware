@@ -76,6 +76,13 @@ def strict_local_v2_receipt(root: Path, launcher: Path) -> dict:
             "record_sha256": digest,
         },
         "codex_hook_generated_script": {"path": None, "record_sha256": None},
+        "codex_bridge_entry_point": {
+            "name": "aoi-codex-bridge",
+            "target": "aoi_orgware.codex_transport_cli:main",
+            "path": str(root / "bin" / "aoi-codex-bridge.exe"),
+            "record_sha256": digest,
+        },
+        "codex_bridge_generated_script": {"path": None, "record_sha256": None},
         "package_runtime_manifest": {"count": 1, "sha256": digest},
         "hook_protocol_version": 6,
         "install_wheel_artifact": {

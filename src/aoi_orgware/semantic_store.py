@@ -597,6 +597,7 @@ def _migration_quiescence_errors(state: dict[str, Any]) -> list[str]:
                     elif attempt_status not in {
                         "armed",
                         "consumed",
+                        "transport_reserved",
                         "disarmed",
                         "expired",
                     }:

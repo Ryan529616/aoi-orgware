@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Sequence
 
 
-CONSOLE_SCRIPTS = ("aoi", "aoi-codex-hook", "aoi-claude-hook")
+CONSOLE_SCRIPTS = ("aoi", "aoi-codex-hook", "aoi-codex-bridge", "aoi-claude-hook")
 BUILD_FRONTEND_VERSION = "1.5.0"
 HATCHLING_VERSION = "1.27.0"
 REQUIRED_PACKAGE_FILES = (
@@ -26,6 +26,9 @@ REQUIRED_PACKAGE_FILES = (
     "aoi_orgware/resources/codex/SKILL.md",
     "aoi_orgware/resources/claude/SKILL.md",
     "aoi_orgware/resources/pilot/run-record.template.json",
+    "aoi_orgware/resources/codex_app_server/0.144.6/runtime-pin.json",
+    "aoi_orgware/resources/codex_app_server/0.144.6/schema-manifest.json",
+    "aoi_orgware/resources/codex_app_server/0.144.6/codex_app_server_protocol.v2.schemas.json",
 )
 FORBIDDEN_SDIST_FILES = ("PROVENANCE.md", "IMPORT_MANIFEST.json")
 INSTALL_PROBE = r"""
@@ -59,6 +62,9 @@ required_resources = (
     "codex/SKILL.md",
     "claude/SKILL.md",
     "pilot/run-record.template.json",
+    "codex_app_server/0.144.6/runtime-pin.json",
+    "codex_app_server/0.144.6/schema-manifest.json",
+    "codex_app_server/0.144.6/codex_app_server_protocol.v2.schemas.json",
 )
 missing = []
 for relative in required_resources:

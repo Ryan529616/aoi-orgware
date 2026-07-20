@@ -7,7 +7,9 @@ import os
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 
@@ -19,6 +21,7 @@ from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import semantic_events as semantic  # noqa: E402
 from aoi_orgware import semantic_objects as objects  # noqa: E402
 from aoi_orgware import semantic_store as store  # noqa: E402
+from aoi_orgware import codex_transport_contracts as transport  # noqa: E402
 from aoi_orgware.config import default_config_text  # noqa: E402
 
 
@@ -163,6 +166,182 @@ class SemanticObjectTests(unittest.TestCase):
         self.assertEqual(
             objects.publish_semantic_object(self.paths, candidate), candidate
         )
+
+    def test_codex_transport_objects_are_closed_contracts_with_bounded_slots(self) -> None:
+        """Transport type registration must not turn semantic storage into a transcript sink."""
+
+        for object_type in (
+            "codex_launch_intent",
+            "codex_transport_receipt",
+            "codex_mutation_verification",
+        ):
+            self.assertIn(object_type, objects.OBJECT_TYPES)
+        for binding_kind in (
+            "codex_launch_reservation",
+            "codex_transport_milestone",
+            "codex_mutation_verification",
+        ):
+            self.assertIn(binding_kind, objects.BINDING_KINDS)
+
+        launch = transport.seal_launch_intent(
+            {
+                "contract_type": transport.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
+                "task_id": TASK,
+                "packet_id": "packet-1",
+                "routing_binding": {
+                    "kind": "cohort",
+                    "cohort_id": "cohort-1",
+                    "cohort_sha256": "a" * 64,
+                    "wave_index": 0,
+                    "transport_slot_sha256": "b" * 64,
+                    "routing_authority_sha256": "c" * 64,
+                    "transport": "codex",
+                    "parent_session_id": "chief-1",
+                    "expected_agent_type": "worker",
+                },
+                "expected_semantic_head_sha256": "a" * 64,
+                "prompt_sha256": "b" * 64,
+                "prompt_size_bytes": 41,
+                "cwd": "C:/scratch/repo",
+                "requested_model": "gpt-5.6",
+                "requested_effort": "high",
+                "sandbox": "readOnly",
+                "approval": "never",
+                "runtime_pin": {
+                    **transport.pinned_runtime_binding(),
+                    "executable_path": "C:/tools/codex-app-server.exe",
+                },
+                "pre_git_binding": {
+                    "git_head_sha256": "a" * 64,
+                    "git_tree_sha256": "b" * 64,
+                    "git_status_sha256": "c" * 64,
+                    "claim_coverage_sha256": "d" * 64,
+                },
+            }
+        )
+        launch_object = self.object("launch-1", launch, "codex_launch_intent")
+        self.assertEqual(objects.publish_semantic_object(self.paths, launch_object), launch_object)
+
+        reservation = transport.seal_reservation(
+            {
+                "contract_type": transport.CODEX_TRANSPORT_RESERVATION_V1,
+                "reservation_id": "reservation-1",
+                "launch_intent_sha256": launch["intent_sha256"],
+                "permit_sha256": "c" * 64,
+                "runtime_pin": {
+                    **transport.pinned_runtime_binding(),
+                    "executable_path": "C:/tools/codex-app-server.exe",
+                },
+                "state": "reserved",
+                "correlation": {"thread_id": None, "turn_id": None, "item_id": None},
+            }
+        )
+        receipt_object = self.object(
+            "reservation-1",
+            {"receipt_kind": "reservation", "receipt": reservation},
+            "codex_transport_receipt",
+        )
+        self.assertEqual(objects.publish_semantic_object(self.paths, receipt_object), receipt_object)
+
+        # A journal receipt retains only sealed wire metadata/digests, never a
+        # raw App Server frame.  The semantic object delegates validation to
+        # the transport schema rather than maintaining a parallel wire schema.
+        reserved_event = transport.seal_journal_event(
+            {
+                "contract_type": transport.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+                "event_id": "event-1",
+                "sequence": 1,
+                "prev_event_sha256": transport.ZERO_SHA256,
+                "launch_intent_sha256": launch["intent_sha256"],
+                "reservation_sha256": reservation["reservation_sha256"],
+                "event_type": "reserved",
+                "state": "reserved",
+                "wire_method": "aoi/reservation",
+                "wire_event_sha256": None,
+                "payload_size_bytes": 0,
+                "item_type": None,
+                "status": "observed",
+                "request_id": None,
+                "request_bytes_sha256": None,
+                "response_sha256": None,
+                "correlation": {"thread_id": None, "turn_id": None, "item_id": None},
+            }
+        )
+        journal_object = self.object(
+            "event-1",
+            {"receipt_kind": "journal_event", "receipt": reserved_event},
+            "codex_transport_receipt",
+        )
+        self.assertEqual(objects.publish_semantic_object(self.paths, journal_object), journal_object)
+
+        verification = {
+            "contract_type": "codex_mutation_verification_v1",
+            "launch_intent_sha256": launch["intent_sha256"],
+            "reservation_sha256": reservation["reservation_sha256"],
+            "journal_head_sha256": reserved_event["event_sha256"],
+            "pre_git_snapshot": {"cas_sha256": "a" * 64, "content_type": "git_snapshot"},
+            "post_git_snapshot": {"cas_sha256": "b" * 64, "content_type": "git_snapshot"},
+            "claim_coverage": {"cas_sha256": "c" * 64, "content_type": "claim_coverage"},
+            "pre_git_tree": {"cas_sha256": "d" * 64, "content_type": "git_tree"},
+            # Same HEAD/tree with a distinct working-tree snapshot is valid.
+            "post_git_tree": {"cas_sha256": "d" * 64, "content_type": "git_tree"},
+        }
+        verification_object = self.object(
+            "verification-1", verification, "codex_mutation_verification"
+        )
+        self.assertEqual(
+            objects.publish_semantic_object(self.paths, verification_object), verification_object
+        )
+        launch_object_sha256 = cast(str, launch_object["object_sha256"])
+
+        for binding_kind in (
+            "codex_launch_reservation",
+            "codex_transport_milestone",
+            "codex_mutation_verification",
+        ):
+            binding = self.binding(
+                f"{binding_kind}-1",
+                [launch_object_sha256],
+                kind=binding_kind,
+            )
+            self.assertEqual(binding["binding_kind"], binding_kind)
+
+        # Every transport payload has a closed schema: no raw prompt, model
+        # output, or tool output can be admitted merely by selecting its type.
+        raw_launch = deepcopy(launch)
+        raw_launch["prompt"] = "must stay outside AOI semantic storage"
+        with self.assertRaisesRegex(objects.SemanticObjectError, "payload"):
+            self.object("raw-launch", raw_launch, "codex_launch_intent")
+        raw_receipt = {"receipt_kind": "reservation", "receipt": deepcopy(reservation)}
+        raw_receipt["receipt"]["tool_output"] = "must stay outside AOI semantic storage"
+        with self.assertRaisesRegex(objects.SemanticObjectError, "payload"):
+            self.object("raw-receipt", raw_receipt, "codex_transport_receipt")
+        raw_journal_receipt = {
+            "receipt_kind": "journal_event",
+            "receipt": deepcopy(reserved_event),
+        }
+        raw_journal_receipt["receipt"]["wire_payload"] = "must stay outside AOI semantic storage"
+        with self.assertRaisesRegex(objects.SemanticObjectError, "payload"):
+            self.object("raw-journal-receipt", raw_journal_receipt, "codex_transport_receipt")
+        raw_verification = dict(verification, output="must stay outside AOI semantic storage")
+        with self.assertRaisesRegex(objects.SemanticObjectError, "schema"):
+            self.object("raw-verification", raw_verification, "codex_mutation_verification")
+
+        self.assertEqual(
+            objects._object_limit("codex_launch_intent"),
+            objects.MAX_CODEX_LAUNCH_INTENT_OBJECT_BYTES,
+        )
+        self.assertEqual(
+            objects._object_limit("codex_transport_receipt"),
+            objects.MAX_CODEX_TRANSPORT_RECEIPT_OBJECT_BYTES,
+        )
+        self.assertEqual(
+            objects._object_limit("codex_mutation_verification"),
+            objects.MAX_CODEX_MUTATION_VERIFICATION_OBJECT_BYTES,
+        )
+        with mock.patch.object(objects, "MAX_CODEX_MUTATION_VERIFICATION_OBJECT_BYTES", 100):
+            with self.assertRaises(objects.SemanticObjectError):
+                self.object("small-verification", verification, "codex_mutation_verification")
 
     def test_release_abandonment_reader_accepts_historical_v1_row(self) -> None:
         """Namespace v1 remains readable while release writers move to row v2."""

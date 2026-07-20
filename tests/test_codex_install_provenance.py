@@ -63,18 +63,26 @@ def _environment(
     prefix = tmp_path / "venv"; site = _site_packages(prefix); dist = site / "aoi_orgware-1.2.3.dist-info"; package = site / "aoi_orgware"; scripts = _scripts(prefix)
     for path in (dist, package, scripts): path.mkdir(parents=True, exist_ok=True)
     (dist / "METADATA").write_text("Name: aoi-orgware\nVersion: 1.2.3\n", encoding="utf-8")
-    for name in ("__init__.py", "_version.py", "cli.py", "codex_hook.py", "helper.py"):
+    for name in (
+        "__init__.py",
+        "_version.py",
+        "cli.py",
+        "codex_hook.py",
+        "codex_transport_cli.py",
+        "helper.py",
+    ):
         (package / name).write_text("# wheel\n", encoding="utf-8")
     for name, target in (
         ("aoi", "aoi_orgware.cli:main"),
         ("aoi-codex-hook", "aoi_orgware.codex_hook:main"),
+        ("aoi-codex-bridge", "aoi_orgware.codex_transport_cli:main"),
     ):
         _write_launcher(prefix, name, target, with_companion=with_companion)
-    rows = [_row(p, site) for p in [dist / "METADATA", *(package / x for x in ("__init__.py", "_version.py", "cli.py", "codex_hook.py", "helper.py")), *sorted(scripts.iterdir())]]
+    rows = [_row(p, site) for p in [dist / "METADATA", *(package / x for x in ("__init__.py", "_version.py", "cli.py", "codex_hook.py", "codex_transport_cli.py", "helper.py")), *sorted(scripts.iterdir())]]
     (dist / "RECORD").write_text("\n".join(",".join(row) for row in rows) + "\n" + str((dist / "RECORD").relative_to(site)).replace("\\", "/") + ",,\n", encoding="utf-8")
-    entries = [SimpleNamespace(group="console_scripts", name="aoi", value="aoi_orgware.cli:main"), SimpleNamespace(group="console_scripts", name="aoi-codex-hook", value="aoi_orgware.codex_hook:main")]
+    entries = [SimpleNamespace(group="console_scripts", name="aoi", value="aoi_orgware.cli:main"), SimpleNamespace(group="console_scripts", name="aoi-codex-hook", value="aoi_orgware.codex_hook:main"), SimpleNamespace(group="console_scripts", name="aoi-codex-bridge", value="aoi_orgware.codex_transport_cli:main")]
     fake_dist = SimpleNamespace(_path=dist, metadata={"Name": "aoi-orgware"}, version="1.2.3", entry_points=entries)
-    modules = {"aoi_orgware": SimpleNamespace(__file__=str(package / "__init__.py"), __version__="1.2.3"), "aoi_orgware._version": SimpleNamespace(__file__=str(package / "_version.py"), __version__="1.2.3"), "aoi_orgware.cli": SimpleNamespace(__file__=str(package / "cli.py")), "aoi_orgware.codex_hook": SimpleNamespace(__file__=str(package / "codex_hook.py"))}
+    modules = {"aoi_orgware": SimpleNamespace(__file__=str(package / "__init__.py"), __version__="1.2.3"), "aoi_orgware._version": SimpleNamespace(__file__=str(package / "_version.py"), __version__="1.2.3"), "aoi_orgware.cli": SimpleNamespace(__file__=str(package / "cli.py")), "aoi_orgware.codex_hook": SimpleNamespace(__file__=str(package / "codex_hook.py")), "aoi_orgware.codex_transport_cli": SimpleNamespace(__file__=str(package / "codex_transport_cli.py"))}
     monkeypatch.setattr(provenance.metadata, "distribution", lambda _: fake_dist)
     monkeypatch.setattr(provenance.importlib, "import_module", lambda name: modules[name])
     monkeypatch.setattr(provenance.sys, "prefix", str(prefix))
@@ -102,7 +110,7 @@ def test_validates_real_recorded_native_launchers_and_returns_deterministic_rece
     assert receipt["promotion_wheel_artifact"]["sha256"] == "b" * 64
     assert receipt["installed_distribution_identity"]["name"] == "aoi-orgware"
     assert receipt["installed_mapping_strength"] == "record_package_only"
-    assert receipt["package_runtime_manifest"]["count"] == 5
+    assert receipt["package_runtime_manifest"]["count"] == 6
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable permissions only")
@@ -253,6 +261,7 @@ def test_local_v2_receipt_binds_exact_wheel_direct_url_and_record(
             "installed_metadata_sha256": metadata_sha,
             "console_entry_point": {"name": "aoi", "target": "aoi_orgware.cli:main"},
             "codex_hook_entry_point": {"name": "aoi-codex-hook", "target": "aoi_orgware.codex_hook:main"},
+            "codex_bridge_entry_point": {"name": "aoi-codex-bridge", "target": "aoi_orgware.codex_transport_cli:main"},
             "hook_protocol_version": 6,
         },
         "artifact_store_root": str(store), "source_commit_oid": "c" * 40,
@@ -274,12 +283,44 @@ def test_local_v2_receipt_binds_exact_wheel_direct_url_and_record(
     assert receipt["installed_mapping_strength"] == "direct_url_archive_sha256"
     assert receipt["installed_mapping_evidence"]["direct_url"]["archive_path"] == str(wheel)
     assert receipt["installed_record"]["path"] == str(record)
+    assert receipt["codex_bridge_entry_point"]["path"] == str(
+        _launcher(prefix, "aoi-codex-bridge").resolve()
+    )
     assert provenance.validate_codex_install_provenance_receipt(receipt) == receipt
+    wrong_bridge = json.loads(json.dumps(receipt))
+    wrong_bridge["codex_bridge_entry_point"]["target"] = "aoi_orgware.cli:main"
+    wrong_bridge["provenance_receipt_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in wrong_bridge.items()
+            if key != "provenance_receipt_sha256"
+        }
+    )
+    with pytest.raises(
+        provenance.CodexInstallProvenanceError,
+        match="entry point is invalid",
+    ):
+        provenance.validate_codex_install_provenance_receipt(wrong_bridge)
     project = tmp_path / "project"; target = project / provenance.CODEX_INSTALL_PROVENANCE_RECEIPT
     target.parent.mkdir(parents=True); target.write_bytes(canonical_json_bytes(receipt))
     assert provenance.verify_runtime_hook_provenance(
         project, receipt["provenance_receipt_sha256"], _launcher(prefix, "aoi-codex-hook")
     ) == receipt
+    bridge_script = receipt["codex_bridge_generated_script"]
+    if bridge_script["path"] is not None:
+        bridge_script_path = Path(bridge_script["path"])
+        original_bridge_script = bridge_script_path.read_bytes()
+        bridge_script_path.write_text("changed\n", encoding="utf-8")
+        with pytest.raises(
+            provenance.CodexInstallProvenanceError,
+            match="bytes differ",
+        ):
+            provenance.verify_runtime_hook_provenance(
+                project,
+                receipt["provenance_receipt_sha256"],
+                _launcher(prefix, "aoi-codex-hook"),
+            )
+        bridge_script_path.write_bytes(original_bridge_script)
 
     # A cooperating attacker can update RECORD after changing direct_url.json;
     # the v2 receipt must still bind the direct_url bytes, not merely RECORD.
@@ -321,12 +362,22 @@ def test_local_v2_receipt_binds_exact_wheel_direct_url_and_record(
         provenance.verify_runtime_hook_provenance(
             project, receipt["provenance_receipt_sha256"], _launcher(prefix, "aoi-codex-hook")
         )
+    wheel.write_bytes(b"reviewed-wheel")
+    _launcher(prefix, "aoi-codex-bridge").unlink()
+    with pytest.raises(
+        provenance.CodexInstallProvenanceError,
+        match="Codex bridge launcher",
+    ):
+        provenance.validate_codex_local_install_provenance(
+            bundle_file, "a" * 64, _launcher(prefix, "aoi")
+        )
 
 
 @pytest.mark.parametrize(
     ("mutated", "expected"),
     [
         ("codex_hook.py", "bytes differ"),
+        ("codex_transport_cli.py", "bytes differ"),
         ("helper.py", "bytes differ"),
         pytest.param(
             "aoi-codex-hook-script.py",
