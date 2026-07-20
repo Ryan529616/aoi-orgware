@@ -84,6 +84,9 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   canonical resource event/receipt/registration authority gate; first
   unreserved no-Chief consumption repeats it and commits routing, permit
   projection, and canonical `ready -> armed` packet state in one semantic CAS.
+  The CLI composition root injects that validator into the semantic command
+  handlers; the handlers fail closed without it and never reverse-import the
+  CLI module.
   Before that first commit, terminal tasks, missing packet delta roots,
   stale/tampered authority, and old-schema substitution fail closed. Exact
   committed replay is historical event/projection recovery, not renewed packet

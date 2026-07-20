@@ -327,7 +327,13 @@ def _reload_permit_paths(paths: h.HarnessPaths) -> h.HarnessPaths:
     return current
 
 
-def cmd_permit_issue(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
+def cmd_permit_issue(
+    args: argparse.Namespace,
+    paths: h.HarnessPaths,
+    *,
+    validate_packet_arm_preimage: permit_runtime.ValidatePacketArmPreimage
+    | None = None,
+) -> int:
     transaction = _load_permit_transaction(args.transaction_file)
     task_id = _require_transaction_task(args, transaction)
     session_id, epoch, token = _permit_issue_secret(args, paths)
@@ -339,11 +345,11 @@ def cmd_permit_issue(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
     )
     kwargs: dict[str, Any] = {}
     if issue is permit_runtime.issue_permitted_arm_transaction:
-        from .. import cli as core_cli
-
-        kwargs["validate_packet_arm_preimage"] = (
-            core_cli._validate_packet_arm_preimage
-        )
+        if validate_packet_arm_preimage is None:
+            raise h.HarnessError(
+                "standalone permit issuance requires the core packet authority gate"
+            )
+        kwargs["validate_packet_arm_preimage"] = validate_packet_arm_preimage
     result = issue(
         paths,
         transaction,
@@ -358,7 +364,13 @@ def cmd_permit_issue(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
     return 0
 
 
-def cmd_permit_consume(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
+def cmd_permit_consume(
+    args: argparse.Namespace,
+    paths: h.HarnessPaths,
+    *,
+    validate_packet_arm_preimage: permit_runtime.ValidatePacketArmPreimage
+    | None = None,
+) -> int:
     transaction = _load_permit_transaction(args.transaction_file)
     task_id = _require_transaction_task(args, transaction)
     with h.state_lock(paths, create_layout=False):
@@ -371,11 +383,11 @@ def cmd_permit_consume(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
         )
         kwargs: dict[str, Any] = {}
         if commit is permit_runtime.commit_permitted_arm_transaction:
-            from .. import cli as core_cli
-
-            kwargs["validate_packet_arm_preimage"] = (
-                core_cli._validate_packet_arm_preimage
-            )
+            if validate_packet_arm_preimage is None:
+                raise h.HarnessError(
+                    "standalone permit consumption requires the core packet authority gate"
+                )
+            kwargs["validate_packet_arm_preimage"] = validate_packet_arm_preimage
         result = commit(
             paths,
             transaction,

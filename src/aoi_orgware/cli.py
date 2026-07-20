@@ -7607,8 +7607,14 @@ def build_parser(
             "cohort_round_preview": cmd_cohort_round_preview,
             "cohort_show": cmd_cohort_show,
             "packet_arm_prepare": cmd_packet_arm_prepare,
-            "permit_consume": cmd_permit_consume,
-            "permit_issue": cmd_permit_issue,
+            "permit_consume": functools.partial(
+                cmd_permit_consume,
+                validate_packet_arm_preimage=_validate_packet_arm_preimage,
+            ),
+            "permit_issue": functools.partial(
+                cmd_permit_issue,
+                validate_packet_arm_preimage=_validate_packet_arm_preimage,
+            ),
             "semantic_head": cmd_semantic_head,
             "semantic_migrate": cmd_semantic_migrate,
             "semantic_migration_rollback": cmd_semantic_migration_rollback,
