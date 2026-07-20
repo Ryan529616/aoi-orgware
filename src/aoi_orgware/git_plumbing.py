@@ -47,6 +47,7 @@ _GIT_SUBMODULE_RE = re.compile(rb"^(?:N\.\.\.|S[.C][.M][.U])$")
 GIT_STATUS_SNAPSHOT_SCHEMA = "aoi.git-status-porcelain-v2.snapshot.v1"
 GIT_MUTATION_SNAPSHOT_SCHEMA = "aoi.git-mutation-snapshot.v2"
 GIT_TASK_CLAIM_SCOPE_SCHEMA = "aoi.git-task-live-claim-scope.v1"
+GIT_TASK_CLAIM_AUTHORITY_SCHEMA = "aoi.git-task-live-claim-authority.v1"
 
 
 def _b64(raw: bytes) -> str:
@@ -718,6 +719,212 @@ def _claim_scope_digest(task_id: str, scope: Iterable[Mapping[str, Any]]) -> str
     return hashlib.sha256(_canonical_json_bytes(preimage)).hexdigest()
 
 
+def capture_task_live_claim_authority(
+    task_id: str,
+    claims: Iterable[Mapping[str, Any]],
+    expected_worktree: str,
+) -> dict[str, Any]:
+    """Capture every reserving task claim, independent of mutation paths.
+
+    Mutation coverage intentionally records only claims needed for observed
+    dirty paths.  A launch authority needs a different boundary: a clean
+    checkout must still change identity when any live task claim is added,
+    removed, or changes owner/status/worktree/lock scope.
+    """
+
+    task_id = _require_task_id(task_id)
+    if (
+        not isinstance(expected_worktree, str)
+        or not expected_worktree
+        or expected_worktree.strip() != expected_worktree
+    ):
+        raise HarnessError(
+            "task claim authority worktree must be non-empty text without "
+            "surrounding whitespace"
+        )
+    scope = _task_live_claim_scope(
+        task_id, claims, expected_worktree=expected_worktree
+    )
+    immutable_scope = _immutable_claim_scope(scope)
+    base = {
+        "schema": GIT_TASK_CLAIM_AUTHORITY_SCHEMA,
+        "task_id": task_id,
+        "worktree": expected_worktree,
+        "claim_tokens": [claim["token"] for claim in scope],
+        "observed_claims": [
+            {"token": claim["token"], "observed_status": claim["status"]}
+            for claim in scope
+        ],
+        "claim_scope": immutable_scope,
+        "claim_scope_sha256": _claim_scope_digest(task_id, scope),
+    }
+    return {
+        **base,
+        "claim_authority_sha256": hashlib.sha256(
+            _canonical_json_bytes(base)
+        ).hexdigest(),
+    }
+
+
+def validate_task_claim_authority_record(
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema",
+        "task_id",
+        "worktree",
+        "claim_tokens",
+        "observed_claims",
+        "claim_scope",
+        "claim_scope_sha256",
+        "claim_authority_sha256",
+    }
+    if not isinstance(authority, Mapping) or set(authority) != expected_keys:
+        raise HarnessError("task claim authority schema is invalid")
+    task_id = _require_task_id(authority.get("task_id"))
+    worktree = authority.get("worktree")
+    if (
+        authority.get("schema") != GIT_TASK_CLAIM_AUTHORITY_SCHEMA
+        or not isinstance(worktree, str)
+        or not worktree
+        or worktree.strip() != worktree
+    ):
+        raise HarnessError("task claim authority identity is invalid")
+    tokens = authority.get("claim_tokens")
+    if (
+        not isinstance(tokens, list)
+        or any(
+            not isinstance(token, str)
+            or not token
+            or token.strip() != token
+            for token in tokens
+        )
+        or tokens != sorted(set(tokens))
+    ):
+        raise HarnessError("task claim authority tokens are not canonical")
+    observed = authority.get("observed_claims")
+    if not isinstance(observed, list) or len(observed) != len(tokens):
+        raise HarnessError("task claim authority observed claims are invalid")
+    known_statuses = RESERVING_CLAIM_STATUSES | {"done", "released", "stale"}
+    checked_observed: list[dict[str, str]] = []
+    for index, item in enumerate(observed):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"token", "observed_status"}
+            or item.get("token") != tokens[index]
+            or item.get("observed_status") not in known_statuses
+        ):
+            raise HarnessError(
+                "task claim authority observed claims are not canonical"
+            )
+        checked_observed.append(
+            {
+                "token": str(item["token"]),
+                "observed_status": str(item["observed_status"]),
+            }
+        )
+    raw_scope = authority.get("claim_scope")
+    if not isinstance(raw_scope, list) or len(raw_scope) != len(tokens):
+        raise HarnessError("task claim authority immutable scope is invalid")
+    checked_scope: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_scope):
+        if not isinstance(item, Mapping) or set(item) != {
+            "token",
+            "owner",
+            "worktree",
+            "locks",
+        }:
+            raise HarnessError("task claim authority immutable scope is invalid")
+        token = item.get("token")
+        owner = item.get("owner")
+        item_worktree = item.get("worktree")
+        locks = item.get("locks")
+        if (
+            token != tokens[index]
+            or not isinstance(owner, str)
+            or not owner
+            or owner.strip() != owner
+            or item_worktree != worktree
+            or not isinstance(locks, list)
+            or not locks
+        ):
+            raise HarnessError(
+                "task claim authority immutable scope is not canonical"
+            )
+        canonical_locks: list[str] = []
+        for lock in locks:
+            if not isinstance(lock, str):
+                raise HarnessError(
+                    "task claim authority immutable scope locks are invalid"
+                )
+            canonical_locks.append(normalize_lock(lock))
+        if canonical_locks != sorted(set(canonical_locks)):
+            raise HarnessError(
+                "task claim authority immutable scope locks are not canonical"
+            )
+        checked_scope.append(
+            {
+                "token": str(token),
+                "owner": owner,
+                "worktree": str(item_worktree),
+                "locks": canonical_locks,
+            }
+        )
+    digest = authority.get("claim_scope_sha256")
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or digest != _claim_scope_digest(task_id, checked_scope)
+    ):
+        raise HarnessError("task claim authority scope digest is invalid")
+    base = {
+        "schema": GIT_TASK_CLAIM_AUTHORITY_SCHEMA,
+        "task_id": task_id,
+        "worktree": worktree,
+        "claim_tokens": list(tokens),
+        "observed_claims": checked_observed,
+        "claim_scope": checked_scope,
+        "claim_scope_sha256": digest,
+    }
+    authority_sha256 = authority.get("claim_authority_sha256")
+    if (
+        not isinstance(authority_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", authority_sha256)
+        or authority_sha256
+        != hashlib.sha256(_canonical_json_bytes(base)).hexdigest()
+    ):
+        raise HarnessError("task claim authority digest is invalid")
+    return {**base, "claim_authority_sha256": authority_sha256}
+
+
+def validate_task_claim_authority(
+    authority: Mapping[str, Any],
+    claims: Iterable[Mapping[str, Any]],
+    *,
+    sealed: bool,
+) -> dict[str, Any]:
+    """Validate one exact full task-claim authority against current records."""
+
+    checked = validate_task_claim_authority_record(authority)
+    if sealed:
+        validate_sealed_task_claim_scope(
+            checked["task_id"],
+            checked["claim_tokens"],
+            checked["claim_scope_sha256"],
+            claims,
+            checked["worktree"],
+        )
+        return checked
+    current = capture_task_live_claim_authority(
+        checked["task_id"], claims, checked["worktree"]
+    )
+    if current != checked:
+        raise HarnessError(
+            "task claim authority differs from the complete live claim scope"
+        )
+    return checked
+
+
 def validate_sealed_task_claim_scope(
     task_id: str,
     covered_tokens: Iterable[str],
@@ -1197,6 +1404,7 @@ __all__ = [
     "FULL_COMMIT_RE",
     "GIT_MUTATION_SNAPSHOT_SCHEMA",
     "GIT_STATUS_SNAPSHOT_SCHEMA",
+    "GIT_TASK_CLAIM_AUTHORITY_SCHEMA",
     "GIT_TASK_CLAIM_SCOPE_SCHEMA",
     "MAX_GIT_COMMAND_BYTES",
     "MAX_GIT_COMMAND_STDERR_BYTES",
@@ -1205,10 +1413,13 @@ __all__ = [
     "MAX_GIT_STATUS_RECORDS",
     "git_is_ancestor",
     "git_metadata",
+    "capture_task_live_claim_authority",
     "task_mutation_snapshot",
     "task_mutation_snapshot_claim_coverage",
     "task_mutation_claim_coverage",
     "validate_sealed_task_claim_scope",
+    "validate_task_claim_authority",
+    "validate_task_claim_authority_record",
     "validate_task_mutation_snapshot_claim_scope",
     "validate_task_mutation_snapshot",
     "git_status_claim_coverage",

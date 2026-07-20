@@ -91,8 +91,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   pending).** The dependency-free core now ships a separate finite
   `aoi-codex-bridge` entry point for one packet/thread/turn over local App
   Server stdio. Chief issuance binds an exact one-shot permit, stable Codex
-  `0.144.6` executable/schema set, prompt/cwd/model/effort/sandbox, and—when
-  writable—a pre-turn Git endpoint preserved in task CAS. Runtime milestones
+  `0.144.6` executable/schema set, prompt/cwd/model/effort/sandbox, and—for both
+  read-only and writable turns—a pre-turn Git endpoint preserved in task CAS.
+  AOI re-captures that endpoint under the issue lock, before reservation, and
+  at process-pending. The endpoint now binds a separate full live task-claim
+  authority as well as mutation-path coverage, so clean Git status cannot hide
+  claim add/remove/owner/status/worktree/lock drift. Historical null-CAS or v1
+  endpoints fail closed before process start; only writable turns may
+  separately elevate the post-image.
+  Runtime milestones
   are semantic transactions with explicit `launch_unknown`/`runtime_unknown`
   reconciliation and no automatic resend. A completed runtime receipt remains
   `codex_runtime_observed`; Git/tree/claim materialization is a separate

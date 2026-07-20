@@ -179,7 +179,10 @@ def test_rejects_after_image_claim_and_source_binding_mismatches(fixture: Mutati
     post = fixture.endpoint()
     bad_claims = copy.deepcopy(fixture.claims)
     bad_claims[0]["locks"] = ["repo:file:other.txt"]
-    with pytest.raises(mutation.CodexTransportMutationError, match="uncovered|claim coverage"):
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="uncovered|claim coverage|claim authority",
+    ):
         mutation.validate_git_endpoint(post, bad_claims, sealed_claim_scope=False)
     bad_binding = dict(mutation.endpoint_pre_git_binding(pre))
     bad_binding["git_tree_sha256"] = SHA_A
@@ -190,6 +193,78 @@ def test_rejects_after_image_claim_and_source_binding_mismatches(fixture: Mutati
                 fixture.paths, task_id="task-1", intent=bad_intent, reservation=bad_reservation, journal=bad_journal,
                 runtime_terminal_receipt=bad_terminal, pre_endpoint=pre, post_endpoint=post, claims=fixture.claims,
             )
+
+
+def test_clean_endpoint_binds_complete_live_claim_authority(
+    fixture: MutationFixture,
+) -> None:
+    before = fixture.endpoint()
+    legacy_base = {
+        "schema": mutation.LEGACY_GIT_ENDPOINT_SCHEMA,
+        "task_id": before["task_id"],
+        "snapshot": before["snapshot"],
+        "tree": before["tree"],
+        "claim_coverage": before["claim_coverage"],
+    }
+    legacy = {
+        **legacy_base,
+        "endpoint_sha256": mutation._sha(
+            mutation._canonical(legacy_base, "legacy Git endpoint")
+        ),
+    }
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="legacy Git endpoint lacks complete live claim authority",
+    ):
+        mutation.validate_git_endpoint(
+            legacy, fixture.claims, sealed_claim_scope=False
+        )
+    added = [
+        *fixture.claims,
+        {
+            "task_id": "task-1",
+            "token": "second-source",
+            "owner": "root",
+            "status": "active",
+            "worktree": str(fixture.root.resolve()),
+            "locks": ["repo:file:src/tracked.txt"],
+        },
+    ]
+    after_add = mutation.capture_git_endpoint(
+        "task-1", fixture.root, fixture.baseline, added
+    )
+    assert before["snapshot"] == after_add["snapshot"]
+    assert before["claim_coverage"] == after_add["claim_coverage"]
+    assert before["claim_authority"] != after_add["claim_authority"]
+    assert before["endpoint_sha256"] != after_add["endpoint_sha256"]
+    assert (
+        mutation.endpoint_pre_git_binding(before)["claim_coverage_sha256"]
+        != mutation.endpoint_pre_git_binding(after_add)[
+            "claim_coverage_sha256"
+        ]
+    )
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="complete live claim scope",
+    ):
+        mutation.validate_git_endpoint(
+            before, added, sealed_claim_scope=False
+        )
+
+    lock_drift = copy.deepcopy(fixture.claims)
+    lock_drift[0]["locks"] = ["repo:file:src/tracked.txt"]
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="complete live claim scope",
+    ):
+        mutation.validate_git_endpoint(
+            before, lock_drift, sealed_claim_scope=False
+        )
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="complete live claim scope",
+    ):
+        mutation.validate_git_endpoint(before, [], sealed_claim_scope=False)
 
 
 def test_rejects_tree_digest_that_does_not_match_live_snapshot_head(fixture: MutationFixture) -> None:
@@ -204,6 +279,7 @@ def test_rejects_tree_digest_that_does_not_match_live_snapshot_head(fixture: Mut
         "snapshot": forged["snapshot"],
         "tree": forged["tree"],
         "claim_coverage": forged["claim_coverage"],
+        "claim_authority": forged["claim_authority"],
     }
     forged["endpoint_sha256"] = mutation._sha(mutation._canonical(endpoint_base, "Git endpoint"))
     with pytest.raises(mutation.CodexTransportMutationError, match="live snapshot HEAD tree"):

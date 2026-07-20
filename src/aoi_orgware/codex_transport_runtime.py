@@ -517,18 +517,14 @@ def issue_codex_launch_transaction(
         )
     # Rebuild rather than trust a caller's stale nested objects.
     rebuilt = prepare_codex_launch_transaction(task_id=tx["task_id"], event_chain=records, intent=tx["intent"], decision=tx["decision"], permit=tx["permit"], launch_authority_contract=canonical_authority, launch_id=tx["launch_id"], command_id=tx["command_id"], recorded_at=tx["recorded_at"], current_time=current_time)
-    if rebuilt["intent"]["sandbox"] == "workspaceWrite":
-        if pre_git_endpoint_cas_sha256 is None:
-            raise CodexTransportRuntimeError(
-                "workspaceWrite issuance requires a pre Git endpoint CAS SHA-256"
-            )
-        pre_git_endpoint_cas_sha256 = _sha(
-            pre_git_endpoint_cas_sha256, "pre Git endpoint CAS SHA-256"
-        )
-    elif pre_git_endpoint_cas_sha256 is not None:
+    if pre_git_endpoint_cas_sha256 is None:
         raise CodexTransportRuntimeError(
-            "readOnly issuance cannot attach mutation pre-image evidence"
+            f"{rebuilt['intent']['sandbox']} issuance requires a pre Git "
+            "endpoint CAS SHA-256"
         )
+    pre_git_endpoint_cas_sha256 = _sha(
+        pre_git_endpoint_cas_sha256, "pre Git endpoint CAS SHA-256"
+    )
     permit_authority = rebuilt["permit"]["chief_authority"]
     if (
         permit_authority["session_id"] != live["session_id"]

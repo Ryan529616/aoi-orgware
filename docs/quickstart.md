@@ -321,6 +321,7 @@ aoi-codex-bridge --root <project> issue `
   --intent-file <sealed-intent.json> `
   --decision-file <sealed-decision.json> `
   --permit-file <sealed-permit.json> `
+  --pre-git-endpoint-file <exact-pre-git-endpoint.json> `
   --command-id <stable-command-id> `
   --recorded-at <timezone-aware-time> `
   --chief-session-id <chief-session> --chief-epoch <epoch> `
@@ -331,11 +332,17 @@ aoi-codex-bridge --root <project> run `
   --prompt-file <exact-utf8-prompt-file> --json
 ```
 
-`run` deliberately has no Chief credential option. For `workspaceWrite`,
-`issue` also requires `--pre-git-endpoint-file`; after a completed runtime turn,
-`verify-mutation` separately records the post-image and claim evidence. A
-completed turn is not task completion. If `inspect` reports `launch_unknown`,
-do not rerun the launch; reconcile the task evidence instead.
+`run` deliberately has no Chief credential option. Every `readOnly` and
+`workspaceWrite` issuance requires `--pre-git-endpoint-file`; AOI re-captures
+that exact Git/tree/status/claim endpoint under the issue lock, again before
+reservation, and again at process-pending. The endpoint separately binds the
+complete canonical live task-claim authority, even when Git status has no
+mutation paths. A historical marker with no endpoint CAS, or a legacy endpoint
+without that complete authority, is readable for inspection but cannot start.
+Only `workspaceWrite` may later use
+`verify-mutation` to record the post-image and elevate the evidence. A completed
+turn is not task completion. If `inspect` reports `launch_unknown`, do not rerun
+the launch; reconcile the task evidence instead.
 
 The bridge consumes the packet arm atomically and does not fabricate a
 `SubagentStart` identity. It uses one per-launch OS lock, checks the earlier

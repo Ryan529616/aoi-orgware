@@ -255,10 +255,37 @@ def _live_transaction(
     return runtime.prepare_codex_launch_transaction(task_id="task-1", event_chain=events, intent=sealed, decision=decision, permit=permit, launch_authority_contract=launch_authority_for(sealed), launch_id=launch_id, command_id=command_id, recorded_at="2026-07-20T00:01:00Z", current_time=NOW)
 
 
-def _issue(paths: h.HarnessPaths, chief: dict[str, Any], credential_path: Path, transaction: dict[str, Any]) -> dict[str, Any]:
+def _issue(
+    paths: h.HarnessPaths,
+    chief: dict[str, Any],
+    credential_path: Path,
+    transaction: dict[str, Any],
+    *,
+    pre_git_endpoint_cas_sha256: str | None = SHA_A,
+) -> dict[str, Any]:
     with h.state_lock(paths, create_layout=False):
         token, _ = h.load_chief_credential(paths, session_id=chief["session_id"], epoch=chief["epoch"], credential_file=credential_path)
-        return runtime.issue_codex_launch_transaction(paths, transaction, store.load_semantic_events(paths, "task-1"), chief_session_id=chief["session_id"], chief_epoch=chief["epoch"], chief_token=token, current_time=NOW, packet_integrity_services=object())  # type: ignore[arg-type]
+        return runtime.issue_codex_launch_transaction(paths, transaction, store.load_semantic_events(paths, "task-1"), chief_session_id=chief["session_id"], chief_epoch=chief["epoch"], chief_token=token, current_time=NOW, packet_integrity_services=object(), pre_git_endpoint_cas_sha256=pre_git_endpoint_cas_sha256)  # type: ignore[arg-type]
+
+
+def test_filesystem_read_only_issue_requires_pre_git_endpoint_cas() -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        tx = _live_transaction(paths, chief)
+        with pytest.raises(
+            runtime.CodexTransportRuntimeError,
+            match="readOnly issuance requires a pre Git endpoint CAS SHA-256",
+        ):
+            _issue(
+                paths,
+                chief,
+                credential_path,
+                tx,
+                pre_git_endpoint_cas_sha256=None,
+            )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
 
 
 def test_filesystem_issue_rejects_permit_from_wrong_live_chief() -> None:

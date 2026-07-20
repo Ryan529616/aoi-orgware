@@ -407,6 +407,8 @@ class CodexTransportReachabilityTests(HarnessTestCase):
         ).stdout.strip()
         claims = h.claims_owned_by_task(self.paths, TASK)
         endpoint = mutation.capture_git_endpoint(TASK, self.root, baseline, claims)
+        endpoint_path = self.bridge_scratch / "pre-git-endpoint.json"
+        endpoint_path.write_bytes(semantic.canonical_json_bytes(endpoint))
         launch_intent = contracts.seal_launch_intent(
             {
                 "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
@@ -493,6 +495,8 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                     str(paths["decision"]),
                     "--permit-file",
                     str(paths["permit"]),
+                    "--pre-git-endpoint-file",
+                    str(endpoint_path),
                     "--command-id",
                     "bridge-launch-issue",
                     "--recorded-at",

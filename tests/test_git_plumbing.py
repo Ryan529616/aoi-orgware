@@ -373,6 +373,76 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
                 sealed=True,
             )
 
+    def test_full_live_claim_authority_binds_clean_claim_set(self) -> None:
+        worktree = str(self.repo.resolve())
+        claim = {
+            "task_id": self.TASK_ID,
+            "token": "source-a",
+            "owner": "owner-a",
+            "status": "active",
+            "worktree": worktree,
+            "locks": ["repo:tree:src"],
+        }
+        authority = gp.capture_task_live_claim_authority(
+            self.TASK_ID, [claim], worktree
+        )
+        self.assertEqual(authority["claim_tokens"], ["source-a"])
+        self.assertEqual(
+            gp.validate_task_claim_authority(
+                authority, [claim], sealed=False
+            ),
+            authority,
+        )
+
+        added = [
+            claim,
+            {
+                "task_id": self.TASK_ID,
+                "token": "source-b",
+                "owner": "owner-b",
+                "status": "active",
+                "worktree": worktree,
+                "locks": ["repo:file:base.txt"],
+            },
+        ]
+        with self.assertRaisesRegex(HarnessError, "complete live claim scope"):
+            gp.validate_task_claim_authority(
+                authority, added, sealed=False
+            )
+        lock_drift = [{**claim, "locks": ["repo:file:base.txt"]}]
+        with self.assertRaisesRegex(HarnessError, "complete live claim scope"):
+            gp.validate_task_claim_authority(
+                authority, lock_drift, sealed=False
+            )
+        for label, drift in (
+            ("owner", [{**claim, "owner": "owner-b"}]),
+            ("status", [{**claim, "status": "blocked"}]),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    HarnessError, "complete live claim scope"
+                ):
+                    gp.validate_task_claim_authority(
+                        authority, drift, sealed=False
+                    )
+        wrong_worktree = [{**claim, "worktree": str(self.repo / "other")}]
+        with self.assertRaisesRegex(HarnessError, "worktree differs"):
+            gp.validate_task_claim_authority(
+                authority, wrong_worktree, sealed=False
+            )
+
+        released = [{**claim, "status": "released"}]
+        self.assertEqual(
+            gp.validate_task_claim_authority(
+                authority, released, sealed=True
+            ),
+            authority,
+        )
+        with self.assertRaisesRegex(HarnessError, "missing|scope"):
+            gp.validate_task_claim_authority(
+                authority, released, sealed=False
+            )
+
     def test_rejects_symlink(self) -> None:
         target = self.repo / "target.txt"
         target.write_bytes(b"target\n")

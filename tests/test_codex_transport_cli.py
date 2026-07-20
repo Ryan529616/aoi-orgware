@@ -103,12 +103,27 @@ def _task_domain() -> dict[str, Any]:
     }
 
 
+_FIXTURE_CLAIMS_BY_ROOT: dict[str, list[dict[str, Any]]] = {}
+
+
 @pytest.fixture(autouse=True)
 def _stub_canonical_launch_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FIXTURE_CLAIMS_BY_ROOT.clear()
     monkeypatch.setattr(
         runtime.launch_authority,
         "require_canonical_launch_authority",
         lambda *args, **kwargs: _launch_authority(kwargs["intent"]),
+    )
+    monkeypatch.setattr(
+        h,
+        "claims_owned_by_task",
+        lambda paths, task_id: [
+            dict(claim)
+            for claim in _FIXTURE_CLAIMS_BY_ROOT.get(
+                str(paths.root.resolve()), []
+            )
+            if claim["task_id"] == task_id
+        ],
     )
 
 
@@ -127,6 +142,39 @@ class BridgeFixture:
     claims: list[dict[str, Any]]
     pre_endpoint_path: Path
     sandbox: str
+
+
+def _additional_claim(value: BridgeFixture) -> dict[str, Any]:
+    return {
+        "task_id": "task-1",
+        "token": "bridge-second-source",
+        "owner": "/root",
+        "status": "active",
+        "worktree": str(value.worktree.resolve()),
+        "locks": ["repo:file:src/tracked.txt"],
+    }
+
+
+def _rewrite_as_legacy_null_cas_marker(value: BridgeFixture) -> dict[str, Any]:
+    marker_path = runtime._issuance_path(
+        value.paths, "task-1", value.permit_sha256
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["pre_git_endpoint_cas_sha256"] = None
+    base = {key: item for key, item in marker.items() if key != "issuance_sha256"}
+    marker["issuance_sha256"] = semantic.canonical_sha256(
+        base, max_bytes=runtime.MAX_ISSUANCE_BYTES
+    )
+    marker_path.write_bytes(
+        semantic.canonical_json_bytes(
+            marker, max_bytes=runtime.MAX_ISSUANCE_BYTES
+        )
+    )
+    return runtime.inspect_codex_launch_issuance(
+        value.paths,
+        task_id="task-1",
+        permit_sha256=value.permit_sha256,
+    )
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -180,6 +228,7 @@ def _fixture(
         "task-1", worktree, baseline, claims
     )
     paths = h.get_paths(root)
+    _FIXTURE_CLAIMS_BY_ROOT[str(paths.root.resolve())] = claims
     with h.state_lock(paths, create_layout=True):
         h.task_dir(paths, "task-1").mkdir(parents=True)
         store.initialize_semantic_task(
@@ -318,10 +367,9 @@ def _issue_args(value: BridgeFixture) -> list[str]:
         str(value.credential_path),
         "--json",
     ]
-    if value.sandbox == "workspaceWrite":
-        result.extend(
-            ["--pre-git-endpoint-file", str(value.pre_endpoint_path)]
-        )
+    result.extend(
+        ["--pre-git-endpoint-file", str(value.pre_endpoint_path)]
+    )
     return result
 
 
@@ -624,6 +672,113 @@ def test_cli_workspace_write_recaptures_pre_endpoint_before_issuance(
     )
 
 
+def test_cli_read_only_recaptures_pre_endpoint_before_issuance(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    monkeypatch.setattr(
+        bridge.h, "claims_owned_by_task", lambda _paths, _task: value.claims
+    )
+    (value.worktree / "src" / "tracked.txt").write_text(
+        "read-only drift before issue\n", encoding="utf-8"
+    )
+
+    assert bridge.main(_issue_args(value)) == 2
+    assert "drifted before permit issuance" in capsys.readouterr().err
+    assert not bridge._launch_is_committed(
+        store.load_semantic_events(value.paths, "task-1"), "launch-1"
+    )
+
+
+def test_cli_read_only_rejects_full_claim_drift_before_issuance(
+    tmp_path: Path, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    value.claims.append(_additional_claim(value))
+
+    assert bridge.main(_issue_args(value)) == 2
+    assert "complete live claim scope" in capsys.readouterr().err
+    assert not runtime._issuance_path(
+        value.paths, "task-1", value.permit_sha256
+    ).exists()
+
+
+def test_cli_read_only_issue_requires_pre_git_endpoint_file(
+    tmp_path: Path, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    missing_pre = _issue_args(value)
+    pre_index = missing_pre.index("--pre-git-endpoint-file")
+    del missing_pre[pre_index : pre_index + 2]
+
+    assert bridge.main(missing_pre) == 2
+    assert (
+        "readOnly issuance requires --pre-git-endpoint-file"
+        in capsys.readouterr().err
+    )
+    assert not runtime._issuance_path(
+        value.paths, "task-1", value.permit_sha256
+    ).exists()
+
+
+def test_cli_legacy_read_only_null_cas_marker_cannot_reserve_or_start(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    marker = _rewrite_as_legacy_null_cas_marker(value)
+    assert marker["pre_git_endpoint_cas_sha256"] is None
+    created: list[FakeAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: created.append(FakeAdapter()) or created[-1],
+    )
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 2
+    assert "lacks its preserved pre Git endpoint" in capsys.readouterr().err
+    assert created == []
+    assert not bridge._launch_is_committed(
+        store.load_semantic_events(value.paths, "task-1"), "launch-1"
+    )
+
+
+def test_cli_legacy_reserved_read_only_null_cas_marker_cannot_start(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    with h.state_lock(value.paths, create_layout=False):
+        reserved = bridge._load_or_reserve(
+            value.paths,
+            task_id="task-1",
+            permit_sha256=value.permit_sha256,
+            now=bridge._now(),
+        )
+    assert [row["event_type"] for row in reserved["journal"]] == [
+        "reserved"
+    ]
+    marker = _rewrite_as_legacy_null_cas_marker(value)
+    assert marker["pre_git_endpoint_cas_sha256"] is None
+    created: list[CallbackWrappingAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: (
+            created.append(CallbackWrappingAdapter()) or created[-1]
+        ),
+    )
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal_state"] == "failed"
+    assert result["process_start_evidence"] == "not_started"
+    assert result["app_server_start_durably_observed"] is False
+    assert len(created) == 1
+
+
 def test_cli_workspace_write_rechecks_source_after_issue_before_reserve(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
@@ -649,6 +804,138 @@ def test_cli_workspace_write_rechecks_source_after_issue_before_reserve(
     assert not bridge._launch_is_committed(
         store.load_semantic_events(value.paths, "task-1"), "launch-1"
     )
+
+
+def test_cli_read_only_rechecks_source_after_issue_before_reserve(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    monkeypatch.setattr(
+        bridge.h, "claims_owned_by_task", lambda _paths, _task: value.claims
+    )
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    (value.worktree / "src" / "tracked.txt").write_text(
+        "read-only drift after issue\n", encoding="utf-8"
+    )
+    created: list[FakeAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: created.append(FakeAdapter()) or created[-1],
+    )
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 2
+    assert "drifted after issuance" in capsys.readouterr().err
+    assert created == []
+    assert not bridge._launch_is_committed(
+        store.load_semantic_events(value.paths, "task-1"), "launch-1"
+    )
+
+
+def test_cli_read_only_rechecks_full_claim_scope_before_reserve(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    value.claims.append(_additional_claim(value))
+    created: list[FakeAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: created.append(FakeAdapter()) or created[-1],
+    )
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 2
+    assert "complete live claim scope" in capsys.readouterr().err
+    assert created == []
+    assert not bridge._launch_is_committed(
+        store.load_semantic_events(value.paths, "task-1"), "launch-1"
+    )
+
+
+def test_cli_read_only_rechecks_source_at_process_pending(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    monkeypatch.setattr(
+        bridge.h, "claims_owned_by_task", lambda _paths, _task: value.claims
+    )
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+
+    class DriftBeforePendingAdapter(CallbackWrappingAdapter):
+        def start(self) -> None:
+            (value.worktree / "src" / "tracked.txt").write_text(
+                "read-only drift at process pending\n", encoding="utf-8"
+            )
+            super().start()
+
+    created: list[DriftBeforePendingAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: (
+            created.append(DriftBeforePendingAdapter()) or created[-1]
+        ),
+    )
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal_state"] == "failed"
+    assert result["process_start_evidence"] == "not_started"
+    assert result["app_server_start_durably_observed"] is False
+    assert len(created) == 1
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    assert [row["event_type"] for row in launch["journal"]] == [
+        "reserved",
+        "failed",
+    ]
+
+
+def test_cli_read_only_rechecks_full_claim_scope_at_process_pending(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+
+    class ClaimDriftBeforePendingAdapter(CallbackWrappingAdapter):
+        def start(self) -> None:
+            value.claims.append(_additional_claim(value))
+            super().start()
+
+    created: list[ClaimDriftBeforePendingAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: (
+            created.append(ClaimDriftBeforePendingAdapter()) or created[-1]
+        ),
+    )
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal_state"] == "failed"
+    assert result["process_start_evidence"] == "not_started"
+    assert result["app_server_start_durably_observed"] is False
+    assert len(created) == 1
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    assert [row["event_type"] for row in launch["journal"]] == [
+        "reserved",
+        "failed",
+    ]
 
 
 def test_cli_expiry_crossing_before_pending_prevents_process_start(
@@ -988,6 +1275,46 @@ def test_nonissuance_commands_scrub_reusable_authority_from_controller_process(
         captured = capsys.readouterr()
         assert "must-not-survive" not in captured.out + captured.err
         assert not any(name in os.environ for name in secret_names)
+
+
+def test_cli_read_only_runtime_cannot_be_elevated_to_verified_mutation(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: FakeAdapter(),
+    )
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    runtime_result = json.loads(capsys.readouterr().out)
+    assert runtime_result["evidence_level"] == "codex_runtime_observed"
+
+    assert bridge.main(
+        [
+            "--root",
+            str(value.root),
+            "verify-mutation",
+            "--task",
+            "task-1",
+            "--launch-id",
+            "launch-1",
+            "--json",
+        ]
+    ) == 2
+    assert "requires a workspaceWrite launch" in capsys.readouterr().err
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    assert launch["terminal_receipt"]["evidence_level"] == (
+        "codex_runtime_observed"
+    )
+    assert launch["verified_terminal_receipt"] is None
 
 
 def test_cli_workspace_write_elevation_is_separate_committed_evidence(

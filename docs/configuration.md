@@ -148,8 +148,12 @@ reparse attributes are checked beyond symlink/junction helpers. Both lexical
 and resolved drives are classified, and malformed URLs are reported as redacted
 invalid destinations instead of aborting doctor. The
 optional Codex bridge
-rechecks the artifact/CAS root at issue, pre-reserve, and process-pending, and
-also checks a `workspaceWrite` cwd. Its child sandbox requests
+rechecks the artifact/CAS root and the exact pre-turn Git/tree/status/claim
+endpoint for both `readOnly` and `workspaceWrite` at issue, pre-reserve, and
+process-pending. The endpoint contains mutation-path coverage plus a separate
+full live task-claim authority binding, so a clean status still binds every
+reserving claim's token, owner, status, worktree, and canonical lock scope. The
+bridge also checks a `workspaceWrite` cwd. Its child sandbox requests
 `networkAccess=false`; the model-service control channel is not represented
 as arbitrary workload network permission.
 

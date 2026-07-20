@@ -150,22 +150,16 @@ def _require_fresh_pre_git_endpoint(
     intent: Mapping[str, Any],
     pre_git_endpoint_cas_sha256: str | None,
 ) -> None:
-    """Reject issue-to-run source or claim drift before permit consumption."""
+    """Reject issue-to-run source or claim drift before process start."""
 
-    if intent.get("sandbox") != "workspaceWrite":
-        if pre_git_endpoint_cas_sha256 is not None:
-            raise CodexTransportCLIError(
-                "readOnly launch unexpectedly binds a pre Git endpoint"
-            )
-        return
     if pre_git_endpoint_cas_sha256 is None:
         raise CodexTransportCLIError(
-            "workspaceWrite launch lacks its preserved pre Git endpoint"
+            f"{intent.get('sandbox')} launch lacks its preserved pre Git endpoint"
         )
     claims = h.claims_owned_by_task(paths, task_id)
     if not claims:
         raise CodexTransportCLIError(
-            "workspaceWrite launch no longer has AOI claim records"
+            "Codex launch no longer has AOI claim records"
         )
     preserved = mutation.load_preserved_git_endpoint(
         paths,
@@ -242,60 +236,53 @@ def _issue(args: argparse.Namespace) -> dict[str, Any]:
         )
         with h.state_lock(paths, create_layout=False):
             events = store.load_semantic_events(paths, args.task)
-            pre_endpoint_cas_sha256: str | None = None
-            if checked_intent["sandbox"] == "workspaceWrite":
-                if args.pre_git_endpoint_file is None:
-                    raise CodexTransportCLIError(
-                        "workspaceWrite issuance requires --pre-git-endpoint-file"
-                    )
-                claims = h.claims_owned_by_task(paths, args.task)
-                if not claims:
-                    raise CodexTransportCLIError(
-                        "workspaceWrite issuance requires AOI claim records"
-                    )
-                pre_endpoint = _read_object(
-                    args.pre_git_endpoint_file, "pre-turn Git endpoint"
-                )
-                checked_pre = mutation.validate_git_endpoint(
-                    pre_endpoint, claims, sealed_claim_scope=False
-                )
-                # A caller-supplied, self-consistent endpoint is only a
-                # proposed pre-image.  Re-capture under this same Chief/state
-                # lock so a source or claim change between endpoint creation
-                # and permit issuance cannot be published as launch evidence.
-                # The sealed intent cwd is authoritative; comparing canonical
-                # bytes also rejects a supplied endpoint from another
-                # worktree even if its four digest binding fields collide.
-                recaptured_pre = mutation.capture_git_endpoint(
-                    args.task,
-                    Path(checked_intent["cwd"]),
-                    str(checked_pre["snapshot"]["baseline_head"]),
-                    claims,
-                )
-                if semantic.canonical_json_bytes(
-                    checked_pre
-                ) != semantic.canonical_json_bytes(recaptured_pre):
-                    raise CodexTransportCLIError(
-                        "pre-turn Git endpoint drifted before permit issuance"
-                    )
-                if (
-                    mutation.endpoint_pre_git_binding(recaptured_pre)
-                    != checked_intent["pre_git_binding"]
-                ):
-                    raise CodexTransportCLIError(
-                        "pre-turn Git endpoint does not match launch intent"
-                    )
-                preserved = mutation.preserve_git_endpoint(
-                    paths,
-                    task_id=args.task,
-                    endpoint=recaptured_pre,
-                    claims=claims,
-                )
-                pre_endpoint_cas_sha256 = preserved["sha256"]
-            elif args.pre_git_endpoint_file is not None:
+            if args.pre_git_endpoint_file is None:
                 raise CodexTransportCLIError(
-                    "readOnly issuance cannot attach a pre Git endpoint"
+                    f"{checked_intent['sandbox']} issuance requires "
+                    "--pre-git-endpoint-file"
                 )
+            claims = h.claims_owned_by_task(paths, args.task)
+            if not claims:
+                raise CodexTransportCLIError(
+                    f"{checked_intent['sandbox']} issuance requires AOI claim records"
+                )
+            pre_endpoint = _read_object(
+                args.pre_git_endpoint_file, "pre-turn Git endpoint"
+            )
+            checked_pre = mutation.validate_git_endpoint(
+                pre_endpoint, claims, sealed_claim_scope=False
+            )
+            # A caller-supplied, self-consistent endpoint is only a proposed
+            # pre-image. Re-capture under this same Chief/state lock for both
+            # readOnly and workspaceWrite. The sealed intent cwd is
+            # authoritative; comparing canonical bytes also rejects an
+            # endpoint from another worktree even if its binding fields collide.
+            recaptured_pre = mutation.capture_git_endpoint(
+                args.task,
+                Path(checked_intent["cwd"]),
+                str(checked_pre["snapshot"]["baseline_head"]),
+                claims,
+            )
+            if semantic.canonical_json_bytes(
+                checked_pre
+            ) != semantic.canonical_json_bytes(recaptured_pre):
+                raise CodexTransportCLIError(
+                    "pre-turn Git endpoint drifted before permit issuance"
+                )
+            if (
+                mutation.endpoint_pre_git_binding(recaptured_pre)
+                != checked_intent["pre_git_binding"]
+            ):
+                raise CodexTransportCLIError(
+                    "pre-turn Git endpoint does not match launch intent"
+                )
+            preserved = mutation.preserve_git_endpoint(
+                paths,
+                task_id=args.task,
+                endpoint=recaptured_pre,
+                claims=claims,
+            )
+            pre_endpoint_cas_sha256 = preserved["sha256"]
             token, _path = h.load_chief_credential(
                 paths,
                 session_id=args.chief_session_id,
@@ -817,7 +804,10 @@ def _parser() -> argparse.ArgumentParser:
     issue.add_argument("--intent-file", required=True)
     issue.add_argument("--decision-file", required=True)
     issue.add_argument("--permit-file", required=True)
-    issue.add_argument("--pre-git-endpoint-file")
+    issue.add_argument(
+        "--pre-git-endpoint-file",
+        help="required exact pre-turn Git/claim endpoint for every launch",
+    )
     issue.add_argument("--command-id", required=True)
     issue.add_argument("--recorded-at", required=True)
     issue.add_argument("--chief-session-id", required=True)

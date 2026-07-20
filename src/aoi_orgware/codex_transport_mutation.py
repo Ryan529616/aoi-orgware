@@ -26,9 +26,10 @@ from . import semantic_store as store
 from .harnesslib import HarnessError, HarnessPaths
 
 
-GIT_ENDPOINT_SCHEMA = "aoi.codex-transport.git-endpoint.v1"
+LEGACY_GIT_ENDPOINT_SCHEMA = "aoi.codex-transport.git-endpoint.v1"
+GIT_ENDPOINT_SCHEMA = "aoi.codex-transport.git-endpoint.v2"
 GIT_TREE_SCHEMA = "aoi.codex-transport.git-tree.v1"
-CLAIM_ENDPOINT_SCHEMA = "aoi.codex-transport.claim-endpoints.v1"
+CLAIM_ENDPOINT_SCHEMA = "aoi.codex-transport.claim-endpoints.v2"
 MAX_MUTATION_RECORD_BYTES = 8 * 1024 * 1024
 # ``rev-parse <commit>^{tree}`` is tiny by contract.  Keep a separate narrow
 # cap rather than allowing a malformed executable on PATH to consume the
@@ -172,11 +173,28 @@ def _validate_tree(value: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dic
     return {**base, "tree_sha256": str(value["tree_sha256"])}
 
 
-def _coverage_digest(coverage: Mapping[str, Any]) -> str:
-    return _sha(_canonical(dict(coverage), "claim coverage"))
+def _claim_binding_digest(
+    coverage: Mapping[str, Any], authority: Mapping[str, Any]
+) -> str:
+    return _sha(
+        _canonical(
+            {
+                "claim_coverage": dict(coverage),
+                "claim_authority_sha256": authority[
+                    "claim_authority_sha256"
+                ],
+            },
+            "claim coverage and authority",
+        )
+    )
 
 
-def _endpoint_base(snapshot: Mapping[str, Any], tree: Mapping[str, Any], coverage: Mapping[str, Any]) -> dict[str, Any]:
+def _endpoint_base(
+    snapshot: Mapping[str, Any],
+    tree: Mapping[str, Any],
+    coverage: Mapping[str, Any],
+    claim_authority: Mapping[str, Any],
+) -> dict[str, Any]:
     task_id, _paths = git.validate_task_mutation_snapshot(snapshot)
     checked_tree = _validate_tree(tree, snapshot)
     if not isinstance(coverage, Mapping) or coverage.get("task_id") != task_id or coverage.get("covered") is not True:
@@ -186,12 +204,24 @@ def _endpoint_base(snapshot: Mapping[str, Any], tree: Mapping[str, Any], coverag
     if not isinstance(tokens, list) or tokens != sorted(set(tokens)) or any(not isinstance(token, str) for token in tokens):
         raise CodexTransportMutationError("Git endpoint covered claim tokens are not canonical")
     _sha_text(str(digest), "Git endpoint claim scope SHA-256")
+    checked_authority = git.validate_task_claim_authority_record(
+        claim_authority
+    )
+    if (
+        checked_authority["task_id"] != task_id
+        or checked_authority["worktree"] != snapshot["worktree"]
+        or not checked_authority["claim_tokens"]
+    ):
+        raise CodexTransportMutationError(
+            "Git endpoint full claim authority is missing or mismatched"
+        )
     return {
         "schema": GIT_ENDPOINT_SCHEMA,
         "task_id": task_id,
         "snapshot": dict(snapshot),
         "tree": checked_tree,
         "claim_coverage": dict(coverage),
+        "claim_authority": checked_authority,
     }
 
 
@@ -206,7 +236,15 @@ def capture_git_endpoint(
     try:
         snapshot = git.task_mutation_snapshot(task_id, worktree, baseline_head)
         coverage = git.task_mutation_snapshot_claim_coverage(snapshot, claims)
-        base = _endpoint_base(snapshot, _git_tree(Path(snapshot["worktree"]), snapshot["current_head"]), coverage)
+        claim_authority = git.capture_task_live_claim_authority(
+            task_id, claims, str(snapshot["worktree"])
+        )
+        base = _endpoint_base(
+            snapshot,
+            _git_tree(Path(snapshot["worktree"]), snapshot["current_head"]),
+            coverage,
+            claim_authority,
+        )
         return {**base, "endpoint_sha256": _sha(_canonical(base, "Git endpoint"))}
     except (HarnessError, KeyError, OSError, TypeError) as exc:
         raise _fail("cannot capture Git mutation endpoint", exc) from exc
@@ -225,12 +263,30 @@ def validate_git_endpoint(
     asserts the claims were held for any time between endpoints.
     """
 
+    if (
+        isinstance(endpoint, Mapping)
+        and endpoint.get("schema") == LEGACY_GIT_ENDPOINT_SCHEMA
+    ):
+        raise CodexTransportMutationError(
+            "legacy Git endpoint lacks complete live claim authority"
+        )
     if not isinstance(endpoint, Mapping) or set(endpoint) != {
-        "schema", "task_id", "snapshot", "tree", "claim_coverage", "endpoint_sha256"
+        "schema", "task_id", "snapshot", "tree", "claim_coverage",
+        "claim_authority", "endpoint_sha256"
     }:
         raise CodexTransportMutationError("Git endpoint schema is invalid")
     try:
-        base = _endpoint_base(endpoint["snapshot"], endpoint["tree"], endpoint["claim_coverage"])
+        checked_authority = git.validate_task_claim_authority(
+            endpoint["claim_authority"],
+            claims,
+            sealed=sealed_claim_scope,
+        )
+        base = _endpoint_base(
+            endpoint["snapshot"],
+            endpoint["tree"],
+            endpoint["claim_coverage"],
+            checked_authority,
+        )
         if endpoint["schema"] != GIT_ENDPOINT_SCHEMA or endpoint["task_id"] != base["task_id"]:
             raise CodexTransportMutationError("Git endpoint identity is invalid")
         if endpoint["endpoint_sha256"] != _sha(_canonical(base, "Git endpoint")):
@@ -258,13 +314,20 @@ def endpoint_pre_git_binding(endpoint: Mapping[str, Any]) -> dict[str, str]:
 
     if not isinstance(endpoint, Mapping):
         raise CodexTransportMutationError("Git endpoint must be an object")
-    base = _endpoint_base(endpoint["snapshot"], endpoint["tree"], endpoint["claim_coverage"])
+    base = _endpoint_base(
+        endpoint["snapshot"],
+        endpoint["tree"],
+        endpoint["claim_coverage"],
+        endpoint["claim_authority"],
+    )
     snapshot = base["snapshot"]
     return {
         "git_head_sha256": _sha(str(snapshot["current_head"]).encode("ascii")),
         "git_tree_sha256": _sha(str(base["tree"]["tree"]).encode("ascii")),
         "git_status_sha256": str(snapshot["snapshot_sha256"]),
-        "claim_coverage_sha256": _coverage_digest(base["claim_coverage"]),
+        "claim_coverage_sha256": _claim_binding_digest(
+            base["claim_coverage"], base["claim_authority"]
+        ),
     }
 
 
@@ -387,6 +450,8 @@ def materialize_verified_mutation(
             "post_endpoint_sha256": post["endpoint_sha256"],
             "pre_claim_coverage": pre["claim_coverage"],
             "post_claim_coverage": post["claim_coverage"],
+            "pre_claim_authority": pre["claim_authority"],
+            "post_claim_authority": post["claim_authority"],
         }
         if task_id != checked_intent["task_id"] or pre["task_id"] != task_id or post["task_id"] != task_id:
             raise CodexTransportMutationError("mutation evidence task identity does not match launch intent")
@@ -466,13 +531,31 @@ def validate_materialized_mutation(
         post_tree = _read_json(paths, task_id, payload["post_git_tree"]["cas_sha256"], "post Git tree")
         coverage = _read_json(paths, task_id, payload["claim_coverage"]["cas_sha256"], "claim endpoint coverage")
         if not isinstance(coverage, dict) or set(coverage) != {
-            "schema", "task_id", "pre_endpoint_sha256", "post_endpoint_sha256", "pre_claim_coverage", "post_claim_coverage"
+            "schema", "task_id", "pre_endpoint_sha256", "post_endpoint_sha256",
+            "pre_claim_coverage", "post_claim_coverage", "pre_claim_authority",
+            "post_claim_authority"
         } or coverage.get("schema") != CLAIM_ENDPOINT_SCHEMA or coverage.get("task_id") != task_id:
             raise CodexTransportMutationError("claim endpoint coverage record is invalid")
-        pre = {"schema": GIT_ENDPOINT_SCHEMA, "task_id": task_id, "snapshot": pre_snapshot, "tree": pre_tree, "claim_coverage": coverage["pre_claim_coverage"]}
-        pre["endpoint_sha256"] = _sha(_canonical(_endpoint_base(pre_snapshot, pre_tree, coverage["pre_claim_coverage"]), "Git endpoint"))
-        post = {"schema": GIT_ENDPOINT_SCHEMA, "task_id": task_id, "snapshot": post_snapshot, "tree": post_tree, "claim_coverage": coverage["post_claim_coverage"]}
-        post["endpoint_sha256"] = _sha(_canonical(_endpoint_base(post_snapshot, post_tree, coverage["post_claim_coverage"]), "Git endpoint"))
+        pre_base = _endpoint_base(
+            pre_snapshot,
+            pre_tree,
+            coverage["pre_claim_coverage"],
+            coverage["pre_claim_authority"],
+        )
+        pre = {
+            **pre_base,
+            "endpoint_sha256": _sha(_canonical(pre_base, "Git endpoint")),
+        }
+        post_base = _endpoint_base(
+            post_snapshot,
+            post_tree,
+            coverage["post_claim_coverage"],
+            coverage["post_claim_authority"],
+        )
+        post = {
+            **post_base,
+            "endpoint_sha256": _sha(_canonical(post_base, "Git endpoint")),
+        }
         if pre["endpoint_sha256"] != coverage["pre_endpoint_sha256"] or post["endpoint_sha256"] != coverage["post_endpoint_sha256"]:
             raise CodexTransportMutationError("claim endpoint coverage hashes do not bind CAS endpoints")
         validate_git_endpoint(pre, claims, sealed_claim_scope=sealed_claim_scope)
@@ -774,7 +857,8 @@ def commit_verified_mutation(
 
 __all__ = [
     "CLAIM_ENDPOINT_SCHEMA", "CODEX_MUTATION_NAMESPACE_KEY", "CODEX_MUTATION_NAMESPACE_VERSION",
-    "GIT_ENDPOINT_SCHEMA", "GIT_TREE_SCHEMA", "MAX_GIT_TREE_OUTPUT_BYTES", "MAX_MUTATION_RECORD_BYTES",
+    "GIT_ENDPOINT_SCHEMA", "GIT_TREE_SCHEMA", "LEGACY_GIT_ENDPOINT_SCHEMA",
+    "MAX_GIT_TREE_OUTPUT_BYTES", "MAX_MUTATION_RECORD_BYTES",
     "CodexTransportMutationError", "capture_git_endpoint", "commit_verified_mutation",
     "endpoint_pre_git_binding", "inspect_verified_mutation_commit",
     "load_preserved_git_endpoint", "materialize_verified_mutation",
