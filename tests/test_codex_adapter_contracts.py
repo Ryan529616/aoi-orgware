@@ -35,7 +35,7 @@ def stop_receipt(**changes: object) -> dict[str, object]:
         "observed_at": "2026-07-19T01:02:03Z",
         "transcript_path_observation": observed("C:/transcripts/one.jsonl"),
         "last_assistant_message": {"sha256": observed(SHA_A), "size_bytes": observed("123"), "presence": observed("present")},
-        "model_observation": observed("gpt-5.6"),
+        "model_observation": observed("gpt-5.6-terra"),
         "permission_mode_observation": observed("workspace-write"),
         "start_correlation": {"status": "matched", "start_receipt_sha256": observed(SHA_B)},
         "no_material_work_verified": False,

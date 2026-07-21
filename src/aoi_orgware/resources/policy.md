@@ -637,6 +637,21 @@ before state publication or Popen; unverified locality is also denied without
 being mislabeled confirmed danger. This is a bounded AOI-managed enforcement
 slice; a same-user process or ungoverned shell can still bypass it.
 
+For an App Server launch, `local_files` additionally requires a dedicated,
+absolute, non-linked `CODEX_HOME` whose initial inventory is exactly three
+ordinary files: `auth.json`, `config.toml`, and `managed_config.toml`. The two
+policy files must parse to closed AOI-owned tables. Their exact paths and
+SHA-256 digests, a credential-safe inventory (the auth file contributes only
+path, type, and size), and the thread-config digest enter the process journal.
+The adapter re-enumerates and revalidates that complete binding after the
+pinned `--version` probe immediately before Popen. Production argv uses
+`--strict-config` and disables web search, apps, remote plugins, and
+multi-agent loading; `thread/start.config` repeats those controls. Managed
+policy pins those feature flags, sets `allowed_web_search_modes=[]` (only the
+implicit disabled mode), and fixes `allow_remote_control=false`, while the turn
+sandbox retains `networkAccess=false`. Any missing, extra, linked, changed, or
+non-exact policy input fails closed.
+
 Promotion is profile-aware. A publication-enabled profile may require exact
 final-SHA remote-main CI. `local_files` forbids that route and instead requires
 an exact local commit/tree, complete Windows and WSL suites, applicable
@@ -679,6 +694,9 @@ bounded exact-binary `--version` probe and the following App Server Popen; no
 child process executes before it. After that boundary, a lost process/thread/
 turn start outcome is `launch_unknown` and must never trigger an automatic
 restart; loss after an established active turn is `runtime_unknown`.
+`model/list` is a read-only pre-thread request, so a lost or policy-rejected
+catalog response is a known `failed` outcome and is not retried by the same
+launch.
 `reservation_effective_at` is the
 Chief-sealed semantic event time, not a measured wall-clock consumption
 timestamp. Process-start claims derive only from journal evidence.
@@ -686,14 +704,22 @@ timestamp. Process-start claims derive only from journal evidence.
 The pinned App Server dialect is its generated, line-delimited RPC schema, not
 a generic JSON-RPC 2.0 envelope. Exact correlated success-response bytes may
 populate both the response and wire digest, but their `wire_method` is the
-actual request method (`initialize`, `thread/start`, `turn/start`, or
-`turn/interrupt`); they may not be labeled as similarly named lifecycle
+actual request method (`initialize`, `model/list`, `thread/start`,
+`turn/start`, or `turn/interrupt`); they may not be labeled as similarly named lifecycle
 notifications. A method-specific success result must satisfy the pinned 0.144.6
 required shape and sealed cwd/model/approval/sandbox constraints before the
-response journal callback can publish a semantic milestone. Supported
+response journal callback can publish a semantic milestone. Initialize must
+report the exact isolated Codex home. Before `thread/start`, one bounded
+`model/list` page must contain exactly one visible exact requested model, list
+the requested reasoning effort as supported, and have no remaining cursor;
+unsupported aliases and silent fallback are forbidden. Supported
 lifecycle notifications validate pinned Thread/Turn/item required fields and
 timestamps and populate only a wire digest. An exact rejected response may be
-bound only as fault evidence. Other bounded synthetic controller/protocol
+bound only as fault evidence after its bounded raw bytes are synchronously
+written to task-local non-Git CAS and read back with the exact digest and size.
+This includes a schema-valid App Server error envelope: it cannot enter the
+success-response callback or publish an initialized/thread/turn milestone.
+Only the verified digest and size enter the semantic journal. Other bounded synthetic controller/protocol
 faults hash a finite redacted reason code and have separate `fault_kind` and
 fault-evidence digest/size fields; neither kind may be presented as response or
 wire bytes. Malformed response/error envelopes fail before response

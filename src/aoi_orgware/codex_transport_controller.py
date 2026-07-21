@@ -18,6 +18,7 @@ from typing import Any
 from . import codex_transport_contracts as contracts
 from .codex_app_server_stdio import (
     AppServerError,
+    AppServerResponseError,
     CodexAppServerStdio,
     ProcessJournalEntry,
     RequestJournalEntry,
@@ -31,6 +32,7 @@ from .codex_app_server_stdio import (
 
 PersistMilestone = Callable[[Mapping[str, Any]], Sequence[Mapping[str, Any]]]
 PublishTerminal = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+PersistFaultEvidence = Callable[[bytes, str], Mapping[str, Any]]
 
 
 class CodexTransportControllerError(RuntimeError):
@@ -52,6 +54,8 @@ _EVENT_STATE = {
     "process_started": "reserved",
     "initialize_send_pending": "reserved",
     "initialized": "reserved",
+    "model_list_send_pending": "reserved",
+    "model_list_observed": "reserved",
     "thread_start_send_pending": "reserved",
     "thread_started": "thread_started",
     "turn_start_send_pending": "thread_started",
@@ -78,6 +82,7 @@ _EVENT_STATUS = {
 }
 _PENDING_BY_METHOD = {
     "initialize": "initialize_send_pending",
+    "model/list": "model_list_send_pending",
     "thread/start": "thread_start_send_pending",
     "turn/start": "turn_start_send_pending",
     "turn/interrupt": "interrupt_send_pending",
@@ -87,6 +92,7 @@ _OBSERVED_BY_METHOD = {
     # exact bytes are not the similarly named lifecycle notifications, which
     # remain buffered runtime events until observation.
     "initialize": ("initialized", "initialize"),
+    "model/list": ("model_list_observed", "model/list"),
     "thread/start": ("thread_started", "thread/start"),
     "turn/start": ("turn_started", "turn/start"),
     "turn/interrupt": ("interrupt_observed", "turn/interrupt"),
@@ -174,6 +180,7 @@ class CodexTransportController:
         journal: Sequence[Mapping[str, Any]],
         persist_milestone: PersistMilestone,
         publish_terminal: PublishTerminal,
+        persist_fault_evidence: PersistFaultEvidence,
     ) -> None:
         try:
             self.intent = contracts.validate_launch_intent(intent)
@@ -197,6 +204,7 @@ class CodexTransportController:
         self.launch_id = self.reservation["reservation_id"]
         self._persist_milestone = persist_milestone
         self._publish_terminal = publish_terminal
+        self._persist_fault_evidence = persist_fault_evidence
         self._terminal_receipt: dict[str, Any] | None = None
 
     @property
@@ -333,17 +341,9 @@ class CodexTransportController:
         message = _strict_object(entry.wire_bytes)
         correlation = self.state.correlation
         if "error" in message:
-            self._persist(
-                self._event(
-                    "failed",
-                    wire_method=entry.method,
-                    correlation=correlation,
-                    payload_size_bytes=len(entry.wire_bytes),
-                    wire_event_sha256=entry.sha256,
-                    response_sha256=entry.sha256,
-                )
+            raise CodexTransportControllerError(
+                "App Server error response cannot enter the success callback"
             )
-            return
         result = _object(message.get("result"), "App Server response result")
         event_type, wire_method = _OBSERVED_BY_METHOD[entry.method]
         if entry.method == "thread/start":
@@ -367,6 +367,35 @@ class CodexTransportController:
                 response_sha256=entry.sha256,
             )
         )
+
+    def _on_rejected_response(
+        self, entry: RequestJournalEntry
+    ) -> Mapping[str, Any]:
+        if entry.phase is not RequestPhase.RESPONSE_RECEIVED:
+            raise CodexTransportControllerError(
+                "rejected response callback is not RESPONSE_RECEIVED"
+            )
+        try:
+            reference = dict(
+                self._persist_fault_evidence(
+                    entry.wire_bytes,
+                    f"Codex App Server {entry.method} rejected response",
+                )
+            )
+        except CodexTransportControllerError:
+            raise
+        except Exception as exc:
+            raise CodexTransportControllerError(
+                "rejected response local CAS persistence failed"
+            ) from exc
+        if (
+            reference.get("sha256") != entry.sha256
+            or reference.get("size_bytes") != len(entry.wire_bytes)
+        ):
+            raise CodexTransportControllerError(
+                "rejected response local CAS reference differs from exact wire bytes"
+            )
+        return reference
 
     def _record_observation(self, observation: TurnObservation) -> None:
         for event in observation.events:
@@ -441,7 +470,10 @@ class CodexTransportController:
 
         supplied = getattr(exc, "reason_code", None)
         if isinstance(supplied, str) and supplied in {
+            "app_server_error",
             "pinned_response_schema",
+            "model_catalog_policy",
+            "sealed_response_policy",
         }:
             return supplied
         message = str(exc).lower()
@@ -473,11 +505,15 @@ class CodexTransportController:
             return
         last = self.journal[-1]
         fault_kind, digest, size = self._fault_digest(exc)
+        known_rejected_start = isinstance(exc, AppServerResponseError) and (
+            state.last_event_type
+            in {"thread_start_send_pending", "turn_start_send_pending"}
+        )
         if state.last_event_type in {
             "process_start_pending",
             "thread_start_send_pending",
             "turn_start_send_pending",
-        }:
+        } and not known_rejected_start:
             self._persist(
                 self._event(
                     "launch_unknown",
@@ -562,6 +598,7 @@ class CodexTransportController:
             adapter.on_process_started,
             adapter.on_send_pending,
             adapter.on_response,
+            adapter.on_rejected_response,
         )
         if any(callback is not None for callback in callbacks):
             raise CodexTransportControllerError(
@@ -572,9 +609,11 @@ class CodexTransportController:
         adapter.on_process_started = self._on_process_started
         adapter.on_send_pending = self._on_send_pending
         adapter.on_response = self._on_response
+        adapter.on_rejected_response = self._on_rejected_response
         try:
             adapter.start()
             adapter.initialize()
+            adapter.verify_model_from_intent(intent=intent_view)
             thread_id = adapter.start_thread_from_intent(intent=intent_view)
             turn_id = adapter.start_turn_from_intent(
                 thread_id=thread_id, prompt=prompt, intent=intent_view
@@ -633,5 +672,6 @@ __all__ = [
     "CodexTransportControllerError",
     "ControllerResult",
     "PersistMilestone",
+    "PersistFaultEvidence",
     "PublishTerminal",
 ]

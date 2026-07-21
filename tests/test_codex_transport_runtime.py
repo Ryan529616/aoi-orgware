@@ -108,7 +108,7 @@ def intent() -> dict[str, object]:
         "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1, "task_id": "task-1", "packet_id": "packet-1",
         "routing_binding": {"kind": "cohort", "cohort_id": "cohort-1", "cohort_sha256": SHA_A, "wave_index": 0, "transport_slot_sha256": SHA_B, "routing_authority_sha256": SHA_C, "transport": "codex", "parent_session_id": "chief-1", "expected_agent_type": "worker"},
         "expected_semantic_head_sha256": SHA_D, "prompt_sha256": SHA_A, "prompt_size_bytes": 1, "cwd": "C:/scratch/aoi",
-        "requested_model": "gpt-5.6", "requested_effort": "high", "sandbox": "readOnly", "approval": "never", "runtime_pin": pin(),
+        "requested_model": "gpt-5.6-terra", "requested_effort": "high", "sandbox": "readOnly", "approval": "never", "runtime_pin": pin(),
         "pre_git_binding": {"git_head_sha256": SHA_A, "git_tree_sha256": SHA_B, "git_status_sha256": SHA_C, "claim_coverage_sha256": SHA_D},
     })
 

@@ -16,6 +16,7 @@ import queue
 import subprocess
 import threading
 import time
+import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -32,7 +33,7 @@ DEFAULT_MAX_STDERR_BYTES: Final = 1_048_576
 DEFAULT_MAX_QUEUE_MESSAGES: Final = 1_024
 
 _REQUEST_METHODS: Final = frozenset(
-    {"initialize", "thread/start", "turn/start", "turn/interrupt"}
+    {"initialize", "model/list", "thread/start", "turn/start", "turn/interrupt"}
 )
 _NOTIFICATION_METHODS: Final = frozenset(
     {
@@ -165,6 +166,22 @@ _THREAD_REQUIRED: Final = frozenset(
     }
 )
 _TURN_REQUIRED: Final = frozenset({"id", "items", "status"})
+_MODEL_LIST_RESPONSE_REQUIRED: Final = frozenset({"data"})
+_MODEL_REQUIRED: Final = frozenset(
+    {
+        "defaultReasoningEffort",
+        "description",
+        "displayName",
+        "hidden",
+        "id",
+        "isDefault",
+        "model",
+        "supportedReasoningEfforts",
+    }
+)
+_REASONING_EFFORT_OPTION_REQUIRED: Final = frozenset(
+    {"description", "reasoningEffort"}
+)
 _THREAD_ITEM_REQUIRED_FIELDS: Final = {
     "userMessage": frozenset({"content", "id", "type"}),
     "hookPrompt": frozenset({"fragments", "id", "type"}),
@@ -207,10 +224,81 @@ _AOI_SECRET_ENV_PREFIXES: Final = ("AOI_CHIEF_", "AOI_ROOT_", "AOI_CREDENTIAL_")
 _AOI_SECRET_ENV_NAMES: Final = frozenset(
     {"AOI_CHIEF_SESSION_ID", "AOI_CHIEF_EPOCH", "AOI_CHIEF_CREDENTIAL_FILE"}
 )
+_LOCAL_FILES_HOME_NAMES: Final = frozenset(
+    {"auth.json", "config.toml", "managed_config.toml"}
+)
+_LOCAL_FILES_CONFIG: Final = {
+    "web_search": "disabled",
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+    "apps": {"_default": {"enabled": False}},
+}
+_LOCAL_FILES_MANAGED_CONFIG: Final = {
+    "allow_remote_control": False,
+    # An empty requirements allowlist permits only the implicit disabled mode.
+    # A plain ``web_search = \"disabled\"`` here would be a default-like
+    # setting, not the same managed constraint.
+    "allowed_web_search_modes": [],
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+}
+_LOCAL_FILES_THREAD_CONFIG: Final = {
+    "web_search": "disabled",
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+    "apps": {"_default": {"enabled": False}},
+}
+_PRODUCTION_LAUNCH_ARGS: Final = (
+    "--strict-config",
+    "--config",
+    'web_search="disabled"',
+    "--config",
+    "features.apps=false",
+    "--config",
+    "features.remote_plugin=false",
+    "--config",
+    "features.multi_agent=false",
+    "--config",
+    "apps._default.enabled=false",
+    "--listen",
+    "stdio://",
+)
 
 
 class AppServerError(RuntimeError):
     """Base class for failures that callers must record as runtime evidence."""
+
+
+class AppServerResponseError(AppServerError):
+    """The peer returned one correlated, schema-valid error response.
+
+    Production controllers retain the exact bounded envelope in task-local CAS
+    before this typed fault is raised.  The error payload is deliberately not
+    copied into the exception message or semantic journal.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str,
+        evidence_sha256: str,
+        evidence_size_bytes: int,
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.evidence_sha256 = evidence_sha256
+        self.evidence_size_bytes = evidence_size_bytes
+        self.reason_code = "app_server_error"
 
 
 class ProtocolViolation(AppServerError):
@@ -225,12 +313,21 @@ class ServerRequestDenied(ProtocolViolation):
     """The server requested approval, user input, or any other client action."""
 
 
+class ResponsePolicyDrift(ProtocolViolation):
+    """A schema-valid response conflicts with sealed AOI runtime policy."""
+
+
+class ModelCatalogDrift(ResponsePolicyDrift):
+    """The live model catalog cannot honor the exact sealed model/effort."""
+
+
 class ResponseSchemaViolation(ProtocolViolation):
     """A correlated success response did not satisfy the pinned method schema.
 
     The rejected response is not a successful response observation.  Its exact
-    bounded wire digest is carried only as fault evidence so a controller can
-    distinguish it from a lost response without publishing the raw bytes.
+    bounded wire bytes are offered synchronously to a controller-owned local
+    CAS sink before this exception is raised; only the verified digest and size
+    enter the transport journal.
     """
 
     def __init__(
@@ -247,6 +344,14 @@ class ResponseSchemaViolation(ProtocolViolation):
         self.evidence_sha256 = evidence_sha256
         self.evidence_size_bytes = evidence_size_bytes
         self.reason_code = reason_code
+
+
+class ResponsePolicyViolation(ResponseSchemaViolation):
+    """A correlated response violated sealed AOI intent or policy."""
+
+
+class ModelCatalogViolation(ResponsePolicyViolation):
+    """The live App Server catalog lacks the exact requested model/effort."""
 
 
 class RequestPhase(str, Enum):
@@ -423,6 +528,11 @@ class CodexAppServerStdio:
         on_process_started: Callable[[ProcessJournalEntry], None] | None = None,
         on_send_pending: Callable[[RequestJournalEntry], None] | None = None,
         on_response: Callable[[RequestJournalEntry], None] | None = None,
+        on_rejected_response: Callable[
+            [RequestJournalEntry], Mapping[str, Any]
+        ]
+        | None = None,
+        require_local_files_policy: bool = False,
         _test_launch_args: tuple[str, ...] | None = None,
         _test_version_args: tuple[str, ...] | None = None,
     ) -> None:
@@ -431,6 +541,8 @@ class CodexAppServerStdio:
             raise ValueError("Codex App Server executable must be an absolute path")
         if max_line_bytes < 128 or max_events < 1 or max_stderr_bytes < 1 or max_queue_messages < 1:
             raise ValueError("stdio bounds must be positive and line bound at least 128")
+        if not isinstance(require_local_files_policy, bool):
+            raise ValueError("require_local_files_policy must be a boolean")
         if executable_path.is_symlink():
             raise ValueError("Codex App Server executable must not be a symlink")
         if runtime_pin is not None and (
@@ -449,10 +561,13 @@ class CodexAppServerStdio:
         self.on_process_started = on_process_started
         self.on_send_pending = on_send_pending
         self.on_response = on_response
+        self.on_rejected_response = on_rejected_response
+        self.require_local_files_policy = require_local_files_policy
         # This narrow injection point lets tests run a scripted Python peer.
         # Production callers must use the standalone App Server default below.
-        self._launch_args = _test_launch_args or ("--listen", "stdio://")
+        self._launch_args = _test_launch_args or _PRODUCTION_LAUNCH_ARGS
         self._version_args = _test_version_args or ("--version",)
+        self._local_files_policy_binding: dict[str, Any] | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._incoming: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=max_queue_messages)
         self._notifications: list[RuntimeEvent] = []
@@ -461,6 +576,8 @@ class CodexAppServerStdio:
         self._next_request_id = 1
         self.last_receipt: RequestReceipt | None = None
         self._initialized = False
+        self._model_intent: SealedLaunchIntent | None = None
+        self._model_catalog_response: dict[str, Any] | None = None
         self._thread_id: str | None = None
         self._turn_id: str | None = None
         self._turn_terminal = False
@@ -496,6 +613,7 @@ class CodexAppServerStdio:
             "event_sha256": self.event_digest,
             "stdout_message_count": self._stdout_message_count,
             "stdout_total_bytes": self._stdout_total_bytes,
+            "local_files_policy": self._local_files_policy_binding,
         }
 
     @property
@@ -525,6 +643,10 @@ class CodexAppServerStdio:
             raise AppServerError(f"App Server executable does not exist: {self.executable}")
         if not self.cwd.is_dir():
             raise AppServerError(f"App Server cwd does not exist: {self.cwd}")
+        if self.require_local_files_policy:
+            self._local_files_policy_binding = _validate_local_files_codex_home(
+                self.environment
+            )
         self._verify_runtime_pin()
         # This durable boundary authorizes every process execution that follows
         # in the exact pinned-runtime start sequence: the bounded ``--version``
@@ -543,6 +665,12 @@ class CodexAppServerStdio:
         # to narrow the executable replacement window.  The process image is
         # then opened by CreateProcess/exec without a shell or PATH lookup.
         self._verify_runtime_pin()
+        if self.require_local_files_policy:
+            refreshed_policy = _validate_local_files_codex_home(self.environment)
+            if refreshed_policy != self._local_files_policy_binding:
+                raise AppServerError(
+                    "local_files CODEX_HOME policy changed after process authorization"
+                )
         self._stderr = b""
         self._stderr_total_bytes = 0
         self._stderr_truncated = False
@@ -615,10 +743,41 @@ class CodexAppServerStdio:
                 "clientInfo": {"name": client_name, "version": client_version},
                 "capabilities": {"experimentalApi": False, "requestAttestation": False},
             },
-            validate_result=_validate_initialize_response,
+            validate_result=lambda result: _validate_initialize_response(
+                result,
+                expected_codex_home=(
+                    str(self._local_files_policy_binding["codex_home"])
+                    if self._local_files_policy_binding is not None
+                    else None
+                ),
+            ),
         )
         self._send_notification("initialized")
         self._initialized = True
+        return response
+
+    def verify_model_from_intent(self, *, intent: SealedLaunchIntent) -> dict[str, Any]:
+        """Bind the sealed model/effort to the live visible App Server catalog."""
+
+        self._require_initialized()
+        if self._thread_id is not None:
+            raise AppServerError("model/list preflight must precede thread/start")
+        if self._model_intent is not None:
+            if self._model_intent != intent or self._model_catalog_response is None:
+                raise ProtocolViolation(
+                    "model/list preflight intent differs from the established catalog binding"
+                )
+            return self._model_catalog_response
+        self._validate_intent_context(intent)
+        response = self.request(
+            "model/list",
+            {"includeHidden": True, "limit": 100},
+            validate_result=lambda result: _validate_model_list_response(
+                result, intent=intent
+            ),
+        )
+        self._model_intent = intent
+        self._model_catalog_response = response
         return response
 
     def start_thread_from_intent(
@@ -629,6 +788,7 @@ class CodexAppServerStdio:
         self._require_initialized()
         if self._thread_id is not None:
             raise AppServerError("MVP permits exactly one thread/start")
+        self.verify_model_from_intent(intent=intent)
         self._validate_intent_context(intent)
         params: dict[str, Any] = {
             "cwd": intent.cwd,
@@ -640,6 +800,7 @@ class CodexAppServerStdio:
             "serviceName": "aoi-orgware",
             "ephemeral": True,
             "model": intent.model,
+            "config": _copy_local_files_thread_config(),
         }
         response = self.request(
             "thread/start",
@@ -834,29 +995,72 @@ class CodexAppServerStdio:
                     raw,
                     hashlib.sha256(raw).hexdigest(),
                 )
-                if "error" not in message:
-                    result = _require_object(
-                        message.get("result"), "App Server response result"
+                if "error" in message:
+                    self._persist_rejected_response(entry)
+                    raise AppServerResponseError(
+                        f"App Server returned a correlated error response during {method}",
+                        method=method,
+                        evidence_sha256=entry.sha256,
+                        evidence_size_bytes=len(raw),
                     )
-                    if validate_result is not None:
-                        try:
-                            result = validate_result(result)
-                        except ProtocolViolation as exc:
-                            raise ResponseSchemaViolation(
-                                f"pinned {method} response schema validation failed",
-                                method=method,
-                                evidence_sha256=entry.sha256,
-                                evidence_size_bytes=len(raw),
-                            ) from exc
+                result = _require_object(
+                    message.get("result"), "App Server response result"
+                )
+                if validate_result is not None:
+                    try:
+                        result = validate_result(result)
+                    except ModelCatalogDrift as exc:
+                        self._persist_rejected_response(entry)
+                        raise ModelCatalogViolation(
+                            f"pinned {method} response conflicts with the sealed model catalog requirement",
+                            method=method,
+                            evidence_sha256=entry.sha256,
+                            evidence_size_bytes=len(raw),
+                            reason_code="model_catalog_policy",
+                        ) from exc
+                    except ResponsePolicyDrift as exc:
+                        self._persist_rejected_response(entry)
+                        raise ResponsePolicyViolation(
+                            f"pinned {method} response conflicts with sealed AOI policy",
+                            method=method,
+                            evidence_sha256=entry.sha256,
+                            evidence_size_bytes=len(raw),
+                            reason_code="sealed_response_policy",
+                        ) from exc
+                    except ProtocolViolation as exc:
+                        self._persist_rejected_response(entry)
+                        raise ResponseSchemaViolation(
+                            f"pinned {method} response schema validation failed",
+                            method=method,
+                            evidence_sha256=entry.sha256,
+                            evidence_size_bytes=len(raw),
+                        ) from exc
                 if self.on_response is not None:
                     try:
                         self.on_response(entry)
                     except Exception as exc:
                         raise AppServerError("response journal callback failed") from exc
-                if "error" in message:
-                    raise AppServerError(f"App Server error response to request {request_id}: {message['error']!r}")
                 return result
             raise ProtocolViolation(f"internal reader emitted unknown kind: {kind}")
+
+    def _persist_rejected_response(self, entry: RequestJournalEntry) -> None:
+        """Synchronously bind exact rejected bytes to a controller-owned CAS."""
+
+        if self.on_rejected_response is None:
+            return
+        try:
+            reference = dict(self.on_rejected_response(entry))
+        except Exception as exc:
+            raise AppServerError(
+                "rejected response evidence callback failed"
+            ) from exc
+        if (
+            reference.get("sha256") != entry.sha256
+            or reference.get("size_bytes") != len(entry.wire_bytes)
+        ):
+            raise AppServerError(
+                "rejected response evidence callback returned divergent bytes"
+            )
 
     def _next_notification(self, deadline: float) -> RuntimeEvent:
         if self._notifications:
@@ -1090,6 +1294,7 @@ class CodexAppServerStdio:
             "executable_sha256": self.runtime_pin.executable_sha256,
             "executable_size_bytes": self.runtime_pin.executable_size_bytes,
             "pid": pid,
+            "local_files_policy": self._local_files_policy_binding,
         }
         raw = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -1138,6 +1343,145 @@ class CodexAppServerStdio:
             raise AppServerError("pinned App Server --version is not strict UTF-8") from exc
         if completed.returncode != 0 or version != self.runtime_pin.app_server_version:
             raise AppServerError("App Server --version does not match packaged runtime pin")
+
+
+def _copy_local_files_thread_config() -> dict[str, Any]:
+    return {
+        "web_search": "disabled",
+        "features": {
+            "apps": False,
+            "remote_plugin": False,
+            "multi_agent": False,
+        },
+        "apps": {"_default": {"enabled": False}},
+    }
+
+
+def _environment_value(environment: Mapping[str, str], name: str) -> str:
+    matches = [value for key, value in environment.items() if key.upper() == name]
+    if len(matches) != 1 or not matches[0]:
+        raise AppServerError(f"local_files requires exactly one non-empty {name}")
+    return matches[0]
+
+
+def _same_physical_path(path: Path, resolved: Path) -> bool:
+    return os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(resolved))
+
+
+def _bounded_regular_bytes(path: Path, *, label: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise AppServerError(f"{label} must be a regular non-symlink file")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise AppServerError(f"could not resolve {label}") from exc
+    if not _same_physical_path(path, resolved):
+        raise AppServerError(f"{label} resolves through a link or reparse boundary")
+    size = path.stat().st_size
+    if size < 1 or size > DEFAULT_MAX_LINE_BYTES:
+        raise AppServerError(
+            f"{label} must contain 1..{DEFAULT_MAX_LINE_BYTES} bytes"
+        )
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise AppServerError(f"could not read {label}") from exc
+    if len(data) != size:
+        raise AppServerError(f"{label} changed while being bound")
+    return data
+
+
+def _strict_toml(data: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        value = tomllib.loads(data.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise AppServerError(f"{label} is not strict UTF-8 TOML") from exc
+    if not isinstance(value, dict):
+        raise AppServerError(f"{label} must decode to a TOML table")
+    return value
+
+
+def _validate_local_files_codex_home(
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    """Fail closed unless CODEX_HOME is an exact isolated policy directory."""
+
+    home = Path(_environment_value(environment, "CODEX_HOME"))
+    if not home.is_absolute() or home.is_symlink() or not home.is_dir():
+        raise AppServerError(
+            "local_files CODEX_HOME must be an absolute regular directory"
+        )
+    try:
+        resolved_home = home.resolve(strict=True)
+    except OSError as exc:
+        raise AppServerError("could not resolve local_files CODEX_HOME") from exc
+    if not _same_physical_path(home, resolved_home):
+        raise AppServerError(
+            "local_files CODEX_HOME resolves through a link or reparse boundary"
+        )
+    try:
+        children = sorted(home.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise AppServerError("could not enumerate local_files CODEX_HOME") from exc
+    names = {item.name for item in children}
+    if names != _LOCAL_FILES_HOME_NAMES or len(children) != len(
+        _LOCAL_FILES_HOME_NAMES
+    ):
+        raise AppServerError(
+            "local_files CODEX_HOME initial inventory must contain only auth.json, config.toml, and managed_config.toml"
+        )
+
+    inventory: list[dict[str, Any]] = []
+    policy_files: dict[str, dict[str, Any]] = {}
+    policy_bytes: dict[str, bytes] = {}
+    for child in children:
+        data = _bounded_regular_bytes(
+            child, label=f"local_files CODEX_HOME/{child.name}"
+        )
+        row: dict[str, Any] = {
+            "name": child.name,
+            "path": child.resolve(strict=True).as_posix(),
+            "size_bytes": len(data),
+            "type": "file",
+        }
+        if child.name != "auth.json":
+            row["sha256"] = hashlib.sha256(data).hexdigest()
+            policy_files[child.name] = row
+            policy_bytes[child.name] = data
+        inventory.append(row)
+
+    config_data = policy_bytes["config.toml"]
+    managed_data = policy_bytes["managed_config.toml"]
+    if _strict_toml(config_data, label="local_files config.toml") != _LOCAL_FILES_CONFIG:
+        raise AppServerError("local_files config.toml policy differs from the exact profile")
+    if (
+        _strict_toml(managed_data, label="local_files managed_config.toml")
+        != _LOCAL_FILES_MANAGED_CONFIG
+    ):
+        raise AppServerError(
+            "local_files managed_config.toml policy differs from the exact profile"
+        )
+
+    inventory_bytes = json.dumps(
+        inventory, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    thread_config_bytes = json.dumps(
+        _LOCAL_FILES_THREAD_CONFIG,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return {
+        "mode": "local_files",
+        "codex_home": resolved_home.as_posix(),
+        "initial_inventory": inventory,
+        "initial_inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(),
+        "config_path": policy_files["config.toml"]["path"],
+        "config_sha256": policy_files["config.toml"]["sha256"],
+        "managed_config_path": policy_files["managed_config.toml"]["path"],
+        "managed_config_sha256": policy_files["managed_config.toml"]["sha256"],
+        "thread_config_sha256": hashlib.sha256(thread_config_bytes).hexdigest(),
+    }
 
 
 def _event_identity(event: RuntimeEvent) -> tuple[str, str]:
@@ -1342,7 +1686,7 @@ def _require_same_path(value: object, expected: str, label: str) -> None:
     observed_path = _absolute_path(value, label)
     expected_path = _absolute_path(expected, f"expected {label}")
     if os.path.normcase(str(observed_path)) != os.path.normcase(str(expected_path)):
-        raise ProtocolViolation(f"{label} differs from the sealed launch intent")
+        raise ResponsePolicyDrift(f"{label} differs from the sealed launch intent")
 
 
 def _validate_thread_status(value: object, label: str) -> None:
@@ -1430,12 +1774,74 @@ def _validate_thread_object(
     return thread
 
 
-def _validate_initialize_response(value: dict[str, Any]) -> dict[str, Any]:
+def _validate_initialize_response(
+    value: dict[str, Any], *, expected_codex_home: str | None = None
+) -> dict[str, Any]:
     _require_fields(value, _INITIALIZE_RESPONSE_REQUIRED, "initialize response")
     _absolute_path(value.get("codexHome"), "initialize response codexHome")
+    if expected_codex_home is not None:
+        _require_same_path(
+            value.get("codexHome"),
+            expected_codex_home,
+            "initialize response codexHome",
+        )
     _require_string(value.get("platformFamily"), "initialize response platformFamily")
     _require_string(value.get("platformOs"), "initialize response platformOs")
     _require_string(value.get("userAgent"), "initialize response userAgent")
+    return value
+
+
+def _validate_model_list_response(
+    value: dict[str, Any], *, intent: SealedLaunchIntent
+) -> dict[str, Any]:
+    _require_fields(value, _MODEL_LIST_RESPONSE_REQUIRED, "model/list response")
+    if value.get("nextCursor") is not None:
+        _require_text(value.get("nextCursor"), "model/list response nextCursor")
+        raise ModelCatalogDrift(
+            "model/list response is paginated beyond the bounded preflight page"
+        )
+    rows = _require_array(value.get("data"), "model/list response data")
+    candidates: list[dict[str, Any]] = []
+    for index, raw_row in enumerate(rows):
+        label = f"model/list response data[{index}]"
+        row = _require_object(raw_row, label)
+        _require_fields(row, _MODEL_REQUIRED, label)
+        _require_string(
+            row.get("defaultReasoningEffort"), f"{label}.defaultReasoningEffort"
+        )
+        _require_text(row.get("description"), f"{label}.description")
+        _require_text(row.get("displayName"), f"{label}.displayName")
+        hidden = _require_boolean(row.get("hidden"), f"{label}.hidden")
+        _require_text(row.get("id"), f"{label}.id")
+        _require_boolean(row.get("isDefault"), f"{label}.isDefault")
+        model = _require_text(row.get("model"), f"{label}.model")
+        effort_rows = _require_array(
+            row.get("supportedReasoningEfforts"),
+            f"{label}.supportedReasoningEfforts",
+        )
+        for effort_index, raw_effort in enumerate(effort_rows):
+            effort_label = f"{label}.supportedReasoningEfforts[{effort_index}]"
+            effort = _require_object(raw_effort, effort_label)
+            _require_fields(effort, _REASONING_EFFORT_OPTION_REQUIRED, effort_label)
+            _require_text(effort.get("description"), f"{effort_label}.description")
+            _require_string(
+                effort.get("reasoningEffort"),
+                f"{effort_label}.reasoningEffort",
+            )
+        if model == intent.model and hidden is False:
+            candidates.append(row)
+    if len(candidates) != 1:
+        raise ModelCatalogDrift(
+            "model/list must contain exactly one visible exact requested model"
+        )
+    supported = {
+        str(item["reasoningEffort"])
+        for item in candidates[0]["supportedReasoningEfforts"]
+    }
+    if intent.effort not in supported:
+        raise ModelCatalogDrift(
+            "model/list exact requested model does not support the sealed effort"
+        )
     return value
 
 
@@ -1446,7 +1852,7 @@ def _validate_thread_start_response(
         value, _THREAD_START_RESPONSE_REQUIRED, "thread/start response"
     )
     if value.get("approvalPolicy") != "never":
-        raise ProtocolViolation(
+        raise ResponsePolicyDrift(
             "thread/start response approvalPolicy differs from sealed approval"
         )
     if value.get("approvalsReviewer") not in {
@@ -1461,7 +1867,7 @@ def _validate_thread_start_response(
         value.get("cwd"), intent.cwd, "thread/start response cwd"
     )
     if value.get("model") != intent.model:
-        raise ProtocolViolation(
+        raise ResponsePolicyDrift(
             "thread/start response model differs from sealed launch intent"
         )
     model_provider = _require_string(
@@ -1473,11 +1879,11 @@ def _validate_thread_start_response(
         "workspaceWrite": "workspaceWrite",
     }[intent.sandbox]
     if sandbox.get("type") != expected_type:
-        raise ProtocolViolation(
+        raise ResponsePolicyDrift(
             "thread/start response sandbox differs from sealed launch intent"
         )
     if sandbox.get("networkAccess", False) is not False:
-        raise ProtocolViolation(
+        raise ResponsePolicyDrift(
             "thread/start response sandbox grants network access"
         )
     if expected_type == "workspaceWrite" and "writableRoots" in sandbox:
@@ -1486,7 +1892,7 @@ def _validate_thread_start_response(
             "thread/start response sandbox.writableRoots",
         )
         if len(roots) != 1:
-            raise ProtocolViolation(
+            raise ResponsePolicyDrift(
                 "thread/start response sandbox has unexpected writable roots"
             )
         _require_same_path(
@@ -1500,7 +1906,7 @@ def _validate_thread_start_response(
         expected_cwd=intent.cwd,
     )
     if thread["ephemeral"] is not True:
-        raise ProtocolViolation("thread/start response thread is not ephemeral")
+        raise ResponsePolicyDrift("thread/start response thread is not ephemeral")
     if thread["modelProvider"] != model_provider:
         raise ProtocolViolation(
             "thread/start response modelProvider disagrees with thread"

@@ -12,11 +12,14 @@ from aoi_orgware import codex_app_server_stdio as stdio
 from aoi_orgware import codex_transport_contracts as contracts
 from aoi_orgware.codex_app_server_stdio import (
     AppServerError,
+    AppServerResponseError,
     CodexAppServerStdio,
     ProcessJournalEntry,
     ProtocolViolation,
     RequestJournalEntry,
     RequestPhase,
+    ModelCatalogViolation,
+    ResponsePolicyViolation,
     ResponseSchemaViolation,
     RuntimeEvent,
     RuntimeDisconnected,
@@ -95,6 +98,41 @@ send({"method":"remoteControl/status/changed","params":{"status":"ready"}})
 if scenario == "flood":
     for _ in range(128):
         send({"method":"warning","params":{"message":"flood"}})
+
+model_list = read()
+assert model_list["method"] == "model/list"
+assert model_list["params"] == {"includeHidden":True,"limit":100}
+model_row = {
+    "defaultReasoningEffort": "medium",
+    "description": "fake model",
+    "displayName": "GPT-5.6-Terra",
+    "hidden": False,
+    "id": "gpt-5.6-terra",
+    "isDefault": True,
+    "model": "gpt-5.6-terra",
+    "supportedReasoningEfforts": [
+        {"description":"Medium","reasoningEffort":"medium"},
+        {"description":"High","reasoningEffort":"high"},
+    ],
+}
+model_result = {"data":[model_row],"nextCursor":None}
+if scenario == "invalid_model_response":
+    model_row.pop("supportedReasoningEfforts")
+if scenario == "model_missing":
+    model_row["model"] = "gpt-5.6-sol"
+if scenario == "model_hidden":
+    model_row["hidden"] = True
+if scenario == "model_duplicate":
+    model_result["data"].append(dict(model_row))
+if scenario == "model_effort_missing":
+    model_row["supportedReasoningEfforts"] = [
+        {"description":"High","reasoningEffort":"high"}
+    ]
+if scenario == "model_paginated":
+    model_result["nextCursor"] = "more"
+if scenario == "eof_model":
+    raise SystemExit(0)
+response(model_list, model_result)
 
 thread = read()
 assert "jsonrpc" not in thread
@@ -229,20 +267,55 @@ def _fake_runtime_pin(
 
 
 def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwargs: Any) -> CodexAppServerStdio:
-    env = {"FAKE_SCENARIO": scenario, "AOI_CHIEF_CREDENTIAL_FILE": "must-not-leak", "GITHUB_TOKEN": "must-not-leak", "SAFE_VALUE": "yes"}
+    env = dict(
+        kwargs.pop(
+            "environment",
+            {
+                "AOI_CHIEF_CREDENTIAL_FILE": "must-not-leak",
+                "GITHUB_TOKEN": "must-not-leak",
+                "SAFE_VALUE": "yes",
+            },
+        )
+    )
+    env["FAKE_SCENARIO"] = scenario
     runtime_pin = kwargs.pop(
         "runtime_pin",
         _fake_runtime_pin(),
     )
+    max_line_bytes = int(kwargs.pop("max_line_bytes", 1024))
     return CodexAppServerStdio(
         Path(sys.executable).resolve(),
         cwd=tmp_path,
         environment=env,
-        max_line_bytes=1024,
+        max_line_bytes=max_line_bytes,
         runtime_pin=runtime_pin,  # type: ignore[arg-type]
         _test_launch_args=("-u", str(fake_server)),
         _test_version_args=("-c", "print('fake-app-server 0.144.6')"),
         **kwargs,
+    )
+
+
+def _write_local_files_codex_home(path: Path) -> None:
+    path.mkdir()
+    (path / "auth.json").write_text("{}\n", encoding="utf-8")
+    (path / "config.toml").write_text(
+        'web_search = "disabled"\n'
+        "[features]\n"
+        "apps = false\n"
+        "remote_plugin = false\n"
+        "multi_agent = false\n"
+        "[apps._default]\n"
+        "enabled = false\n",
+        encoding="utf-8",
+    )
+    (path / "managed_config.toml").write_text(
+        "allow_remote_control = false\n"
+        "allowed_web_search_modes = []\n"
+        "[features]\n"
+        "apps = false\n"
+        "remote_plugin = false\n"
+        "multi_agent = false\n",
+        encoding="utf-8",
     )
 
 
@@ -273,7 +346,7 @@ def _intent_payload(
         "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
         "prompt_size_bytes": len(prompt_bytes),
         "cwd": tmp_path.resolve().as_posix(),
-        "requested_model": "gpt-5.6",
+        "requested_model": "gpt-5.6-terra",
         "requested_effort": "medium",
         "sandbox": sandbox,
         "approval": "never",
@@ -322,9 +395,115 @@ def _initialized_client(fake_server: Path, tmp_path: Path, scenario: str = "norm
 def test_default_launch_is_exact_standalone_stdio_and_scrubs_secret_env(tmp_path: Path) -> None:
     executable = Path(sys.executable).resolve()
     client = CodexAppServerStdio(executable, cwd=tmp_path)
-    assert client.argv == (str(executable), "--listen", "stdio://")
+    assert client.argv == (
+        str(executable),
+        "--strict-config",
+        "--config",
+        'web_search="disabled"',
+        "--config",
+        "features.apps=false",
+        "--config",
+        "features.remote_plugin=false",
+        "--config",
+        "features.multi_agent=false",
+        "--config",
+        "apps._default.enabled=false",
+        "--listen",
+        "stdio://",
+    )
     scrubbed = scrub_aoi_secret_env({"AOI_CHIEF_EPOCH": "secret", "aoi_chief_credential_file": "secret", "GITHUB_TOKEN": "secret", "GITHUB_PAT": "secret", "AZURE_DEVOPS_EXT_PAT": "secret", "DOCKER_AUTH_CONFIG": "secret", "TWINE_PASSWORD": "secret", "OPENAI_API_KEY": "model-control", "SAFE": "1"})
     assert scrubbed == {"OPENAI_API_KEY": "model-control", "SAFE": "1"}
+
+
+def test_local_files_codex_home_policy_is_bound_before_process_start(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    codex_home = tmp_path / "isolated-codex-home"
+    _write_local_files_codex_home(codex_home)
+    entries: list[ProcessJournalEntry] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        environment={"CODEX_HOME": str(codex_home)},
+        max_line_bytes=4096,
+        require_local_files_policy=True,
+        on_process_start_pending=entries.append,
+        on_process_started=entries.append,
+    )
+    client.start()
+    try:
+        initialized = client.initialize()
+        assert Path(initialized["codexHome"]).resolve() == codex_home.resolve()
+        assert len(entries) == 2
+        pending = json.loads(entries[0].payload_bytes)
+        binding = pending["local_files_policy"]
+        assert binding["mode"] == "local_files"
+        assert Path(binding["codex_home"]).resolve() == codex_home.resolve()
+        assert len(binding["config_sha256"]) == 64
+        assert len(binding["managed_config_sha256"]) == 64
+        assert len(binding["thread_config_sha256"]) == 64
+        auth = next(
+            row for row in binding["initial_inventory"] if row["name"] == "auth.json"
+        )
+        assert "sha256" not in auth
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("fault", ["extra", "config", "managed"])
+def test_local_files_codex_home_policy_drift_fails_before_process(
+    fake_server: Path, tmp_path: Path, fault: str
+) -> None:
+    codex_home = tmp_path / f"isolated-{fault}"
+    _write_local_files_codex_home(codex_home)
+    if fault == "extra":
+        (codex_home / "plugins").mkdir()
+    elif fault == "config":
+        (codex_home / "config.toml").write_text(
+            'web_search = "live"\n', encoding="utf-8"
+        )
+    else:
+        (codex_home / "managed_config.toml").write_text(
+            "allow_remote_control = true\n", encoding="utf-8"
+        )
+    pending: list[ProcessJournalEntry] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        environment={"CODEX_HOME": str(codex_home)},
+        require_local_files_policy=True,
+        on_process_start_pending=pending.append,
+    )
+    with pytest.raises(AppServerError, match="local_files"):
+        client.start()
+    assert pending == []
+
+
+def test_local_files_policy_is_rechecked_after_version_probe_before_popen(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home = tmp_path / "isolated-toctou"
+    _write_local_files_codex_home(codex_home)
+    pending: list[ProcessJournalEntry] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        environment={"CODEX_HOME": str(codex_home)},
+        require_local_files_policy=True,
+        on_process_start_pending=pending.append,
+        max_line_bytes=4096,
+    )
+
+    def mutate_after_pending() -> None:
+        (codex_home / "managed_config.toml").write_text(
+            "allow_remote_control = true\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(client, "_verify_runtime_version", mutate_after_pending)
+    with pytest.raises(AppServerError, match="local_files"):
+        client.start()
+    assert len(pending) == 1
+    assert pending[0].phase == "process_start_pending"
 
 
 def test_constructor_rejects_symlinked_executable(tmp_path: Path) -> None:
@@ -374,6 +553,15 @@ def test_pinned_notification_and_item_allowlists_match_generated_schema() -> Non
     assert stdio._THREAD_ITEM_REQUIRED_FIELDS == item_required
     assert stdio._INITIALIZE_RESPONSE_REQUIRED == frozenset(
         {"codexHome", "platformFamily", "platformOs", "userAgent"}
+    )
+    assert stdio._MODEL_LIST_RESPONSE_REQUIRED == frozenset(
+        schema["definitions"]["ModelListResponse"]["required"]
+    )
+    assert stdio._MODEL_REQUIRED == frozenset(
+        schema["definitions"]["Model"]["required"]
+    )
+    assert stdio._REASONING_EFFORT_OPTION_REQUIRED == frozenset(
+        schema["definitions"]["ReasoningEffortOption"]["required"]
     )
 
 
@@ -458,7 +646,16 @@ def test_lifecycle_buffers_event_before_response_and_records_aggregate(fake_serv
             "sandbox": "read-only",
             "serviceName": "aoi-orgware",
             "ephemeral": True,
-            "model": "gpt-5.6",
+            "model": "gpt-5.6-terra",
+            "config": {
+                "web_search": "disabled",
+                "features": {
+                    "apps": False,
+                    "remote_plugin": False,
+                    "multi_agent": False,
+                },
+                "apps": {"_default": {"enabled": False}},
+            },
         }
         assert sent["turn/start"]["sandboxPolicy"] == {
             "type": "readOnly",
@@ -629,17 +826,118 @@ def test_initialize_success_response_is_schema_validated_before_observation(
 
 
 @pytest.mark.parametrize(
+    ("scenario", "error_type"),
+    [
+        ("invalid_model_response", ResponseSchemaViolation),
+        ("model_missing", ModelCatalogViolation),
+        ("model_hidden", ModelCatalogViolation),
+        ("model_duplicate", ModelCatalogViolation),
+        ("model_effort_missing", ModelCatalogViolation),
+        ("model_paginated", ModelCatalogViolation),
+    ],
+)
+def test_model_list_schema_and_exact_catalog_policy_fail_closed_with_local_evidence(
+    fake_server: Path,
+    tmp_path: Path,
+    scenario: str,
+    error_type: type[Exception],
+) -> None:
+    rejected: list[RequestJournalEntry] = []
+
+    def persist_rejected(entry: RequestJournalEntry) -> dict[str, object]:
+        rejected.append(entry)
+        return {
+            "path": "local-cas",
+            "sha256": entry.sha256,
+            "size_bytes": len(entry.wire_bytes),
+        }
+
+    client = _initialized_client(fake_server, tmp_path, scenario)
+    client.on_rejected_response = persist_rejected
+    responses: list[RequestJournalEntry] = []
+    client.on_response = responses.append
+    try:
+        with pytest.raises(error_type, match="pinned model/list") as caught:
+            client.verify_model_from_intent(intent=_intent(tmp_path))
+        assert responses == []
+        assert len(rejected) == 1
+        assert caught.value.evidence_sha256 == rejected[0].sha256
+        assert caught.value.evidence_size_bytes == len(rejected[0].wire_bytes)
+        assert client.last_receipt is not None
+        assert client.last_receipt.phase is RequestPhase.SEND_PENDING
+    finally:
+        client.close()
+
+
+def test_model_list_response_loss_remains_send_pending_without_retry(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path, "eof_model")
+    try:
+        intent = _intent(tmp_path)
+        with pytest.raises(RuntimeDisconnected):
+            client.verify_model_from_intent(intent=intent)
+        assert client.last_receipt is not None
+        assert client.last_receipt.method == "model/list"
+        assert client.last_receipt.phase is RequestPhase.SEND_PENDING
+    finally:
+        client.close()
+
+
+def test_rejected_response_evidence_sink_must_return_exact_digest_and_size(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path, "invalid_model_response")
+    client.on_rejected_response = lambda entry: {
+        "path": "wrong-local-cas",
+        "sha256": "0" * 64,
+        "size_bytes": len(entry.wire_bytes),
+    }
+    try:
+        with pytest.raises(AppServerError, match="divergent bytes"):
+            client.verify_model_from_intent(intent=_intent(tmp_path))
+        assert client.last_receipt is not None
+        assert client.last_receipt.phase is RequestPhase.SEND_PENDING
+    finally:
+        client.close()
+
+
+def test_thread_response_policy_drift_is_distinct_from_generated_schema_drift(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    rejected: list[RequestJournalEntry] = []
+    client = _initialized_client(fake_server, tmp_path, "thread_context_drift")
+    client.on_rejected_response = lambda entry: (
+        rejected.append(entry)
+        or {
+            "path": "local-cas",
+            "sha256": entry.sha256,
+            "size_bytes": len(entry.wire_bytes),
+        }
+    )
+    try:
+        with pytest.raises(ResponsePolicyViolation, match="sealed AOI policy"):
+            client.start_thread_from_intent(intent=_intent(tmp_path))
+        assert len(rejected) == 1
+        assert rejected[0].method == "thread/start"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
     "scenario", ["invalid_thread_response", "thread_context_drift"]
 )
 def test_thread_success_response_schema_and_intent_drift_fail_before_observation(
     fake_server: Path, tmp_path: Path, scenario: str
 ) -> None:
     client = _initialized_client(fake_server, tmp_path, scenario)
-    responses: list[RequestJournalEntry] = []
-    client.on_response = responses.append
     try:
+        intent = _intent(tmp_path)
+        client.verify_model_from_intent(intent=intent)
+        responses: list[RequestJournalEntry] = []
+        client.on_response = responses.append
         with pytest.raises(ResponseSchemaViolation, match="pinned thread/start"):
-            client.start_thread_from_intent(intent=_intent(tmp_path))
+            client.start_thread_from_intent(intent=intent)
         assert responses == []
         assert client.last_receipt is not None
         assert client.last_receipt.phase is RequestPhase.SEND_PENDING
@@ -755,7 +1053,9 @@ def test_interrupt_is_correlated_only_while_turn_is_active(fake_server: Path, tm
         client.close()
 
 
-def test_send_pending_callback_precedes_write_and_response_callback_precedes_error(fake_server: Path, tmp_path: Path) -> None:
+def test_send_pending_precedes_write_and_error_response_uses_rejected_sink(
+    fake_server: Path, tmp_path: Path
+) -> None:
     pending: list[RequestJournalEntry] = []
 
     def reject_before_write(entry: RequestJournalEntry) -> None:
@@ -773,14 +1073,27 @@ def test_send_pending_callback_precedes_write_and_response_callback_precedes_err
         client.close()
 
     responses: list[RequestJournalEntry] = []
+    rejected: list[RequestJournalEntry] = []
     error_client = _initialized_client(fake_server, tmp_path, "error_response")
-    error_client.on_response = responses.append
     try:
-        with pytest.raises(AppServerError, match="error response"):
-            error_client.start_thread_from_intent(intent=_intent(tmp_path))
-        assert len(responses) == 1
-        assert b'"error"' in responses[0].wire_bytes
-        assert len(responses[0].sha256) == 64
+        intent = _intent(tmp_path)
+        error_client.verify_model_from_intent(intent=intent)
+        error_client.on_response = responses.append
+        error_client.on_rejected_response = lambda entry: (
+            rejected.append(entry)
+            or {
+                "sha256": entry.sha256,
+                "size_bytes": len(entry.wire_bytes),
+            }
+        )
+        with pytest.raises(AppServerResponseError, match="correlated error response") as caught:
+            error_client.start_thread_from_intent(intent=intent)
+        assert responses == []
+        assert len(rejected) == 1
+        assert b'"error"' in rejected[0].wire_bytes
+        assert caught.value.evidence_sha256 == rejected[0].sha256
+        assert caught.value.evidence_size_bytes == len(rejected[0].wire_bytes)
+        assert "no" not in str(caught.value)
     finally:
         error_client.close()
 

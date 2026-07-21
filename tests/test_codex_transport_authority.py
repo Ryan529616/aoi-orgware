@@ -100,7 +100,7 @@ def _intent(binding: dict[str, Any]) -> dict[str, Any]:
             "prompt_sha256": SHA_B,
             "prompt_size_bytes": 1,
             "cwd": "C:/scratch/aoi",
-            "requested_model": "gpt-5.6",
+            "requested_model": "gpt-5.6-terra",
             "requested_effort": "high",
             "sandbox": "readOnly",
             "approval": "never",

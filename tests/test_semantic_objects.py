@@ -203,7 +203,7 @@ class SemanticObjectTests(unittest.TestCase):
                 "prompt_sha256": "b" * 64,
                 "prompt_size_bytes": 41,
                 "cwd": "C:/scratch/repo",
-                "requested_model": "gpt-5.6",
+                "requested_model": "gpt-5.6-terra",
                 "requested_effort": "high",
                 "sandbox": "readOnly",
                 "approval": "never",

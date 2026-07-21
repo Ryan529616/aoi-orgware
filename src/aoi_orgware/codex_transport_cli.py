@@ -27,12 +27,14 @@ from . import codex_transport_projection as projection
 from . import codex_transport_runtime as runtime
 from . import codex_transport_mutation as mutation
 from . import confidentiality
+from . import evidence_artifacts
 from . import harnesslib as h
 from . import semantic_events as semantic
 from . import semantic_store as store
 from .codex_app_server_stdio import (
     AppServerError,
     CodexAppServerStdio,
+    DEFAULT_MAX_LINE_BYTES,
     scrub_aoi_secret_env,
 )
 from .codex_transport_controller import (
@@ -521,12 +523,40 @@ def _run_controller(
                 f"durable Codex terminal publication failed: {exc}"
             ) from exc
 
+    def persist_fault_evidence(data: bytes, label: str) -> Mapping[str, Any]:
+        try:
+            with h.state_lock(paths, create_layout=False):
+                artifact = evidence_artifacts.preserve_generated_artifact_blob(
+                    paths,
+                    str(launch["task_id"]),
+                    data,
+                    label=label,
+                    max_bytes=DEFAULT_MAX_LINE_BYTES,
+                )
+                verified = evidence_artifacts.verify_generated_artifact_blob(
+                    paths,
+                    str(launch["task_id"]),
+                    artifact,
+                    label=label,
+                    max_bytes=DEFAULT_MAX_LINE_BYTES,
+                )
+            if verified != data:
+                raise CodexTransportCLIError(
+                    "rejected response local CAS bytes differ after readback"
+                )
+            return artifact
+        except (h.HarnessError, OSError) as exc:
+            raise CodexTransportCLIError(
+                f"rejected response local CAS persistence failed: {exc}"
+            ) from exc
+
     controller = CodexTransportController(
         intent=intent,
         reservation=reservation,
         journal=journal,
         persist_milestone=persist_milestone,
         publish_terminal=publish_terminal,
+        persist_fault_evidence=persist_fault_evidence,
     )
     state = controller.state
     if launch["terminal_receipt"] is not None:
@@ -552,6 +582,7 @@ def _run_controller(
     adapter = CodexAppServerStdio(
         executable_path,
         cwd=str(intent["cwd"]),
+        require_local_files_policy=paths.project.confidentiality.local_files,
     )
     result = controller.run(
         adapter,

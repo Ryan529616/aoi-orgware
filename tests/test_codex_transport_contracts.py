@@ -54,7 +54,7 @@ def intent(**changes: object) -> dict[str, object]:
         "prompt_sha256": SHA_B,
         "prompt_size_bytes": 41,
         "cwd": "C:/scratch/repo",
-        "requested_model": "gpt-5.6",
+        "requested_model": "gpt-5.6-terra",
         "requested_effort": "high",
         "sandbox": "workspaceWrite",
         "approval": "never",
@@ -101,6 +101,7 @@ def event(
     method = str(changes.get("wire_method", contracts._EVENT_WIRE_METHOD[event_type]))
     response_observed = event_type in {
         "initialized",
+        "model_list_observed",
         "thread_started",
         "turn_started",
         "interrupt_observed",
@@ -232,6 +233,80 @@ def test_launch_intent_accepts_standalone_and_zero_based_cohort_routing() -> Non
         intent(routing_binding=standalone_binding)
     )
     assert standalone["routing_binding"] == standalone_binding
+
+
+def test_launch_intent_rejects_legacy_fallback_model_name() -> None:
+    with pytest.raises(
+        contracts.CodexTransportContractError,
+        match="requested_model is not an approved bounded model",
+    ):
+        contracts.seal_launch_intent(intent(requested_model="gpt-5.6"))
+
+
+def test_model_list_preflight_is_ordered_and_failure_is_known_before_thread_start() -> None:
+    sealed_intent = contracts.seal_launch_intent(intent())
+    sealed_reservation = contracts.seal_reservation(
+        reservation(sealed_intent["intent_sha256"])
+    )
+    intent_sha = str(sealed_intent["intent_sha256"])
+    reservation_sha = str(sealed_reservation["reservation_sha256"])
+    records: list[dict[str, object]] = []
+    for event_type in (
+        "reserved",
+        "process_start_pending",
+        "process_started",
+        "initialize_send_pending",
+        "initialized",
+        "model_list_send_pending",
+        "model_list_observed",
+    ):
+        records = append(
+            records,
+            intent_sha,
+            reservation_sha,
+            event_type,
+            "reserved",
+            correlation(),
+        )
+    state = contracts.validate_transport_journal(records)
+    assert state.state == "reserved"
+    assert state.last_event_type == "model_list_observed"
+    assert append(
+        records,
+        intent_sha,
+        reservation_sha,
+        "thread_start_send_pending",
+        "reserved",
+        correlation(),
+    )[-1]["wire_method"] == "thread/start"
+
+    pending = records[:-1]
+    assert pending[-1]["event_type"] == "model_list_send_pending"
+    failed = append(
+        pending,
+        intent_sha,
+        reservation_sha,
+        "failed",
+        "failed",
+        correlation(),
+        wire_method="model/list",
+        wire_event_sha256=None,
+        response_sha256=None,
+        fault_kind="ModelCatalogViolation",
+        fault_evidence_sha256=SHA_D,
+        fault_evidence_size_bytes=42,
+    )
+    assert contracts.validate_transport_journal(failed).state == "failed"
+    with pytest.raises(contracts.CodexTransportContractError):
+        append(
+            pending,
+            intent_sha,
+            reservation_sha,
+            "launch_unknown",
+            "launch_unknown",
+            correlation(),
+            wire_method="model/list",
+        )
 
 
 def test_launch_reservation_is_exactly_bound_to_intent_and_pin() -> None:

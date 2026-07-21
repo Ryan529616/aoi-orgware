@@ -148,7 +148,7 @@ class CodexHookReceiptStoreTests(HarnessTestCase):
                     "size_bytes": observed("123"),
                     "presence": observed("present"),
                 },
-                "model_observation": observed("gpt-5.6"),
+                "model_observation": observed("gpt-5.6-terra"),
                 "permission_mode_observation": observed("workspace-write"),
                 "start_correlation": {
                     "status": "matched",

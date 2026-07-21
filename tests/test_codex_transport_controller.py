@@ -15,6 +15,7 @@ sys.path.insert(0, str(HERE.parent / "src"))
 from aoi_orgware import codex_transport_contracts as contracts
 from aoi_orgware.codex_app_server_stdio import (
     AppServerError,
+    AppServerResponseError,
     ProcessJournalEntry,
     ProtocolViolation,
     RequestJournalEntry,
@@ -71,7 +72,7 @@ def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, An
             "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
             "prompt_size_bytes": len(prompt),
             "cwd": "C:/scratch/aoi",
-            "requested_model": "gpt-5.6",
+            "requested_model": "gpt-5.6-terra",
             "requested_effort": "high",
             "sandbox": "readOnly",
             "approval": "never",
@@ -158,6 +159,7 @@ class Sink:
         self.journal = list(journal)
         self.fail_publications = fail_publications
         self.published: list[dict[str, Any]] = []
+        self.fault_evidence: list[tuple[str, bytes]] = []
 
     def persist(self, event: Mapping[str, Any]) -> list[dict[str, Any]]:
         self.journal = contracts.append_transport_journal_event(self.journal, event)
@@ -173,6 +175,14 @@ class Sink:
         self.published.append(checked)
         return checked
 
+    def persist_fault(self, data: bytes, label: str) -> dict[str, Any]:
+        self.fault_evidence.append((label, data))
+        return {
+            "path": "local-cas",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+        }
+
 
 class FakeAdapter:
     def __init__(self, mode: str = "completed") -> None:
@@ -181,6 +191,7 @@ class FakeAdapter:
         self.on_process_started: Any = None
         self.on_send_pending: Any = None
         self.on_response: Any = None
+        self.on_rejected_response: Any = None
         self.request_count: dict[str, int] = {}
         self.closed = False
         self._next_id = 1
@@ -220,7 +231,18 @@ class FakeAdapter:
         if self.mode == method.replace("/", "_") + "_loss":
             raise RuntimeDisconnected(f"{method} response lost")
         if self.mode == method.replace("/", "_") + "_schema_error":
-            rejected = b'{"id":2,"result":{"invalid":true}}\n'
+            rejected = json.dumps(
+                {"id": request_id, "result": {"invalid": True}},
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+            rejected_entry = RequestJournalEntry(
+                request_id,
+                method,
+                RequestPhase.RESPONSE_RECEIVED,
+                rejected,
+                hashlib.sha256(rejected).hexdigest(),
+            )
+            self.on_rejected_response(rejected_entry)
             raise ResponseSchemaViolation(
                 f"pinned {method} response schema validation failed",
                 method=method,
@@ -234,21 +256,42 @@ class FakeAdapter:
             else {"id": request_id, "result": dict(result)}
         )
         response_raw = json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
-        self.on_response(
-            RequestJournalEntry(
-                request_id,
-                method,
-                RequestPhase.RESPONSE_RECEIVED,
-                response_raw,
-                hashlib.sha256(response_raw).hexdigest(),
-            )
+        response_entry = RequestJournalEntry(
+            request_id,
+            method,
+            RequestPhase.RESPONSE_RECEIVED,
+            response_raw,
+            hashlib.sha256(response_raw).hexdigest(),
         )
         if error:
-            raise AppServerError(f"{method} error response")
+            self.on_rejected_response(response_entry)
+            raise AppServerResponseError(
+                f"App Server returned a correlated error response during {method}",
+                method=method,
+                evidence_sha256=response_entry.sha256,
+                evidence_size_bytes=len(response_raw),
+            )
+        self.on_response(response_entry)
         return dict(result)
 
     def initialize(self) -> dict[str, Any]:
         return self._request("initialize", {"capabilities": {}})
+
+    def verify_model_from_intent(self, *, intent: object) -> dict[str, Any]:
+        return self._request(
+            "model/list",
+            {
+                "data": [
+                    {
+                        "model": "gpt-5.6-terra",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "high"}
+                        ],
+                    }
+                ],
+                "nextCursor": None,
+            },
+        )
 
     def start_thread_from_intent(self, *, intent: object) -> str:
         result = self._request("thread/start", {"thread": {"id": "thread-1"}})
@@ -308,6 +351,7 @@ def controller(mode: str = "completed", *, fail_publications: int = 0) -> tuple[
         journal=journal,
         persist_milestone=sink.persist,
         publish_terminal=sink.publish,
+        persist_fault_evidence=sink.persist_fault,
     )
     return value, sink, FakeAdapter(mode)
 
@@ -329,6 +373,8 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
         "process_started",
         "initialize_send_pending",
         "initialized",
+        "model_list_send_pending",
+        "model_list_observed",
         "thread_start_send_pending",
         "thread_started",
         "turn_start_send_pending",
@@ -341,10 +387,11 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
         row["event_type"]: row["wire_method"]
         for row in result.journal
         if row["event_type"]
-        in {"initialized", "thread_started", "turn_started"}
+        in {"initialized", "model_list_observed", "thread_started", "turn_started"}
     }
     assert response_methods == {
         "initialized": "initialize",
+        "model_list_observed": "model/list",
         "thread_started": "thread/start",
         "turn_started": "turn/start",
     }
@@ -352,10 +399,46 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
     assert adapter.closed is True
 
 
+def test_error_envelope_cannot_enter_success_response_callback() -> None:
+    value, _sink, adapter = controller()
+    value._on_process_start_pending(
+        adapter._process_entry("process_start_pending", None)
+    )
+    value._on_process_started(adapter._process_entry("process_started", 42))
+    request_raw = b'{"id":1,"method":"initialize","params":{}}\n'
+    value._on_send_pending(
+        RequestJournalEntry(
+            1,
+            "initialize",
+            RequestPhase.SEND_PENDING,
+            request_raw,
+            hashlib.sha256(request_raw).hexdigest(),
+        )
+    )
+    before = tuple(value.journal)
+    error_raw = b'{"id":1,"error":{"code":-1,"message":"redacted"}}\n'
+    with pytest.raises(
+        CodexTransportControllerError, match="cannot enter the success callback"
+    ):
+        value._on_response(
+            RequestJournalEntry(
+                1,
+                "initialize",
+                RequestPhase.RESPONSE_RECEIVED,
+                error_raw,
+                hashlib.sha256(error_raw).hexdigest(),
+            )
+        )
+    assert tuple(value.journal) == before
+    assert value.state.last_event_type == "initialize_send_pending"
+
+
 @pytest.mark.parametrize(
     ("mode", "terminal", "thread_id"),
     [
         ("process_loss", "launch_unknown", None),
+        ("model_list_loss", "failed", None),
+        ("model_list_schema_error", "failed", None),
         ("thread_start_loss", "launch_unknown", None),
         ("thread_start_schema_error", "launch_unknown", None),
         ("turn_start_loss", "launch_unknown", "thread-1"),
@@ -367,26 +450,27 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
 def test_crash_and_protocol_faults_terminalize_without_resend(
     mode: str, terminal: str, thread_id: str | None
 ) -> None:
-    value, _sink, adapter = controller(mode)
+    value, sink, adapter = controller(mode)
     result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
     assert result.terminal_state == terminal
     assert result.terminal_receipt["correlation"]["thread_id"] == thread_id
     terminal_event = result.journal[-1]
+    assert terminal_event["wire_event_sha256"] is None
+    assert terminal_event["response_sha256"] is None
+    assert terminal_event["fault_kind"] in {
+        "AppServerError",
+        "AppServerResponseError",
+        "ProtocolViolation",
+        "ResponseSchemaViolation",
+        "RuntimeDisconnected",
+    }
+    assert terminal_event["fault_evidence_sha256"] is not None
+    assert terminal_event["fault_evidence_size_bytes"] > 0
     if mode == "thread_start_error":
-        assert terminal_event["wire_event_sha256"] is not None
-        assert terminal_event["response_sha256"] == terminal_event["wire_event_sha256"]
-        assert terminal_event["fault_kind"] is None
-    else:
-        assert terminal_event["wire_event_sha256"] is None
-        assert terminal_event["response_sha256"] is None
-        assert terminal_event["fault_kind"] in {
-            "AppServerError",
-            "ProtocolViolation",
-            "ResponseSchemaViolation",
-            "RuntimeDisconnected",
-        }
-        assert terminal_event["fault_evidence_sha256"] is not None
-        assert terminal_event["fault_evidence_size_bytes"] > 0
+        assert len(sink.fault_evidence) == 1
+        assert hashlib.sha256(sink.fault_evidence[0][1]).hexdigest() == terminal_event[
+            "fault_evidence_sha256"
+        ]
     assert all(count == 1 for count in adapter.request_count.values())
     assert adapter.closed is True
 
@@ -452,6 +536,7 @@ def test_restart_reconciliation_never_calls_an_adapter() -> None:
         journal=pending_journal,
         persist_milestone=recovered_sink.persist,
         publish_terminal=recovered_sink.publish,
+        persist_fault_evidence=recovered_sink.persist_fault,
     )
     recovered_result = recovered.reconcile_after_crash()
     assert recovered_result.terminal_state == "launch_unknown"

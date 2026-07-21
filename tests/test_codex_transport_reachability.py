@@ -433,7 +433,7 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                 "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
                 "prompt_size_bytes": len(prompt),
                 "cwd": self.root.resolve().as_posix(),
-                "requested_model": "gpt-5.6",
+                "requested_model": "gpt-5.6-terra",
                 "requested_effort": "high",
                 "sandbox": "readOnly",
                 "approval": "never",

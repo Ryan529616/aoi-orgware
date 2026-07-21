@@ -110,7 +110,7 @@ class MutationFixture:
             "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1, "task_id": "task-1", "packet_id": "packet-1",
             "routing_binding": {"kind": "cohort", "cohort_id": "cohort-1", "cohort_sha256": SHA_A, "wave_index": 0, "transport_slot_sha256": SHA_B, "routing_authority_sha256": SHA_C, "transport": "codex", "parent_session_id": "chief-1", "expected_agent_type": "worker"},
             "expected_semantic_head_sha256": SHA_A, "prompt_sha256": SHA_B, "prompt_size_bytes": 1,
-            "cwd": self.root.resolve().as_posix(), "requested_model": "gpt-5.6", "requested_effort": "high",
+            "cwd": self.root.resolve().as_posix(), "requested_model": "gpt-5.6-terra", "requested_effort": "high",
             "sandbox": "workspaceWrite", "approval": "never", "runtime_pin": pin,
             "pre_git_binding": pre_binding or mutation.endpoint_pre_git_binding(pre),
         })

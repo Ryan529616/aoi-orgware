@@ -93,6 +93,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   Server stdio. Chief issuance binds an exact one-shot permit, stable Codex
   `0.144.6` executable/schema set, prompt/cwd/model/effort/sandbox, and—for both
   read-only and writable turns—a pre-turn Git endpoint preserved in task CAS.
+  The current repair candidate also binds an isolated exact-policy
+  `CODEX_HOME`, disables web/apps/remote-plugin/multi-agent/remote-control
+  surfaces at process and thread levels, and inserts a bounded live
+  `model/list` gate before `thread/start`; only one visible exact model with the
+  requested supported effort and no remaining page can proceed.
   AOI re-captures that endpoint under the issue lock, before reservation, and
   at process-pending. The endpoint now binds a separate full live task-claim
   authority as well as mutation-path coverage, so clean Git status cannot hide
@@ -137,7 +142,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   Thread/Turn/item fields. Journal evidence now distinguishes request
   responses, process/notification observations, exact rejected-response fault
   evidence, and synthetic faults with finite redacted reason codes; a fault can
-  never claim `response_sha256` or `wire_event_sha256`. A first real read-only canary
+  never claim `response_sha256` or `wire_event_sha256`. Correlated responses
+  rejected by schema or sealed policy are synchronously retained and verified
+  in task-local non-Git CAS before their digest/size fault evidence is
+  journaled. Schema-valid App Server error envelopes use that same fault path
+  and cannot publish a success milestone. A first real read-only canary
   exposed the former framing defect and failed explicitly at initialize; it was
   not retried and is not a live PASS. Local fake-runtime tests and that failed
   diagnostic canary are not release, package-install, or downstream ARISE
@@ -151,7 +160,10 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   reports remotes, rewrites, LFS, workflows, sync/network storage,
   publish-credential names/helpers, and receipts without exposing credential
   values. The Bridge enforces storage/cwd preflight at issue, pre-reserve, and
-  process pending and requests `networkAccess=false`. Windows mapped drives are
+  process pending and requests `networkAccess=false`. App Server launch now
+  requires a non-linked exact three-file `CODEX_HOME`, rechecks its closed
+  policy binding immediately before Popen, uses strict process overrides, and
+  repeats file-publication surface denials in `thread/start.config`. Windows mapped drives are
   rejected through volume/DOS-device inspection; missing roots, aliases, and
   reparse uncertainty also fail confirmed-local gates. Percent-encoded `file:`
   drives and generic Windows reparse attributes cannot bypass that classifier;

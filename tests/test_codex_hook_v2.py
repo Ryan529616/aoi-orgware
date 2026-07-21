@@ -254,7 +254,7 @@ class CodexHookV2Tests(HarnessTestCase):
             "transcript_path": str(self.root / "rollout.jsonl"),
             "cwd": str(self.root),
             "hook_event_name": "PreToolUse",
-            "model": "gpt-5.6",
+            "model": "gpt-5.6-terra",
             "permission_mode": "default",
             "tool_name": "apply_patch",
             "tool_input": {
@@ -488,7 +488,7 @@ class CodexHookV2Tests(HarnessTestCase):
             "agent_transcript_path": str(self.root / "child.jsonl"),
             "cwd": str(self.root),
             "hook_event_name": "SubagentStop",
-            "model": "gpt-5.6",
+            "model": "gpt-5.6-terra",
             "permission_mode": "default",
             "stop_hook_active": False,
             "agent_id": "child-agent",

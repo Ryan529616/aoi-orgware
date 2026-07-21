@@ -57,6 +57,8 @@ _EVENT_TYPES = frozenset(
         "process_started",
         "initialize_send_pending",
         "initialized",
+        "model_list_send_pending",
+        "model_list_observed",
         "thread_start_send_pending",
         "thread_started",
         "turn_start_send_pending",
@@ -73,7 +75,17 @@ _EVENT_TYPES = frozenset(
     }
 )
 _EVIDENCE_LEVELS = frozenset({"codex_runtime_observed", "verified_mutation"})
-_REQUESTED_MODELS = frozenset({"gpt-5.6", "gpt-5.6-codex"})
+_REQUESTED_MODELS = frozenset(
+    {
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+    }
+)
 _REQUESTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 _SANDBOXES = frozenset({"readOnly", "workspaceWrite"})
 _WIRE_METHODS = frozenset(
@@ -83,6 +95,7 @@ _WIRE_METHODS = frozenset(
         "process/started",
         "initialize",
         "initialized",
+        "model/list",
         "thread/start",
         "thread/started",
         "turn/start",
@@ -99,8 +112,11 @@ _WIRE_STATUSES = frozenset({"observed", "completed", "failed", "interrupted", "u
 _FAULT_KINDS = frozenset(
     {
         "AppServerError",
+        "AppServerResponseError",
         "CodexTransportControllerError",
         "ProtocolViolation",
+        "ModelCatalogViolation",
+        "ResponsePolicyViolation",
         "ResponseSchemaViolation",
         "RuntimeDisconnected",
         "ServerRequestDenied",
@@ -112,6 +128,8 @@ _EVENT_WIRE_METHOD = {
     "process_started": "process/started",
     "initialize_send_pending": "initialize",
     "initialized": "initialize",
+    "model_list_send_pending": "model/list",
+    "model_list_observed": "model/list",
     "thread_start_send_pending": "thread/start",
     "thread_started": "thread/start",
     "turn_start_send_pending": "turn/start",
@@ -132,6 +150,8 @@ _EVENT_WIRE_STATUS = {
     "process_started": "observed",
     "initialize_send_pending": "observed",
     "initialized": "observed",
+    "model_list_send_pending": "observed",
+    "model_list_observed": "observed",
     "thread_start_send_pending": "observed",
     "thread_started": "observed",
     "turn_start_send_pending": "observed",
@@ -739,6 +759,7 @@ def _event_base(value: Any) -> dict[str, Any]:
         expected_methods = {
             "process/exited",
             "initialize",
+            "model/list",
             "thread/start",
             "turn/start",
             "turn/interrupt",
@@ -805,6 +826,7 @@ def _event_base(value: Any) -> dict[str, Any]:
         _fail("launch_unknown requires fault evidence and cannot claim response/event bytes")
     response_events = {
         "initialized",
+        "model_list_observed",
         "thread_started",
         "turn_started",
         "interrupt_observed",
@@ -932,6 +954,8 @@ def _required_correlation(event_type: str, correlation: Mapping[str, str | None]
         "process_started",
         "initialize_send_pending",
         "initialized",
+        "model_list_send_pending",
+        "model_list_observed",
         "thread_start_send_pending",
     }:
         valid = thread is None and turn is None and item is None
@@ -973,7 +997,13 @@ def _transition(previous: JournalState | None, event: Mapping[str, Any]) -> Jour
             "process_start_pending": {"process_started", "launch_unknown", "failed"},
             "process_started": {"initialize_send_pending", "failed"},
             "initialize_send_pending": {"initialized", "failed"},
-            "initialized": {"thread_start_send_pending", "failed"},
+            # Historical v0.4 journals may transition directly from initialize
+            # to thread/start.  New controllers always insert the read-only
+            # model-list preflight, while the reader keeps old terminal bytes
+            # replayable instead of silently reinterpreting them.
+            "initialized": {"model_list_send_pending", "thread_start_send_pending", "failed"},
+            "model_list_send_pending": {"model_list_observed", "failed"},
+            "model_list_observed": {"thread_start_send_pending", "failed"},
             "thread_start_send_pending": {"thread_started", "launch_unknown", "failed"},
             "thread_started": {"turn_start_send_pending", "failed"},
             "turn_start_send_pending": {"turn_started", "launch_unknown", "failed"},
@@ -1027,6 +1057,8 @@ def _transition(previous: JournalState | None, event: Mapping[str, Any]) -> Jour
         "process_started": "reserved",
         "initialize_send_pending": "reserved",
         "initialized": "reserved",
+        "model_list_send_pending": "reserved",
+        "model_list_observed": "reserved",
         "thread_start_send_pending": "reserved",
         "thread_started": "thread_started",
         "turn_start_send_pending": "thread_started",

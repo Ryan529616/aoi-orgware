@@ -23,6 +23,7 @@ from aoi_orgware import confidentiality
 from aoi_orgware import codex_transport_contracts as contracts
 from aoi_orgware import codex_transport_mutation as mutation
 from aoi_orgware import codex_transport_runtime as runtime
+from aoi_orgware import evidence_artifacts
 from aoi_orgware import harnesslib as h
 from aoi_orgware import semantic_events as semantic
 from aoi_orgware import semantic_store as store
@@ -32,6 +33,7 @@ from aoi_orgware.codex_app_server_stdio import (
     ProcessJournalEntry,
     RequestJournalEntry,
     RequestPhase,
+    ResponseSchemaViolation,
     RuntimeDisconnected,
     RuntimeEvent,
     TurnObservation,
@@ -274,7 +276,7 @@ def _fixture(
             "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
             "prompt_size_bytes": len(prompt),
             "cwd": worktree.resolve().as_posix(),
-            "requested_model": "gpt-5.6",
+            "requested_model": "gpt-5.6-terra",
             "requested_effort": "high",
             "sandbox": sandbox,
             "approval": "never",
@@ -390,6 +392,7 @@ class FakeAdapter:
         self.on_process_started: Any = None
         self.on_send_pending: Any = None
         self.on_response: Any = None
+        self.on_rejected_response: Any = None
         self.request_count: dict[str, int] = {}
         self._next_id = 1
 
@@ -423,6 +426,25 @@ class FakeAdapter:
         )
         if self.mode == "thread_start_loss" and method == "thread/start":
             raise RuntimeDisconnected("thread/start response lost")
+        if self.mode == "model_list_schema_error" and method == "model/list":
+            rejected = json.dumps(
+                {"id": request_id, "result": {"invalid": True}},
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+            entry = RequestJournalEntry(
+                request_id,
+                method,
+                RequestPhase.RESPONSE_RECEIVED,
+                rejected,
+                hashlib.sha256(rejected).hexdigest(),
+            )
+            self.on_rejected_response(entry)
+            raise ResponseSchemaViolation(
+                "pinned model/list response schema validation failed",
+                method=method,
+                evidence_sha256=entry.sha256,
+                evidence_size_bytes=len(rejected),
+            )
         response = json.dumps(
             {"id": request_id, "result": dict(result)},
             separators=(",", ":"),
@@ -440,6 +462,22 @@ class FakeAdapter:
 
     def initialize(self) -> dict[str, Any]:
         return self._request("initialize", {"capabilities": {}})
+
+    def verify_model_from_intent(self, *, intent: object) -> dict[str, Any]:
+        return self._request(
+            "model/list",
+            {
+                "data": [
+                    {
+                        "model": "gpt-5.6-terra",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "high"}
+                        ],
+                    }
+                ],
+                "nextCursor": None,
+            },
+        )
 
     def start_thread_from_intent(self, *, intent: object) -> str:
         result = self._request("thread/start", {"thread": {"id": "thread-1"}})
@@ -619,6 +657,66 @@ def test_cli_thread_start_loss_is_launch_unknown_and_never_resent(
     assert second["app_server_start_durably_observed"] is False
     assert second["runtime_process_boundary_reached"] is False
     assert len(created) == 1
+
+
+def test_cli_rejected_response_bytes_are_verified_in_task_local_cas(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    created: list[FakeAdapter] = []
+
+    def factory(*args: object, **kwargs: object) -> FakeAdapter:
+        adapter = FakeAdapter("model_list_schema_error")
+        created.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(bridge, "CodexAppServerStdio", factory)
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal_state"] == "failed"
+    assert created[0].request_count == {"initialize": 1, "model/list": 1}
+
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    terminal = launch["journal"][-1]
+    assert terminal["fault_kind"] == "ResponseSchemaViolation"
+    digest = terminal["fault_evidence_sha256"]
+    blob = evidence_artifacts.artifact_blob_path(
+        value.paths, "task-1", digest
+    ).read_bytes()
+    assert hashlib.sha256(blob).hexdigest() == digest
+    assert len(blob) == terminal["fault_evidence_size_bytes"]
+    assert json.loads(blob)["result"] == {"invalid": True}
+
+
+def test_cli_local_files_profile_requires_adapter_process_policy(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path, local_files=True)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    observed_kwargs: list[dict[str, object]] = []
+
+    def factory(*args: object, **kwargs: object) -> FakeAdapter:
+        observed_kwargs.append(dict(kwargs))
+        return FakeAdapter()
+
+    monkeypatch.setattr(bridge, "CodexAppServerStdio", factory)
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    assert json.loads(capsys.readouterr().out)["terminal_state"] == "completed"
+    intent = json.loads(value.intent_path.read_text(encoding="utf-8"))
+    assert observed_kwargs == [
+        {
+            "cwd": str(intent["cwd"]),
+            "require_local_files_policy": True,
+        }
+    ]
 
 
 def test_cli_interrupt_persists_response_then_turn_terminal(

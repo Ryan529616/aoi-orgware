@@ -433,6 +433,17 @@ ungoverned same-user shell and does not replace OS DLP. Profile-selected
 promotion makes remote CI mandatory only for a publication-enabled route; it
 is forbidden/not applicable for `local_files`.
 
+The transport adapter turns that profile into a process boundary as well as a
+turn setting. It launches from an isolated, non-linked `CODEX_HOME` with an
+exact three-file initial inventory and closed AOI-owned config/managed-policy
+tables. Safe inventory plus policy and thread-config digests are part of the
+process journal and are revalidated after the exact-version probe immediately
+before Popen. Strict process argv and `thread/start.config` independently
+disable web search, apps, remote plugins, and multi-agent loading; managed
+policy denies remote control and the turn sandbox denies workload network
+access. The auth file's contents and digest are deliberately excluded from
+semantic evidence.
+
 
 ## Optional Codex Transport Bridge
 
@@ -472,6 +483,23 @@ replacement process. `reservation_effective_at` is a sealed semantic event
 time, not observed consumption wall time. CLI start fields are derived only
 from the durable journal; `app_server_start_durably_observed` deliberately does
 not infer an unpersisted physical Popen.
+
+After initialize rebinds the exact isolated Codex home, the controller performs
+one bounded read-only `model/list` request. Exactly one visible row must match
+the sealed model, include the sealed effort, and exhaust the page before
+`thread/start`; aliases, fallback, hidden-only matches, and ambiguous catalogs
+fail. Catalog loss or rejection is a known pre-thread `failed` outcome, while
+the existing unknown-state rules remain reserved for uncertain process or
+non-idempotent start boundaries.
+
+Every correlated success response is validated before it can become a runtime
+milestone. If generated schema, sealed response policy, or catalog policy
+rejects it, the controller synchronously places the bounded raw bytes in the
+task-local non-Git CAS and verifies exact readback before journal publication.
+The same rejected-evidence path handles a schema-valid App Server error
+envelope before any success callback. The semantic fault retains only the
+verified digest and size; rejected/error bytes never become response or
+lifecycle evidence.
 
 The runtime projection preserves the original `codex_runtime_observed`
 terminal receipt. A writable turn can gain a second, binding-backed
