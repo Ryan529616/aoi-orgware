@@ -186,8 +186,14 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   runtime regression proves that pre-plan issuance publishes nothing. These
   fixtures strip all reusable Chief credential locators, reject them again in
   the consumer child, and prove a fresh child cannot resolve the live Chief
-  credential. These test-only repairs remove host/WSL wall-clock-step flakes without
-  weakening production relationship, live-arm, permit, or expiry validation.
+  credential. The Bridge reachability fixture now anchors arm time strictly
+  after both the migrated semantic head and resource registration, applies the
+  same persisted-time discipline to permit issue/consume, then invokes Codex transport
+  `issue` through a separate tests-only driver that patches only its existing
+  `_now` seam. The driver accepts one canonical UTC instant and only the
+  `issue` command; invalid clock input fails before CLI work. These test-only
+  repairs remove host/WSL wall-clock-step flakes without weakening production
+  relationship, live-arm, permit, or expiry validation.
   The prior exact WSL failures remain recorded; a fresh clean-successor full
   run is required.
 

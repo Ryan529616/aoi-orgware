@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import unittest
 
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +32,10 @@ from tests.harness_case import HarnessTestCase  # noqa: E402
 TASK = "task-1"
 PACKET = "bridge-packet"
 PARENT_SESSION = "harness-test-chief"
+PERMIT_CLOCK_DRIVER = HERE / "permit_cli_clock_driver.py"
+PERMIT_CLOCK_ENV = "AOI_TEST_PERMIT_CURRENT_TIME"
+CODEX_CLOCK_DRIVER = HERE / "codex_transport_cli_clock_driver.py"
+CODEX_CLOCK_ENV = "AOI_TEST_CODEX_TRANSPORT_CURRENT_TIME"
 _CONTROLLER_SECRET_PREFIXES = ("AOI_CHIEF_", "AOI_CREDENTIAL_")
 _CONTROLLER_SECRET_NAMES = {"AOI_BACKUP_ROOT"}
 
@@ -38,6 +44,13 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _parse_iso(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp needs a timezone")
+    return parsed.astimezone(UTC)
 
 
 class CodexTransportReachabilityTests(HarnessTestCase):
@@ -293,11 +306,11 @@ class CodexTransportReachabilityTests(HarnessTestCase):
         )
         return environment
 
-    def _subprocess(
-        self, module: str, arguments: list[str], *, env: dict[str, str]
+    def _driver_subprocess(
+        self, driver: Path, arguments: list[str], *, env: dict[str, str]
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, "-m", module, *arguments],
+            [sys.executable, str(driver), *arguments],
             cwd=self.root,
             env=env,
             text=True,
@@ -310,7 +323,21 @@ class CodexTransportReachabilityTests(HarnessTestCase):
 
     def test_migrated_ready_packet_reaches_real_bridge_issue(self) -> None:
         self._migrate()
-        now = datetime.now(UTC)
+        migrated_events = store.load_semantic_events(self.paths, TASK)
+        migrated = semantic.projection_domain(
+            semantic.replay_events(migrated_events)
+        )
+        registration = next(
+            row
+            for row in migrated["resource_session_registrations"]
+            if row["session_id"] == PARENT_SESSION
+        )
+        latest_prior_time = max(
+            _parse_iso(str(registration["registered_at"])),
+            _parse_iso(str(migrated_events[-1]["recorded_at"])),
+        )
+        now = latest_prior_time + timedelta(microseconds=1)
+        self.assertGreater(now, latest_prior_time)
         arm = self._arm(now)
         arm_sha256 = routing_authority.authority_sha256(arm)
         events = store.load_semantic_events(self.paths, TASK)
@@ -377,16 +404,24 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                 prepared, max_bytes=permit_runtime.MAX_PERMIT_TRANSACTION_BYTES
             )
         )
-        self.cli(
-            "permit-issue",
-            "--task",
-            TASK,
-            "--transaction-file",
-            str(transaction_path),
-            "--json",
+        issuer_env = self.env.copy()
+        issuer_env[PERMIT_CLOCK_ENV] = _iso(now + timedelta(microseconds=1))
+        self._driver_subprocess(
+            PERMIT_CLOCK_DRIVER,
+            [
+                "permit-issue",
+                "--task",
+                TASK,
+                "--transaction-file",
+                str(transaction_path),
+                "--json",
+            ],
+            env=issuer_env,
         )
-        self._subprocess(
-            "aoi_orgware.cli",
+        controller_env = self._controller_env()
+        controller_env[PERMIT_CLOCK_ENV] = _iso(now + timedelta(microseconds=2))
+        self._driver_subprocess(
+            PERMIT_CLOCK_DRIVER,
             [
                 "permit-consume",
                 "--task",
@@ -395,7 +430,7 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                 str(transaction_path),
                 "--json",
             ],
-            env=self._controller_env(),
+            env=controller_env,
         )
 
         armed_events = store.load_semantic_events(self.paths, TASK)
@@ -403,6 +438,11 @@ class CodexTransportReachabilityTests(HarnessTestCase):
         packet = next(row for row in armed_state["packets"] if row["packet_id"] == PACKET)
         self.assertEqual(packet["status"], "armed")
         self.assertEqual(packet["dispatch_attempts"][0]["arm_id"], f"{PACKET}-a1")
+        attempt = packet["dispatch_attempts"][0]
+        launch_current_time = _parse_iso(str(attempt["armed_at"])) + timedelta(
+            microseconds=3
+        )
+        self.assertLess(launch_current_time, _parse_iso(str(attempt["expires_at"])))
 
         prompt_path = self.bridge_scratch / "prompt.txt"
         prompt_path.write_text("Inspect this disposable task read-only.", encoding="utf-8")
@@ -487,8 +527,8 @@ class CodexTransportReachabilityTests(HarnessTestCase):
             path.write_bytes(semantic.canonical_json_bytes(value))
             paths[name] = path
         issued = json.loads(
-            self._subprocess(
-                "aoi_orgware.codex_transport_cli",
+            self._driver_subprocess(
+                CODEX_CLOCK_DRIVER,
                 [
                     "--root",
                     str(self.root),
@@ -508,7 +548,7 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                     "--command-id",
                     "bridge-launch-issue",
                     "--recorded-at",
-                    _iso(datetime.now(UTC)),
+                    _iso(launch_current_time),
                     "--chief-session-id",
                     chief["session_id"],
                     "--chief-epoch",
@@ -517,14 +557,58 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                     self.chief_credential_file,
                     "--json",
                 ],
-                env=self.env,
+                env={**self.env, CODEX_CLOCK_ENV: _iso(launch_current_time)},
             ).stdout
         )
         self.assertEqual(issued["launch_id"], "launch-1")
         self.assertFalse(issued["chief_credential_retained"])
 
 
-if __name__ == "__main__":
-    import unittest
+class CodexTransportClockDriverTests(unittest.TestCase):
+    def _run_driver(
+        self, clock_value: str | None, command: str = "issue"
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.pop(CODEX_CLOCK_ENV, None)
+        if clock_value is not None:
+            environment[CODEX_CLOCK_ENV] = clock_value
+        return subprocess.run(
+            [
+                sys.executable,
+                str(CODEX_CLOCK_DRIVER),
+                "--root",
+                str(REPO),
+                command,
+            ],
+            cwd=REPO,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
 
+    def test_driver_rejects_invalid_clock_before_cli(self) -> None:
+        cases = (
+            (None, f"{CODEX_CLOCK_ENV} is required"),
+            ("not-a-time", f"{CODEX_CLOCK_ENV} is invalid"),
+            ("2026-07-21T00:00:00.000000", f"{CODEX_CLOCK_ENV} needs a timezone"),
+            (
+                "2026-07-21T00:00:00.000000+00:00",
+                f"{CODEX_CLOCK_ENV} is not canonical UTC",
+            ),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                result = self._run_driver(value)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(expected, result.stderr)
+
+    def test_driver_rejects_non_issue_command(self) -> None:
+        result = self._run_driver("2026-07-21T00:00:00.000000Z", "inspect")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("permits only issue", result.stderr)
+
+
+if __name__ == "__main__":
     unittest.main()
