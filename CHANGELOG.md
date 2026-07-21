@@ -169,7 +169,12 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   source before hashing; the manual-dispatch expiry test uses a fixed valid
   far-past window; and permit fixtures derive arm time from the persisted
   subprocess registration plus one microsecond rather than a parent-process
-  clock. These test-only repairs remove host/WSL wall-clock-step flakes without
+  clock. Successful permit issue/consume integration now runs the full CLI in a
+  `tests/`-only subprocess driver at an exact post-plan time, while a direct
+  runtime regression proves that pre-plan issuance publishes nothing. These
+  fixtures strip all reusable Chief credential locators, reject them again in
+  the consumer child, and prove a fresh child cannot resolve the live Chief
+  credential. These test-only repairs remove host/WSL wall-clock-step flakes without
   weakening production relationship, live-arm, permit, or expiry validation.
   The prior exact WSL failures remain recorded; a fresh clean-successor full
   run is required.

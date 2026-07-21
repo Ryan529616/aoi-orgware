@@ -30,6 +30,8 @@ from tests.harness_case import HarnessTestCase  # noqa: E402
 TASK = "task-1"
 PACKET = "bridge-packet"
 PARENT_SESSION = "harness-test-chief"
+_CONTROLLER_SECRET_PREFIXES = ("AOI_CHIEF_", "AOI_CREDENTIAL_")
+_CONTROLLER_SECRET_NAMES = {"AOI_BACKUP_ROOT"}
 
 
 def _iso(value: datetime) -> str:
@@ -276,13 +278,19 @@ class CodexTransportReachabilityTests(HarnessTestCase):
 
     def _controller_env(self) -> dict[str, str]:
         environment = self.env.copy()
-        for name in (
-            "AOI_CHIEF_SESSION_ID",
-            "AOI_CHIEF_EPOCH",
-            "AOI_CHIEF_CREDENTIAL_FILE",
-            "AOI_CHIEF_TOKEN",
-        ):
-            environment.pop(name, None)
+        for name in tuple(environment):
+            upper_name = name.upper()
+            if upper_name in _CONTROLLER_SECRET_NAMES or upper_name.startswith(
+                _CONTROLLER_SECRET_PREFIXES
+            ):
+                environment.pop(name, None)
+        self.assertFalse(
+            any(
+                name.upper() in _CONTROLLER_SECRET_NAMES
+                or name.upper().startswith(_CONTROLLER_SECRET_PREFIXES)
+                for name in environment
+            )
+        )
         return environment
 
     def _subprocess(

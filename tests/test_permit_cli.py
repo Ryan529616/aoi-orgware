@@ -31,6 +31,10 @@ from tests.harness_case import HarnessTestCase  # noqa: E402
 
 TASK = "task-1"
 CLI_MODULE = "aoi_orgware.cli"
+CLOCK_DRIVER = HERE / "permit_cli_clock_driver.py"
+CLOCK_ENV = "AOI_TEST_PERMIT_CURRENT_TIME"
+_CONTROLLER_SECRET_PREFIXES = ("AOI_CHIEF_", "AOI_CREDENTIAL_")
+_CONTROLLER_SECRET_NAMES = {"AOI_BACKUP_ROOT"}
 
 _PACKET_IDS = {
     "packet-cli",
@@ -230,14 +234,84 @@ class PermitCliTests(HarnessTestCase):
 
     def controller_env(self) -> dict[str, str]:
         environment = self.env.copy()
-        for name in (
-            "AOI_CHIEF_SESSION_ID",
-            "AOI_CHIEF_EPOCH",
-            "AOI_CHIEF_CREDENTIAL_FILE",
-            "AOI_CHIEF_TOKEN",
-        ):
-            environment.pop(name, None)
+        for name in tuple(environment):
+            upper_name = name.upper()
+            if upper_name in _CONTROLLER_SECRET_NAMES or upper_name.startswith(
+                _CONTROLLER_SECRET_PREFIXES
+            ):
+                environment.pop(name, None)
         return environment
+
+    def test_controller_environment_cannot_resolve_chief_credential(self) -> None:
+        controller = self.controller_env()
+        leaked = sorted(
+            name
+            for name in controller
+            if name.upper() in _CONTROLLER_SECRET_NAMES
+            or name.upper().startswith(_CONTROLLER_SECRET_PREFIXES)
+        )
+        self.assertEqual(leaked, [])
+        probe = "\n".join(
+            [
+                "from aoi_orgware import harnesslib as h",
+                "paths = h.get_paths()",
+                "authority = h.load_chief_authority(paths)",
+                "assert authority is not None",
+                "try:",
+                "    h.load_chief_credential(",
+                "        paths,",
+                "        session_id=authority['session_id'],",
+                "        epoch=authority['epoch'],",
+                "    )",
+                "except h.HarnessError:",
+                "    raise SystemExit(0)",
+                "raise SystemExit(3)",
+            ]
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=self.root,
+            env=controller,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_clocked_consumer_driver_rejects_chief_locator_before_cli(
+        self,
+    ) -> None:
+        transaction = self.transaction(packet_id="packet-input")
+        path = self.transaction_file(transaction, "controller-secret-leak.json")
+        before = store.semantic_head(self.paths, TASK)
+        environment = self.permit_clock_env(path, self.controller_env())
+        environment["AOI_CHIEF_CREDENTIAL_HOME"] = self.env[
+            "AOI_CHIEF_CREDENTIAL_HOME"
+        ]
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLOCK_DRIVER),
+                "permit-consume",
+                "--task",
+                TASK,
+                "--transaction-file",
+                str(path),
+                "--json",
+            ],
+            cwd=self.root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("received reusable Chief authority locators", result.stderr)
+        self.assertNotIn(environment["AOI_CHIEF_CREDENTIAL_HOME"], result.stderr)
+        self.assertEqual(store.semantic_head(self.paths, TASK), before)
 
     def arm_request(
         self,
@@ -398,15 +472,57 @@ class PermitCliTests(HarnessTestCase):
         return path
 
     def issue(self, path: Path) -> dict[str, object]:
-        result = self.cli(
-            "permit-issue",
-            "--task",
-            TASK,
-            "--transaction-file",
-            str(path),
-            "--json",
+        return json.loads(self.permit_cli("permit-issue", path).stdout)
+
+    def permit_clock_env(
+        self,
+        path: Path,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        transaction = json.loads(path.read_text(encoding="utf-8"))
+        planned_at = datetime.fromisoformat(
+            str(transaction["recorded_at"]).replace("Z", "+00:00")
         )
-        return json.loads(result.stdout)
+        environment = (self.env if env is None else env).copy()
+        environment[CLOCK_ENV] = self.iso(planned_at + timedelta(seconds=1))
+        return environment
+
+    def permit_cli(
+        self,
+        command: str,
+        path: Path,
+        *,
+        env: dict[str, str] | None = None,
+        ok: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertIn(command, {"permit-issue", "permit-consume"})
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLOCK_DRIVER),
+                command,
+                "--task",
+                TASK,
+                "--transaction-file",
+                str(path),
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.permit_clock_env(path, env),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if ok and result.returncode != 0:
+            self.fail(
+                f"clocked CLI failed ({result.returncode}): {command}\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
+        if not ok:
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        return result
 
     def test_packet_arm_prepare_emits_exact_transaction_and_consume_arms_packet(
         self,
@@ -446,15 +562,7 @@ class PermitCliTests(HarnessTestCase):
 
         path = self.transaction_file(prepared, "prepared-arm.json")
         self.issue(path)
-        self.cli(
-            "permit-consume",
-            "--task",
-            TASK,
-            "--transaction-file",
-            str(path),
-            "--json",
-            env=self.controller_env(),
-        )
+        self.permit_cli("permit-consume", path, env=self.controller_env())
         state = semantic.projection_domain(
             semantic.replay_events(store.load_semantic_events(self.paths, TASK))
         )
@@ -617,15 +725,7 @@ class PermitCliTests(HarnessTestCase):
         )
         first_path = self.transaction_file(first, "first-slot.json")
         self.issue(first_path)
-        self.cli(
-            "permit-consume",
-            "--task",
-            TASK,
-            "--transaction-file",
-            str(first_path),
-            "--json",
-            env=self.controller_env(),
-        )
+        self.permit_cli("permit-consume", first_path, env=self.controller_env())
         with self.assertRaisesRegex(runtime.PermitRuntimeError, "slot is already armed"):
             self.transaction(
                 packet_id="packet-cli-race", expected_agent_type="shared-worker"
@@ -635,15 +735,7 @@ class PermitCliTests(HarnessTestCase):
         first = self.transaction(packet_id="packet-cli", expected_agent_type="*")
         first_path = self.transaction_file(first, "wildcard-slot.json")
         self.issue(first_path)
-        self.cli(
-            "permit-consume",
-            "--task",
-            TASK,
-            "--transaction-file",
-            str(first_path),
-            "--json",
-            env=self.controller_env(),
-        )
+        self.permit_cli("permit-consume", first_path, env=self.controller_env())
         with self.assertRaisesRegex(runtime.PermitRuntimeError, "slot is already armed"):
             self.transaction(
                 packet_id="packet-cli-race", expected_agent_type="another-worker"
@@ -669,15 +761,7 @@ class PermitCliTests(HarnessTestCase):
 
         controller = self.controller_env()
         first = json.loads(
-            self.cli(
-                "permit-consume",
-                "--task",
-                TASK,
-                "--transaction-file",
-                str(path),
-                "--json",
-                env=controller,
-            ).stdout
+            self.permit_cli("permit-consume", path, env=controller).stdout
         )
         state = semantic.projection_domain(
             semantic.replay_events(store.load_semantic_events(self.paths, TASK))
@@ -689,15 +773,7 @@ class PermitCliTests(HarnessTestCase):
             "tampered after committed arm\n", encoding="utf-8"
         )
         second = json.loads(
-            self.cli(
-                "permit-consume",
-                "--task",
-                TASK,
-                "--transaction-file",
-                str(path),
-                "--json",
-                env=controller,
-            ).stdout
+            self.permit_cli("permit-consume", path, env=controller).stdout
         )
         self.assertFalse(first["idempotent_replay"])
         self.assertTrue(second["idempotent_replay"])
@@ -778,8 +854,7 @@ class PermitCliTests(HarnessTestCase):
         self.issue(path)
         command = [
             sys.executable,
-            "-m",
-            CLI_MODULE,
+            str(CLOCK_DRIVER),
             "permit-consume",
             "--task",
             TASK,
@@ -787,7 +862,7 @@ class PermitCliTests(HarnessTestCase):
             str(path),
             "--json",
         ]
-        controller = self.controller_env()
+        controller = self.permit_clock_env(path, self.controller_env())
         processes = [
             subprocess.Popen(
                 command,

@@ -236,6 +236,31 @@ class PermitRuntimeTests(unittest.TestCase):
                 self.paths, transaction["binding"], self.events
             )
 
+    def test_issue_rejects_current_time_before_planned_event_without_publication(
+        self,
+    ) -> None:
+        transaction = self.make_transaction()
+        planned_at = datetime.fromisoformat(
+            str(transaction["recorded_at"]).replace("Z", "+00:00")
+        )
+        with self.assertRaisesRegex(
+            runtime.PermitRuntimeError,
+            "permit issuance precedes its planned event time",
+        ):
+            self.issue(
+                transaction,
+                current_time=planned_at - timedelta(microseconds=1),
+            )
+        report = objects.inspect_semantic_objects(self.paths, TASK, self.events)
+        self.assertEqual(report["objects"], [])
+        self.assertFalse(
+            runtime.permit_issuance_path(
+                self.paths,
+                TASK,
+                transaction["objects"][2]["payload"]["permit_sha256"],
+            ).exists()
+        )
+
     def test_v3_transaction_and_v1_marker_bytes_and_path_are_frozen(self) -> None:
         arm = root_arm("packet-golden")
         arm["attempt_identity"].update(
