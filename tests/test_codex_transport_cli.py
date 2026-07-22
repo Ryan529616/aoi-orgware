@@ -393,8 +393,10 @@ class FakeAdapter:
         self.on_send_pending: Any = None
         self.on_response: Any = None
         self.on_rejected_response: Any = None
+        self.on_rejected_notification: Any = None
         self.request_count: dict[str, int] = {}
         self._next_id = 1
+        self.reroute_event: RuntimeEvent | None = None
 
     @staticmethod
     def _process(phase: str, pid: int | None) -> ProcessJournalEntry:
@@ -497,6 +499,27 @@ class FakeAdapter:
     def observe_turn(
         self, *, thread_id: str, turn_id: str, timeout_seconds: float
     ) -> TurnObservation:
+        if self.mode == "model_rerouted":
+            self.reroute_event = _runtime_event(
+                "model/rerouted",
+                {
+                    "fromModel": "gpt-5.6-terra",
+                    "reason": "highRiskCyberActivity",
+                    "threadId": thread_id,
+                    "toModel": "reroute-secret-model",
+                    "turnId": turn_id,
+                },
+            )
+            completed = _runtime_event(
+                "turn/completed",
+                {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
+            )
+            return TurnObservation(
+                thread_id, turn_id, "completed", (self.reroute_event, completed)
+            )
         item = {"id": "item-1", "type": "agentMessage", "text": "not persisted"}
         status = (
             "interrupted" if self.request_count.get("turn/interrupt") else "completed"
@@ -516,6 +539,12 @@ class FakeAdapter:
             ),
         )
         return TurnObservation(thread_id, turn_id, status, events)
+
+    def synchronize_reader_boundary(self, *, timeout_seconds: float) -> None:
+        return None
+
+    def seal_reader_for_terminal_commit(self, *, timeout_seconds: float) -> None:
+        return None
 
     def close(self) -> None:
         return None
@@ -693,6 +722,55 @@ def test_cli_rejected_response_bytes_are_verified_in_task_local_cas(
     assert hashlib.sha256(blob).hexdigest() == digest
     assert len(blob) == terminal["fault_evidence_size_bytes"]
     assert json.loads(blob)["result"] == {"invalid": True}
+
+
+def test_cli_model_reroute_is_failed_with_exact_task_local_cas_and_no_resend(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    created: list[FakeAdapter] = []
+
+    def factory(*args: object, **kwargs: object) -> FakeAdapter:
+        adapter = FakeAdapter("model_rerouted")
+        created.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(bridge, "CodexAppServerStdio", factory)
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["terminal_state"] == "failed"
+    assert first["runtime_completed"] is False
+    assert len(created) == 1
+    assert created[0].reroute_event is not None
+
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    assert "completed" not in [row["event_type"] for row in launch["journal"]]
+    terminal = launch["journal"][-1]
+    assert terminal["event_type"] == "failed"
+    assert terminal["wire_method"] == "model/rerouted"
+    assert terminal["fault_kind"] == "ModelReroutedViolation"
+    digest = terminal["fault_evidence_sha256"]
+    blob = evidence_artifacts.artifact_blob_path(
+        value.paths, "task-1", digest
+    ).read_bytes()
+    assert blob == created[0].reroute_event.wire_bytes
+    assert hashlib.sha256(blob).hexdigest() == digest
+    assert len(blob) == terminal["fault_evidence_size_bytes"]
+
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["terminal_state"] == "failed"
+    assert replay["runtime_completed"] is False
+    assert replay["terminal_receipt_sha256"] == first["terminal_receipt_sha256"]
+    assert replay["app_server_start_durably_observed"] is False
+    assert len(created) == 1
 
 
 def test_cli_local_files_profile_requires_adapter_process_policy(

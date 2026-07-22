@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, NoReturn
 
 from . import codex_transport_contracts as contracts
 from .confidentiality import is_publish_credential_environment_name
@@ -113,6 +113,10 @@ _LIFECYCLE_NOTIFICATION_METHODS: Final = frozenset(
 _AUXILIARY_NOTIFICATION_METHODS: Final = (
     _NOTIFICATION_METHODS - _LIFECYCLE_NOTIFICATION_METHODS
 )
+_MODEL_REROUTE_REQUIRED_FIELDS: Final = frozenset(
+    {"fromModel", "reason", "threadId", "toModel", "turnId"}
+)
+_MODEL_REROUTE_REASONS: Final = frozenset({"highRiskCyberActivity"})
 _ITEM_TYPES: Final = frozenset(
     {
         "userMessage",
@@ -305,6 +309,17 @@ class ProtocolViolation(AppServerError):
     """The peer sent data outside the explicitly supported protocol subset."""
 
 
+class ModelReroutedViolation(ProtocolViolation):
+    """The runtime attempted to leave the exact model sealed by AOI."""
+
+    def __init__(self, *, evidence_sha256: str, evidence_size_bytes: int) -> None:
+        super().__init__("App Server model reroute violates sealed AOI policy")
+        self.method = "model/rerouted"
+        self.evidence_sha256 = evidence_sha256
+        self.evidence_size_bytes = evidence_size_bytes
+        self.reason_code = "model_rerouted"
+
+
 class RuntimeDisconnected(AppServerError):
     """The App Server stream ended before a required response or terminal event."""
 
@@ -360,6 +375,15 @@ class RequestPhase(str, Enum):
     BEFORE_SEND = "before_send"
     SEND_PENDING = "send_pending"
     RESPONSE_RECEIVED = "response_received"
+
+
+class _TerminalStreamPhase(str, Enum):
+    """One-way ownership state for the MVP stdout terminal cut."""
+
+    OPEN = "open"
+    DRAINING = "draining"
+    SEALED = "sealed"
+    ABORTED = "aborted"
 
 
 @dataclass(frozen=True)
@@ -455,6 +479,17 @@ class RuntimeEvent:
 
 
 @dataclass(frozen=True)
+class RejectedNotificationWire:
+    """Raw-only carrier offered to durable evidence before payload parsing."""
+
+    method: str
+    sha256: str
+    wire_bytes: bytes
+    evidence_sha256: str | None = None
+    evidence_size_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class TurnObservation:
     thread_id: str
     turn_id: str
@@ -532,6 +567,10 @@ class CodexAppServerStdio:
             [RequestJournalEntry], Mapping[str, Any]
         ]
         | None = None,
+        on_rejected_notification: Callable[
+            [RuntimeEvent | RejectedNotificationWire], Mapping[str, Any]
+        ]
+        | None = None,
         require_local_files_policy: bool = False,
         _test_launch_args: tuple[str, ...] | None = None,
         _test_version_args: tuple[str, ...] | None = None,
@@ -562,6 +601,7 @@ class CodexAppServerStdio:
         self.on_send_pending = on_send_pending
         self.on_response = on_response
         self.on_rejected_response = on_rejected_response
+        self.on_rejected_notification = on_rejected_notification
         self.require_local_files_policy = require_local_files_policy
         # This narrow injection point lets tests run a scripted Python peer.
         # Production callers must use the standalone App Server default below.
@@ -583,6 +623,12 @@ class CodexAppServerStdio:
         self._turn_terminal = False
         self._intent: SealedLaunchIntent | None = None
         self._reader_error: AppServerError | None = None
+        self._reader_condition = threading.Condition()
+        self._reroute_persistence_inflight = 0
+        self._terminal_stream_phase = _TerminalStreamPhase.OPEN
+        self._stdout_reader_done = False
+        self._stderr_reader_done = False
+        self._forced_shutdown = False
         self._stdout_message_count = 0
         self._stdout_total_bytes = 0
         self._stderr = b""
@@ -688,6 +734,9 @@ class CodexAppServerStdio:
         except OSError as exc:
             raise AppServerError("could not start Codex App Server") from exc
         assert self._process.stdout is not None and self._process.stderr is not None
+        with self._reader_condition:
+            self._stdout_reader_done = False
+            self._stderr_reader_done = False
         self._stdout_thread = threading.Thread(target=self._stdout_reader, daemon=True, name="aoi-app-server-stdout")
         self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True, name="aoi-app-server-stderr")
         self._stdout_thread.start()
@@ -705,27 +754,272 @@ class CodexAppServerStdio:
                 ) from exc
 
     def close(self) -> None:
+        """Best-effort bounded cleanup; never confers a clean terminal seal."""
+
         process = self._process
-        if process is None:
-            return
-        if process.stdin is not None:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.terminate()
+        cleanup_failed = False
+        if process is not None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    cleanup_failed = True
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+                self._force_terminal_cleanup(process)
+            except Exception:
+                self._force_terminal_cleanup(process)
+            else:
+                if self._process is process:
+                    self._process = None
+        if cleanup_failed:
+            self._abort_terminal_stream()
+            self._retain_reader_error(
+                RuntimeDisconnected(
+                    "App Server process cleanup encountered an owned stream fault"
+                )
+            )
+        self._join_readers_for_cleanup(timeout_seconds=2)
+
+    def seal_reader_for_terminal_commit(self, *, timeout_seconds: float) -> None:
+        """Create the permanent stdout cut required before terminal journaling.
+
+        ``turn/completed`` is only a candidate until the one-shot App Server
+        accepts stdin EOF, exits naturally with status zero, and its stdout and
+        stderr readers drain and join without error.  No forced cleanup or
+        instantaneous barrier check can authorize ``completed``.
+        """
+
+        if timeout_seconds <= 0:
+            raise ValueError("terminal stream seal timeout must be positive")
+        if not self._turn_terminal:
+            raise AppServerError(
+                "terminal stream seal requires an observed terminal turn"
+            )
+        deadline = time.monotonic() + timeout_seconds
+        with self._reader_condition:
+            if self._terminal_stream_phase is _TerminalStreamPhase.SEALED:
+                return
+            if self._terminal_stream_phase is not _TerminalStreamPhase.OPEN:
+                raise RuntimeDisconnected(
+                    "App Server terminal stream is not eligible for a clean seal"
+                )
+            self._terminal_stream_phase = _TerminalStreamPhase.DRAINING
+            self._reader_condition.notify_all()
+
+        try:
+            process = self._require_process()
+        except AppServerError:
+            self._abort_terminal_stream()
+            raise
+        if process.stdin is None:
+            self._force_terminal_cleanup(process)
+            self._raise_terminal_stream_failure(
+                "App Server stdin is unavailable for terminal stream seal",
+                deadline=deadline,
+            )
+        try:
+            process.stdin.close()
+        except Exception as exc:
+            self._force_terminal_cleanup(process)
+            self._raise_terminal_stream_failure(
+                "could not close App Server stdin for terminal stream seal",
+                cause=exc,
+                deadline=deadline,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._force_terminal_cleanup(process)
+            self._raise_terminal_stream_failure(
+                "timed out before App Server terminal stream shutdown",
+                deadline=deadline,
+            )
+        try:
+            exit_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            self._force_terminal_cleanup(process)
+            self._raise_terminal_stream_failure(
+                "App Server did not exit naturally for terminal stream seal",
+                cause=exc,
+                deadline=deadline,
+            )
+        except Exception as exc:
+            self._force_terminal_cleanup(process)
+            self._raise_terminal_stream_failure(
+                "could not wait for App Server terminal stream shutdown",
+                cause=exc,
+                deadline=deadline,
+            )
+
         self._process = None
+        if exit_code != 0:
+            self._abort_terminal_stream()
+            self._join_readers_until(deadline)
+            self._raise_terminal_stream_failure(
+                "App Server exited nonzero before terminal stream seal",
+                deadline=deadline,
+            )
+
+        if not self._join_readers_until(deadline):
+            self._abort_terminal_stream()
+            self._raise_terminal_stream_failure(
+                "App Server readers did not quiesce before terminal stream seal",
+                deadline=deadline,
+            )
+
+        try:
+            self._wait_rejected_notification_barrier(deadline)
+        except AppServerError:
+            self._abort_terminal_stream()
+            raise
+        with self._reader_condition:
+            if (
+                not self._stdout_reader_done
+                or not self._stderr_reader_done
+                or self._reroute_persistence_inflight != 0
+                or self._reader_error is not None
+            ):
+                self._terminal_stream_phase = _TerminalStreamPhase.ABORTED
+                self._reader_condition.notify_all()
+                raise RuntimeDisconnected(
+                    "App Server terminal stream did not reach a clean reader boundary"
+                )
+            self._terminal_stream_phase = _TerminalStreamPhase.SEALED
+            self._reader_condition.notify_all()
+
+    def _join_readers_until(self, deadline: float) -> bool:
         for reader in (self._stdout_thread, self._stderr_thread):
-            if reader is not None:
-                reader.join(timeout=2)
+            if reader is None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                reader.join(timeout=remaining)
+            except Exception:
+                return False
+            try:
+                alive = reader.is_alive()
+            except Exception:
+                return False
+            if alive:
+                return False
+        return True
+
+    def _join_readers_for_cleanup(self, *, timeout_seconds: float) -> bool:
+        """Best-effort symmetric reader cleanup without leaking raw faults."""
+
+        cleanup_failed = False
+        for reader in (self._stdout_thread, self._stderr_thread):
+            if reader is None:
+                continue
+            try:
+                reader.join(timeout=timeout_seconds)
+            except Exception:
+                cleanup_failed = True
+            try:
+                alive = reader.is_alive()
+            except Exception:
+                cleanup_failed = True
+                alive = True
+            if alive:
+                cleanup_failed = True
+        if cleanup_failed:
+            self._abort_terminal_stream()
+            self._retain_reader_error(
+                RuntimeDisconnected(
+                    "App Server readers did not stop during bounded cleanup"
+                )
+            )
+        return not cleanup_failed
+
+    def _abort_terminal_stream(self, *, forced: bool = False) -> None:
+        with self._reader_condition:
+            if self._terminal_stream_phase is not _TerminalStreamPhase.SEALED:
+                self._terminal_stream_phase = _TerminalStreamPhase.ABORTED
+            if forced:
+                self._forced_shutdown = True
+            self._reader_condition.notify_all()
+
+    def _raise_terminal_stream_failure(
+        self,
+        message: str,
+        *,
+        cause: BaseException | None = None,
+        deadline: float | None = None,
+    ) -> NoReturn:
+        """Raise the retained reader fault before any later stream fault."""
+
+        self._abort_terminal_stream()
+        if deadline is not None:
+            try:
+                self._wait_rejected_notification_barrier(deadline)
+            except AppServerError:
+                pass
+        with self._reader_condition:
+            retained = self._reader_error
+        failure: AppServerError = retained or RuntimeDisconnected(message)
+        if cause is None:
+            raise failure
+        raise failure from cause
+
+    def _force_terminal_cleanup(
+        self, process: subprocess.Popen[bytes]
+    ) -> None:
+        self._abort_terminal_stream(forced=True)
+        cleanup_failed = False
+
+        # Treat each child-process operation as an independent cleanup step.
+        # A broken status query must not skip terminate/kill, and an exit that
+        # cannot be confirmed must not erase the only process handle.
+        exit_confirmed = False
+        try:
+            exit_confirmed = process.poll() is not None
+        except Exception:
+            cleanup_failed = True
+
+        if not exit_confirmed:
+            try:
+                process.terminate()
+            except Exception:
+                cleanup_failed = True
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                cleanup_failed = True
+            else:
+                exit_confirmed = True
+
+        if not exit_confirmed:
+            try:
+                process.kill()
+            except Exception:
+                cleanup_failed = True
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                cleanup_failed = True
+            else:
+                exit_confirmed = True
+
+        if exit_confirmed:
+            if self._process is process:
+                self._process = None
+        else:
+            cleanup_failed = True
+            if self._process is None or self._process is process:
+                self._process = process
+
+        if not self._join_readers_for_cleanup(timeout_seconds=2):
+            cleanup_failed = True
+        if cleanup_failed:
+            self._retain_reader_error(
+                RuntimeDisconnected(
+                    "App Server forced terminal cleanup did not fully quiesce"
+                )
+            )
 
     def __enter__(self) -> "CodexAppServerStdio":
         self.start()
@@ -893,8 +1187,23 @@ class CodexAppServerStdio:
                 status = _require_string(turn.get("status"), "turn/completed turn.status")
                 if status not in {"completed", "failed", "interrupted"}:
                     raise ProtocolViolation(f"turn/completed has non-terminal status: {status!r}")
+                self._wait_rejected_notification_barrier(deadline)
                 self._turn_terminal = True
                 return TurnObservation(thread_id, turn_id, status, tuple(observed))
+
+    def synchronize_reader_boundary(self, *, timeout_seconds: float) -> None:
+        """Wait for callbacks already recognized at the instant of this call.
+
+        This is a diagnostic/consumer barrier only.  It is not a permanent
+        terminal cut and must never authorize a terminal journal entry; use
+        :meth:`seal_reader_for_terminal_commit` for that boundary.
+        """
+
+        if timeout_seconds <= 0:
+            raise ValueError("reader boundary timeout must be positive")
+        self._wait_rejected_notification_barrier(
+            time.monotonic() + timeout_seconds
+        )
 
     def request(
         self,
@@ -976,6 +1285,8 @@ class CodexAppServerStdio:
     ) -> dict[str, Any]:
         while True:
             kind, payload = self._next_incoming(deadline)
+            if kind == "rejected_notification":
+                self._reject_model_rerouted_wire(payload)
             if kind == "notification":
                 message, raw = payload
                 self._record_notification(message, raw, buffer=True)
@@ -1062,11 +1373,97 @@ class CodexAppServerStdio:
                 "rejected response evidence callback returned divergent bytes"
             )
 
+    def _persist_rejected_notification(
+        self, event: RuntimeEvent | RejectedNotificationWire
+    ) -> Mapping[str, Any]:
+        """Synchronously bind exact rejected notification bytes to local CAS."""
+
+        if self.on_rejected_notification is None:
+            raise AppServerError(
+                "rejected notification evidence callback is required"
+            )
+        actual_sha256 = hashlib.sha256(event.wire_bytes).hexdigest()
+        try:
+            reference = dict(self.on_rejected_notification(event))
+        except Exception as exc:
+            raise AppServerError(
+                "rejected notification evidence callback failed"
+            ) from exc
+        if (
+            reference.get("sha256") != actual_sha256
+            or reference.get("size_bytes") != len(event.wire_bytes)
+        ):
+            raise AppServerError(
+                "rejected notification evidence callback returned divergent bytes"
+            )
+        return reference
+
+    def _reject_model_rerouted_wire(
+        self, entry: RejectedNotificationWire
+    ) -> NoReturn:
+        """Raise the typed fault for a reader-persisted raw reroute line."""
+
+        actual_sha256 = hashlib.sha256(entry.wire_bytes).hexdigest()
+        if (
+            entry.evidence_sha256 != actual_sha256
+            or entry.evidence_size_bytes != len(entry.wire_bytes)
+        ):
+            raise AppServerError(
+                "rejected notification lacks verified reader-boundary evidence"
+            )
+        try:
+            message = _strict_json_object(entry.wire_bytes)
+            if message.get("method") != "model/rerouted" or "id" in message:
+                raise ProtocolViolation(
+                    "rejected model/rerouted wire envelope is inconsistent"
+                )
+            params = _require_object(
+                message.get("params"), "model/rerouted params"
+            )
+            _require_fields(
+                params, _MODEL_REROUTE_REQUIRED_FIELDS, "model/rerouted params"
+            )
+            observed_thread = _require_string(
+                params.get("threadId"), "model/rerouted threadId"
+            )
+            observed_turn = _require_string(
+                params.get("turnId"), "model/rerouted turnId"
+            )
+            observed_from = _require_string(
+                params.get("fromModel"), "model/rerouted fromModel"
+            )
+            _require_string(params.get("toModel"), "model/rerouted toModel")
+            reason = _require_string(params.get("reason"), "model/rerouted reason")
+            if reason not in _MODEL_REROUTE_REASONS:
+                raise ProtocolViolation("model/rerouted reason is outside pinned schema")
+            if self._thread_id is not None and observed_thread != self._thread_id:
+                raise ProtocolViolation("model/rerouted thread correlation mismatch")
+            if self._turn_id is not None and observed_turn != self._turn_id:
+                raise ProtocolViolation("model/rerouted turn correlation mismatch")
+            if self._model_intent is None:
+                raise ProtocolViolation(
+                    "model/rerouted arrived without a sealed model binding"
+                )
+            if observed_from != self._model_intent.model:
+                raise ProtocolViolation(
+                    "model/rerouted fromModel differs from sealed launch intent"
+                )
+        except ProtocolViolation:
+            # Persistence already succeeded.  Classification details are
+            # deliberately not exposed through the fixed typed fault.
+            pass
+        raise ModelReroutedViolation(
+            evidence_sha256=actual_sha256,
+            evidence_size_bytes=len(entry.wire_bytes),
+        )
+
     def _next_notification(self, deadline: float) -> RuntimeEvent:
         if self._notifications:
             return self._notifications.pop(0)
         while True:
             kind, payload = self._next_incoming(deadline)
+            if kind == "rejected_notification":
+                self._reject_model_rerouted_wire(payload)
             if kind == "notification":
                 message, raw = payload
                 event = self._record_notification(message, raw, buffer=False)
@@ -1080,8 +1477,7 @@ class CodexAppServerStdio:
             raise ProtocolViolation(f"internal reader emitted unknown kind: {kind}")
 
     def _next_incoming(self, deadline: float) -> tuple[str, Any]:
-        if self._reader_error is not None:
-            raise self._reader_error
+        self._wait_rejected_notification_barrier(deadline)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeDisconnected("timed out waiting for App Server protocol data")
@@ -1089,10 +1485,9 @@ class CodexAppServerStdio:
             kind, payload = self._incoming.get(timeout=remaining)
         except queue.Empty as exc:
             raise RuntimeDisconnected("timed out waiting for App Server protocol data") from exc
+        self._wait_rejected_notification_barrier(deadline)
         if kind == "eof":
             raise RuntimeDisconnected("App Server stdout reached EOF")
-        if self._reader_error is not None:
-            raise self._reader_error
         if kind == "error":
             if isinstance(payload, AppServerError):
                 raise payload
@@ -1100,9 +1495,9 @@ class CodexAppServerStdio:
         return kind, payload
 
     def _stdout_reader(self) -> None:
-        process = self._require_process()
-        assert process.stdout is not None
         try:
+            process = self._require_process()
+            assert process.stdout is not None
             while True:
                 raw = process.stdout.readline(self.max_line_bytes + 1)
                 if not raw:
@@ -1118,42 +1513,150 @@ class CodexAppServerStdio:
                 self._enqueue(self._classify_incoming(message, raw))
         except BaseException as exc:  # reader must surface a deterministic protocol fault
             error = exc if isinstance(exc, AppServerError) else ProtocolViolation("App Server stdout reader failed")
-            self._reader_error = error
-            self._enqueue(("error", error))
+            retained = self._retain_reader_error(error)
+            self._enqueue(("error", retained))
+        finally:
+            with self._reader_condition:
+                self._stdout_reader_done = True
+                self._reader_condition.notify_all()
 
     def _stderr_reader(self) -> None:
-        process = self._require_process()
-        assert process.stderr is not None
         chunks: list[bytes] = []
         captured = 0
-        while True:
-            chunk = process.stderr.read(65_536)
-            if not chunk:
-                break
-            self._stderr_total_bytes += len(chunk)
-            self._stderr_hasher.update(chunk)
-            remaining = self.max_stderr_bytes - captured
-            if remaining > 0:
-                kept = chunk[:remaining]
-                chunks.append(kept)
-                captured += len(kept)
-            if len(chunk) > max(remaining, 0):
-                self._stderr_truncated = True
-        self._stderr = b"".join(chunks)
+        try:
+            process = self._require_process()
+            assert process.stderr is not None
+            while True:
+                chunk = process.stderr.read(65_536)
+                if not chunk:
+                    break
+                self._stderr_total_bytes += len(chunk)
+                self._stderr_hasher.update(chunk)
+                remaining = self.max_stderr_bytes - captured
+                if remaining > 0:
+                    kept = chunk[:remaining]
+                    chunks.append(kept)
+                    captured += len(kept)
+                if len(chunk) > max(remaining, 0):
+                    self._stderr_truncated = True
+        except BaseException as exc:
+            error = (
+                exc
+                if isinstance(exc, AppServerError)
+                else RuntimeDisconnected("App Server stderr reader failed")
+            )
+            self._retain_reader_error(error)
+        finally:
+            self._stderr = b"".join(chunks)
+            with self._reader_condition:
+                self._stderr_reader_done = True
+                self._reader_condition.notify_all()
 
     def _enqueue(self, item: tuple[str, Any]) -> None:
         try:
             self._incoming.put_nowait(item)
         except queue.Full:
-            self._reader_error = ProtocolViolation("App Server reader queue/backpressure limit exceeded")
+            self._retain_reader_error(
+                ProtocolViolation(
+                    "App Server reader queue/backpressure limit exceeded"
+                )
+            )
+
+    def _retain_reader_error(self, error: AppServerError) -> AppServerError:
+        """Keep the first fault, except that an exact reroute outranks generic faults."""
+
+        with self._reader_condition:
+            current = self._reader_error
+            if current is None or (
+                isinstance(error, ModelReroutedViolation)
+                and not isinstance(current, ModelReroutedViolation)
+            ):
+                self._reader_error = error
+            retained = self._reader_error
+            assert retained is not None
+            self._reader_condition.notify_all()
+            return retained
+
+    def _begin_rejected_notification_persistence(self) -> None:
+        with self._reader_condition:
+            if (
+                self._terminal_stream_phase is _TerminalStreamPhase.SEALED
+                or self._stdout_reader_done
+            ):
+                raise AssertionError(
+                    "reroute persistence cannot begin after terminal stream seal"
+                )
+            self._reroute_persistence_inflight += 1
+            self._reader_condition.notify_all()
+
+    def _finish_rejected_notification_persistence(self) -> None:
+        with self._reader_condition:
+            if self._reroute_persistence_inflight < 1:
+                raise AssertionError("reroute persistence barrier underflow")
+            self._reroute_persistence_inflight -= 1
+            self._reader_condition.notify_all()
+
+    def _wait_rejected_notification_barrier(self, deadline: float) -> None:
+        with self._reader_condition:
+            while self._reroute_persistence_inflight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timeout = RuntimeDisconnected(
+                        "timed out waiting for rejected notification evidence"
+                    )
+                    if self._reader_error is None:
+                        self._reader_error = timeout
+                    raise self._reader_error
+                self._reader_condition.wait(timeout=remaining)
+            if self._reader_error is not None:
+                raise self._reader_error
 
     def _classify_incoming(self, message: dict[str, Any], raw: bytes) -> tuple[str, Any]:
         if "jsonrpc" in message:
             raise ProtocolViolation(
                 "pinned App Server 0.144.6 framing must not contain jsonrpc"
-            )
+        )
         if "method" in message:
             method = _require_string(message["method"], "incoming method")
+            if "id" not in message and method == "model/rerouted":
+                self._begin_rejected_notification_persistence()
+                try:
+                    raw_entry = RejectedNotificationWire(
+                        method,
+                        hashlib.sha256(raw).hexdigest(),
+                        raw,
+                    )
+                    reference = self._persist_rejected_notification(raw_entry)
+                    evidence_sha256 = str(reference["sha256"])
+                    evidence_size_bytes = int(reference["size_bytes"])
+                    persisted_entry = RejectedNotificationWire(
+                        method,
+                        raw_entry.sha256,
+                        raw,
+                        evidence_sha256=evidence_sha256,
+                        evidence_size_bytes=evidence_size_bytes,
+                    )
+                    self._retain_reader_error(
+                        ModelReroutedViolation(
+                            evidence_sha256=evidence_sha256,
+                            evidence_size_bytes=evidence_size_bytes,
+                        )
+                    )
+                    return (
+                        "rejected_notification",
+                        persisted_entry,
+                    )
+                except AppServerError as exc:
+                    self._retain_reader_error(exc)
+                    raise
+                except BaseException as exc:
+                    boundary_error = ProtocolViolation(
+                        "rejected notification persistence boundary failed"
+                    )
+                    self._retain_reader_error(boundary_error)
+                    raise boundary_error from exc
+                finally:
+                    self._finish_rejected_notification_persistence()
             params = message.get("params", {})
             _require_object(params, "incoming notification/request params")
             if "id" in message:
@@ -1207,8 +1710,8 @@ class CodexAppServerStdio:
         for event in self._notifications:
             self._validate_event(event, thread_id=thread_id, turn_id=turn_id, allow_future_turn=turn_id is None)
 
-    @staticmethod
     def _validate_event(
+        self,
         event: RuntimeEvent,
         *,
         thread_id: str,
@@ -1216,6 +1719,13 @@ class CodexAppServerStdio:
         allow_future_turn: bool = False,
     ) -> None:
         params = event.params
+        if event.method == "model/rerouted":
+            self._reject_model_rerouted(
+                event,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                allow_future_turn=allow_future_turn,
+            )
         if event.method in _AUXILIARY_NOTIFICATION_METHODS:
             _validate_auxiliary_correlation(
                 event,
@@ -1263,6 +1773,60 @@ class CodexAppServerStdio:
             raise ProtocolViolation(f"{event.method} turn correlation mismatch")
         if turn_id is None and not allow_future_turn:
             raise ProtocolViolation(f"{event.method} arrived before a turn was established")
+
+    def _reject_model_rerouted(
+        self,
+        event: RuntimeEvent,
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        allow_future_turn: bool,
+    ) -> NoReturn:
+        """Persist first, then classify, and reject every model reroute."""
+
+        reference = self._persist_rejected_notification(event)
+        try:
+            params = event.params
+            _require_fields(
+                params, _MODEL_REROUTE_REQUIRED_FIELDS, "model/rerouted params"
+            )
+            observed_thread = _require_string(
+                params.get("threadId"), "model/rerouted threadId"
+            )
+            observed_turn = _require_string(
+                params.get("turnId"), "model/rerouted turnId"
+            )
+            observed_from = _require_string(
+                params.get("fromModel"), "model/rerouted fromModel"
+            )
+            _require_string(params.get("toModel"), "model/rerouted toModel")
+            reason = _require_string(params.get("reason"), "model/rerouted reason")
+            if reason not in _MODEL_REROUTE_REASONS:
+                raise ProtocolViolation("model/rerouted reason is outside pinned schema")
+            if observed_thread != thread_id:
+                raise ProtocolViolation("model/rerouted thread correlation mismatch")
+            if turn_id is not None and observed_turn != turn_id:
+                raise ProtocolViolation("model/rerouted turn correlation mismatch")
+            if turn_id is None and not allow_future_turn:
+                raise ProtocolViolation(
+                    "model/rerouted arrived before a turn was established"
+                )
+            if self._model_intent is None:
+                raise ProtocolViolation(
+                    "model/rerouted arrived without a sealed model binding"
+                )
+            if observed_from != self._model_intent.model:
+                raise ProtocolViolation(
+                    "model/rerouted fromModel differs from sealed launch intent"
+                )
+        except ProtocolViolation:
+            # The payload is untrusted classification input.  Every shape has
+            # the same fixed, redacted terminal fault after exact persistence.
+            pass
+        raise ModelReroutedViolation(
+            evidence_sha256=str(reference["sha256"]),
+            evidence_size_bytes=int(reference["size_bytes"]),
+        )
 
     def _require_process(self) -> subprocess.Popen[bytes]:
         if self._process is None:
@@ -1495,6 +2059,10 @@ def _event_identity(event: RuntimeEvent) -> tuple[str, str]:
     if event.method == "thread/started":
         thread = _require_object(params.get("thread"), "thread/started thread")
         return (event.method, _require_string(thread.get("id"), "thread id"))
+    if event.method == "model/rerouted":
+        # Do not parse untrusted reroute fields before the exact raw line has
+        # reached the rejected-notification evidence callback.
+        return (event.method, event.sha256)
     if event.method in _AUXILIARY_NOTIFICATION_METHODS:
         correlation = _auxiliary_correlation(event)
         if correlation is not None:

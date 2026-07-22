@@ -98,6 +98,37 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   surfaces at process and thread levels, and inserts a bounded live
   `model/list` gate before `thread/start`; only one visible exact model with the
   requested supported effort and no remaining page can proceed.
+  `model/rerouted` is now a forbidden exact-model contract breach rather than
+  an auxiliary observation: at stdout method recognition, before main-queue
+  enqueue or reading a later line, every recognized exact bounded notification
+  publishes an in-flight consumer barrier and is synchronously written to
+  controller-owned task-local CAS. Queue reads and terminal-candidate return
+  wait for already recognized callbacks, but an instantaneous wait is not
+  completion authority. Before a `turn/completed` observation can produce its
+  terminal journal append, the one-shot controller closes stdin and requires
+  natural exit zero, full stdout/stderr drain/join, zero callback inflight, and
+  no reader fault. Forced cleanup, nonzero exit, process I/O/wait failure,
+  partial output, or timeout aborts that irreversible stream seal and can never
+  publish `completed`. Exact-CAS reroutes may instead append typed `failed`, and
+  other owned faults may append `runtime_unknown`, without claiming a clean
+  seal; bounded cleanup then follows. A reroute serialized after the earlier
+  completion candidate is therefore still persisted and preempts it.
+  Successful persistence retains a typed reader fault over later reader,
+  backpressure, process, and cleanup errors, so queued completion, callback
+  latency, and duplicate ordering cannot bypass it. Failure paths settle any
+  already in-flight reroute callback within the same absolute deadline before
+  selecting the terminal fault. Owned cleanup now isolates poll, terminate,
+  wait, and kill so one failed step cannot skip later kill fallback, and it
+  retains the child handle until exit is confirmed. Reader join/liveness faults
+  are fixed transport errors rather than raw escapes, with symmetric stdout and
+  stderr accounting; an unknown receipt with a live reader is explicitly not a
+  full-quiescence claim. Ambiguous durable journal/CAS sink errors remain
+  outside that bounded cleanup catch. All
+  malformed, wrongly correlated, wrong-model, and schema-valid forms raise one
+  redacted typed fault. The callback receives only method, exact wire bytes,
+  and digest; it is mandatory, cannot synthesize evidence when absent, and
+  controller defense persists raw test-double bytes before parsed-field
+  consistency checks.
   AOI re-captures that endpoint under the issue lock, before reservation, and
   at process-pending. The endpoint now binds a separate full live task-claim
   authority as well as mutation-path coverage, so clean Git status cannot hide

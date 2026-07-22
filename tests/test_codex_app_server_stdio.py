@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import hashlib
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,8 +23,10 @@ from aoi_orgware.codex_app_server_stdio import (
     RequestJournalEntry,
     RequestPhase,
     ModelCatalogViolation,
+    ModelReroutedViolation,
     ResponsePolicyViolation,
     ResponseSchemaViolation,
+    RejectedNotificationWire,
     RuntimeEvent,
     RuntimeDisconnected,
     RuntimePin,
@@ -41,6 +47,7 @@ import json
 import os
 import platform
 import sys
+import time
 
 scenario = os.environ.get("FAKE_SCENARIO", "normal")
 if scenario == "stderr_flood":
@@ -204,7 +211,25 @@ if scenario == "invalid_turn_response":
     turn_result = {"turn":{"id":"turn-1","status":"inProgress"}}
 if scenario == "turn_status_drift":
     turn_result = {"turn":{"id":"turn-1","items":[],"status":"completed"}}
+reroute = {
+    "method":"model/rerouted",
+    "params":{
+        "fromModel":"gpt-5.6-terra",
+        "reason":"highRiskCyberActivity",
+        "threadId":"thread-1",
+        "toModel":"reroute-secret-model",
+        "turnId":"turn-1",
+    },
+}
+if scenario == "model_rerouted_buffered":
+    send(reroute)
+if scenario == "model_rerouted_nonobject_buffered":
+    send({"method":"model/rerouted","params":"payload-secret"})
 response(turn, turn_result)
+if scenario == "model_rerouted_live":
+    send(reroute)
+    send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"completed"}}})
+    raise SystemExit(0)
 if scenario == "auxiliary_notifications":
     send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"not persisted by AOI"}})
     send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","tokenUsage":{"totalTokens":1}}})
@@ -230,6 +255,15 @@ elif scenario == "duplicate_exact":
     send(started)
 send(completed)
 send({"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[item],"status":"completed"}}})
+if scenario == "model_rerouted_after_stdin_eof":
+    assert sys.stdin.readline() == ""
+    send(reroute)
+    raise SystemExit(0)
+if scenario == "nonzero_after_completion":
+    raise SystemExit(7)
+if scenario == "hang_after_stdin_eof":
+    assert sys.stdin.readline() == ""
+    time.sleep(30)
 if scenario == "interrupt":
     interrupt = read()
     assert "jsonrpc" not in interrupt
@@ -760,6 +794,587 @@ def test_auxiliary_event_identity_binds_explicit_correlation_ids() -> None:
     assert first[0] == "item/agentMessage/delta"
     assert "thread=thread-1;turn=turn-1;item=item-1;payload=" in first[1]
     assert first != changed_thread
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"fromModel": None},
+        {"toModel": None},
+        {"reason": None},
+        {"fromModel": "wrong-model"},
+        {"toModel": ""},
+        {"reason": "unsupported-reason"},
+        {"threadId": "wrong-thread"},
+        {"turnId": "wrong-turn"},
+        {"threadId": 7},
+        {"turnId": []},
+        {"fromModel": 7},
+        {"toModel": {}},
+        {"reason": 7},
+        {},
+    ],
+)
+def test_model_rerouted_always_fails_closed_after_exact_evidence(
+    fake_server: Path,
+    tmp_path: Path,
+    changes: dict[str, object | None],
+) -> None:
+    params: dict[str, object] = {
+        "fromModel": "gpt-5.6-terra",
+        "reason": "highRiskCyberActivity",
+        "threadId": "thread-1",
+        "toModel": "reroute-secret-model",
+        "turnId": "turn-1",
+    }
+    for key, value in changes.items():
+        if value is None:
+            params.pop(key)
+        else:
+            params[key] = value
+    raw = json.dumps(
+        {"method": "model/rerouted", "params": params},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    event = RuntimeEvent(
+        "model/rerouted", params, hashlib.sha256(raw).hexdigest(), raw
+    )
+    persisted: list[RuntimeEvent] = []
+    client = _client(fake_server, tmp_path)
+    client._model_intent = _intent(tmp_path)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed)
+        or {
+            "path": "local-cas",
+            "sha256": observed.sha256,
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+
+    with pytest.raises(
+        ModelReroutedViolation,
+        match="App Server model reroute violates sealed AOI policy",
+    ) as caught:
+        client._validate_event(
+            event, thread_id="thread-1", turn_id="turn-1"
+        )
+
+    assert persisted == [event]
+    assert persisted[0].wire_bytes == raw
+    assert caught.value.method == "model/rerouted"
+    assert caught.value.reason_code == "model_rerouted"
+    assert caught.value.evidence_sha256 == hashlib.sha256(raw).hexdigest()
+    assert caught.value.evidence_size_bytes == len(raw)
+    assert "reroute-secret-model" not in str(caught.value)
+    assert "wrong-model" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "failure_point"),
+    [
+        ("model_rerouted_buffered", "start"),
+        ("model_rerouted_live", "start_or_observe"),
+    ],
+)
+def test_model_rerouted_buffered_or_live_preempts_queued_completion(
+    fake_server: Path,
+    tmp_path: Path,
+    scenario: str,
+    failure_point: str,
+) -> None:
+    persisted: list[RuntimeEvent | RejectedNotificationWire] = []
+    client = _initialized_client(fake_server, tmp_path, scenario)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed)
+        or {
+            "path": "local-cas",
+            "sha256": observed.sha256,
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        if failure_point == "start":
+            with pytest.raises(ModelReroutedViolation):
+                client.start_turn_from_intent(
+                    thread_id=thread_id, prompt="hello", intent=intent
+                )
+        else:
+            try:
+                turn_id = client.start_turn_from_intent(
+                    thread_id=thread_id, prompt="hello", intent=intent
+                )
+            except ModelReroutedViolation:
+                pass
+            else:
+                with pytest.raises(ModelReroutedViolation):
+                    client.observe_turn(
+                        thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+                    )
+        assert len(persisted) == 1
+        assert b'"method":"model/rerouted"' in persisted[0].wire_bytes
+        assert b"reroute-secret-model" in persisted[0].wire_bytes
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def test_terminal_stream_seal_requires_natural_exit_and_full_reader_join(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        observation = client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        )
+
+        client.seal_reader_for_terminal_commit(timeout_seconds=3)
+        client.seal_reader_for_terminal_commit(timeout_seconds=3)
+
+        assert observation.terminal_status == "completed"
+        assert client._terminal_stream_phase.value == "sealed"
+        assert client._stdout_reader_done is True
+        assert client._stderr_reader_done is True
+        assert client._reroute_persistence_inflight == 0
+        assert client._process is None
+        assert client._stdout_thread is not None
+        assert client._stdout_thread.is_alive() is False
+        assert client._stderr_thread is not None
+        assert client._stderr_thread.is_alive() is False
+    finally:
+        client.close()
+
+
+def test_terminal_stream_seal_drains_reroute_emitted_after_stdin_eof(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[RuntimeEvent | RejectedNotificationWire] = []
+    client = _initialized_client(
+        fake_server, tmp_path, "model_rerouted_after_stdin_eof"
+    )
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed)
+        or {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        observation = client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        )
+        assert observation.terminal_status == "completed"
+
+        with pytest.raises(ModelReroutedViolation) as caught:
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+
+        assert len(persisted) == 1
+        assert caught.value.evidence_sha256 == hashlib.sha256(
+            persisted[0].wire_bytes
+        ).hexdigest()
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._stdout_reader_done is True
+        assert client._process is None
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "message"),
+    [
+        ("nonzero_after_completion", "exited nonzero"),
+        ("hang_after_stdin_eof", "did not exit naturally"),
+    ],
+)
+def test_terminal_stream_seal_never_accepts_nonzero_or_forced_shutdown(
+    fake_server: Path, tmp_path: Path, scenario: str, message: str
+) -> None:
+    client = _initialized_client(fake_server, tmp_path, scenario)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        observation = client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        )
+        assert observation.terminal_status == "completed"
+
+        with pytest.raises(RuntimeDisconnected, match=message):
+            client.seal_reader_for_terminal_commit(timeout_seconds=0.2)
+
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._process is None
+        if scenario == "hang_after_stdin_eof":
+            assert client._forced_shutdown is True
+        with pytest.raises(RuntimeDisconnected, match="not eligible"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=0.2)
+    finally:
+        client.close()
+
+
+def test_model_rerouted_nonobject_params_persist_before_classification(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[RuntimeEvent | RejectedNotificationWire] = []
+    client = _initialized_client(
+        fake_server, tmp_path, "model_rerouted_nonobject_buffered"
+    )
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed)
+        or {
+            "path": "local-cas",
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        with pytest.raises(ModelReroutedViolation) as caught:
+            client.start_turn_from_intent(
+                thread_id=thread_id, prompt="hello", intent=intent
+            )
+        assert len(persisted) == 1
+        assert isinstance(persisted[0], RejectedNotificationWire)
+        assert b'"params":"payload-secret"' in persisted[0].wire_bytes
+        assert caught.value.evidence_sha256 == hashlib.sha256(
+            persisted[0].wire_bytes
+        ).hexdigest()
+        assert caught.value.evidence_size_bytes == len(persisted[0].wire_bytes)
+        assert "payload-secret" not in str(caught.value)
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def _reroute_wire(to_model: str = "reroute-secret-model") -> tuple[dict[str, Any], bytes]:
+    message = {
+        "method": "model/rerouted",
+        "params": {
+            "fromModel": "gpt-5.6-terra",
+            "reason": "highRiskCyberActivity",
+            "threadId": "thread-1",
+            "toModel": to_model,
+            "turnId": "turn-1",
+        },
+    }
+    raw = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+    return message, raw
+
+
+def test_model_rerouted_reader_persists_before_queued_completion(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[RuntimeEvent | RejectedNotificationWire] = []
+    client = _client(fake_server, tmp_path)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed)
+        or {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    completed = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "items": [], "status": "completed"},
+        },
+    }
+    completed_raw = (
+        json.dumps(completed, separators=(",", ":")).encode("utf-8") + b"\n"
+    )
+    client._incoming.put_nowait(("notification", (completed, completed_raw)))
+    reroute, reroute_raw = _reroute_wire()
+    client._enqueue(client._classify_incoming(reroute, reroute_raw))
+
+    assert [entry.wire_bytes for entry in persisted] == [reroute_raw]
+    assert isinstance(client._reader_error, ModelReroutedViolation)
+    with pytest.raises(ModelReroutedViolation) as caught:
+        client._next_notification(time.monotonic() + 1)
+    assert caught.value.evidence_sha256 == hashlib.sha256(reroute_raw).hexdigest()
+    assert client._turn_terminal is False
+
+
+def test_model_rerouted_reader_fault_cannot_overtake_exact_evidence(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[bytes] = []
+    client = _client(fake_server, tmp_path)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed.wire_bytes)
+        or {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    reroute, raw = _reroute_wire()
+    client._enqueue(client._classify_incoming(reroute, raw))
+    retained = client._retain_reader_error(ProtocolViolation("later reader fault"))
+
+    assert persisted == [raw]
+    assert isinstance(retained, ModelReroutedViolation)
+    with pytest.raises(ModelReroutedViolation):
+        client._next_incoming(time.monotonic() + 1)
+
+
+def test_model_rerouted_reader_persists_even_when_main_queue_is_full(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[bytes] = []
+    client = _client(fake_server, tmp_path, max_queue_messages=1)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed.wire_bytes)
+        or {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    client._incoming.put_nowait(("notification", ({"method": "warning"}, b"{}\n")))
+    reroute, raw = _reroute_wire()
+    client._enqueue(client._classify_incoming(reroute, raw))
+
+    assert persisted == [raw]
+    assert client._incoming.qsize() == 1
+    assert isinstance(client._reader_error, ModelReroutedViolation)
+
+
+def test_model_rerouted_reader_persists_each_recognized_duplicate(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[bytes] = []
+    client = _client(fake_server, tmp_path)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed.wire_bytes)
+        or {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    first, first_raw = _reroute_wire("reroute-secret-model-1")
+    second, second_raw = _reroute_wire("reroute-secret-model-2")
+
+    client._classify_incoming(first, first_raw)
+    client._classify_incoming(second, second_raw)
+
+    assert persisted == [first_raw, second_raw]
+    assert isinstance(client._reader_error, ModelReroutedViolation)
+
+
+@pytest.mark.parametrize("callback_mode", ["success", "raises", "diverges"])
+def test_model_rerouted_inflight_callback_blocks_terminal_completion(
+    fake_server: Path,
+    tmp_path: Path,
+    callback_mode: str,
+) -> None:
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observer_done = threading.Event()
+    persisted: list[bytes] = []
+    classifier_errors: list[BaseException] = []
+    observer_errors: list[BaseException] = []
+    observations: list[object] = []
+    client = _client(fake_server, tmp_path)
+
+    def callback(
+        observed: RuntimeEvent | RejectedNotificationWire,
+    ) -> dict[str, object]:
+        callback_entered.set()
+        assert release_callback.wait(timeout=3)
+        if callback_mode == "raises":
+            raise RuntimeError("payload-secret")
+        persisted.append(observed.wire_bytes)
+        if callback_mode == "diverges":
+            return {"sha256": "0" * 64, "size_bytes": len(observed.wire_bytes)}
+        return {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+
+    client.on_rejected_notification = callback
+    completed = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "items": [], "status": "completed"},
+        },
+    }
+    completed_raw = json.dumps(
+        completed, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    client._notifications.append(
+        RuntimeEvent(
+            "turn/completed",
+            completed["params"],
+            hashlib.sha256(completed_raw).hexdigest(),
+            completed_raw,
+        )
+    )
+    reroute, reroute_raw = _reroute_wire()
+
+    def classify() -> None:
+        try:
+            client._classify_incoming(reroute, reroute_raw)
+        except BaseException as exc:
+            classifier_errors.append(exc)
+
+    def observe() -> None:
+        try:
+            observations.append(
+                client.observe_turn(
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                    timeout_seconds=3,
+                )
+            )
+        except BaseException as exc:
+            observer_errors.append(exc)
+        finally:
+            observer_done.set()
+
+    classifier = threading.Thread(target=classify)
+    classifier.start()
+    assert callback_entered.wait(timeout=2)
+    observer = threading.Thread(target=observe)
+    observer.start()
+
+    assert not observer_done.wait(timeout=0.1)
+    assert client._turn_terminal is False
+    assert observations == []
+
+    release_callback.set()
+    classifier.join(timeout=3)
+    observer.join(timeout=3)
+    assert not classifier.is_alive()
+    assert not observer.is_alive()
+    assert observations == []
+    assert len(observer_errors) == 1
+    assert "payload-secret" not in str(observer_errors[0])
+    assert client._turn_terminal is False
+    assert client._reroute_persistence_inflight == 0
+    if callback_mode == "success":
+        assert classifier_errors == []
+        assert persisted == [reroute_raw]
+        assert isinstance(observer_errors[0], ModelReroutedViolation)
+    else:
+        assert len(classifier_errors) == 1
+        assert isinstance(classifier_errors[0], AppServerError)
+        assert isinstance(observer_errors[0], AppServerError)
+
+
+def test_stdout_reader_persists_duplicate_reroutes_despite_full_main_queue(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    persisted: list[bytes] = []
+    client = _client(fake_server, tmp_path, max_queue_messages=1)
+    client.on_rejected_notification = lambda observed: (
+        persisted.append(observed.wire_bytes)
+        or {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+    )
+    ordinary = json.dumps(
+        {
+            "method": "thread/status/changed",
+            "params": {"threadId": "thread-1", "status": "active"},
+        },
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    first, first_raw = _reroute_wire("reroute-secret-model-1")
+    second, second_raw = _reroute_wire("reroute-secret-model-2")
+    assert first != second
+    client._process = SimpleNamespace(
+        stdout=io.BytesIO(ordinary + first_raw + second_raw)
+    )  # type: ignore[assignment]
+
+    reader = threading.Thread(target=client._stdout_reader)
+    reader.start()
+    reader.join(timeout=3)
+    client._process = None
+
+    assert not reader.is_alive()
+    assert persisted == [first_raw, second_raw]
+    assert client._incoming.qsize() == 1
+    assert isinstance(client._reader_error, ModelReroutedViolation)
+    assert client._reroute_persistence_inflight == 0
+
+
+@pytest.mark.parametrize("callback_mode", ["missing", "raises"])
+def test_model_rerouted_requires_successful_evidence_callback(
+    fake_server: Path,
+    tmp_path: Path,
+    callback_mode: str,
+) -> None:
+    client = _initialized_client(
+        fake_server, tmp_path, "model_rerouted_nonobject_buffered"
+    )
+    if callback_mode == "raises":
+        def fail_callback(
+            _entry: RuntimeEvent | RejectedNotificationWire,
+        ) -> dict[str, object]:
+            raise RuntimeError("payload-secret")
+
+        client.on_rejected_notification = fail_callback
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        expected = "required" if callback_mode == "missing" else "callback failed"
+        with pytest.raises(AppServerError, match=expected) as caught:
+            client.start_turn_from_intent(
+                thread_id=thread_id, prompt="hello", intent=intent
+            )
+        assert "payload-secret" not in str(caught.value)
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def test_model_rerouted_evidence_sink_must_return_exact_digest_and_size(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    params = {
+        "fromModel": "gpt-5.6-terra",
+        "reason": "highRiskCyberActivity",
+        "threadId": "thread-1",
+        "toModel": "other",
+        "turnId": "turn-1",
+    }
+    raw = json.dumps(
+        {"method": "model/rerouted", "params": params},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    event = RuntimeEvent(
+        "model/rerouted", params, hashlib.sha256(raw).hexdigest(), raw
+    )
+    client = _client(fake_server, tmp_path)
+    client._model_intent = _intent(tmp_path)
+    client.on_rejected_notification = lambda _event: {
+        "sha256": "0" * 64,
+        "size_bytes": len(raw),
+    }
+    with pytest.raises(AppServerError, match="divergent bytes"):
+        client._validate_event(event, thread_id="thread-1", turn_id="turn-1")
+
+    client.on_rejected_notification = lambda _event: {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size_bytes": len(raw) + 1,
+    }
+    with pytest.raises(AppServerError, match="divergent bytes"):
+        client._validate_event(event, thread_id="thread-1", turn_id="turn-1")
 
 
 @pytest.mark.parametrize("scenario", ["malformed", "oversize"])

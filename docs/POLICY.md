@@ -725,6 +725,55 @@ fault-evidence digest/size fields; neither kind may be presented as response or
 wire bytes. Malformed response/error envelopes fail before response
 observation; ambiguous or rejected non-idempotent starts remain non-retryable.
 
+`model/rerouted` is never an ignorable auxiliary observation. On every bounded
+raw notification line, the stdout reader must, at method recognition and before
+main-queue enqueue or reading a later line, synchronously offer a raw-only
+method/wire/digest carrier to a mandatory controller-owned task-local non-Git
+CAS callback and require exact digest/size readback. Each recognized duplicate
+is offered independently. Before invoking that callback, the reader publishes
+an in-flight barrier visible to protocol consumers. Queue reads and terminal-turn
+candidate return must wait until every already recognized callback resolves to
+either verified `ModelReroutedViolation` or a fixed fail-closed callback fault.
+That instantaneous barrier is not completion authority. Before a
+`turn/completed` observation may authorize its terminal journal append, the
+one-shot controller must close App Server stdin, require a natural zero exit,
+fully drain and join the stdout and stderr readers, and under the same condition
+prove both readers done, zero reroute callbacks in flight, and no reader fault.
+Only that irreversible terminal stream seal can authorize an
+observation-derived terminal append. A forced terminate/kill, nonzero exit,
+process stdin/poll/wait error, partial line, reader/CAS timeout, or live reader
+aborts the seal and can never produce `completed`. A verified rejected
+notification may instead append typed `failed` after its exact CAS evidence is
+durable, and other owned transport faults may append `runtime_unknown`, without
+claiming a successful stream seal; bounded cleanup then follows. This drain catches a
+reroute serialized after the earlier `turn/completed` candidate and removes the
+final-check-to-journal TOCTOU window. An absent or failed callback fails closed
+and may not be
+replaced by a synthesized evidence reference. Verified recognition retains a
+typed reader fault that outranks a later generic reader, backpressure, process,
+or cleanup fault. A terminal-failure path waits for an already in-flight
+reroute persistence operation within the same absolute deadline before choosing
+that fault. An earlier queued completion therefore cannot overtake either an
+in-flight or completed reroute persistence operation. Owned cleanup treats
+poll, terminate, wait, and kill as independent bounded steps: a failed status
+query or terminate/wait pair cannot skip the later kill fallback, and AOI must
+not discard its process handle unless child exit was confirmed. Reader cleanup
+normalizes owned join/liveness exceptions, accounts for stdout and stderr
+symmetrically, and retains a fixed cleanup fault if either reader remains live;
+such a fault/unknown receipt is not a claim that the runtime fully quiesced.
+These bounded catches do not extend to an ambiguous durable journal or CAS sink
+failure. Only after verified persistence may the adapter
+classify the pinned required fields, reason,
+thread/turn correlation, and `fromModel` against the sealed requested model.
+Missing or malformed fields, wrong correlation or source model, any destination
+model, and a fully schema-valid reroute all raise the same fixed, redacted
+`ModelReroutedViolation`; raw model values do not enter the semantic journal or
+error text. The controller must pre-scan returned observations for the same
+notification as defense in depth and must persist raw test-double bytes before
+comparing them with parsed fields. A verified reroute fault is a known terminal
+`failed` outcome with `wire_method=model/rerouted` and its exact CAS digest/size,
+never `completed`; a CAS/persistence failure still fails closed.
+
 A terminal App Server turn remains `codex_runtime_observed`. Only a separate
 exact pre/post Git tree and claim binding may add `verified_mutation`; neither
 receipt implies packet or task completion. `turn/interrupt` acknowledgement

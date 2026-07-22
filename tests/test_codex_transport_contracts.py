@@ -309,6 +309,38 @@ def test_model_list_preflight_is_ordered_and_failure_is_known_before_thread_star
         )
 
 
+def test_model_rerouted_typed_failed_event_is_terminal() -> None:
+    intent_sha, reservation_sha, records = to_turn_started()
+    records = append(
+        records,
+        intent_sha,
+        reservation_sha,
+        "failed",
+        "failed",
+        correlation("thread-1", "turn-1"),
+        wire_method="model/rerouted",
+        wire_event_sha256=None,
+        response_sha256=None,
+        fault_kind="ModelReroutedViolation",
+        fault_evidence_sha256=SHA_D,
+        fault_evidence_size_bytes=42,
+    )
+    state = contracts.validate_transport_journal(records)
+    assert state.state == "failed"
+    assert records[-1]["wire_method"] == "model/rerouted"
+    assert records[-1]["fault_kind"] == "ModelReroutedViolation"
+
+    with pytest.raises(contracts.CodexTransportContractError, match="terminal"):
+        append(
+            records,
+            intent_sha,
+            reservation_sha,
+            "completed",
+            "completed",
+            correlation("thread-1", "turn-1"),
+        )
+
+
 def test_launch_reservation_is_exactly_bound_to_intent_and_pin() -> None:
     sealed_intent = contracts.seal_launch_intent(intent())
     sealed = contracts.seal_reservation(reservation(sealed_intent["intent_sha256"]))

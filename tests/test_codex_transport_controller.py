@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Mapping
 
 import pytest
@@ -16,6 +17,8 @@ from aoi_orgware import codex_transport_contracts as contracts
 from aoi_orgware.codex_app_server_stdio import (
     AppServerError,
     AppServerResponseError,
+    CodexAppServerStdio,
+    ModelReroutedViolation,
     ProcessJournalEntry,
     ProtocolViolation,
     RequestJournalEntry,
@@ -192,8 +195,12 @@ class FakeAdapter:
         self.on_send_pending: Any = None
         self.on_response: Any = None
         self.on_rejected_response: Any = None
+        self.on_rejected_notification: Any = None
         self.request_count: dict[str, int] = {}
         self.closed = False
+        self.seal_called = False
+        self.terminal_sealed = False
+        self.reroute_event: RuntimeEvent | None = None
         self._next_id = 1
 
     @staticmethod
@@ -315,6 +322,47 @@ class FakeAdapter:
             raise RuntimeDisconnected("stream lost")
         if self.mode == "wrong_correlation":
             raise ProtocolViolation("wrong turn correlation")
+        if self.mode == "model_rerouted_early":
+            self.reroute_event = runtime_event(
+                "model/rerouted",
+                {
+                    "fromModel": "gpt-5.6-terra",
+                    "reason": "highRiskCyberActivity",
+                    "threadId": thread_id,
+                    "toModel": "reroute-secret-model",
+                    "turnId": turn_id,
+                },
+            )
+            reference = self.on_rejected_notification(self.reroute_event)
+            raise ModelReroutedViolation(
+                evidence_sha256=str(reference["sha256"]),
+                evidence_size_bytes=int(reference["size_bytes"]),
+            )
+        if self.mode in {"model_rerouted", "model_rerouted_mismatch"}:
+            params = {
+                "fromModel": "gpt-5.6-terra",
+                "reason": "highRiskCyberActivity",
+                "threadId": thread_id,
+                "toModel": "reroute-secret-model",
+                "turnId": turn_id,
+            }
+            if self.mode == "model_rerouted_mismatch":
+                raw = b'{"method":"model/rerouted","params":"payload-secret"}\n'
+                self.reroute_event = RuntimeEvent(
+                    "model/rerouted", params, "0" * 64, raw
+                )
+            else:
+                self.reroute_event = runtime_event("model/rerouted", params)
+            completed = runtime_event(
+                "turn/completed",
+                {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
+            )
+            return TurnObservation(
+                thread_id, turn_id, "completed", (self.reroute_event, completed)
+            )
         item = {"id": "item-1", "type": "agentMessage", "text": "not persisted"}
         status = (
             "interrupted"
@@ -337,6 +385,28 @@ class FakeAdapter:
             ),
         )
         return TurnObservation(thread_id, turn_id, status, events)
+
+    def synchronize_reader_boundary(self, *, timeout_seconds: float) -> None:
+        return None
+
+    def seal_reader_for_terminal_commit(self, *, timeout_seconds: float) -> None:
+        self.seal_called = True
+        if self.mode != "boundary_rerouted":
+            self.terminal_sealed = True
+            return
+        params = {
+            "fromModel": "gpt-5.6-terra",
+            "reason": "highRiskCyberActivity",
+            "threadId": "thread-1",
+            "toModel": "reroute-secret-model",
+            "turnId": "turn-1",
+        }
+        self.reroute_event = runtime_event("model/rerouted", params)
+        reference = self.on_rejected_notification(self.reroute_event)
+        raise ModelReroutedViolation(
+            evidence_sha256=str(reference["sha256"]),
+            evidence_size_bytes=int(reference["size_bytes"]),
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -361,6 +431,7 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
     result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
     assert result.terminal_state == "completed"
     assert result.runtime_completed is True
+    assert adapter.terminal_sealed is True
     assert result.task_completion == "not_inferred"
     assert result.terminal_receipt["evidence_level"] == "codex_runtime_observed"
     assert result.terminal_receipt["mutation_verification"] == {
@@ -397,6 +468,411 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
     }
     assert sink.published == [result.terminal_receipt]
     assert adapter.closed is True
+
+
+@pytest.mark.parametrize(
+    "mode", ["model_rerouted", "model_rerouted_mismatch"]
+)
+def test_controller_model_reroute_preempts_completed_terminal(mode: str) -> None:
+    value, sink, adapter = controller(mode)
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    assert result.terminal_state == "failed"
+    assert result.runtime_completed is False
+    assert adapter.closed is True
+    assert adapter.reroute_event is not None
+    assert "completed" not in [row["event_type"] for row in result.journal]
+    terminal = result.journal[-1]
+    assert terminal["event_type"] == "failed"
+    assert terminal["wire_method"] == "model/rerouted"
+    assert terminal["fault_kind"] == "ModelReroutedViolation"
+    assert terminal["wire_event_sha256"] is None
+    assert terminal["response_sha256"] is None
+    assert terminal["correlation"] == correlation("thread-1", "turn-1")
+    assert sink.fault_evidence == [
+        (
+            "Codex App Server model/rerouted rejected notification",
+            adapter.reroute_event.wire_bytes,
+        )
+    ]
+    assert terminal["fault_evidence_sha256"] == hashlib.sha256(
+        adapter.reroute_event.wire_bytes
+    ).hexdigest()
+    assert terminal["fault_evidence_size_bytes"] == len(
+        adapter.reroute_event.wire_bytes
+    )
+    assert "payload-secret" not in json.dumps(result.terminal_receipt)
+    assert "payload-secret" not in json.dumps(result.journal)
+    with pytest.raises(CodexTransportControllerError, match="terminal"):
+        value._persist(
+            value._event(
+                "completed",
+                wire_method="turn/completed",
+                correlation=value.state.correlation,
+                payload_size_bytes=1,
+                wire_event_sha256=SHA_A,
+            )
+        )
+
+
+def test_controller_early_model_reroute_fault_does_not_claim_clean_seal() -> None:
+    value, sink, adapter = controller("model_rerouted_early")
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    assert result.terminal_state == "failed"
+    assert result.runtime_completed is False
+    assert adapter.seal_called is False
+    assert adapter.terminal_sealed is False
+    assert adapter.closed is True
+    assert adapter.reroute_event is not None
+    assert "completed" not in [row["event_type"] for row in result.journal]
+    assert sink.fault_evidence == [
+        (
+            "Codex App Server model/rerouted rejected notification",
+            adapter.reroute_event.wire_bytes,
+        )
+    ]
+    terminal = result.journal[-1]
+    assert terminal["event_type"] == "failed"
+    assert terminal["wire_method"] == "model/rerouted"
+    assert terminal["fault_kind"] == "ModelReroutedViolation"
+    assert terminal["fault_evidence_sha256"] == hashlib.sha256(
+        adapter.reroute_event.wire_bytes
+    ).hexdigest()
+    assert terminal["fault_evidence_size_bytes"] == len(
+        adapter.reroute_event.wire_bytes
+    )
+    assert sink.published == [result.terminal_receipt]
+
+
+@pytest.mark.parametrize("sink_mode", ["raises", "diverges"])
+def test_controller_model_reroute_cas_failure_never_completes(
+    sink_mode: str,
+) -> None:
+    value, _sink, adapter = controller("model_rerouted")
+
+    def broken_fault_sink(data: bytes, _label: str) -> dict[str, Any]:
+        if sink_mode == "raises":
+            raise RuntimeError("payload-secret")
+        return {
+            "path": "local-cas",
+            "sha256": "0" * 64,
+            "size_bytes": len(data),
+        }
+
+    value._persist_fault_evidence = broken_fault_sink
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    assert result.terminal_state == "runtime_unknown"
+    assert result.runtime_completed is False
+    assert "completed" not in [row["event_type"] for row in result.journal]
+    terminal = result.journal[-1]
+    assert terminal["fault_kind"] == "CodexTransportControllerError"
+    assert "payload-secret" not in json.dumps(result.journal)
+    assert "payload-secret" not in json.dumps(result.terminal_receipt)
+
+
+@pytest.mark.parametrize(
+    ("cas_fault", "expected_terminal"),
+    [
+        ("none", "failed"),
+        ("raise", "runtime_unknown"),
+        ("diverge", "runtime_unknown"),
+    ],
+)
+def test_controller_seals_reader_before_post_observe_completion_commit(
+    cas_fault: str, expected_terminal: str
+) -> None:
+    value, sink, adapter = controller("boundary_rerouted")
+    if cas_fault == "raise":
+        def raise_fault(_data: bytes, _label: str) -> dict[str, Any]:
+            raise OSError("local CAS unavailable")
+
+        value._persist_fault_evidence = raise_fault
+    elif cas_fault == "diverge":
+        value._persist_fault_evidence = lambda data, _label: {
+            "path": "local-cas",
+            "sha256": "0" * 64,
+            "size_bytes": len(data),
+        }
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    assert result.terminal_state == expected_terminal
+    assert result.runtime_completed is False
+    assert "completed" not in [row["event_type"] for row in result.journal]
+    assert adapter.seal_called is True
+    assert adapter.terminal_sealed is False
+    assert adapter.reroute_event is not None
+    if cas_fault == "none":
+        assert sink.fault_evidence == [
+            (
+                "Codex App Server model/rerouted rejected notification",
+                adapter.reroute_event.wire_bytes,
+            )
+        ]
+        assert result.journal[-1]["fault_kind"] == "ModelReroutedViolation"
+    assert sink.published[-1]["terminal_state"] == expected_terminal
+
+
+@pytest.mark.parametrize(
+    ("fault_mode", "expected_terminal"),
+    [
+        ("none", "failed"),
+        ("raise", "runtime_unknown"),
+        ("diverge", "runtime_unknown"),
+        ("stderr", "runtime_unknown"),
+        ("wait_oserror", "runtime_unknown"),
+        ("poll_oserror", "runtime_unknown"),
+        ("stdin_close_exit0", "runtime_unknown"),
+        ("stdin_none", "runtime_unknown"),
+        ("typed_wait_oserror", "failed"),
+        ("cleanup_poll_oserror_live", "runtime_unknown"),
+        ("cleanup_terminate_wait_oserror", "runtime_unknown"),
+        ("cleanup_unconfirmed", "runtime_unknown"),
+        ("join_oserror", "runtime_unknown"),
+        ("typed_join_oserror", "failed"),
+        ("stderr_reader_live", "runtime_unknown"),
+    ],
+)
+def test_production_stream_seal_blocks_actual_controller_terminal_publication(
+    tmp_path: Path, fault_mode: str, expected_terminal: str
+) -> None:
+    """Reproduce v68 with the production reader/condition/seal implementation."""
+
+    value, sink, delegate = controller()
+    # A POSIX venv launcher may be a symlink; this synthetic process test needs
+    # a regular executable placeholder without weakening the production check.
+    adapter = CodexAppServerStdio(Path(sys.executable).resolve(), cwd=tmp_path)
+    release_stdout = threading.Event()
+    process_exited = threading.Event()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    release_stderr = threading.Event()
+    process_killed = threading.Event()
+    process_calls: list[str] = []
+    emits_reroute = fault_mode in {
+        "none",
+        "raise",
+        "diverge",
+        "typed_wait_oserror",
+        "typed_join_oserror",
+    }
+    reroute = runtime_event(
+        "model/rerouted",
+        {
+            "fromModel": "gpt-5.6-terra",
+            "reason": "highRiskCyberActivity",
+            "threadId": "thread-1",
+            "toModel": "reroute-secret-model",
+            "turnId": "turn-1",
+        },
+    )
+
+    class DeferredStdin:
+        def close(self) -> None:
+            process_calls.append("stdin.close")
+            release_stdout.set()
+            if fault_mode not in {
+                "cleanup_poll_oserror_live",
+                "cleanup_terminate_wait_oserror",
+                "cleanup_unconfirmed",
+            }:
+                process_exited.set()
+            if fault_mode in {
+                "poll_oserror",
+                "stdin_close_exit0",
+                "cleanup_poll_oserror_live",
+                "cleanup_terminate_wait_oserror",
+                "cleanup_unconfirmed",
+            }:
+                raise OSError("synthetic stdin close failure")
+
+    class DeferredStdout:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def readline(self, _limit: int) -> bytes:
+            release_stdout.wait(timeout=5)
+            if not emits_reroute:
+                return b""
+            if not self.sent:
+                self.sent = True
+                return reroute.wire_bytes + b"\n"
+            return b""
+
+    class DeferredStderr:
+        def read(self, _limit: int) -> bytes:
+            if fault_mode == "stderr":
+                raise OSError("synthetic stderr read failure")
+            if fault_mode == "stderr_reader_live":
+                release_stderr.wait(timeout=10)
+            return b""
+
+    class DeferredProcess:
+        def __init__(self) -> None:
+            self.stdin = None if fault_mode == "stdin_none" else DeferredStdin()
+            self.stdout = DeferredStdout()
+            self.stderr = DeferredStderr()
+            self.pid = 42
+
+        def poll(self) -> int | None:
+            process_calls.append("poll")
+            if fault_mode in {"poll_oserror", "cleanup_poll_oserror_live", "cleanup_unconfirmed"}:
+                raise OSError("synthetic process poll failure")
+            return 0 if process_exited.is_set() else None
+
+        def wait(self, timeout: float | None = None) -> int:
+            process_calls.append("wait")
+            if fault_mode in {"wait_oserror", "typed_wait_oserror"}:
+                raise OSError("synthetic process wait failure")
+            if fault_mode == "cleanup_terminate_wait_oserror" and not process_killed.is_set():
+                raise OSError("synthetic process wait failure before kill")
+            if fault_mode == "cleanup_unconfirmed":
+                raise OSError("synthetic process wait failure")
+            if not process_exited.wait(timeout=timeout):
+                raise RuntimeError("synthetic process wait unexpectedly timed out")
+            return 0
+
+        def terminate(self) -> None:
+            process_calls.append("terminate")
+            if fault_mode in {"cleanup_terminate_wait_oserror", "cleanup_unconfirmed"}:
+                raise OSError("synthetic process terminate failure")
+            release_stdout.set()
+            process_exited.set()
+
+        def kill(self) -> None:
+            process_calls.append("kill")
+            if fault_mode == "cleanup_unconfirmed":
+                raise OSError("synthetic process kill failure")
+            release_stdout.set()
+            process_killed.set()
+            process_exited.set()
+
+    process = DeferredProcess()
+
+    def start() -> None:
+        for name in (
+            "on_process_start_pending",
+            "on_process_started",
+            "on_send_pending",
+            "on_response",
+            "on_rejected_response",
+            "on_rejected_notification",
+        ):
+            setattr(delegate, name, getattr(adapter, name))
+        adapter._process = process  # type: ignore[assignment]
+        adapter._stdout_thread = threading.Thread(
+            target=adapter._stdout_reader, daemon=True
+        )
+        adapter._stderr_thread = threading.Thread(
+            target=adapter._stderr_reader, daemon=True
+        )
+        adapter._stdout_thread.start()
+        adapter._stderr_thread.start()
+        if fault_mode in {"join_oserror", "typed_join_oserror"}:
+            real_stdout_thread = adapter._stdout_thread
+
+            class JoinFaultThread:
+                def join(self, timeout: float | None = None) -> None:
+                    real_stdout_thread.join(timeout=timeout)
+                    raise OSError("synthetic reader join failure")
+
+                def is_alive(self) -> bool:
+                    return real_stdout_thread.is_alive()
+
+            adapter._stdout_thread = JoinFaultThread()  # type: ignore[assignment]
+        delegate.start()
+
+    def observe_turn(
+        *, thread_id: str, turn_id: str, timeout_seconds: float
+    ) -> TurnObservation:
+        observation = delegate.observe_turn(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            timeout_seconds=timeout_seconds,
+        )
+        adapter._turn_terminal = True
+        return observation
+
+    adapter.start = start  # type: ignore[method-assign]
+    adapter.initialize = delegate.initialize  # type: ignore[method-assign]
+    adapter.verify_model_from_intent = delegate.verify_model_from_intent  # type: ignore[method-assign]
+    adapter.start_thread_from_intent = delegate.start_thread_from_intent  # type: ignore[method-assign]
+    adapter.start_turn_from_intent = delegate.start_turn_from_intent  # type: ignore[method-assign]
+    adapter.interrupt_turn = delegate.interrupt_turn  # type: ignore[method-assign]
+    adapter.observe_turn = observe_turn  # type: ignore[method-assign]
+
+    def persist_fault(data: bytes, label: str) -> dict[str, Any]:
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        if fault_mode == "raise":
+            raise OSError("local CAS unavailable")
+        if fault_mode == "diverge":
+            return {
+                "path": "local-cas",
+                "sha256": "0" * 64,
+                "size_bytes": len(data),
+            }
+        return sink.persist_fault(data, label)
+
+    value._persist_fault_evidence = persist_fault
+    results: list[Any] = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            value.run(
+                adapter,
+                prompt="hello",
+                timeout_seconds=0.2 if fault_mode == "stderr_reader_live" else 3,
+            )
+        ),
+        daemon=True,
+    )
+    worker.start()
+    if emits_reroute:
+        assert callback_entered.wait(timeout=3)
+        assert sink.published == []
+        assert "completed" not in [row["event_type"] for row in value.journal]
+        release_callback.set()
+    worker.join(timeout=6)
+
+    assert worker.is_alive() is False
+    assert len(results) == 1
+    result = results[0]
+    assert result.terminal_state == expected_terminal, (
+        result.journal,
+        adapter._reader_error,
+    )
+    assert result.runtime_completed is False
+    assert "completed" not in [row["event_type"] for row in result.journal]
+    assert sink.published[-1]["terminal_state"] == expected_terminal
+    if fault_mode == "stderr":
+        assert adapter._stderr_reader_done is True
+        assert isinstance(adapter._reader_error, RuntimeDisconnected)
+    if fault_mode == "typed_wait_oserror":
+        assert isinstance(adapter._reader_error, ModelReroutedViolation)
+        assert result.journal[-1]["wire_method"] == "model/rerouted"
+    if fault_mode == "cleanup_poll_oserror_live":
+        assert "terminate" in process_calls
+        assert process_exited.is_set()
+        assert adapter._process is None
+    if fault_mode == "cleanup_terminate_wait_oserror":
+        assert "kill" in process_calls
+        assert process_exited.is_set()
+        assert adapter._process is None
+    if fault_mode == "cleanup_unconfirmed":
+        assert "terminate" in process_calls
+        assert "kill" in process_calls
+        assert process_exited.is_set() is False
+        assert adapter._process is process
+    if fault_mode in {"join_oserror", "typed_join_oserror"}:
+        assert isinstance(adapter._reader_error, RuntimeDisconnected if fault_mode == "join_oserror" else ModelReroutedViolation)
+    if fault_mode == "stderr_reader_live":
+        assert adapter._stderr_thread is not None
+        assert adapter._stderr_thread.is_alive()
+        assert isinstance(adapter._reader_error, RuntimeDisconnected)
+        release_stderr.set()
+        adapter._stderr_thread.join(timeout=2)
+        assert adapter._stderr_thread.is_alive() is False
 
 
 def test_error_envelope_cannot_enter_success_response_callback() -> None:

@@ -20,9 +20,11 @@ from .codex_app_server_stdio import (
     AppServerError,
     AppServerResponseError,
     CodexAppServerStdio,
+    ModelReroutedViolation,
     ProcessJournalEntry,
     RequestJournalEntry,
     RequestPhase,
+    RejectedNotificationWire,
     RuntimeDisconnected,
     RuntimeEvent,
     SealedLaunchIntent,
@@ -397,7 +399,52 @@ class CodexTransportController:
             )
         return reference
 
+    def _on_rejected_notification(
+        self, event: RuntimeEvent | RejectedNotificationWire
+    ) -> Mapping[str, Any]:
+        if event.method != "model/rerouted":
+            raise CodexTransportControllerError(
+                "rejected notification callback received an unsupported method"
+            )
+        raw = event.wire_bytes
+        actual_sha256 = hashlib.sha256(raw).hexdigest()
+        try:
+            reference = dict(
+                self._persist_fault_evidence(
+                    raw, "Codex App Server model/rerouted rejected notification"
+                )
+            )
+        except CodexTransportControllerError:
+            raise
+        except Exception as exc:
+            raise CodexTransportControllerError(
+                "rejected notification local CAS persistence failed"
+            ) from exc
+        if (
+            reference.get("sha256") != actual_sha256
+            or reference.get("size_bytes") != len(raw)
+        ):
+            raise CodexTransportControllerError(
+                "rejected notification local CAS reference differs from exact wire bytes"
+            )
+        if isinstance(event, RuntimeEvent):
+            try:
+                _runtime_event_bytes(event)
+            except CodexTransportControllerError:
+                # Exact raw bytes are already durable.  A mismatched test
+                # double is still the same forbidden typed reroute fault.
+                pass
+        return reference
+
     def _record_observation(self, observation: TurnObservation) -> None:
+        for event in observation.events:
+            if event.method != "model/rerouted":
+                continue
+            reference = self._on_rejected_notification(event)
+            raise ModelReroutedViolation(
+                evidence_sha256=str(reference["sha256"]),
+                evidence_size_bytes=int(reference["size_bytes"]),
+            )
         for event in observation.events:
             if event.method not in {"item/started", "item/completed", "turn/completed"}:
                 continue
@@ -474,6 +521,7 @@ class CodexTransportController:
             "pinned_response_schema",
             "model_catalog_policy",
             "sealed_response_policy",
+            "model_rerouted",
         }:
             return supplied
         message = str(exc).lower()
@@ -505,6 +553,19 @@ class CodexTransportController:
             return
         last = self.journal[-1]
         fault_kind, digest, size = self._fault_digest(exc)
+        if isinstance(exc, ModelReroutedViolation):
+            self._persist(
+                self._event(
+                    "failed",
+                    wire_method="model/rerouted",
+                    correlation=state.correlation,
+                    payload_size_bytes=size,
+                    fault_kind=fault_kind,
+                    fault_evidence_sha256=digest,
+                    fault_evidence_size_bytes=size,
+                )
+            )
+            return
         known_rejected_start = isinstance(exc, AppServerResponseError) and (
             state.last_event_type
             in {"thread_start_send_pending", "turn_start_send_pending"}
@@ -599,6 +660,7 @@ class CodexTransportController:
             adapter.on_send_pending,
             adapter.on_response,
             adapter.on_rejected_response,
+            adapter.on_rejected_notification,
         )
         if any(callback is not None for callback in callbacks):
             raise CodexTransportControllerError(
@@ -610,6 +672,7 @@ class CodexTransportController:
         adapter.on_send_pending = self._on_send_pending
         adapter.on_response = self._on_response
         adapter.on_rejected_response = self._on_rejected_response
+        adapter.on_rejected_notification = self._on_rejected_notification
         try:
             adapter.start()
             adapter.initialize()
@@ -624,6 +687,9 @@ class CodexTransportController:
                 thread_id=thread_id,
                 turn_id=turn_id,
                 timeout_seconds=timeout_seconds,
+            )
+            adapter.seal_reader_for_terminal_commit(
+                timeout_seconds=timeout_seconds
             )
             self._record_observation(observation)
         except (AppServerError, CodexTransportControllerError) as exc:
