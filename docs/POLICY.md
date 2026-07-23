@@ -619,6 +619,11 @@ nonce, and expiry. The exporter receives no reusable Chief credential, and
 permit consumption is authorization only; it does not claim that AOI performed
 or observed an upload.
 
+Protected path identity is ASCII-case-insensitive and non-ASCII-exact. This
+matches the common filesystem/AOI/Git-history contract instead of applying a
+Python-only multi-codepoint Unicode fold that Git `icase` cannot prove. Exact
+non-ASCII paths, including CJK names, remain supported.
+
 An omitted or empty `protected` list classifies no project files. AOI may then
 update itself normally: Git push/LFS, remote CI, GitHub Release, package
 publication, external artifact storage, and attachment/connector publication

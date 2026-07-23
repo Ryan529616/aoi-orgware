@@ -78,6 +78,129 @@ def test_empty_snapshot_works_without_aoi_toml(tmp_path: Path) -> None:
     assert receipt["protected_exposures"] == []
 
 
+def test_snapshot_resolves_ascii_case_variant_protected_origin(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    protected = root / "Private" / "Secret.bin"
+    protected.parent.mkdir(parents=True)
+    protected.write_bytes(b"ASCII case variant")
+
+    snapshot = build_publication_policy_snapshot(
+        root,
+        _policy(ProtectedPathRule("private/secret.bin", "file", "local_only")),
+        CONFIG_SHA,
+    )
+    assert snapshot["protected_content"] == [
+        {
+            "rule_path": "private/secret.bin",
+            "path": "Private/Secret.bin",
+            "sha256": hashlib.sha256(b"ASCII case variant").hexdigest(),
+            "size_bytes": len(b"ASCII case variant"),
+        }
+    ]
+
+
+def test_snapshot_keeps_non_ascii_case_expansions_distinct(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    private = root / "private"
+    private.mkdir(parents=True)
+    sharp_s = private / "Straße.bin"
+    expanded = private / "STRASSE.bin"
+    sharp_s.write_bytes(b"sharp-s")
+    expanded.write_bytes(b"expanded")
+    if sharp_s.samefile(expanded):
+        pytest.skip("filesystem aliases the non-ASCII spellings")
+
+    snapshot = build_publication_policy_snapshot(
+        root,
+        _policy(
+            ProtectedPathRule("private/Straße.bin", "file", "local_only"),
+            ProtectedPathRule("private/STRASSE.bin", "file", "local_only"),
+        ),
+        CONFIG_SHA,
+    )
+    assert {row["path"] for row in snapshot["protected_rules"]} == {
+        "private/Straße.bin",
+        "private/STRASSE.bin",
+    }
+    assert {row["path"] for row in snapshot["protected_content"]} == {
+        "private/Straße.bin",
+        "private/STRASSE.bin",
+    }
+
+
+@pytest.mark.parametrize(
+    "rules",
+    (
+        (
+            ProtectedPathRule("a", "tree", "local_only"),
+            ProtectedPathRule("a-", "file", "local_only"),
+            ProtectedPathRule("a/b", "file", "local_only"),
+        ),
+        (
+            ProtectedPathRule("a", "file", "local_only"),
+            ProtectedPathRule("a/b", "file", "local_only"),
+        ),
+    ),
+)
+def test_snapshot_rejects_every_config_overlapping_rule_pair(
+    tmp_path: Path,
+    rules: tuple[ProtectedPathRule, ...],
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    with pytest.raises(PublicationPolicyError, match="overlap or duplicate"):
+        build_publication_policy_snapshot(root, _policy(*rules), CONFIG_SHA)
+
+
+def test_publication_gate_does_not_unicode_casefold_rule_paths(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    private = root / "private"
+    private.mkdir(parents=True)
+    protected = private / "Straße.bin"
+    public = private / "STRASSE.bin"
+    protected.write_bytes(b"protected sharp-s")
+    public.write_bytes(b"separate public bytes")
+    if protected.samefile(public):
+        pytest.skip("filesystem aliases the non-ASCII spellings")
+    snapshot = build_publication_policy_snapshot(
+        root,
+        _policy(ProtectedPathRule("private/Straße.bin", "file", "local_only")),
+        CONFIG_SHA,
+    )
+
+    receipt = preflight_publication_snapshot(
+        snapshot=snapshot,
+        root=root,
+        action="artifact_upload",
+        destination="https://example.invalid/upload",
+        subjects=[public],
+    )
+    assert receipt["decision"] == "allowed"
+    assert receipt["protected_exposures"] == []
+
+
+def test_snapshot_and_gate_support_exact_cjk_protected_path(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    protected = root / "私密" / "檔案.bin"
+    protected.parent.mkdir(parents=True)
+    protected.write_bytes(b"exact CJK path")
+    snapshot = build_publication_policy_snapshot(
+        root,
+        _policy(ProtectedPathRule("私密/檔案.bin", "file", "local_only")),
+        CONFIG_SHA,
+    )
+
+    receipt = preflight_publication_snapshot(
+        snapshot=snapshot,
+        root=root,
+        action="artifact_upload",
+        destination=str(root / "local-destination"),
+        subjects=[protected],
+    )
+    assert receipt["decision"] == "allowed"
+    assert receipt["protected_exposures"][0]["rule_path"] == "私密/檔案.bin"
+
+
 def test_renamed_archive_member_with_protected_digest_is_denied(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()

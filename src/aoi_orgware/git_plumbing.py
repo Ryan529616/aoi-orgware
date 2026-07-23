@@ -67,9 +67,16 @@ def _require_task_id(value: object) -> str:
 
 
 def _git_environment() -> dict[str, str]:
-    """Disable Git's optional locks; a snapshot is strictly read-only."""
+    """Make read-only Git inspection independent of ambient pathspec modes."""
 
     environment = dict(os.environ)
+    for name in (
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ):
+        environment.pop(name, None)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 

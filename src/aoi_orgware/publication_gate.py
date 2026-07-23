@@ -21,6 +21,7 @@ import sys
 from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 from . import publication_subjects
+from .config import fold_protected_path_identity
 from .confidentiality import ConfidentialityError, canonical_publication_destination
 from .publication_policy import (
     PublicationPolicyError,
@@ -171,13 +172,16 @@ def _exposures(
     for subject in inventory["subjects"]:
         matching: dict[str, dict[str, Any]] = {}
         for rule in snapshot["protected_rules"]:
-            path = rule["path"].casefold()
-            candidate = subject["path"].casefold()
+            path = fold_protected_path_identity(rule["path"])
+            candidate = fold_protected_path_identity(subject["path"])
             if candidate == path or (rule["kind"] == "tree" and candidate.startswith(path + "/")):
                 matching[rule["path"]] = rule
         for rule in digest_rules.get(subject["sha256"], []):
             matching[rule["path"]] = rule
-        for rule_path in sorted(matching, key=lambda item: (item.casefold(), item)):
+        for rule_path in sorted(
+            matching,
+            key=lambda item: (fold_protected_path_identity(item), item),
+        ):
             rule = matching[rule_path]
             allowed = (
                 destination.startswith("file:")
@@ -283,7 +287,16 @@ def validate_publication_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
         ):
             _fail(f"publication receipt exposure {index} is invalid")
         normalized.append(dict(row))
-    if exposures != sorted(normalized, key=lambda row: (row["subject_path"].casefold(), row["subject_path"], row["subject_sha256"], row["rule_path"].casefold(), row["rule_path"])):
+    if exposures != sorted(
+        normalized,
+        key=lambda row: (
+            row["subject_path"].casefold(),
+            row["subject_path"],
+            row["subject_sha256"],
+            fold_protected_path_identity(row["rule_path"]),
+            row["rule_path"],
+        ),
+    ):
         _fail("publication receipt exposures are not normalized")
     base = {key: receipt[key] for key in expected - {"receipt_sha256"}}
     if not isinstance(receipt.get("receipt_sha256"), str) or receipt["receipt_sha256"] != _digest(base):

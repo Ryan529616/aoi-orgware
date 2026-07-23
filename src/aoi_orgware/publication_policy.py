@@ -15,6 +15,8 @@ import re
 import stat
 from typing import Any, Mapping, NoReturn
 
+from .config import fold_protected_path_identity, protected_path_prefix_covers
+
 
 SCHEMA_VERSION = 1
 MAX_RULES = 256
@@ -228,10 +230,11 @@ def _safe_path(value: Any, label: str) -> str:
 
 
 def _covers(rule_path: str, kind: str, candidate: str) -> bool:
+    folded_rule = fold_protected_path_identity(rule_path)
+    folded_candidate = fold_protected_path_identity(candidate)
     if kind == "file":
-        return candidate.casefold() == rule_path.casefold()
-    prefix = rule_path.casefold() + "/"
-    return candidate.casefold().startswith(prefix)
+        return folded_candidate == folded_rule
+    return folded_candidate.startswith(folded_rule + "/")
 
 
 def _normalise_rules(value: Any, *, mode: str) -> list[dict[str, Any]]:
@@ -284,17 +287,49 @@ def _normalise_rules(value: Any, *, mode: str) -> list[dict[str, Any]]:
         )
     if mode == "standard" and rows:
         _fail("standard publication policy may not contain protected rules")
-    rows.sort(key=lambda row: (row["path"].casefold(), row["path"]))
-    for previous, current in zip(rows, rows[1:]):
-        if _covers(previous["path"], previous["kind"], current["path"]) or _covers(
-            current["path"], current["kind"], previous["path"]
-        ):
-            _fail("protected rules overlap or duplicate")
+    rows.sort(
+        key=lambda row: (fold_protected_path_identity(row["path"]), row["path"])
+    )
+    for index, current in enumerate(rows):
+        for previous in rows[:index]:
+            if protected_path_prefix_covers(
+                previous["path"], current["path"]
+            ) or protected_path_prefix_covers(current["path"], previous["path"]):
+                _fail("protected rules overlap or duplicate")
     return rows
 
 
-def _walk_protected_tree(root: Path, rule_path: str) -> list[Path]:
-    origin = root.joinpath(*PurePosixPath(rule_path).parts)
+def _resolve_protected_origin(root: Path, rule_path: str) -> Path:
+    current = root
+    observed_entries = 0
+    for component in PurePosixPath(rule_path).parts:
+        _directory(current, f"protected origin {rule_path}")
+        matches: list[str] = []
+        try:
+            with os.scandir(current) as scanner:
+                for entry in scanner:
+                    observed_entries += 1
+                    if observed_entries > MAX_PROTECTED_TREE_ENTRIES:
+                        _fail(
+                            f"protected origin {rule_path} exceeds its entry-count bound"
+                        )
+                    if fold_protected_path_identity(
+                        entry.name
+                    ) == fold_protected_path_identity(component):
+                        matches.append(entry.name)
+                        if len(matches) > 1:
+                            _fail(
+                                f"protected origin {rule_path} has case-colliding entries"
+                            )
+        except OSError as exc:
+            _fail(f"cannot scan protected origin {rule_path}: {exc}")
+        if not matches:
+            _fail(f"cannot inspect protected origin {rule_path}: path is missing")
+        current /= matches[0]
+    return current
+
+
+def _walk_protected_tree(root: Path, rule_path: str, origin: Path) -> list[Path]:
     _directory(origin, f"protected origin {rule_path}")
     pending = [origin]
     files: list[Path] = []
@@ -312,14 +347,20 @@ def _walk_protected_tree(root: Path, rule_path: str) -> list[Path]:
                             f"protected origin {rule_path} exceeds its entry-count bound"
                         )
                     entries.append(entry)
-            entries.sort(key=lambda entry: (entry.name.casefold(), entry.name))
+            entries.sort(
+                key=lambda entry: (
+                    fold_protected_path_identity(entry.name),
+                    entry.name,
+                )
+            )
         except OSError as exc:
             _fail(f"cannot scan protected origin {rule_path}: {exc}")
         folded: set[str] = set()
         for entry in entries:
-            if entry.name.casefold() in folded:
+            folded_name = fold_protected_path_identity(entry.name)
+            if folded_name in folded:
                 _fail(f"protected origin {rule_path} has case-colliding entries")
-            folded.add(entry.name.casefold())
+            folded.add(folded_name)
             candidate = Path(entry.path)
             try:
                 metadata = candidate.lstat()
@@ -335,7 +376,10 @@ def _walk_protected_tree(root: Path, rule_path: str) -> list[Path]:
                 files.append(candidate)
             else:
                 _fail(f"protected origin {rule_path} contains a special entry")
-    return sorted(files, key=lambda item: (str(item).casefold(), str(item)))
+    return sorted(
+        files,
+        key=lambda item: (fold_protected_path_identity(str(item)), str(item)),
+    )
 
 
 def protected_content_identities(root: Path | str, rules: Any) -> list[dict[str, Any]]:
@@ -349,11 +393,11 @@ def protected_content_identities(root: Path | str, rules: Any) -> list[dict[str,
     total_bytes = 0
     for rule in checked_rules:
         rule_path = rule["path"]
-        origin = checked_root.joinpath(*PurePosixPath(rule_path).parts)
+        origin = _resolve_protected_origin(checked_root, rule_path)
         files = (
             [origin]
             if rule["kind"] == "file"
-            else _walk_protected_tree(checked_root, rule_path)
+            else _walk_protected_tree(checked_root, rule_path, origin)
         )
         for file_path in files:
             if len(rows) >= MAX_CONTENT:
@@ -375,7 +419,14 @@ def protected_content_identities(root: Path | str, rules: Any) -> list[dict[str,
             rows.append(
                 {"rule_path": rule_path, "path": actual, "sha256": digest, "size_bytes": size}
             )
-    rows.sort(key=lambda row: (row["rule_path"].casefold(), row["rule_path"], row["path"].casefold(), row["path"]))
+    rows.sort(
+        key=lambda row: (
+            fold_protected_path_identity(row["rule_path"]),
+            row["rule_path"],
+            fold_protected_path_identity(row["path"]),
+            row["path"],
+        )
+    )
     if len(rows) > MAX_CONTENT:
         _fail("protected content exceeds its entry-count bound")
     return rows
@@ -488,12 +539,22 @@ def validate_publication_policy_snapshot(snapshot: Mapping[str, Any]) -> dict[st
         total_bytes += size
         if total_bytes > MAX_PROTECTED_TOTAL_BYTES:
             _fail("publication policy snapshot protected content exceeds its total-byte bound")
-        key = (rule_path.casefold(), actual.casefold())
+        key = (
+            fold_protected_path_identity(rule_path),
+            fold_protected_path_identity(actual),
+        )
         if key in seen:
             _fail("publication policy snapshot has duplicate protected content")
         seen.add(key)
         normalized_content.append({"rule_path": rule_path, "path": actual, "sha256": digest, "size_bytes": size})
-    normalized_content.sort(key=lambda row: (row["rule_path"].casefold(), row["rule_path"], row["path"].casefold(), row["path"]))
+    normalized_content.sort(
+        key=lambda row: (
+            fold_protected_path_identity(row["rule_path"]),
+            row["rule_path"],
+            fold_protected_path_identity(row["path"]),
+            row["path"],
+        )
+    )
     if content != normalized_content:
         _fail("publication policy snapshot protected content is not normalized")
     base = {key: snapshot[key] for key in expected - {"snapshot_sha256"}}

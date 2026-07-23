@@ -240,9 +240,26 @@ def _safe_project_relative_prefix(value: Any, label: str) -> str:
     return canonical + ("/" if directory_prefix else "")
 
 
+_PROTECTED_PATH_ASCII_FOLD = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def fold_protected_path_identity(value: str) -> str:
+    """Fold only ASCII case; all non-ASCII path code points remain exact."""
+
+    return value.translate(_PROTECTED_PATH_ASCII_FOLD)
+
+
+def protected_path_prefix_covers(prefix: str, path: str) -> bool:
+    # Git pathspec icase is ASCII-oriented.  Using that same bounded identity
+    # avoids Python multi-codepoint Unicode folds that Git history cannot prove.
+    canonical = fold_protected_path_identity(prefix.rstrip("/"))
+    candidate = fold_protected_path_identity(path)
+    return candidate == canonical or candidate.startswith(canonical + "/")
+
+
 def _prefix_covers_path(prefix: str, path: str) -> bool:
-    # One cross-platform identity prevents a policy accepted on POSIX from
-    # becoming overlapping or bypassable on a case-insensitive Windows tree.
     canonical = prefix.rstrip("/").casefold()
     candidate = path.casefold()
     return candidate == canonical or candidate.startswith(canonical + "/")
@@ -319,9 +336,9 @@ def _protected_rules(value: Any, *, mode: str) -> tuple[ProtectedPathRule, ...]:
                 f"{label} local_only rules may not define a home destination"
             )
         for earlier in rules:
-            if _prefix_covers_path(earlier.path, path) or _prefix_covers_path(
-                path, earlier.path
-            ):
+            if protected_path_prefix_covers(
+                earlier.path, path
+            ) or protected_path_prefix_covers(path, earlier.path):
                 raise ValueError(
                     "confidentiality.protected contains overlapping paths: "
                     f"{earlier.path!r} and {path!r}"

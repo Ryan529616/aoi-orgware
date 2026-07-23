@@ -229,6 +229,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   recovery, and per-mutation tag rechecks keep draft crash recovery fail closed.
   An independent read-only API/download/hash readback must then pass before the
   no-checkout OIDC PyPI job can start.
+  Protected current-byte lookup, Git history/index/tree correlation, tracked
+  publication snapshots, artifact gates, and doctor now use one
+  ASCII-case-folded, non-ASCII-exact path identity on Windows and POSIX, while
+  rejecting multiple case-distinct spellings as ambiguous instead of selecting
+  one. Exact non-ASCII paths remain supported without relying on Python-only
+  multi-codepoint folds that Git history cannot prove.
+  Ambient Git pathspec modes are scrubbed, and cached unfiltered history trees
+  share one aggregate bound so hostile environment or repository shape cannot
+  silently weaken lineage inspection.
   Doctor reports rules,
   remotes, rewrites, LFS, workflows, sync/network storage, credential
   names/helpers, and receipts without exposing credential values; external

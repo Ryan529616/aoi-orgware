@@ -156,6 +156,12 @@ receipt through a changed config. If the configured protected origin is missing
 at publication time, preflight fails closed; restore the file/tree or explicitly
 change the reviewed rule before publication.
 
+Protected path identity is ASCII-case-insensitive and non-ASCII-exact. This is
+the common contract supported by filesystem lookup, AOI tree filtering, and Git
+history pathspecs; it deliberately does not apply Python-only multi-codepoint
+Unicode folds such as treating `Straße` and `STRASSE` as one path. Exact Unicode
+paths, including CJK names, remain supported.
+
 For package, release-asset, CI, attachment, connector, or artifact boundaries,
 use `confidentiality-publication-preflight` with every exact file/directory that
 will leave the project. AOI inventories regular files and bounded wheel/ZIP and

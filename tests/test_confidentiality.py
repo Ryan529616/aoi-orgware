@@ -584,6 +584,27 @@ def test_doctor_binds_protected_path_to_exact_home_destination(tmp_path: Path) -
     assert any("destination drifted" in item for item in drifted["errors"])
 
 
+def test_doctor_reports_case_variant_protected_file_as_present_and_tracked(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path / "project")
+    protected = root / "Private" / "Secret.bin"
+    protected.parent.mkdir()
+    protected.write_bytes(b"case-folded identity")
+    _commit(root, "protected case variant")
+    _git(root, "remote", "add", "origin", "https://example.invalid/home.git")
+
+    report = _report(root, policy=_protected_home())
+    assert report["errors"] == []
+    assert not any(
+        "not currently Git-tracked" in item for item in report["warnings"]
+    )
+    row = report["protected"]["rules"][0]
+    assert row["exists"] is True
+    assert row["tracked_path_count"] == 1
+    assert row["content_count"] == 1
+
+
 def test_doctor_rejects_protected_push_without_bound_preflight(tmp_path: Path) -> None:
     root = _repo(tmp_path / "project")
     protected = root / "private" / "secret.bin"
@@ -1175,6 +1196,239 @@ def test_git_preflight_protects_case_variant_path_identity(tmp_path: Path) -> No
         )
 
 
+def test_git_preflight_keeps_non_ascii_path_identity_exact(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "project")
+    protected = root / "private" / "Straße.bin"
+    protected.parent.mkdir()
+    protected.write_bytes(b"unicode spelling")
+    head = _commit(root, "non-ASCII protected spelling")
+    _git(root, "remote", "add", "mirror", "https://example.invalid/other.git")
+    policy = ConfidentialityConfig(
+        mode="local_files",
+        model_context="allowed",
+        git_push="deny",
+        remote_ci="deny",
+        artifact_upload="deny",
+        external_export="permit_required",
+        local_cas=True,
+        protected=(
+            ProtectedPathRule(
+                path="private/STRASSE.bin",
+                kind="file",
+                policy="home_remote_only",
+                home_remote="origin",
+                home_destination="https://example.invalid/home.git",
+            ),
+        ),
+    )
+    with pytest.raises(ConfidentialityError, match="protected path is missing"):
+        preflight_git_push(
+            root=root,
+            policy=policy,
+            config_sha256="a" * 64,
+            remote="mirror",
+            destination="https://example.invalid/other.git",
+            updates=[
+                ("refs/heads/main", head, "refs/heads/main", "0" * len(head))
+            ],
+        )
+
+
+def test_git_preflight_supports_exact_non_ascii_protected_path(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "project")
+    home = _bare_repo(tmp_path / "home.git")
+    protected = root / "私密" / "檔案.bin"
+    protected.parent.mkdir()
+    protected.write_bytes(b"exact unicode path")
+    head = _commit(root, "exact non-ASCII protected path")
+    _git(root, "remote", "add", "origin", home.as_posix())
+    policy = ConfidentialityConfig(
+        mode="local_files",
+        model_context="allowed",
+        git_push="deny",
+        remote_ci="deny",
+        artifact_upload="deny",
+        external_export="permit_required",
+        local_cas=True,
+        protected=(
+            ProtectedPathRule(
+                path="私密/檔案.bin",
+                kind="file",
+                policy="home_remote_only",
+                home_remote="origin",
+                home_destination=home.as_posix(),
+            ),
+        ),
+    )
+    receipt = preflight_git_push(
+        root=root,
+        policy=policy,
+        config_sha256="a" * 64,
+        remote="origin",
+        destination=home.as_posix(),
+        updates=[("refs/heads/main", head, "refs/heads/main", "0" * len(head))],
+    )
+    assert [row["path"] for row in receipt["protected_exposures"]] == [
+        "私密/檔案.bin"
+    ]
+
+
+def test_git_preflight_rejects_ambiguous_casefold_path_identity(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path / "project")
+    parent = root / "private"
+    parent.mkdir()
+    upper = parent / "Secret.bin"
+    lower = parent / "secret.bin"
+    upper.write_bytes(b"upper spelling")
+    lower.write_bytes(b"lower spelling")
+    if upper.samefile(lower):
+        pytest.skip("filesystem does not permit case-distinct path identities")
+    head = _commit(root, "ambiguous protected case variants")
+    _git(root, "remote", "add", "mirror", "https://example.invalid/other.git")
+    policy = ConfidentialityConfig(
+        mode="local_files",
+        model_context="allowed",
+        git_push="deny",
+        remote_ci="deny",
+        artifact_upload="deny",
+        external_export="permit_required",
+        local_cas=True,
+        protected=(
+            ProtectedPathRule(
+                path="private/secret.bin",
+                kind="file",
+                policy="home_remote_only",
+                home_remote="origin",
+                home_destination="https://example.invalid/home.git",
+            ),
+        ),
+    )
+    with pytest.raises(ConfidentialityError, match="ambiguous case-fold identity"):
+        preflight_git_push(
+            root=root,
+            policy=policy,
+            config_sha256="a" * 64,
+            remote="mirror",
+            destination="https://example.invalid/other.git",
+            updates=[
+                ("refs/heads/main", head, "refs/heads/main", "0" * len(head))
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "ambient_pathspec_mode",
+    (
+        None,
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ),
+)
+def test_git_preflight_follows_case_variant_historical_blob_after_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambient_pathspec_mode: str | None,
+) -> None:
+    root = _repo(tmp_path / "project")
+    home = _bare_repo(tmp_path / "home.git")
+    protected = root / "Private" / "Secret.bin"
+    protected.parent.mkdir()
+    old_bytes = b"historical protected bytes"
+    protected.write_bytes(old_bytes)
+    base = _commit(root, "protected case-variant base")
+    _git(root, "remote", "add", "origin", home.as_posix())
+    _git(root, "push", "origin", "HEAD:refs/heads/main")
+
+    protected.write_bytes(b"current protected bytes")
+    copied = root / "public" / "renamed.bin"
+    copied.parent.mkdir()
+    copied.write_bytes(old_bytes)
+    head = _commit(root, "copy historical bytes and revise protected origin")
+    if ambient_pathspec_mode is not None:
+        monkeypatch.setenv(ambient_pathspec_mode, "1")
+
+    receipt = preflight_git_push(
+        root=root,
+        policy=_protected_home(home.as_posix()),
+        config_sha256="a" * 64,
+        remote="origin",
+        destination=home.as_posix(),
+        updates=[("refs/heads/main", head, "refs/heads/main", base)],
+    )
+    historical = [
+        row
+        for row in receipt["protected_exposures"]
+        if row["path"] == "public/renamed.bin"
+    ]
+    assert len(historical) == 1
+    assert historical[0]["content_sha256"] == hashlib.sha256(old_bytes).hexdigest()
+    assert historical[0]["rule_path"] == "private/secret.bin"
+
+
+def test_git_preflight_bounds_aggregate_unfiltered_history_trees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path / "project")
+    home = _bare_repo(tmp_path / "home.git")
+    protected = root / "private" / "secret.bin"
+    protected.parent.mkdir()
+    protected.write_bytes(b"base protected bytes")
+    (root / "public.txt").write_text("public\n", encoding="utf-8")
+    base = _commit(root, "two-entry protected base")
+    _git(root, "remote", "add", "origin", home.as_posix())
+    _git(root, "push", "origin", "HEAD:refs/heads/main")
+    protected.write_bytes(b"revised protected bytes")
+    head = _commit(root, "two-entry protected successor")
+    monkeypatch.setattr(confidentiality, "MAX_GIT_TREE_ENTRIES", 3)
+
+    with pytest.raises(ConfidentialityError, match="aggregate tree inspection"):
+        preflight_git_push(
+            root=root,
+            policy=_protected_home(home.as_posix()),
+            config_sha256="a" * 64,
+            remote="origin",
+            destination=home.as_posix(),
+            updates=[("refs/heads/main", head, "refs/heads/main", base)],
+        )
+
+
+def test_git_preflight_loads_one_tree_once_across_history_and_outgoing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path / "project")
+    home = _bare_repo(tmp_path / "home.git")
+    protected = root / "private" / "secret.bin"
+    protected.parent.mkdir()
+    protected.write_bytes(b"one protected entry")
+    head = _commit(root, "one-entry protected tree")
+    _git(root, "remote", "add", "origin", home.as_posix())
+    monkeypatch.setattr(confidentiality, "MAX_GIT_TREE_ENTRIES", 1)
+    original = confidentiality._git_tree_entries
+    calls: list[str] = []
+
+    def observed_tree_entries(project: Path, commit: str) -> list[dict[str, str]]:
+        calls.append(commit)
+        return original(project, commit)
+
+    monkeypatch.setattr(confidentiality, "_git_tree_entries", observed_tree_entries)
+    receipt = preflight_git_push(
+        root=root,
+        policy=_protected_home(home.as_posix()),
+        config_sha256="a" * 64,
+        remote="origin",
+        destination=home.as_posix(),
+        updates=[("refs/heads/main", head, "refs/heads/main", "0" * len(head))],
+    )
+    assert receipt["decision"] == "allowed"
+    assert calls == [head]
+
+
 def test_cli_git_preflight_emits_bound_receipt_and_denies_other_repo(
     tmp_path: Path,
 ) -> None:
@@ -1568,6 +1822,34 @@ def test_protected_tree_rejects_linked_content(tmp_path: Path) -> None:
                     "path": "target.bin",
                     "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
                 }
+            ],
+        )
+
+
+def test_git_preflight_rejects_casefold_collision_inside_protected_tree(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path / "project")
+    private = root / "Private"
+    private.mkdir()
+    upper = private / "Secret.bin"
+    lower = private / "secret.bin"
+    upper.write_bytes(b"upper spelling")
+    lower.write_bytes(b"lower spelling")
+    if upper.samefile(lower):
+        pytest.skip("filesystem does not permit case-distinct path identities")
+    head = _commit(root, "ambiguous protected tree descendants")
+    _git(root, "remote", "add", "external", "https://example.invalid/other.git")
+
+    with pytest.raises(ConfidentialityError, match="ambiguous case-fold identity"):
+        preflight_git_push(
+            root=root,
+            policy=_protected_local(),
+            config_sha256="a" * 64,
+            remote="external",
+            destination="https://example.invalid/other.git",
+            updates=[
+                ("refs/heads/main", head, "refs/heads/main", "0" * len(head))
             ],
         )
 

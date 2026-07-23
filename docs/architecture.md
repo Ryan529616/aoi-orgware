@@ -438,6 +438,10 @@ must have an exact receipt for the current protected-policy digest. A remote
 alias or worktree change therefore does not split coverage, and a same-tip
 retroactive receipt is rejected; rule changes require a genuinely outgoing
 governed successor (which may be an intentional empty commit).
+Protected path matching is ASCII-case-insensitive and non-ASCII-exact across
+config admission, filesystem lookup, Git history/index/tree correlation, and
+doctor. Exact CJK and other non-ASCII paths remain supported, but AOI does not
+claim Python's wider multi-codepoint Unicode folding matches Git `icase`.
 
 Generic artifact/package/attachment paths use the same policy evaluator over a
 bounded exact inventory. The publication preflight binds outer container

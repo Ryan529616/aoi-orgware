@@ -23,6 +23,7 @@ from .config import (
     MAX_PROTECTED_PATH_RULES,
     ConfidentialityConfig,
     ProtectedPathRule,
+    fold_protected_path_identity,
 )
 from . import external_exports
 from . import publication_subjects
@@ -557,8 +558,8 @@ def _canonical_subject_path(value: object, label: str) -> str:
 
 
 def _rule_covers_path(rule: ProtectedPathRule, path: str) -> bool:
-    rule_path = rule.path.casefold()
-    candidate = path.casefold()
+    rule_path = fold_protected_path_identity(rule.path)
+    candidate = fold_protected_path_identity(path)
     return candidate == rule_path or (
         rule.kind == "tree" and candidate.startswith(rule_path + "/")
     )
@@ -610,11 +611,19 @@ def _protected_tree_files(root: Path, tree: Path) -> list[Path]:
             raise ConfidentialityError(
                 f"protected tree could not be enumerated: {directory}"
             ) from exc
+        folded_children: dict[str, str] = {}
         for child in children:
             observed_entries += 1
             if observed_entries > MAX_PROTECTED_CONTENT_FILES:
                 raise ConfidentialityError(
                     "protected content exceeds the configured entry-count bound"
+                )
+            folded_name = fold_protected_path_identity(child.name)
+            previous_name = folded_children.setdefault(folded_name, child.name)
+            if previous_name != child.name:
+                raise ConfidentialityError(
+                    "protected tree has an ambiguous case-fold identity: "
+                    f"{child.relative_to(root)}"
                 )
             if _path_is_link_or_reparse(child):
                 raise ConfidentialityError(
@@ -629,6 +638,92 @@ def _protected_tree_files(root: Path, tree: Path) -> list[Path]:
                     f"protected tree contains an unsupported entry: {child}"
                 )
     return sorted(result, key=lambda item: item.as_posix())
+
+
+def _resolve_protected_path_casefold(root: Path, configured_path: str) -> Path:
+    """Resolve one policy path with the same case-folded identity used by gates.
+
+    Git exposure matching is deliberately case-insensitive on every platform.
+    The current-byte lookup must therefore find a differently-cased filesystem
+    spelling on case-sensitive hosts too.  Multiple spellings of one folded
+    component are ambiguous and fail closed instead of selecting one.
+    """
+
+    root = root.resolve(strict=True)
+    current = root
+    observed_entries = 0
+    for component in PurePosixPath(configured_path).parts:
+        if _path_is_link_or_reparse(current):
+            raise ConfidentialityError(
+                "protected path case-fold lookup traverses a link/reparse point"
+            )
+        if not current.is_dir():
+            raise ConfidentialityError(
+                f"protected path is missing before publication: {configured_path}; "
+                "restore it or explicitly revise the protected-path policy"
+            )
+        matches: list[str] = []
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    observed_entries += 1
+                    if observed_entries > MAX_PROTECTED_CONTENT_FILES:
+                        raise ConfidentialityError(
+                            "protected path case-fold lookup exceeds the configured "
+                            "entry-count bound"
+                        )
+                    if fold_protected_path_identity(
+                        entry.name
+                    ) == fold_protected_path_identity(component):
+                        matches.append(entry.name)
+                        if len(matches) > 1:
+                            raise ConfidentialityError(
+                                "protected path has an ambiguous case-fold identity: "
+                                f"{configured_path}"
+                            )
+        except OSError as exc:
+            raise ConfidentialityError(
+                f"protected path could not be enumerated: {configured_path}"
+            ) from exc
+        if not matches:
+            raise ConfidentialityError(
+                f"protected path is missing before publication: {configured_path}; "
+                "restore it or explicitly revise the protected-path policy"
+            )
+        current = current / matches[0]
+    return current
+
+
+def _require_unambiguous_casefold_git_paths(
+    paths: Iterable[str],
+    *,
+    rule: ProtectedPathRule,
+    label: str,
+) -> list[str]:
+    """Validate actual Git path spellings returned for one protected rule."""
+
+    validated: list[str] = []
+    spellings: dict[tuple[str, ...], tuple[str, ...]] = {}
+    for raw_path in paths:
+        path = _canonical_subject_path(raw_path, label)
+        if not _rule_covers_path(rule, path):
+            raise ConfidentialityError(
+                f"{label} returned a path outside the protected rule"
+            )
+        parts = PurePosixPath(path).parts
+        for length in range(1, len(parts) + 1):
+            exact_prefix = parts[:length]
+            folded_prefix = tuple(
+                fold_protected_path_identity(part) for part in exact_prefix
+            )
+            previous = spellings.setdefault(folded_prefix, exact_prefix)
+            if previous != exact_prefix:
+                raise ConfidentialityError(
+                    f"{label} has an ambiguous case-fold identity for "
+                    f"protected path {rule.path!r}"
+                )
+        validated.append(path)
+    return validated
 
 
 def _stable_regular_file_hashes(
@@ -724,7 +819,7 @@ def _protected_content_identities(
     file_count = 0
     total_bytes = 0
     for rule in policy.protected:
-        candidate = root / PurePosixPath(rule.path)
+        candidate = _resolve_protected_path_casefold(root, rule.path)
         if not _path_within(candidate.resolve(strict=False), root):
             raise ConfidentialityError("protected path escapes the project root")
         if rule.kind == "file":
@@ -758,14 +853,9 @@ def _protected_current_git_blob_identities(
     file_count = 0
     total_bytes = 0
     for rule in policy.protected:
-        candidate = root / PurePosixPath(rule.path)
+        candidate = _resolve_protected_path_casefold(root, rule.path)
         if not _path_within(candidate.resolve(strict=False), root):
             raise ConfidentialityError("protected path escapes the project root")
-        if not os.path.lexists(candidate):
-            raise ConfidentialityError(
-                f"protected path is missing before publication: {rule.path}; "
-                "restore it or explicitly revise the protected-path policy"
-            )
         if rule.kind == "file":
             _require_no_link_traversal(root, candidate, label="protected file")
             paths = [candidate]
@@ -1110,12 +1200,11 @@ def _revision_commits(
 def _git_tree_entries(
     root: Path,
     commit: str,
-    *,
-    path: str | None = None,
 ) -> list[dict[str, str]]:
     arguments = ["ls-tree", "-r", "-z", "--full-tree", commit]
-    if path is not None:
-        arguments.extend(("--", f":(literal){path}"))
+    # Unlike rev-list and ls-files, ls-tree rejects the icase pathspec magic.
+    # Read its bounded full tree and apply AOI's case-folded rule correlation to
+    # the strict actual paths below instead of silently falling back to exact case.
     raw = _git_confidentiality_bytes(
         root,
         arguments,
@@ -1154,6 +1243,23 @@ def _git_tree_entries(
             }
         )
     return entries
+
+
+def _git_tree_entries_for_rule(
+    entries: Iterable[dict[str, str]],
+    *,
+    rule: ProtectedPathRule,
+    label: str,
+) -> list[dict[str, str]]:
+    filtered = [
+        entry for entry in entries if _rule_covers_path(rule, entry["path"])
+    ]
+    _require_unambiguous_casefold_git_paths(
+        (entry["path"] for entry in filtered),
+        rule=rule,
+        label=label,
+    )
+    return filtered
 
 
 def _git_blob_sha256(root: Path, oid: str) -> tuple[str, int]:
@@ -1411,6 +1517,21 @@ def preflight_git_push(
         if key.startswith("url.")
         and key.endswith((".pushinsteadof", ".insteadof"))
     ]
+    tree_cache: dict[str, list[dict[str, str]]] = {}
+    aggregate_tree_entries = 0
+
+    def load_tree(commit: str) -> list[dict[str, str]]:
+        nonlocal aggregate_tree_entries
+        if commit not in tree_cache:
+            entries = _git_tree_entries(root, commit)
+            aggregate_tree_entries += len(entries)
+            if aggregate_tree_entries > MAX_GIT_TREE_ENTRIES:
+                raise ConfidentialityError(
+                    "Git push aggregate tree inspection exceeds the configured bound"
+                )
+            tree_cache[commit] = entries
+        return tree_cache[commit]
+
     sensitive_rules_by_oid = _protected_current_git_blob_identities(root, policy)
     history_tree_scans = 0
     for rule in policy.protected:
@@ -1424,7 +1545,7 @@ def preflight_git_push(
                         f"--max-count={MAX_GIT_PUSH_COMMITS + 1}",
                         local_sha,
                         "--",
-                        f":(literal){rule.path}",
+                        f":(icase,literal){rule.path}",
                     ),
                     label="protected Git history inspection",
                 )
@@ -1435,7 +1556,11 @@ def preflight_git_push(
                 raise ConfidentialityError(
                     "protected Git history exceeds the configured scan bound"
                 )
-            for entry in _git_tree_entries(root, commit, path=rule.path):
+            for entry in _git_tree_entries_for_rule(
+                load_tree(commit),
+                rule=rule,
+                label="protected Git tree inspection",
+            ):
                 if entry["type"] == "blob" and _rule_covers_path(
                     rule, entry["path"]
                 ):
@@ -1443,14 +1568,14 @@ def preflight_git_push(
 
     exposures: list[dict[str, Any]] = []
     seen_exposures: set[tuple[str, str, str, str]] = set()
-    total_tree_entries = 0
     blob_digests: dict[str, tuple[str, int]] = {}
     for commit in sorted(outgoing) if policy.protected else ():
-        entries = _git_tree_entries(root, commit)
-        total_tree_entries += len(entries)
-        if total_tree_entries > MAX_GIT_TREE_ENTRIES:
-            raise ConfidentialityError(
-                "Git push combined trees exceed the configured entry bound"
+        entries = load_tree(commit)
+        for rule in policy.protected:
+            _git_tree_entries_for_rule(
+                entries,
+                rule=rule,
+                label="outgoing protected Git tree inspection",
             )
         for entry in entries:
             rules = {
@@ -2070,37 +2195,55 @@ def _protected_rule_report(
     remote_names = set(remotes)
     rows: list[dict[str, Any]] = []
     for rule in policy.protected:
-        candidate = root / PurePosixPath(rule.path)
-        exists = candidate.exists()
+        candidate: Path | None
+        try:
+            candidate = _resolve_protected_path_casefold(root, rule.path)
+        except ConfidentialityError as exc:
+            candidate = None
+            errors.append(
+                f"protected {rule.kind} inspection failed for {rule.path}: {exc}"
+            )
+        exists = candidate is not None
         linked = False
-        if exists:
+        if candidate is not None:
             try:
                 linked = _path_is_link_or_reparse(candidate)
             except ConfidentialityError as exc:
                 errors.append(str(exc))
                 linked = True
-        if not exists:
-            errors.append(f"protected {rule.kind} is missing: {rule.path}")
-        elif linked:
+        if linked:
             errors.append(f"protected {rule.kind} is linked/reparsed: {rule.path}")
-        elif rule.kind == "file" and not candidate.is_file():
+        elif candidate is not None and rule.kind == "file" and not candidate.is_file():
             errors.append(f"protected file is not a regular file: {rule.path}")
-        elif rule.kind == "tree" and not candidate.is_dir():
+        elif candidate is not None and rule.kind == "tree" and not candidate.is_dir():
             errors.append(f"protected tree is not a directory: {rule.path}")
         tracked_raw = _git_confidentiality_bytes(
             root,
-            ("ls-files", "-z", "--", f":(literal){rule.path}"),
+            ("ls-files", "-z", "--", f":(icase,literal){rule.path}"),
             label="protected Git tracking inspection",
         )
         if tracked_raw and not tracked_raw.endswith(b"\x00"):
             raise ConfidentialityError(
                 "protected Git tracking output is not NUL terminated"
             )
-        tracked = [item for item in tracked_raw.split(b"\x00") if item]
-        if len(tracked) > MAX_PROTECTED_CONTENT_FILES:
+        raw_tracked = [item for item in tracked_raw.split(b"\x00") if item]
+        if len(raw_tracked) > MAX_PROTECTED_CONTENT_FILES:
             raise ConfidentialityError(
                 "protected Git tracking output exceeds the configured bound"
             )
+        try:
+            decoded_tracked = [
+                item.decode("utf-8", errors="strict") for item in raw_tracked
+            ]
+        except UnicodeDecodeError as exc:
+            raise ConfidentialityError(
+                "protected Git tracking paths are not strict UTF-8"
+            ) from exc
+        tracked = _require_unambiguous_casefold_git_paths(
+            decoded_tracked,
+            rule=rule,
+            label="protected Git tracking inspection",
+        )
         if exists and not tracked:
             warnings.append(
                 f"protected {rule.kind} is not currently Git-tracked: {rule.path}"
