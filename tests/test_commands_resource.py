@@ -62,6 +62,8 @@ class RelocationContractTests(unittest.TestCase):
         "cmd_override_revoke",
         "cmd_codex_config_plan",
         "cmd_codex_config_apply",
+        "cmd_codex_config_migrate_legacy_plan",
+        "cmd_codex_config_migrate_legacy",
         "cmd_codex_config_rollback",
     )
 
@@ -88,6 +90,12 @@ class RelocationContractTests(unittest.TestCase):
             "override-revoke": resource_cmds.cmd_override_revoke,
             "codex-config-plan": resource_cmds.cmd_codex_config_plan,
             "codex-config-apply": resource_cmds.cmd_codex_config_apply,
+            "codex-config-migrate-legacy-plan": (
+                resource_cmds.cmd_codex_config_migrate_legacy_plan
+            ),
+            "codex-config-migrate-legacy": (
+                resource_cmds.cmd_codex_config_migrate_legacy
+            ),
             "codex-config-rollback": resource_cmds.cmd_codex_config_rollback,
             "codex-session-register": resource_cmds.cmd_codex_session_register,
         }

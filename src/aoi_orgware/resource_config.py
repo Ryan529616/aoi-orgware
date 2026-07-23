@@ -25,12 +25,96 @@ from .harnesslib import (
     atomic_write_bytes,
     canonicalize_no_link_traversal,
     fsync_directory,
+    parse_tz_aware_time,
     validate_id,
 )
 
 
 RESOURCE_PLAN_SCHEMA_VERSION = 1
 RESOURCE_RECEIPT_SCHEMA_VERSION = 2
+LEGACY_RESOURCE_CONFIG_MIGRATION_SCHEMA_VERSION = 1
+LEGACY_RESOURCE_CONFIG_MIGRATION_MAX_BYTES = 1024 * 1024
+LEGACY_RESOURCE_CONFIG_MIGRATION_KIND = (
+    "rolled_back_pre_applicability_resource_config_v1"
+)
+LEGACY_RESOURCE_CONFIG_MIGRATION_DISPOSITION = (
+    "rolled_back_history_only_no_applicability_inference"
+)
+LEGACY_RESOURCE_CONFIG_EVENT_MISSING_FIELDS = (
+    "applicability_basis",
+    "config_applicability",
+    "inapplicable_acknowledged",
+)
+LEGACY_RESOURCE_CONFIG_PLAN_MISSING_FIELDS = (
+    "applicability_basis",
+    "codex_home",
+    "config_applicability",
+    "invocation_cwd",
+)
+LEGACY_RESOURCE_CONFIG_EVENT_FIELDS = frozenset(
+    {
+        "integrity_version",
+        "event_id",
+        "status",
+        "plan_sha256",
+        "task_plan_sha256",
+        "override_id",
+        "receipt_path",
+        "receipt_sha256",
+        "resolved",
+        "dynamic_envelope",
+        "execution_selection_id",
+        "required_locks",
+        "restart_required",
+        "root_session_id",
+        "applied_at",
+        "rollback",
+    }
+)
+LEGACY_RESOURCE_CONFIG_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "event_id",
+        "task_id",
+        "plan_sha256",
+        "plan",
+        "override_id",
+        "root_session_id",
+        "applied_at",
+        "restart_required",
+        "files",
+        "authority_boundary",
+    }
+)
+LEGACY_RESOURCE_CONFIG_PLAN_FIELDS = frozenset(
+    {
+        "schema_version",
+        "event_id",
+        "task_id",
+        "approved_task_plan_sha256",
+        "project_root",
+        "aoi_config_sha256",
+        "demand",
+        "resolved",
+        "dynamic_envelope",
+        "policy_ceiling",
+        "override_id",
+        "selection_role_settings",
+        "override_settings",
+        "required_locks",
+        "files",
+        "restart_required",
+        "routing_evidence_boundary",
+        "non_overridable_guardrails",
+        "plan_sha256",
+    }
+)
+LEGACY_RESOURCE_CONFIG_MIGRATION_AUTHORITY_BOUNDARY = (
+    "Chief-fenced compatibility record for one exact rolled-back resource "
+    "configuration created before applicability fields existed. The original "
+    "event and receipt remain unchanged; no applicability, activation, routing, "
+    "or release status is inferred."
+)
 RESOURCE_FILE_MAX_BYTES = 512 * 1024
 RESOURCE_FILE_MAX_COUNT = 64
 RESOURCE_TOTAL_MAX_BYTES = 4 * 1024 * 1024
@@ -1103,6 +1187,291 @@ def make_resource_receipt(
 
 def receipt_sha256(receipt: dict[str, Any]) -> str:
     return _sha256(_canonical_json(receipt))
+
+
+def resource_config_record_sha256(record: dict[str, Any]) -> str:
+    """Return the canonical digest used to bind resource migration preimages."""
+
+    return _sha256(_canonical_json(record))
+
+
+def is_legacy_pre_applicability_resource_config(
+    event: dict[str, Any], receipt: dict[str, Any]
+) -> bool:
+    """Recognize only the exact pre-applicability event/plan omission shape."""
+
+    plan = receipt.get("plan")
+    return (
+        event.get("status") == "rolled_back"
+        and isinstance(event.get("rollback"), dict)
+        and isinstance(plan, dict)
+        and set(event) == LEGACY_RESOURCE_CONFIG_EVENT_FIELDS
+        and set(receipt) == LEGACY_RESOURCE_CONFIG_RECEIPT_FIELDS
+        and set(plan) == LEGACY_RESOURCE_CONFIG_PLAN_FIELDS
+        and all(
+            field not in event
+            for field in LEGACY_RESOURCE_CONFIG_EVENT_MISSING_FIELDS
+        )
+        and all(
+            field not in plan
+            for field in LEGACY_RESOURCE_CONFIG_PLAN_MISSING_FIELDS
+        )
+    )
+
+
+def make_legacy_resource_config_migration_receipt(
+    *,
+    task_id: str,
+    event: dict[str, Any],
+    legacy_receipt: dict[str, Any],
+    legacy_receipt_sha256: str,
+    migration_task_plan_sha256: str,
+    reason: str,
+    root_session_id: str,
+    chief_session_id: str,
+    chief_epoch: int,
+    chief_authority_record_sha256: str,
+    migrated_at: str,
+    aoi_version: str,
+) -> dict[str, Any]:
+    """Build one explicit receipt without rewriting legacy event/receipt bytes."""
+
+    task_id = validate_id(task_id, "legacy resource config migration task id")
+    validate_resource_receipt(legacy_receipt)
+    if not is_legacy_pre_applicability_resource_config(event, legacy_receipt):
+        raise HarnessError(
+            "resource config event is not exact rolled-back pre-applicability history"
+        )
+    legacy_plan = legacy_receipt["plan"]
+    if (
+        legacy_receipt.get("event_id") != event.get("event_id")
+        or legacy_receipt.get("task_id") != task_id
+        or legacy_receipt.get("plan_sha256") != event.get("plan_sha256")
+        or legacy_plan.get("approved_task_plan_sha256")
+        != event.get("task_plan_sha256")
+        or legacy_receipt.get("override_id", "") != event.get("override_id", "")
+        or legacy_receipt.get("root_session_id") != event.get("root_session_id")
+        or legacy_receipt.get("applied_at") != event.get("applied_at")
+        or legacy_receipt.get("restart_required")
+        != event.get("restart_required")
+        or legacy_plan.get("restart_required") != event.get("restart_required")
+        or legacy_plan.get("resolved") != event.get("resolved")
+        or legacy_plan.get("dynamic_envelope") != event.get("dynamic_envelope")
+        or event.get("execution_selection_id")
+        != legacy_plan.get("dynamic_envelope", {}).get(
+            "execution_selection_id", ""
+        )
+        or legacy_plan.get("required_locks") != event.get("required_locks")
+        or legacy_receipt_sha256 != event.get("receipt_sha256")
+    ):
+        raise HarnessError(
+            "legacy resource config migration source binding is invalid"
+        )
+    receipt = {
+        "schema_version": LEGACY_RESOURCE_CONFIG_MIGRATION_SCHEMA_VERSION,
+        "migration_kind": LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+        "disposition": LEGACY_RESOURCE_CONFIG_MIGRATION_DISPOSITION,
+        "task_id": task_id,
+        "event_id": event.get("event_id"),
+        "legacy_event_preimage": event,
+        "legacy_event_sha256": resource_config_record_sha256(event),
+        "legacy_rollback_snapshot": event.get("rollback"),
+        "legacy_receipt_path": event.get("receipt_path"),
+        "legacy_receipt_sha256": legacy_receipt_sha256,
+        "legacy_receipt_schema_version": legacy_receipt.get("schema_version"),
+        "legacy_plan_schema_version": (
+            legacy_receipt.get("plan", {}).get("schema_version")
+            if isinstance(legacy_receipt.get("plan"), dict)
+            else None
+        ),
+        "legacy_plan_sha256": event.get("plan_sha256"),
+        "legacy_task_plan_sha256": event.get("task_plan_sha256"),
+        "legacy_event_missing_fields": list(
+            LEGACY_RESOURCE_CONFIG_EVENT_MISSING_FIELDS
+        ),
+        "legacy_plan_missing_fields": list(
+            LEGACY_RESOURCE_CONFIG_PLAN_MISSING_FIELDS
+        ),
+        "migration_task_plan_sha256": migration_task_plan_sha256,
+        "reason": reason,
+        "root_session_id": root_session_id,
+        "chief_session_id": chief_session_id,
+        "chief_epoch": chief_epoch,
+        "chief_authority_record_sha256": chief_authority_record_sha256,
+        "migrated_at": migrated_at,
+        "aoi_version": aoi_version,
+        "authority_boundary": LEGACY_RESOURCE_CONFIG_MIGRATION_AUTHORITY_BOUNDARY,
+    }
+    validate_legacy_resource_config_migration_receipt(receipt)
+    return receipt
+
+
+def validate_legacy_resource_config_migration_receipt(
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one immutable legacy compatibility receipt."""
+
+    required = {
+        "schema_version",
+        "migration_kind",
+        "disposition",
+        "task_id",
+        "event_id",
+        "legacy_event_preimage",
+        "legacy_event_sha256",
+        "legacy_rollback_snapshot",
+        "legacy_receipt_path",
+        "legacy_receipt_sha256",
+        "legacy_receipt_schema_version",
+        "legacy_plan_schema_version",
+        "legacy_plan_sha256",
+        "legacy_task_plan_sha256",
+        "legacy_event_missing_fields",
+        "legacy_plan_missing_fields",
+        "migration_task_plan_sha256",
+        "reason",
+        "root_session_id",
+        "chief_session_id",
+        "chief_epoch",
+        "chief_authority_record_sha256",
+        "migrated_at",
+        "aoi_version",
+        "authority_boundary",
+    }
+    if (
+        set(receipt) != required
+        or receipt.get("schema_version")
+        != LEGACY_RESOURCE_CONFIG_MIGRATION_SCHEMA_VERSION
+        or receipt.get("migration_kind") != LEGACY_RESOURCE_CONFIG_MIGRATION_KIND
+        or receipt.get("disposition")
+        != LEGACY_RESOURCE_CONFIG_MIGRATION_DISPOSITION
+        or receipt.get("authority_boundary")
+        != LEGACY_RESOURCE_CONFIG_MIGRATION_AUTHORITY_BOUNDARY
+    ):
+        raise HarnessError("legacy resource config migration receipt schema is invalid")
+    validate_id(
+        str(receipt.get("task_id", "")), "legacy resource config migration task id"
+    )
+    event_id = validate_id(
+        str(receipt.get("event_id", "")), "legacy resource config migration event id"
+    )
+    event = receipt.get("legacy_event_preimage")
+    if (
+        not isinstance(event, dict)
+        or event.get("event_id") != event_id
+        or event.get("status") != "rolled_back"
+        or not isinstance(event.get("rollback"), dict)
+        or receipt.get("legacy_rollback_snapshot") != event.get("rollback")
+        or receipt.get("legacy_receipt_path") != event.get("receipt_path")
+        or receipt.get("legacy_receipt_schema_version")
+        != RESOURCE_RECEIPT_SCHEMA_VERSION
+        or receipt.get("legacy_plan_schema_version")
+        != RESOURCE_PLAN_SCHEMA_VERSION
+        or any(
+            field in event
+            for field in LEGACY_RESOURCE_CONFIG_EVENT_MISSING_FIELDS
+        )
+        or receipt.get("legacy_event_missing_fields")
+        != list(LEGACY_RESOURCE_CONFIG_EVENT_MISSING_FIELDS)
+        or receipt.get("legacy_plan_missing_fields")
+        != list(LEGACY_RESOURCE_CONFIG_PLAN_MISSING_FIELDS)
+    ):
+        raise HarnessError(
+            "legacy resource config migration event preimage is ineligible"
+        )
+    digest_fields = (
+        "legacy_event_sha256",
+        "legacy_receipt_sha256",
+        "legacy_plan_sha256",
+        "legacy_task_plan_sha256",
+        "migration_task_plan_sha256",
+        "chief_authority_record_sha256",
+    )
+    if any(
+        not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get(field, "")))
+        for field in digest_fields
+    ):
+        raise HarnessError(
+            "legacy resource config migration digest binding is invalid"
+        )
+    if (
+        receipt["legacy_event_sha256"] != resource_config_record_sha256(event)
+        or receipt["legacy_receipt_sha256"] != event.get("receipt_sha256")
+        or receipt["legacy_plan_sha256"] != event.get("plan_sha256")
+        or receipt["legacy_task_plan_sha256"] != event.get("task_plan_sha256")
+    ):
+        raise HarnessError(
+            "legacy resource config migration event binding is invalid"
+        )
+    reason = receipt.get("reason")
+    version = receipt.get("aoi_version")
+    epoch = receipt.get("chief_epoch")
+    if (
+        not isinstance(reason, str)
+        or len(reason.strip()) < 12
+        or not isinstance(version, str)
+        or not version.strip()
+        or len(version) > 64
+        or not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or epoch < 1
+        or receipt.get("root_session_id") != receipt.get("chief_session_id")
+    ):
+        raise HarnessError(
+            "legacy resource config migration authority metadata is invalid"
+        )
+    validate_id(
+        str(receipt.get("root_session_id", "")),
+        "legacy resource config migration root session id",
+    )
+    rollback_at = parse_tz_aware_time(
+        str(event["rollback"].get("recorded_at", ""))
+    )
+    migrated_at = parse_tz_aware_time(str(receipt.get("migrated_at", "")))
+    if (
+        rollback_at is None
+        or migrated_at is None
+        or migrated_at <= rollback_at
+    ):
+        raise HarnessError(
+            "legacy resource config migration timeline is invalid"
+        )
+    return receipt
+
+
+def make_legacy_resource_config_migration_record(
+    *,
+    receipt: dict[str, Any],
+    migration_receipt_path: Path,
+    migration_receipt_sha256: str,
+) -> dict[str, Any]:
+    """Build the compact task-state reference for one migration receipt."""
+
+    validate_legacy_resource_config_migration_receipt(receipt)
+    if (
+        not migration_receipt_path.is_absolute()
+        or not re.fullmatch(r"[0-9a-f]{64}", migration_receipt_sha256)
+    ):
+        raise HarnessError("legacy resource config migration record path is invalid")
+    return {
+        "integrity_version": 1,
+        "migration_kind": LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+        "task_id": receipt["task_id"],
+        "event_id": receipt["event_id"],
+        "legacy_event_sha256": receipt["legacy_event_sha256"],
+        "legacy_receipt_path": receipt["legacy_receipt_path"],
+        "legacy_receipt_sha256": receipt["legacy_receipt_sha256"],
+        "migration_task_plan_sha256": receipt["migration_task_plan_sha256"],
+        "migration_receipt_path": str(migration_receipt_path),
+        "migration_receipt_sha256": migration_receipt_sha256,
+        "root_session_id": receipt["root_session_id"],
+        "chief_session_id": receipt["chief_session_id"],
+        "chief_epoch": receipt["chief_epoch"],
+        "chief_authority_record_sha256": receipt[
+            "chief_authority_record_sha256"
+        ],
+        "migrated_at": receipt["migrated_at"],
+    }
 
 
 def validate_resource_receipt(receipt: dict[str, Any]) -> list[dict[str, Any]]:

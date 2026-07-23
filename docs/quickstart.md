@@ -1,7 +1,8 @@
 # AOI v0.4 quickstart
 
-This guide targets alpha `aoi-orgware==0.4.0a3`. Use it only when the selected
-reviewed proof names that exact version and wheel SHA-256; source presence, a
+This guide targets the unreleased successor
+`aoi-orgware==0.4.0a4`. It is not release-ready or promoted. Use it only when
+the selected reviewed proof names that exact version and wheel SHA-256; source presence, a
 tag, workflow success, or PyPI visibility alone is not promotion authority. Do
 not substitute an unpinned package, a different wheel, or a newer build. The
 package install, Codex hook trust, provider routing, and reviewer identity are
@@ -28,13 +29,13 @@ being governed. The example below uses PowerShell; replace placeholders with
 reviewed absolute paths and lowercase digests.
 
 ```powershell
-$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a3'
+$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a4'
 python -m venv $aoiToolRoot
 $aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
 # Python 3.11 may seed executable distutils-precedence.pth. AOI has no
 # Setuptools runtime dependency and provenance intentionally rejects that file.
 & $aoiPython -m pip uninstall --yes setuptools
-$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a3-py3-none-any.whl').Path
+$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a4-py3-none-any.whl').Path
 $expectedWheelSha256 = '<reviewed-wheel-sha256>'
 $actualWheelSha256 = (Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant()
 if ($actualWheelSha256 -ne $expectedWheelSha256) { throw 'wheel SHA-256 mismatch' }
@@ -45,7 +46,7 @@ $aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
 & $aoiLauncher --version
 ```
 
-The installed package version must be exactly `0.4.0a3`. The wheel filename is
+The installed package version must be exactly `0.4.0a4`. The wheel filename is
 not sufficient evidence: compare its full SHA-256 before installation. Keep the
 tool environment outside the governed repository so it cannot pollute Git
 mutation snapshots or claim coverage. The environment must be dedicated to AOI:
@@ -76,11 +77,11 @@ On Linux/WSL, create a repo-external venv and install the same exact local
 wheel without index or dependencies, then invoke its console script directly:
 
 ```bash
-AOI_TOOL_ROOT="$HOME/.local/share/aoi/venvs/0.4.0a3"
+AOI_TOOL_ROOT="$HOME/.local/share/aoi/venvs/0.4.0a4"
 python3 -m venv "$AOI_TOOL_ROOT"
 "$AOI_TOOL_ROOT/bin/python" -m pip uninstall --yes setuptools
 "$AOI_TOOL_ROOT/bin/python" -m pip install --isolated --no-index --no-deps \
-  /absolute/reviewed-local-install/aoi_orgware-0.4.0a3-py3-none-any.whl
+  /absolute/reviewed-local-install/aoi_orgware-0.4.0a4-py3-none-any.whl
 "$AOI_TOOL_ROOT/bin/aoi" codex-init \
   --project-name 'My Project' \
   --local-artifact-bundle-file /absolute/reviewed-local-install/reviewed-local-install-bundle.json \
@@ -197,6 +198,17 @@ $expiresAt = (Get-Date).ToUniversalTime().AddHours(2).ToString('o')
 machine contract. A manually entered reviewer identity is a cooperative
 assertion, not independent authentication. Do not represent it as proof that a
 different person, model, or runtime performed the review.
+
+### Optional: repair exact rolled-back pre-applicability history
+
+If `doctor` reports a legacy resource receipt binding error after an unchanged
+pre-applicability event has been rolled back, use
+`codex-config-migrate-legacy-plan` to obtain its exact event/receipt digests,
+then run Chief-fenced `codex-config-migrate-legacy` with those expected values.
+The migration preserves the original bytes and records no inferred
+applicability. Applied/current or partially upgraded history is ineligible.
+See [Resource control](resource_control.md#migrate-rolled-back-pre-applicability-history)
+for the complete command, receipt, recovery, and idempotency contract.
 
 ## 4. Adopt or upgrade integrity for an eligible material task
 

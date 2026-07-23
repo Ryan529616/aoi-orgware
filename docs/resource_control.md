@@ -247,6 +247,68 @@ not poison the bounded store. They cannot satisfy v2 registration and are never
 silently upgraded; creating v2 for the same session id is an explicit conflict,
 while unrelated new v2 sessions continue normally.
 
+## Migrate rolled-back pre-applicability history
+
+AOI 0.4 applicability fields are additive. A resource event and schema-v2
+receipt created before those fields existed must not be silently interpreted as
+`applicable` or `not_applicable`. If such an event is still applied or
+effective-current, roll it back first with the runtime that can authenticate
+its unchanged receipt and exact target bytes. Migration accepts only inert
+`rolled_back` history.
+
+Preview the one exact eligible event without a Chief credential:
+
+```bash
+aoi codex-config-migrate-legacy-plan \
+  --task <task-id> \
+  --event-id <legacy-event-id> \
+  --json
+```
+
+The preview fails on partial modern/legacy shapes or unrelated resource
+damage. On success it reports the canonical `legacy_event_sha256`, the
+immutable `legacy_resource_receipt_sha256`, rollback snapshot, current approved
+task-plan SHA, and deterministic migration-receipt path. It explicitly reports
+that the original event and receipt will not be rewritten and no applicability
+will be inferred.
+
+After reviewing those exact identities, the current task-bound Chief records
+the migration:
+
+```bash
+aoi codex-config-migrate-legacy \
+  --task <task-id> \
+  --event-id <legacy-event-id> \
+  --expected-event-sha256 <previewed-event-sha256> \
+  --expected-resource-receipt-sha256 <previewed-receipt-sha256> \
+  --reason "Retain exact rolled-back pre-applicability history" \
+  --session-id <current-task-bound-chief-session> \
+  --json
+```
+
+The command creates
+`results/resource-config-legacy-migration-<event-id>.json` first, then appends
+one compact `resource_config_legacy_migrations` state record, and writes the
+index last. The receipt binds the full event preimage, original receipt path
+and SHA-256, receipt/plan schema versions, rollback snapshot, both historical
+plan digests, the current approved migration-plan digest, task, event, reason,
+Chief session/epoch/authority-record digest, AOI version, and migration time.
+The approved migration-plan digest must remain present in `plan_approvals`.
+
+An exact retry is idempotent and does not bump the task revision. A state-write
+failure removes only a receipt known to have been created by that failed
+attempt; an ambiguous or already-published state keeps the receipt and fails
+closed for inspection/retry. An exact orphan receipt from an interrupted
+receipt-first publication may be adopted only by the same current Chief and
+approved task plan. Different bytes, duplicate records, unknown events,
+symlinks, cross-task/event evidence, original receipt/event drift, or an
+unapproved plan digest remain integrity errors.
+
+Migration repairs only historical readability. It does not reapply resource
+files, prove a Codex reload, validate provider routing, or authorize a release.
+Create a new applicability-bound event through the normal plan/apply and
+fresh-session registration flow when resource configuration is needed again.
+
 ## Rollback
 
 Rollback requires the same live task, Chief/root authority, claim coverage, an

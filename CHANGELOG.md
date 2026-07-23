@@ -7,6 +7,24 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+### v0.4.0a4 (unreleased; not release-ready)
+
+- **Explicit legacy resource-config migration.** A new read-only
+  `codex-config-migrate-legacy-plan` command exposes the exact event and
+  immutable receipt digests for one pre-applicability resource event.
+  Chief-fenced `codex-config-migrate-legacy` accepts only exact rolled-back
+  history, creates a separate receipt before publishing an additive task-state
+  record, and never rewrites the original event, receipt, or resource target
+  bytes. Modern strict applicability binding remains unchanged; applied,
+  effective-current, partial, forged, tampered, cross-task, cross-event,
+  duplicate, symlinked, or unapproved-plan migration evidence fails closed.
+  Exact replay is idempotent, and receipt/state/index fault paths retain or
+  remove only the bytes whose publication state is known.
+- **Release boundary.** This successor does not repair or waive the independent
+  Windows path-identity and coverage source-path CI blockers observed against
+  the frozen `0.4.0a3` tree. A successful compatibility test run alone is not
+  release qualification, publication, or promotion evidence.
+
 ### v0.4.0a3 (unreleased)
 
 - **v136 sequential full qualification (native runtime passed; wrapper

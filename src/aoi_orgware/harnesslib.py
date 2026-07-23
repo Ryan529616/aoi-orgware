@@ -175,6 +175,7 @@ TASK_OBJECT_LIST_FIELDS = {
     "packets",
     "plan_revisions",
     "resource_config_events",
+    "resource_config_legacy_migrations",
     "resource_session_registrations",
     "skill_adoption_events",
     "skill_releases",

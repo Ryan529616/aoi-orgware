@@ -187,6 +187,8 @@ from .commands.offboard import cmd_offboard, register_offboard_commands
 from .commands.resource import (
     ResourceCmdServices,
     cmd_codex_config_apply,
+    cmd_codex_config_migrate_legacy,
+    cmd_codex_config_migrate_legacy_plan,
     cmd_codex_config_plan,
     cmd_codex_config_rollback,
     cmd_codex_session_register,
@@ -716,6 +718,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "check-locks",
     "codebase-memory-benchmark-validate",
     "codex-config-plan",
+    "codex-config-migrate-legacy-plan",
     "codex-startup-receipt-show",
     "confidentiality-git-push-preflight",
     "confidentiality-policy-snapshot",
@@ -1178,10 +1181,16 @@ def override_integrity_errors(state: dict[str, Any]) -> list[str]:
 
 
 def resource_config_integrity_errors(
-    paths: HarnessPaths, state: dict[str, Any]
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    allow_unmigrated_legacy_event_id: str = "",
 ) -> list[str]:
     return resource_governance_impl.resource_config_integrity_errors(
-        paths, state, policy=_resource_governance_policy()
+        paths,
+        state,
+        policy=_resource_governance_policy(),
+        allow_unmigrated_legacy_event_id=allow_unmigrated_legacy_event_id,
     )
 
 
@@ -8155,6 +8164,13 @@ def build_parser(
             ),
             "codex_config_apply": functools.partial(
                 cmd_codex_config_apply, services=resource_services
+            ),
+            "codex_config_migrate_legacy": functools.partial(
+                cmd_codex_config_migrate_legacy, services=resource_services
+            ),
+            "codex_config_migrate_legacy_plan": functools.partial(
+                cmd_codex_config_migrate_legacy_plan,
+                services=resource_services,
             ),
             "codex_config_rollback": functools.partial(
                 cmd_codex_config_rollback, services=resource_services

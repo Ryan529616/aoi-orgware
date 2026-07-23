@@ -106,8 +106,9 @@ project hooks is a supply-chain and trust decision.
 
 ### Direct install
 
-> **This README documents the v0.4 alpha line, whose current version target is
-> `0.4.0a3`.** Install it only when an exact reviewed proof names that version
+> **This README documents the v0.4 alpha line, whose current source target is
+> the unreleased successor `0.4.0a4`.** This is not a release-ready or promoted
+> build. Install it only when an exact reviewed proof names that version
 > and wheel SHA-256. A
 > `reviewed_local_install_bundle` has
 > `proof_scope=exact_local_wheel_install_only`: it is not a release record or
@@ -115,13 +116,13 @@ project hooks is a supply-chain and trust decision.
 > unpinned install command or substitute a different alpha build.
 
 ```powershell
-$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a3'
+$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a4'
 python -m venv $aoiToolRoot
 $aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
 # AOI provenance rejects every executable .pth. Python 3.11 venvs may seed
 # Setuptools' distutils-precedence.pth; AOI has no runtime dependency on it.
 & $aoiPython -m pip uninstall --yes setuptools
-$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a3-py3-none-any.whl').Path
+$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a4-py3-none-any.whl').Path
 $expectedWheelSha256 = '<reviewed-wheel-sha256>'
 if ((Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant() -ne $expectedWheelSha256) { throw 'wheel SHA-256 mismatch' }
 & $aoiPython -m pip install --isolated --no-index --no-deps $aoiWheel
@@ -146,7 +147,7 @@ environment is cleaned and requalified. A public pair is valid only when the
 current Chief created it through `release-promote` after exact GitHub Release
 and PyPI readback; workflow success alone is insufficient. The installed
 package version must equal the version named by the selected proof (for this
-line, `0.4.0a3`). See the
+source target, `0.4.0a4`). See the
 [v0.4 quickstart](docs/quickstart.md) for both routes and the complete
 isolated-install, mini-task, status, and offboarding sequence.
 

@@ -34,8 +34,13 @@ from .harnesslib import (
 from .resource_config import (
     AOI_MAX_DELEGATION_DEPTH,
     ARISE_MAX_THREADS_CEILING,
+    LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+    LEGACY_RESOURCE_CONFIG_MIGRATION_MAX_BYTES,
     assert_resource_files_applied,
+    is_legacy_pre_applicability_resource_config,
+    make_legacy_resource_config_migration_record,
     parse_override_settings,
+    validate_legacy_resource_config_migration_receipt,
     validate_resource_receipt,
 )
 from .routing_authority import (
@@ -48,6 +53,7 @@ from .session_receipts import load_startup_receipt
 
 
 MAX_RESOURCE_SESSION_REGISTRATIONS = 256
+MAX_RESOURCE_CONFIG_LEGACY_MIGRATIONS = 256
 
 
 @dataclass(frozen=True)
@@ -241,6 +247,8 @@ def load_bound_resource_receipt(
     paths: HarnessPaths,
     state: dict[str, Any],
     event: dict[str, Any],
+    *,
+    allow_unmigrated_legacy: bool = False,
 ) -> dict[str, Any]:
     """Load one exact managed receipt and cross-bind it to task and event."""
 
@@ -276,12 +284,6 @@ def load_bound_resource_receipt(
         or receipt.get("applied_at") != event.get("applied_at")
         or receipt.get("restart_required") != event.get("restart_required")
         or receipt_plan.get("restart_required") != event.get("restart_required")
-        or receipt_plan.get("config_applicability")
-        != event.get("config_applicability")
-        or receipt_plan.get("applicability_basis")
-        != event.get("applicability_basis")
-        or event.get("inapplicable_acknowledged")
-        is not (receipt_plan.get("config_applicability") == "not_applicable")
         or receipt_plan.get("resolved") != event.get("resolved")
         or receipt_plan.get("dynamic_envelope") != event.get("dynamic_envelope")
         or event.get("execution_selection_id")
@@ -290,6 +292,98 @@ def load_bound_resource_receipt(
     ):
         raise HarnessError(
             f"resource config event {event_id} receipt binding is invalid"
+        )
+    if is_legacy_pre_applicability_resource_config(event, receipt):
+        if not allow_unmigrated_legacy:
+            load_bound_legacy_resource_config_migration(paths, state, event)
+    elif (
+        receipt_plan.get("config_applicability")
+        != event.get("config_applicability")
+        or receipt_plan.get("applicability_basis")
+        != event.get("applicability_basis")
+        or event.get("inapplicable_acknowledged")
+        is not (receipt_plan.get("config_applicability") == "not_applicable")
+    ):
+        raise HarnessError(
+            f"resource config event {event_id} receipt binding is invalid"
+        )
+    return receipt
+
+
+def load_bound_legacy_resource_config_migration(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    """Load the one exact receipt that makes inert legacy history readable."""
+
+    event_id = validate_id(
+        str(event.get("event_id", "")), "legacy resource config migration event id"
+    )
+    records = state.get("resource_config_legacy_migrations", [])
+    if not isinstance(records, list):
+        raise HarnessError("legacy resource config migrations must be a list")
+    if len(records) > MAX_RESOURCE_CONFIG_LEGACY_MIGRATIONS:
+        raise HarnessError("legacy resource config migration count exceeds the bound")
+    matches = [
+        item
+        for item in records
+        if isinstance(item, dict) and item.get("event_id") == event_id
+    ]
+    if len(matches) != 1:
+        raise HarnessError(
+            f"legacy resource config event {event_id} lacks one exact migration"
+        )
+    record = matches[0]
+    migration_path = Path(str(record.get("migration_receipt_path", "")))
+    expected_path = (
+        task_dir(paths, state["task_id"])
+        / "results"
+        / f"resource-config-legacy-migration-{event_id}.json"
+    )
+    migration_sha = str(record.get("migration_receipt_sha256", ""))
+    if (
+        migration_path != expected_path
+        or not migration_path.is_file()
+        or migration_path.is_symlink()
+        or migration_path.stat().st_size
+        > LEGACY_RESOURCE_CONFIG_MIGRATION_MAX_BYTES
+        or not re.fullmatch(r"[0-9a-f]{64}", migration_sha)
+        or sha256_file(migration_path) != migration_sha
+    ):
+        raise HarnessError(
+            f"legacy resource config event {event_id} migration receipt "
+            "identity is invalid"
+        )
+    receipt = load_json(migration_path)
+    validate_legacy_resource_config_migration_receipt(receipt)
+    expected_record = make_legacy_resource_config_migration_record(
+        receipt=receipt,
+        migration_receipt_path=migration_path,
+        migration_receipt_sha256=migration_sha,
+    )
+    approved_plan_shas = {
+        item.get("plan_sha256")
+        for item in state.get("plan_approvals", [])
+        if isinstance(item, dict)
+    }
+    if (
+        record != expected_record
+        or receipt.get("task_id") != state.get("task_id")
+        or receipt.get("event_id") != event_id
+        or receipt.get("legacy_event_preimage") != event
+        or receipt.get("legacy_event_sha256")
+        != _canonical_record_sha256(event)
+        or receipt.get("legacy_receipt_sha256") != event.get("receipt_sha256")
+        or receipt.get("migration_task_plan_sha256") not in approved_plan_shas
+        or receipt.get("root_session_id") not in state.get("session_ids", [])
+        or receipt.get("chief_session_id") not in state.get("session_ids", [])
+        or event.get("root_session_id") not in state.get("session_ids", [])
+        or (event.get("rollback") or {}).get("root_session_id")
+        not in state.get("session_ids", [])
+    ):
+        raise HarnessError(
+            f"legacy resource config event {event_id} migration binding is invalid"
         )
     return receipt
 
@@ -962,6 +1056,7 @@ def resource_config_integrity_errors(
     state: dict[str, Any],
     *,
     policy: ResourceGovernancePolicy,
+    allow_unmigrated_legacy_event_id: str = "",
 ) -> list[str]:
     errors: list[str] = []
     seen: set[str] = set()
@@ -973,6 +1068,56 @@ def resource_config_integrity_errors(
         errors.append(str(exc))
     raw_events = state.get("resource_config_events", [])
     events = raw_events if isinstance(raw_events, list) else []
+    raw_migrations = state.get("resource_config_legacy_migrations", [])
+    migrations = raw_migrations if isinstance(raw_migrations, list) else []
+    if not isinstance(raw_migrations, list):
+        errors.append("legacy resource config migrations must be a list")
+    if len(migrations) > MAX_RESOURCE_CONFIG_LEGACY_MIGRATIONS:
+        errors.append("legacy resource config migration count exceeds the bound")
+    seen_migration_events: set[str] = set()
+    for index, migration in enumerate(migrations):
+        if not isinstance(migration, dict):
+            errors.append(
+                f"legacy resource config migration at index {index} must be an object"
+            )
+            continue
+        migration_event_id = str(migration.get("event_id", ""))
+        try:
+            validate_id(
+                migration_event_id, "legacy resource config migration event id"
+            )
+        except HarnessError as exc:
+            errors.append(str(exc))
+            continue
+        if migration_event_id in seen_migration_events:
+            errors.append(
+                f"duplicate legacy resource config migration for "
+                f"{migration_event_id}"
+            )
+        seen_migration_events.add(migration_event_id)
+        if migration.get("migration_kind") != LEGACY_RESOURCE_CONFIG_MIGRATION_KIND:
+            errors.append(
+                f"legacy resource config migration {migration_event_id} "
+                "has invalid kind"
+            )
+        matching_events = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("event_id") == migration_event_id
+        ]
+        if len(matching_events) != 1:
+            errors.append(
+                f"legacy resource config migration {migration_event_id} "
+                "lacks one exact resource event"
+            )
+            continue
+        try:
+            load_bound_legacy_resource_config_migration(
+                paths, state, matching_events[0]
+            )
+        except HarnessError as exc:
+            errors.append(str(exc))
     for index, event in enumerate(events):
         if not isinstance(event, dict):
             errors.append(f"resource config event at index {index} must be an object")
@@ -1003,7 +1148,14 @@ def resource_config_integrity_errors(
                 f"resource config event {event_id} task plan SHA-256 is invalid"
             )
         try:
-            receipts[event_id] = load_bound_resource_receipt(paths, state, event)
+            receipts[event_id] = load_bound_resource_receipt(
+                paths,
+                state,
+                event,
+                allow_unmigrated_legacy=(
+                    event_id == allow_unmigrated_legacy_event_id
+                ),
+            )
         except HarnessError as exc:
             errors.append(str(exc))
         if event.get("override_id"):
@@ -1190,6 +1342,7 @@ def resource_config_integrity_errors(
 
 
 __all__ = [
+    "MAX_RESOURCE_CONFIG_LEGACY_MIGRATIONS",
     "ResourceGovernancePolicy",
     "ResourceTransition",
     "ResourceTransitionReplay",
@@ -1200,6 +1353,7 @@ __all__ = [
     "execution_selection_target_contract_from_record",
     "lane_authority_snapshot",
     "latest_resource_transition_at",
+    "load_bound_legacy_resource_config_migration",
     "override_by_id",
     "override_integrity_errors",
     "replay_resource_transitions",

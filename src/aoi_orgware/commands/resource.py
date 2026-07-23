@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from .._version import __version__
 from ..execution_topology import _require_execution_selection_snapshots_current
 from ..harnesslib import (
     HarnessError,
@@ -66,22 +67,31 @@ from ..harnesslib import (
 from ..resource_config import (
     AOI_MAX_DELEGATION_DEPTH,
     ARISE_MAX_THREADS_CEILING,
+    LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+    LEGACY_RESOURCE_CONFIG_MIGRATION_MAX_BYTES,
     OVERRIDE_TARGET_KINDS,
     RESOURCE_RECEIPT_SCHEMA_VERSION,
     ResourceApplyRollbackError,
     apply_resource_files,
     assert_resource_files_applied,
     build_codex_resource_plan,
+    is_legacy_pre_applicability_resource_config,
+    make_legacy_resource_config_migration_receipt,
+    make_legacy_resource_config_migration_record,
     make_resource_receipt,
     parse_override_settings,
     reapply_files_from_receipt,
+    resource_config_record_sha256,
     resource_plan_sha256,
     rollback_files_from_receipt,
+    validate_legacy_resource_config_migration_receipt,
 )
 from ..resource_governance import (
+    MAX_RESOURCE_CONFIG_LEGACY_MIGRATIONS,
     MAX_RESOURCE_SESSION_REGISTRATIONS,
     current_applied_resource_event,
     latest_resource_transition_at,
+    load_bound_legacy_resource_config_migration,
     load_bound_resource_receipt,
     override_by_id,
     require_override_target_contract,
@@ -113,6 +123,8 @@ _HANDLER_NAMES = frozenset(
         "override_revoke",
         "codex_config_plan",
         "codex_config_apply",
+        "codex_config_migrate_legacy_plan",
+        "codex_config_migrate_legacy",
         "codex_config_rollback",
         "codex_startup_receipt_show",
         "codex_session_register",
@@ -169,7 +181,11 @@ class _ValidateSelectionResourceEnvelope(Protocol):
 
 class _ResourceConfigIntegrityErrors(Protocol):
     def __call__(
-        self, paths: HarnessPaths, state: dict[str, Any]
+        self,
+        paths: HarnessPaths,
+        state: dict[str, Any],
+        *,
+        allow_unmigrated_legacy_event_id: str = "",
     ) -> list[str]: ...
 
 
@@ -792,6 +808,430 @@ def _expected_sha256(value: str, label: str) -> str:
     return normalized
 
 
+def _next_legacy_resource_migration_time(
+    state: dict[str, Any], event: dict[str, Any]
+) -> str:
+    rollback = event.get("rollback")
+    rollback_at = parse_tz_aware_time(
+        str(rollback.get("recorded_at", ""))
+        if isinstance(rollback, dict)
+        else None
+    )
+    if rollback_at is None:
+        raise HarnessError(
+            "legacy resource config migration requires valid rollback evidence"
+        )
+    references = [rollback_at]
+    migrations = state.get("resource_config_legacy_migrations", [])
+    if not isinstance(migrations, list):
+        raise HarnessError("legacy resource config migrations must be a list")
+    for migration in migrations:
+        if not isinstance(migration, dict):
+            raise HarnessError("legacy resource config migration record is malformed")
+        migrated_at = parse_tz_aware_time(str(migration.get("migrated_at", "")))
+        if migrated_at is None:
+            raise HarnessError("legacy resource config migration time is invalid")
+        references.append(migrated_at)
+    return _bounded_strict_time_after(
+        references, label="legacy resource config migration"
+    )
+
+
+def _require_legacy_migration_command_binding(
+    *,
+    receipt: dict[str, Any],
+    state: dict[str, Any],
+    event: dict[str, Any],
+    legacy_receipt: dict[str, Any],
+    expected_event_sha256: str,
+    expected_receipt_sha256: str,
+    reason: str,
+    authority: dict[str, Any] | None = None,
+) -> None:
+    validate_legacy_resource_config_migration_receipt(receipt)
+    if (
+        receipt.get("task_id") != state.get("task_id")
+        or receipt.get("event_id") != event.get("event_id")
+        or receipt.get("legacy_event_preimage") != event
+        or receipt.get("legacy_event_sha256") != expected_event_sha256
+        or receipt.get("legacy_receipt_path") != event.get("receipt_path")
+        or receipt.get("legacy_receipt_sha256") != expected_receipt_sha256
+        or receipt.get("legacy_receipt_schema_version")
+        != legacy_receipt.get("schema_version")
+        or receipt.get("legacy_plan_schema_version")
+        != legacy_receipt.get("plan", {}).get("schema_version")
+        or receipt.get("reason") != reason
+    ):
+        raise HarnessError(
+            "legacy resource config migration receipt conflicts with the command"
+        )
+    if authority is not None and (
+        receipt.get("migration_task_plan_sha256") != state.get("plan_sha256")
+        or receipt.get("root_session_id") != authority.get("session_id")
+        or receipt.get("chief_session_id") != authority.get("session_id")
+        or receipt.get("chief_epoch") != authority.get("epoch")
+        or receipt.get("chief_authority_record_sha256")
+        != authority.get("authority_record_sha256")
+        or receipt.get("aoi_version") != __version__
+    ):
+        raise HarnessError(
+            "orphan legacy resource config migration receipt authority conflicts"
+        )
+
+
+def _require_current_legacy_migration_plan_approval(
+    state: dict[str, Any],
+) -> None:
+    """Require an additive approval record for the exact current task plan."""
+
+    approvals = state.get("plan_approvals", [])
+    current_plan_sha256 = str(state.get("plan_sha256", ""))
+    if (
+        not isinstance(approvals, list)
+        or not re.fullmatch(r"[0-9a-f]{64}", current_plan_sha256)
+        or not any(
+            isinstance(item, dict)
+            and item.get("plan_sha256") == current_plan_sha256
+            for item in approvals
+        )
+    ):
+        raise HarnessError(
+            "legacy resource config migration requires an approval record "
+            "for the exact current task plan"
+        )
+
+
+def cmd_codex_config_migrate_legacy_plan(
+    args: argparse.Namespace, paths: HarnessPaths, *, services: ResourceCmdServices
+) -> int:
+    """Preview the exact immutable legacy identities required by migration."""
+
+    event_id = validate_id(args.event_id, "resource config event id")
+    with services.state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(
+            state, "plan legacy Codex resource configuration migration for"
+        )
+        services.require_plan_ready(
+            paths, state, "plan legacy Codex resource configuration migration"
+        )
+        _require_current_legacy_migration_plan_approval(state)
+        matches = [
+            event
+            for event in state.get("resource_config_events", [])
+            if isinstance(event, dict) and event.get("event_id") == event_id
+        ]
+        if len(matches) != 1:
+            raise HarnessError(
+                "legacy resource config migration plan requires one exact "
+                "resource event"
+            )
+        event = matches[0]
+        legacy_receipt = load_bound_resource_receipt(
+            paths, state, event, allow_unmigrated_legacy=True
+        )
+        if not is_legacy_pre_applicability_resource_config(
+            event, legacy_receipt
+        ):
+            raise HarnessError(
+                "resource config event is not exact rolled-back "
+                "pre-applicability history"
+            )
+        preflight_errors = services.resource_config_integrity_errors(
+            paths,
+            state,
+            allow_unmigrated_legacy_event_id=event_id,
+        )
+        if preflight_errors:
+            raise HarnessError(
+                "legacy resource config migration plan found unrelated damage: "
+                + "; ".join(preflight_errors)
+            )
+        migrations = state.get("resource_config_legacy_migrations", [])
+        matching_migrations = [
+            item
+            for item in migrations
+            if isinstance(item, dict) and item.get("event_id") == event_id
+        ]
+        migration_path = (
+            task_dir(paths, state["task_id"])
+            / "results"
+            / f"resource-config-legacy-migration-{event_id}.json"
+        )
+        payload = {
+            "task_id": state["task_id"],
+            "event_id": event_id,
+            "eligible": True,
+            "already_migrated": len(matching_migrations) == 1,
+            "migration_kind": LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+            "legacy_event_sha256": resource_config_record_sha256(event),
+            "legacy_resource_receipt_path": event["receipt_path"],
+            "legacy_resource_receipt_sha256": event["receipt_sha256"],
+            "legacy_plan_sha256": event["plan_sha256"],
+            "legacy_task_plan_sha256": event["task_plan_sha256"],
+            "migration_task_plan_sha256": state["plan_sha256"],
+            "rollback": copy.deepcopy(event["rollback"]),
+            "migration_receipt_path": str(migration_path),
+            "original_event_rewritten": False,
+            "original_receipt_rewritten": False,
+            "applicability_inferred": False,
+        }
+    emit(payload, args.json)
+    return 0
+
+
+def cmd_codex_config_migrate_legacy(
+    args: argparse.Namespace, paths: HarnessPaths, *, services: ResourceCmdServices
+) -> int:
+    """Make one exact rolled-back pre-applicability event readable again."""
+
+    event_id = validate_id(args.event_id, "resource config event id")
+    expected_event_sha = _expected_sha256(
+        args.expected_event_sha256, "--expected-event-sha256"
+    )
+    expected_receipt_sha = _expected_sha256(
+        args.expected_resource_receipt_sha256,
+        "--expected-resource-receipt-sha256",
+    )
+    reason = require_evidence_detail(
+        args.reason, "legacy resource config migration reason"
+    )
+    with services.state_lock(paths):
+        state = load_task(paths, args.task)
+        require_open_task(state, "migrate legacy Codex resource configuration for")
+        services.require_plan_ready(
+            paths, state, "migrate legacy Codex resource configuration"
+        )
+        _require_current_legacy_migration_plan_approval(state)
+        session_id = services.require_root_session(paths, state, args.session_id)
+        authority = getattr(args, "_aoi_chief_authority", None)
+        if (
+            not isinstance(authority, dict)
+            or authority.get("session_id") != session_id
+            or not isinstance(authority.get("epoch"), int)
+            or isinstance(authority.get("epoch"), bool)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(authority.get("authority_record_sha256", "")),
+            )
+        ):
+            raise HarnessError(
+                "legacy resource config migration requires the current "
+                "task-bound Chief session"
+            )
+        matches = [
+            event
+            for event in state.get("resource_config_events", [])
+            if isinstance(event, dict) and event.get("event_id") == event_id
+        ]
+        if len(matches) != 1:
+            raise HarnessError(
+                "legacy resource config migration requires one exact resource event"
+            )
+        event = matches[0]
+        actual_event_sha = resource_config_record_sha256(event)
+        if actual_event_sha != expected_event_sha:
+            raise HarnessError(
+                "resource config event changed after migration review"
+            )
+        if event.get("receipt_sha256") != expected_receipt_sha:
+            raise HarnessError(
+                "resource config receipt changed after migration review"
+            )
+        legacy_receipt = load_bound_resource_receipt(
+            paths, state, event, allow_unmigrated_legacy=True
+        )
+        if not is_legacy_pre_applicability_resource_config(
+            event, legacy_receipt
+        ):
+            raise HarnessError(
+                "resource config event is not exact rolled-back "
+                "pre-applicability history"
+            )
+        preflight_errors = services.resource_config_integrity_errors(
+            paths,
+            state,
+            allow_unmigrated_legacy_event_id=event_id,
+        )
+        if preflight_errors:
+            raise HarnessError(
+                "legacy resource config migration preflight found unrelated "
+                "damage: " + "; ".join(preflight_errors)
+            )
+
+        migration_records = state.get("resource_config_legacy_migrations", [])
+        if not isinstance(migration_records, list):
+            raise HarnessError("legacy resource config migrations must be a list")
+        existing = [
+            item
+            for item in migration_records
+            if isinstance(item, dict) and item.get("event_id") == event_id
+        ]
+        if len(existing) > 1:
+            raise HarnessError(
+                f"duplicate legacy resource config migration for {event_id}"
+            )
+        if existing:
+            migration_receipt = load_bound_legacy_resource_config_migration(
+                paths, state, event
+            )
+            _require_legacy_migration_command_binding(
+                receipt=migration_receipt,
+                state=state,
+                event=event,
+                legacy_receipt=legacy_receipt,
+                expected_event_sha256=expected_event_sha,
+                expected_receipt_sha256=expected_receipt_sha,
+                reason=reason,
+            )
+            services.write_index(paths)
+            emit(
+                {
+                    "event_id": event_id,
+                    "migration_kind": LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+                    "migration": existing[0],
+                    "idempotent_replay": True,
+                },
+                args.json,
+            )
+            return 0
+        if len(migration_records) >= MAX_RESOURCE_CONFIG_LEGACY_MIGRATIONS:
+            raise HarnessError(
+                "legacy resource config migration count exceeds the bound"
+            )
+
+        migration_path = (
+            task_dir(paths, state["task_id"])
+            / "results"
+            / f"resource-config-legacy-migration-{event_id}.json"
+        )
+        receipt_created = False
+        if migration_path.is_symlink() or (
+            migration_path.exists() and not migration_path.is_file()
+        ):
+            raise HarnessError(
+                "legacy resource config migration receipt path is unsafe"
+            )
+        if migration_path.exists():
+            if (
+                migration_path.stat().st_size
+                > LEGACY_RESOURCE_CONFIG_MIGRATION_MAX_BYTES
+            ):
+                raise HarnessError(
+                    "legacy resource config migration receipt exceeds the "
+                    "byte limit"
+                )
+            migration_receipt = load_json(migration_path)
+            migration_sha = sha256_file(migration_path)
+            _require_legacy_migration_command_binding(
+                receipt=migration_receipt,
+                state=state,
+                event=event,
+                legacy_receipt=legacy_receipt,
+                expected_event_sha256=expected_event_sha,
+                expected_receipt_sha256=expected_receipt_sha,
+                reason=reason,
+                authority=authority,
+            )
+        else:
+            recorded = _next_legacy_resource_migration_time(state, event)
+            migration_receipt = make_legacy_resource_config_migration_receipt(
+                task_id=state["task_id"],
+                event=copy.deepcopy(event),
+                legacy_receipt=legacy_receipt,
+                legacy_receipt_sha256=expected_receipt_sha,
+                migration_task_plan_sha256=state["plan_sha256"],
+                reason=reason,
+                root_session_id=session_id,
+                chief_session_id=str(authority["session_id"]),
+                chief_epoch=int(authority["epoch"]),
+                chief_authority_record_sha256=str(
+                    authority["authority_record_sha256"]
+                ),
+                migrated_at=recorded,
+                aoi_version=__version__,
+            )
+            migration_payload = (
+                json.dumps(migration_receipt, indent=2, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            if len(migration_payload) > LEGACY_RESOURCE_CONFIG_MIGRATION_MAX_BYTES:
+                raise HarnessError(
+                    "legacy resource config migration receipt exceeds the "
+                    "byte limit"
+                )
+            migration_sha = hashlib.sha256(migration_payload).hexdigest()
+            atomic_create_bytes(migration_path, migration_payload)
+            receipt_created = True
+
+        migration_record = make_legacy_resource_config_migration_record(
+            receipt=migration_receipt,
+            migration_receipt_path=migration_path,
+            migration_receipt_sha256=migration_sha,
+        )
+        state.setdefault("resource_config_legacy_migrations", []).append(
+            migration_record
+        )
+        staged_errors = services.resource_config_integrity_errors(paths, state)
+        if staged_errors:
+            if receipt_created:
+                migration_path.unlink()
+            raise HarnessError(
+                "legacy resource config migration candidate failed integrity: "
+                + "; ".join(staged_errors)
+            )
+        bump_task(state)
+        state_published = False
+        try:
+            services.write_task(paths, state)
+            state_published = True
+            services.write_index(paths)
+        except BaseException as exc:
+            if not state_published:
+                try:
+                    published_state = load_task(paths, args.task)
+                except (HarnessError, OSError, ValueError) as probe_exc:
+                    raise HarnessError(
+                        "legacy migration receipt was created, but task-state "
+                        "publication is ambiguous; receipt retained for recovery"
+                    ) from probe_exc
+                published = [
+                    item
+                    for item in published_state.get(
+                        "resource_config_legacy_migrations", []
+                    )
+                    if item == migration_record
+                ]
+                state_published = len(published) == 1
+            if state_published:
+                raise HarnessError(
+                    "legacy resource config migration state was published, but "
+                    "the final durability/index step reported an error"
+                ) from exc
+            if receipt_created:
+                try:
+                    migration_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise HarnessError(
+                "legacy resource config migration state publication failed; "
+                + (
+                    "the newly created receipt was removed"
+                    if receipt_created
+                    else "the exact orphan receipt was retained"
+                )
+            ) from exc
+    emit(
+        {
+            "event_id": event_id,
+            "migration_kind": LEGACY_RESOURCE_CONFIG_MIGRATION_KIND,
+            "migration": migration_record,
+            "idempotent_replay": False,
+        },
+        args.json,
+    )
+    return 0
+
+
 def cmd_codex_startup_receipt_show(
     args: argparse.Namespace, paths: HarnessPaths
 ) -> int:
@@ -1347,6 +1787,22 @@ def register_resource_commands(
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["codex_config_apply"])
 
+    parser = subparsers.add_parser("codex-config-migrate-legacy")
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--event-id", required=True)
+    parser.add_argument("--expected-event-sha256", required=True)
+    parser.add_argument("--expected-resource-receipt-sha256", required=True)
+    parser.add_argument("--reason", required=True)
+    parser.add_argument("--session-id", required=True)
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["codex_config_migrate_legacy"])
+
+    parser = subparsers.add_parser("codex-config-migrate-legacy-plan")
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--event-id", required=True)
+    add_json_argument(parser)
+    parser.set_defaults(handler=handlers["codex_config_migrate_legacy_plan"])
+
     parser = subparsers.add_parser("codex-session-register")
     parser.add_argument("--task", required=True)
     parser.add_argument("--session-id", required=True)
@@ -1373,6 +1829,8 @@ def register_resource_commands(
 __all__ = [
     "ResourceCmdServices",
     "cmd_codex_config_apply",
+    "cmd_codex_config_migrate_legacy",
+    "cmd_codex_config_migrate_legacy_plan",
     "cmd_codex_config_plan",
     "cmd_codex_config_rollback",
     "cmd_codex_session_register",
