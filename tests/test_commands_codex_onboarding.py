@@ -223,8 +223,9 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         encoding="utf-8",
     )
     record = dist_info / "RECORD"
+    bridge_record_path = os.path.relpath(bridge, site_root).replace("\\", "/")
     extra_record_rows = [
-        f"{os.path.relpath(bridge, site_root).replace('\\', '/')},"
+        f"{bridge_record_path},"
         + "sha256="
         + base64.urlsafe_b64encode(hashlib.sha256(bridge.read_bytes()).digest())
         .decode("ascii")
@@ -232,8 +233,11 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         + f",{bridge.stat().st_size}",
     ]
     if bridge_script is not None:
+        bridge_script_record_path = os.path.relpath(bridge_script, site_root).replace(
+            "\\", "/"
+        )
         extra_record_rows.append(
-            f"{os.path.relpath(bridge_script, site_root).replace('\\', '/')},"
+            f"{bridge_script_record_path},"
             + "sha256="
             + base64.urlsafe_b64encode(
                 hashlib.sha256(bridge_script.read_bytes()).digest()

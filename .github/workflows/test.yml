@@ -129,7 +129,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:PYTHONPATH = 'src'
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE/src"
           Push-Location package-artifact
           try {
             python -m aoi_orgware.publication_gate verify `

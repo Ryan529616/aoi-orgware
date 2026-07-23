@@ -7,7 +7,7 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
-### v0.4.0a1 (unreleased)
+### v0.4.0a2 (unreleased)
 
 - **O1 — semantic commit v2.** Event-authoritative task state, replayable
   projections, exact retry, and recovery are covered by focused semantic tests.

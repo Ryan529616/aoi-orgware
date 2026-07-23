@@ -16,6 +16,7 @@ import pytest
 
 from aoi_orgware import codex_install_provenance as provenance
 from aoi_orgware import local_install_proof
+from aoi_orgware._version import __version__
 from aoi_orgware.semantic_events import canonical_json_bytes, canonical_sha256
 
 
@@ -515,7 +516,7 @@ print(json.dumps(receipt, sort_keys=True))
         "name": wheel.name,
         "sha256": wheel_sha256,
     }
-    assert receipt["installed_distribution_identity"]["version"] == "0.4.0a1"
+    assert receipt["installed_distribution_identity"]["version"] == __version__
     assert receipt["installed_mapping_strength"] == "direct_url_archive_sha256"
     assert (
         receipt["installed_mapping_evidence"]["direct_url"]["archive_sha256"]
