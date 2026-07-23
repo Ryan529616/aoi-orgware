@@ -82,6 +82,8 @@ _NOTIFICATION_METHODS: Final = frozenset(
         "thread/closed",
         "thread/compacted",
         "thread/deleted",
+        "thread/environment/connected",
+        "thread/environment/disconnected",
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
@@ -1221,7 +1223,7 @@ class CodexAppServerStdio:
         with self._request_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
-            # The pinned 0.144.6 generated ClientRequest schema and live
+            # The pinned 0.145.0 generated ClientRequest schema and live
             # runtime use the App Server's line-delimited RPC envelope.  It
             # deliberately has no JSON-RPC ``jsonrpc`` member.
             message = {"id": request_id, "method": method, "params": dict(params)}
@@ -1614,7 +1616,7 @@ class CodexAppServerStdio:
     def _classify_incoming(self, message: dict[str, Any], raw: bytes) -> tuple[str, Any]:
         if "jsonrpc" in message:
             raise ProtocolViolation(
-                "pinned App Server 0.144.6 framing must not contain jsonrpc"
+                "pinned App Server 0.145.0 framing must not contain jsonrpc"
         )
         if "method" in message:
             method = _require_string(message["method"], "incoming method")

@@ -272,10 +272,10 @@ semantic intent rather than creating a fresh attempt. Reviewer IDs are
 cooperative and must differ from recorded producer IDs; they do not authenticate
 an independent human or runtime.
 
-## 5. Select local-files confidentiality when publication is forbidden
+## 5. Protect selected files from the wrong publication destination
 
-Use this profile when Codex may see project context but project files, Git
-objects, artifacts, EDA outputs, packages, or attachments must remain local:
+Use this profile when Codex may see project context but user-selected files or
+trees must either remain local or go only to their home repository:
 
 ```toml
 [confidentiality]
@@ -286,27 +286,98 @@ remote_ci = "deny"
 artifact_upload = "deny"
 external_export = "permit_required"
 local_cas = true
+protected = [
+  { path = "private/design.bin", kind = "file", policy = "home_remote_only", home_remote = "origin", home_destination = "https://github.com/example/chip.git" },
+  { path = "eda/private", kind = "tree", policy = "local_only" },
+]
 ```
 
-Local branch/status/diff/commit and local evidence remain allowed. Run
-`aoi doctor --json` before governed work and resolve every confirmed external
-remote/LFS/sync-root/known-publish-credential error. Credential matching is a
-finite known-name check, not proof that no unlisted secret exists. A Windows
-mapped drive is denied as network storage. Missing drive metadata, SUBST
-aliases, and link/reparse traversal are labelled unverified and also block a
-confirmed-local gate. Percent-encoded `file:` paths and generic Windows reparse
-attributes are included. AOI checks both the caller-visible drive and resolved
-target and reports malformed URLs as invalid; workflow-file presence remains a
-separate warning. Do
-not treat this mode as an air gap: model context is allowed. Do not run push, remote CI, GitHub
-Release, package publish, artifact upload, or connector/attachment publication.
-An approved external export must use the exact one-shot export-permit commands;
-the receipt proves authorization/consumption, not an observed upload.
+Omit `protected`, or set it to `[]`, to classify nothing. That preserves normal
+repository updates, remote CI, GitHub Release, and package publication; the
+profile name alone is not a whole-repository ban. Local
+branch/status/diff/commit and local evidence are always allowed.
 
-For promotion, stop after the exact local commit/tree, complete Windows and WSL
-tests, applicable authorized local EDA only when required, independent review,
-integrity-v2 seal, package/isolated-install smoke, and encrypted local bundle.
-Remote-main CI is not an alternative under this profile.
+If the repository uses clean remote release jobs, generate and review its
+tracked policy projection locally:
+
+```powershell
+aoi confidentiality-policy-snapshot > publication-policy.new.json
+# Compare exact bytes, then replace release/publication-policy.json only after review.
+```
+
+The generator verifies current protected origins. Remote jobs receive the
+canonical snapshot and a separately pinned expected digest, not raw `aoi.toml`
+or the local-only origins.
+
+Before an AOI-managed push from a project with protected rules, create an exact
+UTF-8 preflight receipt for every ref update:
+
+```powershell
+aoi confidentiality-git-push-preflight `
+  --task <task-id> `
+  --remote origin `
+  --destination https://github.com/example/chip.git `
+  --update refs/heads/main <local-commit> refs/heads/main <remote-commit-or-40-zeroes> `
+  --json > protected-push-preflight.json
+
+git push origin <local-commit>:refs/heads/main
+
+aoi set-delivery --task <task-id> --mode pushed `
+  --detail "exact protected-content preflight" `
+  --commit <local-commit> --remote origin --remote-ref refs/heads/main `
+  --confidentiality-preflight-file protected-push-preflight.json --json
+```
+
+Use `--task` whenever the delivery comes from a recorded isolated worktree. It
+selects that task's validated worktree for Git inspection while retaining the
+authoritative AOI root's config and policy digest. It may be omitted only when
+the authoritative AOI root itself is the pushed worktree.
+
+The preflight read-checks every remote ref's exact old OID and scans the exact
+outgoing commits, including protected files later deleted or copied under
+another path. Current protected bytes also enter the Git-blob identity set even
+when their configured path has never been tracked, so an exact copy committed
+elsewhere remains classified. It binds the config, destination, Git blob
+identities, and content SHA-256 values. `set-delivery` revalidates the receipt
+and preserves its canonical bytes in task-local CAS; deleting the operator's
+temporary JSON does not erase the governed evidence. It permits a `home_remote_only`
+subject only at its exact home remote/destination and denies a `local_only`
+subject externally. Rewrites and ambiguous LFS routing fail closed. Other
+publication actions inventory the exact input files and archive members whenever
+protected rules exist:
+
+```powershell
+aoi confidentiality-publication-preflight `
+  --action package_publish `
+  --destination https://pypi.org/project/example `
+  --subject <exact-wheel-path> `
+  --subject <exact-sdist-path> `
+  --json > package-publication-preflight.json
+```
+
+This local live-config command does not authorize a Git push. In clean CI use
+`python -m aoi_orgware.publication_gate` with the tracked snapshot and its
+reviewed `--expected-snapshot-sha256`. A caller-supplied `--remote` cannot make
+an artifact/package upload eligible for `home_remote_only`.
+
+The receipt binds every outer container SHA-256 and a bounded manifest of
+regular wheel/ZIP/gzip-tar members. Exact copied bytes or protected member paths
+are denied at other destinations; unrelated package bytes remain publishable.
+A missing configured protected file/tree fails closed because AOI cannot recover
+an untracked origin after deletion. Restore it or explicitly revise the reviewed
+rule before retrying. An approved local-only exception uses the one-shot export-permit
+commands. Its receipt proves authorization/consumption, not an observed upload.
+
+Run `aoi doctor --json` before governed work. External remotes, workflow files,
+credential helpers, and known publish-credential names are reported as
+inventory/warnings unless AOI proves a protected-content contradiction.
+Credential matching is finite and cannot prove that no unlisted secret exists.
+A Windows mapped drive is denied as network storage. Missing drive metadata,
+SUBST aliases, and link/reparse traversal are labelled unverified and, when
+protected rules exist, also block a confirmed-local state/launch gate. An empty
+protected list does not activate that gate. Do not treat this mode as an air gap:
+model context is allowed. An ungoverned same-user Git or upload command remains
+outside this cooperative AOI boundary.
 
 
 ## 6. Optional one-turn Codex bridge
@@ -348,8 +419,8 @@ The bridge consumes the packet arm atomically and does not fabricate a
 `SubagentStart` identity. It uses one per-launch OS lock, checks the earlier
 permit/arm expiry and exact packet ownership at `process_start_pending`. That
 milestone precedes and authorizes both the exact-binary version probe and the
-App Server Popen; the bridge never restarts after it becomes durable. Under
-`local_files`, known sync/network AOI state roots and writable cwd paths are
+App Server Popen; the bridge never restarts after it becomes durable. When
+`local_files` has protected rules, known sync/network AOI state roots and writable cwd paths are
 rejected before Popen, as are mapped Windows drives and paths whose Windows
 volume/reparse locality cannot be confirmed. `reservation_effective_at` is a Chief-planned semantic
 time, not measured wall-clock consumption.

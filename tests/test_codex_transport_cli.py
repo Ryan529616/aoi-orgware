@@ -199,12 +199,18 @@ def _fixture(
     *,
     sandbox: str = "readOnly",
     local_files: bool = False,
+    protected_paths: bool = True,
 ) -> BridgeFixture:
     root = tmp_path / "project"
     root.mkdir()
     config_text = default_config_text("Codex transport bridge")
     if local_files:
         config_text += '\n[confidentiality]\nmode = "local_files"\n'
+        if protected_paths:
+            config_text += (
+                'protected = [{ path = "scratch/src/tracked.txt", kind = "file", '
+                'policy = "local_only" }]\n'
+            )
     (root / "aoi.toml").write_text(config_text, encoding="utf-8")
     worktree = root / "scratch"
     worktree.mkdir()
@@ -373,6 +379,33 @@ def _issue_args(value: BridgeFixture) -> list[str]:
         ["--pre-git-endpoint-file", str(value.pre_endpoint_path)]
     )
     return result
+
+
+def _release_issuing_chief(value: BridgeFixture) -> None:
+    with h.state_lock(value.paths, create_layout=False):
+        current = h.load_chief_authority(value.paths)
+        if current["status"] == "inactive":
+            latest = current["audit_tail"][-1]
+            assert current["epoch"] == value.chief["epoch"]
+            assert latest["action"] == "release"
+            assert latest["session_id"] == value.chief["session_id"]
+            return
+        assert current["session_id"] == value.chief["session_id"]
+        assert current["epoch"] == value.chief["epoch"]
+        token, _ = h.load_chief_credential(
+            value.paths,
+            session_id=value.chief["session_id"],
+            epoch=value.chief["epoch"],
+            credential_file=value.credential_path,
+        )
+        h.release_chief_authority(
+            value.paths,
+            session_id=value.chief["session_id"],
+            epoch=value.chief["epoch"],
+            token=token,
+            reason="Codex bridge CLI process-start test release",
+            now=datetime.now(UTC),
+        )
 
 
 def _runtime_event(method: str, params: Mapping[str, Any]) -> RuntimeEvent:
@@ -583,7 +616,14 @@ class StartedCallbackWrappingAdapter(FakeAdapter):
             ) from exc
 
 
-def _run_args(value: BridgeFixture, prompt: Path, *extra: str) -> list[str]:
+def _run_args(
+    value: BridgeFixture,
+    prompt: Path,
+    *extra: str,
+    release_chief: bool = True,
+) -> list[str]:
+    if release_chief:
+        _release_issuing_chief(value)
     return [
         "--root",
         str(value.root),
@@ -638,9 +678,9 @@ def test_cli_issue_run_inspect_and_no_resend(
     assert bridge.main(_run_args(value, value.prompt_path)) == 0
     replay = json.loads(capsys.readouterr().out)
     assert replay["terminal_receipt_sha256"] == completed["terminal_receipt_sha256"]
-    assert replay["app_server_start_durably_observed"] is False
-    assert replay["runtime_process_boundary_reached"] is False
-    assert replay["process_start_evidence"] == "not_started"
+    assert replay["app_server_start_durably_observed"] is True
+    assert replay["runtime_process_boundary_reached"] is True
+    assert replay["process_start_evidence"] == "process_started_observed"
     assert len(created) == 1
 
     assert bridge.main(
@@ -683,8 +723,9 @@ def test_cli_thread_start_loss_is_launch_unknown_and_never_resent(
     assert bridge.main(_run_args(value, value.prompt_path)) == 0
     second = json.loads(capsys.readouterr().out)
     assert second["terminal_state"] == "launch_unknown"
-    assert second["app_server_start_durably_observed"] is False
-    assert second["runtime_process_boundary_reached"] is False
+    assert second["process_start_evidence"] == "process_started_observed"
+    assert second["app_server_start_durably_observed"] is True
+    assert second["runtime_process_boundary_reached"] is True
     assert len(created) == 1
 
 
@@ -769,7 +810,9 @@ def test_cli_model_reroute_is_failed_with_exact_task_local_cas_and_no_resend(
     assert replay["terminal_state"] == "failed"
     assert replay["runtime_completed"] is False
     assert replay["terminal_receipt_sha256"] == first["terminal_receipt_sha256"]
-    assert replay["app_server_start_durably_observed"] is False
+    assert replay["process_start_evidence"] == "process_started_observed"
+    assert replay["app_server_start_durably_observed"] is True
+    assert replay["runtime_process_boundary_reached"] is True
     assert len(created) == 1
 
 
@@ -1154,6 +1197,45 @@ def test_cli_expiry_crossing_before_pending_prevents_process_start(
     ]
 
 
+def test_cli_active_issuing_chief_prevents_process_start_pending_commit(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    created: list[CallbackWrappingAdapter] = []
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: (
+            created.append(CallbackWrappingAdapter()) or created[-1]
+        ),
+    )
+
+    assert bridge.main(
+        _run_args(
+            value,
+            value.prompt_path,
+            release_chief=False,
+        )
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal_state"] == "failed"
+    assert result["process_start_evidence"] == "not_started"
+    assert result["runtime_process_boundary_reached"] is False
+    assert len(created) == 1
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    assert [row["event_type"] for row in launch["journal"]] == [
+        "reserved",
+        "failed",
+    ]
+
+
 def test_cli_never_infers_physical_start_from_pending_only_journal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
@@ -1219,6 +1301,18 @@ def test_local_files_bridge_blocks_confirmed_synced_state_root_before_issue(
     assert bridge.main(_issue_args(value)) == 2
     assert "AOI artifact/CAS root" in capsys.readouterr().err
     assert not runtime._issuance_path(
+        value.paths, "task-1", value.permit_sha256
+    ).exists()
+
+
+def test_local_files_empty_rules_do_not_globally_block_synced_state_root(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path, local_files=True, protected_paths=False)
+    monkeypatch.setenv("ONEDRIVE", str(value.root))
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    assert runtime._issuance_path(
         value.paths, "task-1", value.permit_sha256
     ).exists()
 
@@ -1332,9 +1426,12 @@ def test_concurrent_run_uses_one_controller_and_one_process_owner(
     assert failures == []
     assert len(created) == 1
     assert len(results) == 2
-    assert sorted(
+    assert all(
         result["app_server_start_durably_observed"] for result in results
-    ) == [False, True]
+    )
+    assert {
+        result["process_start_evidence"] for result in results
+    } == {"process_started_observed"}
     assert len({result["terminal_receipt_sha256"] for result in results}) == 1
 
 

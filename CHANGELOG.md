@@ -91,7 +91,7 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   pending).** The dependency-free core now ships a separate finite
   `aoi-codex-bridge` entry point for one packet/thread/turn over local App
   Server stdio. Chief issuance binds an exact one-shot permit, stable Codex
-  `0.144.6` executable/schema set, prompt/cwd/model/effort/sandbox, and—for both
+  `0.145.0` executable/schema set, prompt/cwd/model/effort/sandbox, and—for both
   read-only and writable turns—a pre-turn Git endpoint preserved in task CAS.
   The current repair candidate also binds an isolated exact-policy
   `CODEX_HOME`, disables web/apps/remote-plugin/multi-agent/remote-control
@@ -137,7 +137,10 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   separately elevate the post-image.
   Runtime milestones
   are semantic transactions with explicit `launch_unknown`/`runtime_unknown`
-  reconciliation and no automatic resend. A completed runtime receipt remains
+  reconciliation and no automatic resend. Initial execution, replay, and
+  reconciliation now derive the same process-start evidence from the complete
+  durable journal instead of describing only the current CLI invocation. A
+  completed runtime receipt remains
   `codex_runtime_observed`; Git/tree/claim materialization is a separate
   binding-backed `verified_mutation` projection and neither implies AOI task
   completion. A migrated semantic-v2 task can now reach that arm without a
@@ -160,14 +163,24 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   races. If a crash lands the exact marker-bound reservation binding before its
   semantic event, that authenticated pending binding is the sole witness that
   allows the same still-terminal command to recover after permit expiry;
-  absent, different, or head-drifted witnesses fail closed. The pinned 0.144.6
+  absent, different, or head-drifted witnesses fail closed. The process-start
+  boundary now also rereads the immutable issuance marker and the
+  canonical Chief record under the state lock. Popen requires that record to be
+  inactive at the marker's exact issuing epoch with its latest non-forced
+  release event naming the exact issuing session and epoch. A still-active
+  issuer, a different active or released Chief (including another credential
+  root), a wrong release audit identity, or a missing/malformed record fails
+  before `process_start_pending`; credential-home emptiness remains only
+  defense in depth. Once that pending milestone is durable, later Chief changes
+  do not retroactively revoke it and crash ambiguity still forbids automatic
+  restart. The pinned 0.145.0
   wire dialect is now enforced directly: requests and
   notifications omit `jsonrpc`, `initialized` is method-only, tagged or
   malformed error envelopes fail closed, and lifecycle digests bind exact raw
   wire bytes. Response-derived milestones retain the actual request method from
   the contract's single event-method table and cannot masquerade as lifecycle
   notifications. Successful initialize/thread/
-  turn results are checked against the pinned 0.144.6 required shape before
+  turn results are checked against the pinned 0.145.0 required shape before
   the journal callback; thread context is rebound to the sealed cwd/model/
   approval/sandbox, and the supported lifecycle subset checks pinned required
   Thread/Turn/item fields. Journal evidence now distinguishes request
@@ -181,32 +194,58 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   exposed the former framing defect and failed explicitly at initialize; it was
   not retried and is not a live PASS. Local fake-runtime tests and that failed
   diagnostic canary are not release, package-install, or downstream ARISE
-  evidence.
-- **Local-files confidentiality profile (implementation candidate; promotion
-  pending).** `mode = "local_files"` means model context allowed and governed
-  file publication denied. Local Git and local CAS/evidence remain available;
-  push/LFS upload, remote CI, release/package publication, artifact upload,
-  and attachment/connector publication fail closed. Exact external export
-  requires a Chief one-shot destination/content/purpose/expiry permit. Doctor
-  reports remotes, rewrites, LFS, workflows, sync/network storage,
-  publish-credential names/helpers, and receipts without exposing credential
-  values. The Bridge enforces storage/cwd preflight at issue, pre-reserve, and
-  process pending and requests `networkAccess=false`. App Server launch now
-  requires a non-linked exact three-file `CODEX_HOME`, rechecks its closed
-  policy binding immediately before Popen, uses strict process overrides, and
-  repeats file-publication surface denials in `thread/start.config`. Windows mapped drives are
-  rejected through volume/DOS-device inspection; missing roots, aliases, and
-  reparse uncertainty also fail confirmed-local gates. Percent-encoded `file:`
-  drives and generic Windows reparse attributes cannot bypass that classifier;
-  lexical and resolved drives are both checked so SUBST identity survives the
-  trust decision, and malformed URLs become structured invalid findings.
-  Terminal transport
-  receipts cannot close while an item remains started, except that
-  `runtime_unknown` preserves it as incomplete evidence. This is not DLP, an air
-  gap, or a claim that model providers cannot see prompt/context. The active
-  promotion route is local Windows/WSL plus applicable authorized EDA,
-  independent review, seal, install smoke, and encrypted bundle; remote CI and
-  publication are forbidden/not applicable.
+  evidence. The selected release target is exact final-SHA GitHub CI, immutable
+  tag/Release readback, and exact wheel/sdist PyPI Trusted Publishing with
+  remote hash/install readback. The same sealed task owns those gates and the
+  released ARISE install; no confidentiality-profile migration is required.
+- **Selective local-files confidentiality (implementation candidate; promotion
+  pending).** `mode = "local_files"` means model context allowed and
+  user-designated file/tree publication constrained by destination. An omitted
+  or empty `protected` list classifies nothing, so AOI itself can update, push,
+  run remote CI, and publish GitHub/PyPI releases normally.
+  `home_remote_only` binds protected bytes to one exact named home remote and
+  credential-free destination; `local_only` denies every external destination
+  absent an exact Chief one-shot destination/content/purpose/expiry export
+  permit. The Git preflight binds config, exact ref updates, read-only observed
+  remote pre-state OIDs, outgoing commits, protected history/blob/content
+  identities, and rejects other destinations,
+  rewrite/LFS ambiguity, delete/copy bypasses, missing protected origins, or
+  rule drift. Delivery persists the exact policy binding with the receipt, so
+  later config evolution cannot reinterpret historical evidence; a later
+  unreceipted remote tip also cannot borrow an older receipt. Other publication
+  gates inventory exact regular files plus bounded wheel/ZIP/gzip-tar members.
+  Local snapshot generation binds ignored `aoi.toml`, normalized rules, and
+  exact protected content into tracked `release/publication-policy.json`; clean
+  runners consume that snapshot with an independent expected-digest pin and
+  without requiring or uploading local-only origins. The release workflow
+  invokes that gate before every Actions artifact upload, transports
+  non-recursive receipt sidecars, and revalidates the exact package-container
+  pair before PyPI. It also seals a separate GitHub Release envelope, gives one
+  no-checkout job only `contents: write`, stages or resumes the exact
+  annotated-tag Release as a non-public draft, verifies all three assets before
+  publishing the complete prerelease, and rejects an incomplete already-public
+  Release. Authenticated paginated discovery, a deterministic
+  source/content/policy contract marker, exact Release-ID mutations, bounded zero-byte starter
+  recovery, and per-mutation tag rechecks keep draft crash recovery fail closed.
+  An independent read-only API/download/hash readback must then pass before the
+  no-checkout OIDC PyPI job can start.
+  Doctor reports rules,
+  remotes, rewrites, LFS, workflows, sync/network storage, credential
+  names/helpers, and receipts without exposing credential values; external
+  capability alone is warning/inventory, not a profile-wide error. The Bridge
+  enforces local storage/cwd preflight at issue, pre-reserve, and process pending
+  and requests `networkAccess=false`. App Server launch requires a non-linked
+  exact three-file `CODEX_HOME`, rechecks its closed policy binding immediately
+  before Popen, uses strict process overrides, and repeats publication-surface
+  denials in `thread/start.config`. Windows mapped drives are rejected through
+  volume/DOS-device inspection; missing roots, aliases, and reparse uncertainty
+  also fail confirmed-local gates when protected rules exist, while an empty
+  rule set leaves the launch-storage gate inactive. Terminal transport receipts cannot close
+  while an item remains started, except that `runtime_unknown` preserves it as
+  incomplete evidence. This is not DLP, an air gap, or a claim that model
+  providers cannot see prompt/context. With the AOI repo's empty protected-rule
+  set, the active promotion route includes exact final-SHA GitHub and PyPI gates
+  after local Windows/WSL, review, seal, package/install, and canary evidence.
 - **Deterministic cross-process timestamp fixtures.** Synthetic verification
   supersession now makes each replacement timestamp strictly later than its
   source before hashing; the manual-dispatch expiry test uses a fixed valid
@@ -237,7 +276,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   worktree, and Chief epoch without claiming provider routing, config loading,
   runtime profile, or sandbox facts. The resource lifecycle now replays a
   strict timezone-aware LIFO apply/rollback timeline and serializes at most five
-  seconds of cross-process clock jitter. Registration explicitly proves only
+  seconds of cross-process clock jitter after every validated resource
+  transition, registration, and already-persisted startup observation. This
+  prevents a later apply from sorting before a startup that causally preceded
+  it when Windows and WSL wall clocks step backwards. Registration explicitly
+  proves only
   `registered_byte_state_equivalent_only`: byte-identical events cannot be
   ordered by filesystem evidence. Historical schema-v1 receipts remain
   hash-validated but are never silently upgraded and do not block unrelated v2

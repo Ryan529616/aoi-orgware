@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -460,6 +461,75 @@ class HookMergeTests(unittest.TestCase):
             )
         )
 
+    def test_wsl_command_pair_preserves_spaced_tokens(self) -> None:
+        launcher = "/opt/AOI Tools/bin/aoi-codex-hook"
+        root = "/work/Project Alpha"
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu 24.04",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            launcher,
+            root,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        self.assertNotEqual(command, command_windows)
+        self.assertEqual(
+            shlex.split(command_windows, posix=True),
+            [
+                "wsl.exe",
+                "--distribution",
+                "Ubuntu 24.04",
+                "--user",
+                "tester",
+                "--cd",
+                root,
+                "--exec",
+                launcher,
+                "--hook-version",
+                "6",
+                "--project-root",
+                root,
+                "--provenance-sha256",
+                TEST_PROVENANCE_SHA256,
+            ],
+        )
+        self.assertTrue(
+            co.is_current_codex_hook_command_pair(
+                command,
+                command_windows,
+                expected_launcher=launcher,
+                expected_project_root=root,
+                expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+                environment=environment,
+                kernel_release="6.6.0-microsoft-standard-WSL2",
+                host_os_name="posix",
+                wsl_user="tester",
+            )
+        )
+
+    def test_wsl_command_rejects_posix_backslash_quoting_ambiguity(self) -> None:
+        cases = (
+            ("/opt/aoi/bin/aoi-codex-hook\\", TEST_PROJECT_ROOT),
+            (TEST_HOOK_LAUNCHER, "/work/aoi-project\\"),
+        )
+        for launcher, root in cases:
+            with self.subTest(launcher=launcher, root=root):
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError, "safe absolute POSIX path"
+                ):
+                    co.build_codex_windows_wsl_hook_command(
+                        launcher,
+                        root,
+                        TEST_PROVENANCE_SHA256,
+                        distribution="Ubuntu",
+                        user="tester",
+                    )
+
     def test_wsl_current_wrapper_rejects_shape_and_pair_drift(self) -> None:
         environment = {
             "WSL_DISTRO_NAME": "Ubuntu",
@@ -655,6 +725,73 @@ class HookMergeTests(unittest.TestCase):
             [{"type": "command", "command": "other-stop"}],
         )
         self.assertEqual(stop_entries[1]["hooks"][0]["command"], CURRENT_HOOK_COMMAND)
+
+    def test_legacy_wsl_handler_upgrades_to_exact_pair_without_dropping_foreign_hook(
+        self,
+    ) -> None:
+        old_launcher = "/opt/aoi-0.3/bin/aoi-codex-hook"
+        old_root = "/home/tester/project/ARISE"
+        old_command = f'"{old_launcher}" --hook-version 6'
+        old_windows = (
+            f'wsl.exe -d Ubuntu --cd "{old_root}" "{old_launcher}" '
+            "--hook-version 6"
+        )
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            TEST_HOOK_LAUNCHER,
+            old_root,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "other-stop"},
+                            {
+                                "type": "command",
+                                "command": old_command,
+                                "commandWindows": old_windows,
+                                "timeout": 30,
+                            },
+                        ]
+                    }
+                ]
+            }
+        }
+        merged, added = co.merge_codex_hook_settings(
+            existing, command=command, command_windows=command_windows
+        )
+        self.assertEqual(
+            added,
+            [
+                "SessionStart",
+                "UserPromptSubmit",
+                "SubagentStart",
+                "SubagentStop",
+                "PreToolUse",
+                "PostToolUse",
+            ],
+        )
+        stop_entries = merged["hooks"]["Stop"]
+        self.assertEqual(
+            stop_entries[0]["hooks"],
+            [{"type": "command", "command": "other-stop"}],
+        )
+        self.assertEqual(
+            (
+                stop_entries[1]["hooks"][0]["command"],
+                stop_entries[1]["hooks"][0]["commandWindows"],
+            ),
+            (command, command_windows),
+        )
 
     def test_current_command_requires_exact_bound_absolute_command(self) -> None:
         self.assertTrue(co.is_aoi_codex_hook_command(CURRENT_HOOK_COMMAND))
@@ -1421,6 +1558,12 @@ class FreshCodexInitCliTests(unittest.TestCase):
                 cli_impl.codex_install_provenance_impl,
                 "validate_codex_install_provenance",
                 return_value=provenance,
+            ), mock.patch.object(
+                cli_impl.confidentiality_impl,
+                "require_publication_action_allowed",
+                side_effect=AssertionError(
+                    "inbound AOI installation is not project-file publication"
+                ),
             ), mock.patch.object(sys, "stdout", captured):
                 self.assertEqual(cli_impl.cmd_codex_init(args, h.get_paths(root)), 0)
             payload = json.loads(captured.getvalue())

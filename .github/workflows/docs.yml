@@ -13,6 +13,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PUBLICATION_POLICY_SHA256: 11ad65c25fee5d4060422001a344faa7c8e06b427e452bd7d48a76231e4b905f
+
 concurrency:
   group: docs-deploy
   cancel-in-progress: false
@@ -33,6 +36,17 @@ jobs:
         run: python -m pip install "mkdocs-material==9.*"
       - name: Build site
         run: mkdocs build --strict
+      - name: Preflight GitHub Pages artifact publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python -m aoi_orgware.publication_gate preflight \
+            --policy-snapshot release/publication-policy.json \
+            --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" \
+            --action artifact_upload \
+            --destination "https://github.com/$GITHUB_REPOSITORY/actions/artifacts" \
+            --subject site/ \
+            --json > "$RUNNER_TEMP/docs-pages-publication-receipt.json"
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: site

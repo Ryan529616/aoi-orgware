@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import io
+import json
 import re
 import stat
 import subprocess
@@ -96,11 +99,161 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_release_verifier_requires_bridge_entry_point_and_pinned_resources(self) -> None:
         self.assertIn("aoi-codex-bridge", dist_verify.CONSOLE_SCRIPTS)
         expected = {
-            "aoi_orgware/resources/codex_app_server/0.144.6/runtime-pin.json",
-            "aoi_orgware/resources/codex_app_server/0.144.6/schema-manifest.json",
-            "aoi_orgware/resources/codex_app_server/0.144.6/codex_app_server_protocol.v2.schemas.json",
+            "aoi_orgware/resources/codex_app_server/0.145.0/runtime-pin.json",
+            "aoi_orgware/resources/codex_app_server/0.145.0/schema-manifest.json",
+            "aoi_orgware/resources/codex_app_server/0.145.0/codex_app_server_protocol.v2.schemas.json",
         }
         self.assertTrue(expected.issubset(dist_verify.REQUIRED_PACKAGE_FILES))
+
+    def test_release_verifier_rejects_self_consistent_runtime_resource_tampering(
+        self,
+    ) -> None:
+        """RECORD cannot substitute for the independently pinned runtime bytes."""
+
+        resource_bytes = {
+            member: (SRC / member).read_bytes()
+            for member in dist_verify.REQUIRED_PACKAGE_FILES
+        }
+
+        def write_sdist(path: Path) -> None:
+            with tarfile.open(path, "w:gz") as archive:
+                for member, payload in resource_bytes.items():
+                    info = tarfile.TarInfo(f"candidate/src/{member}")
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+
+        def write_wheel(path: Path, altered_member: str, payload: bytes) -> str:
+            members = {
+                **resource_bytes,
+                altered_member: payload,
+                "aoi_orgware-0.4.0a1.dist-info/METADATA": (
+                    b"Metadata-Version: 2.1\nName: aoi-orgware\nVersion: 0.4.0a1\n"
+                ),
+            }
+            with zipfile.ZipFile(path, "w") as archive:
+                for member, member_bytes in members.items():
+                    archive.writestr(member, member_bytes)
+                rows = []
+                for member, member_bytes in members.items():
+                    digest = base64.urlsafe_b64encode(
+                        hashlib.sha256(member_bytes).digest()
+                    ).rstrip(b"=").decode("ascii")
+                    rows.append(f"{member},sha256={digest},{len(member_bytes)}")
+                record_member = "aoi_orgware-0.4.0a1.dist-info/RECORD"
+                archive.writestr(record_member, "\n".join(rows) + f"\n{record_member},,\n")
+            return "\n".join(rows)
+
+        altered_pin = json.loads(resource_bytes[dist_verify.RUNTIME_PIN_MEMBER])
+        altered_pin["release_url"] = "https://attacker.invalid/rust-v0.145.0"
+        altered_manifest = resource_bytes[dist_verify.SCHEMA_MANIFEST_MEMBER] + b" "
+        cases = (
+            (
+                dist_verify.RUNTIME_PIN_MEMBER,
+                json.dumps(altered_pin, sort_keys=True).encode("utf-8"),
+                "provenance differs",
+            ),
+            (
+                dist_verify.SCHEMA_MANIFEST_MEMBER,
+                altered_manifest,
+                "schema-manifest.json digest differs",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdist = root / "candidate.tar.gz"
+            write_sdist(sdist)
+            for member, payload, message in cases:
+                with self.subTest(member=member):
+                    wheel = root / "candidate.whl"
+                    record_rows = write_wheel(wheel, member, payload)
+                    encoded = base64.urlsafe_b64encode(
+                        hashlib.sha256(payload).digest()
+                    ).rstrip(b"=").decode("ascii")
+                    self.assertIn(f"{member},sha256={encoded},{len(payload)}", record_rows)
+                    with self.assertRaisesRegex(dist_verify.VerificationError, message):
+                        dist_verify._validate_archive_contents(wheel, sdist)
+
+    def test_release_verifier_requires_installed_runtime_binding_and_digests(
+        self,
+    ) -> None:
+        probe = {
+            "runtime_binding": dist_verify.EXPECTED_CODEX_RUNTIME_BINDING,
+            "runtime_resources": {
+                "runtime_pin": dist_verify.EXPECTED_CODEX_RUNTIME_PIN,
+                "runtime_pin_sha256": dist_verify.EXPECTED_RUNTIME_PIN_SHA256,
+                "runtime_pin_size": dist_verify.EXPECTED_RUNTIME_PIN_SIZE,
+                "schema_manifest_sha256": dist_verify.EXPECTED_SCHEMA_MANIFEST_SHA256,
+                "schema_manifest_size": dist_verify.EXPECTED_SCHEMA_MANIFEST_SIZE,
+                "combined_schema_sha256": dist_verify.EXPECTED_COMBINED_SCHEMA_SHA256,
+                "combined_schema_size": dist_verify.EXPECTED_COMBINED_SCHEMA_SIZE,
+            },
+        }
+        dist_verify._validate_installed_runtime_probe(
+            probe, artifact=Path("candidate.whl")
+        )
+        bad_probe = {
+            **probe,
+            "runtime_binding": {
+                **dist_verify.EXPECTED_CODEX_RUNTIME_BINDING,
+                "schema_manifest_sha256": "0" * 64,
+            },
+        }
+        with self.assertRaisesRegex(dist_verify.VerificationError, "runtime binding"):
+            dist_verify._validate_installed_runtime_probe(
+                bad_probe, artifact=Path("candidate.whl")
+            )
+
+    def test_sdist_derived_wheel_runtime_resources_are_checked_before_install(
+        self,
+    ) -> None:
+        resource_bytes = {
+            member: (SRC / member).read_bytes()
+            for member in dist_verify.RUNTIME_RESOURCE_MEMBERS
+        }
+        resource_bytes[dist_verify.SCHEMA_MANIFEST_MEMBER] += b" "
+
+        def fake_build(command: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.assertIsInstance(command, list)
+            arguments = list(command)  # type: ignore[arg-type]
+            output = Path(arguments[arguments.index("--outdir") + 1])
+            output.mkdir(parents=True, exist_ok=True)
+            wheel = output / "candidate-0.4.0a1-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for member, payload in resource_bytes.items():
+                    archive.writestr(member, payload)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdist = root / "candidate.tar.gz"
+            sdist.write_bytes(b"placeholder")
+            source = root / "source-project"
+            source.mkdir()
+            with (
+                mock.patch.object(
+                    dist_verify,
+                    "_verify_build_backend",
+                    return_value=Path(sys.executable),
+                ),
+                mock.patch.object(dist_verify, "_extract_sdist", return_value=source),
+                mock.patch.object(dist_verify, "_run", side_effect=fake_build),
+                mock.patch.object(
+                    dist_verify,
+                    "_verify_installed_artifact",
+                    return_value="0.4.0a1",
+                ) as installed,
+            ):
+                with self.assertRaisesRegex(
+                    dist_verify.VerificationError,
+                    "schema-manifest.json digest differs",
+                ):
+                    dist_verify._verify_sdist_via_derived_wheel(
+                        sdist,
+                        build_python=Path(sys.executable),
+                        expected_build_version=dist_verify.BUILD_FRONTEND_VERSION,
+                        expected_hatchling_version=dist_verify.HATCHLING_VERSION,
+                    )
+                installed.assert_not_called()
 
     def test_release_verifier_scrubs_ambient_python_and_pip_configuration(self) -> None:
         with mock.patch.dict(
@@ -237,7 +390,11 @@ class ReleaseMetadataTests(unittest.TestCase):
                 dist_verify, "_extract_sdist", return_value=source_root
             ), mock.patch.object(
                 dist_verify, "_verify_installed_artifact", return_value="0.4.0a1"
-            ), mock.patch.object(dist_verify, "_run", side_effect=run_build):
+            ), mock.patch.object(
+                dist_verify, "_validate_archived_runtime_resources"
+            ) as runtime_validation, mock.patch.object(
+                dist_verify, "_run", side_effect=run_build
+            ):
                 version = dist_verify._verify_sdist_via_derived_wheel(
                     sdist,
                     build_python=build_python,
@@ -246,6 +403,7 @@ class ReleaseMetadataTests(unittest.TestCase):
                 )
 
             self.assertEqual(version, "0.4.0a1")
+            runtime_validation.assert_called_once()
             build_call = next(command for command in calls if "build" in command)
             self.assertEqual(Path(build_call[0]), build_python.absolute())
             self.assertNotEqual(Path(build_call[0]), Path(sys.executable).resolve())

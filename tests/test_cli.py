@@ -5481,6 +5481,414 @@ class HardeningTests(HarnessTestCase):
         )
         self.assertEqual(json.loads(result.stdout)["remote_sha"], commit)
 
+    def test_selective_push_receipt_is_persisted_and_revalidated_from_task_cas(
+        self,
+    ) -> None:
+        home = Path(self.backup_temp.name) / "selective-home.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(home)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        config_path = self.root / "aoi.toml"
+        with config_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n[confidentiality]\n"
+                'mode = "local_files"\n'
+                "protected = [{ path = \"private/secret.bin\", kind = \"file\", "
+                "policy = \"home_remote_only\", home_remote = \"origin\", "
+                f'home_destination = "{home.as_posix()}" }}]\n'
+            )
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "aoi.toml"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "selective policy"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.init_task("selective-push-task")
+        protected = self.root / "private" / "secret.bin"
+        protected.parent.mkdir()
+        protected.write_bytes(b"classified delivery bytes")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "private/secret.bin"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "protected delivery"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.root), "remote", "add", "origin", str(home)],
+            check=True,
+        )
+        zeros = "0" * len(commit)
+        preflight = self.cli(
+            "confidentiality-git-push-preflight",
+            "--remote",
+            "origin",
+            "--destination",
+            home.as_posix(),
+            "--update",
+            "refs/heads/main",
+            commit,
+            "refs/heads/main",
+            zeros,
+            "--json",
+        )
+        receipt_path = Path(self.backup_temp.name) / "push-preflight.json"
+        receipt_path.write_text(preflight.stdout, encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "push", "origin", "main:refs/heads/main"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.cli(
+            "set-delivery",
+            "--task",
+            "selective-push-task",
+            "--mode",
+            "pushed",
+            "--detail",
+            "exact protected home delivery with durable preflight",
+            "--commit",
+            commit,
+            "--remote",
+            "origin",
+            "--remote-ref",
+            "refs/heads/main",
+            "--confidentiality-preflight-file",
+            str(receipt_path),
+        )
+        paths = h.get_paths(self.root)
+        state = h.load_task(paths, "selective-push-task")
+        artifact = state["delivery"]["confidentiality_preflight_artifact"]
+        self.assertRegex(artifact["sha256"], r"^[0-9a-f]{64}$")
+        receipt_path.unlink()
+        self.assertEqual(
+            cli_impl.delivery_integrity_errors(paths, state, verify_remote=True), []
+        )
+        self.assertEqual(
+            cli_impl.confidentiality_remote_tip_coverage_errors(paths, [state]), []
+        )
+        self.add_passing_verification("selective-push-task")
+        self.cli(
+            "checkpoint",
+            "--task",
+            "selective-push-task",
+            "--next-action",
+            "Close the receipted predecessor before successor delivery",
+        )
+        self.cli(
+            "close-task",
+            "--outcome",
+            "achieved",
+            "--task",
+            "selective-push-task",
+            "--summary",
+            "The predecessor protected delivery is exact and verified",
+        )
+        state = h.load_task(paths, "selective-push-task")
+        protected.write_bytes(b"classified delivery bytes\nnew unreceipted tip")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "private/secret.bin"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "unreceipted descendant"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "push", "origin", "main:refs/heads/main"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        coverage_errors = cli_impl.confidentiality_remote_tip_coverage_errors(
+            paths, [state]
+        )
+        self.assertTrue(
+            any("lacks an exact persisted preflight" in item for item in coverage_errors),
+            coverage_errors,
+        )
+
+        successor_worktree = Path(self.backup_temp.name) / "successor-worktree"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "worktree",
+                "add",
+                "-b",
+                "governed-successor",
+                str(successor_worktree),
+                "HEAD",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.cli(
+            "init-task",
+            "--task-id",
+            "selective-successor-task",
+            "--title",
+            "Cross-worktree governed successor",
+            "--objective",
+            "Cover the next remote tip from an isolated worktree",
+            "--owner",
+            "test-root",
+            "--completion-boundary",
+            "The successor tip has an exact persisted preflight receipt",
+            "--worktree",
+            str(successor_worktree),
+        )
+        self.cli(
+            "approve-plan",
+            "--task",
+            "selective-successor-task",
+            "--note",
+            "Use the same canonical destination and remote ref",
+        )
+        successor_protected = successor_worktree / "private" / "secret.bin"
+        successor_protected.write_bytes(b"classified governed successor")
+        subprocess.run(
+            ["git", "-C", str(successor_worktree), "add", "private/secret.bin"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(successor_worktree), "commit", "-m", "governed successor"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        successor_commit = subprocess.run(
+            ["git", "-C", str(successor_worktree), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        successor_preflight = self.cli(
+            "confidentiality-git-push-preflight",
+            "--task",
+            "selective-successor-task",
+            "--remote",
+            "origin",
+            "--destination",
+            home.as_posix(),
+            "--update",
+            "refs/heads/governed-successor",
+            successor_commit,
+            "refs/heads/main",
+            subprocess.run(
+                ["git", "-C", str(successor_worktree), "rev-parse", "HEAD^"],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip(),
+            "--json",
+        )
+        successor_receipt_path = (
+            Path(self.backup_temp.name) / "successor-preflight.json"
+        )
+        successor_receipt_path.write_text(
+            successor_preflight.stdout, encoding="utf-8"
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(successor_worktree),
+                "push",
+                "origin",
+                "HEAD:refs/heads/main",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.cli(
+            "set-delivery",
+            "--task",
+            "selective-successor-task",
+            "--mode",
+            "pushed",
+            "--detail",
+            "cross-worktree successor has an exact durable receipt",
+            "--commit",
+            successor_commit,
+            "--remote",
+            "origin",
+            "--remote-ref",
+            "refs/heads/main",
+            "--confidentiality-preflight-file",
+            str(successor_receipt_path),
+        )
+        successor_state = h.load_task(paths, "selective-successor-task")
+        self.assertEqual(
+            cli_impl.confidentiality_remote_tip_coverage_errors(
+                paths, [state, successor_state]
+            ),
+            [],
+        )
+        for doctor_args in (
+            ("doctor", "--task", "selective-successor-task", "--json"),
+            ("doctor", "--json"),
+        ):
+            doctor = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, *doctor_args],
+                cwd=self.root,
+                env=self.env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+
+        drift_remote = Path(self.backup_temp.name) / "drift-home.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(drift_remote)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(successor_worktree),
+                "push",
+                str(drift_remote),
+                f"{successor_commit}:refs/heads/main",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(successor_worktree),
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                str(drift_remote),
+            ],
+            check=True,
+        )
+        drift_errors = cli_impl.delivery_integrity_errors(
+            paths, successor_state, verify_remote=False
+        )
+        self.assertTrue(
+            any("effective remote destination differs" in item for item in drift_errors),
+            drift_errors,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(successor_worktree),
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                str(home),
+            ],
+            check=True,
+        )
+
+        evidence_artifacts_impl.artifact_blob_path(
+            paths, "selective-push-task", artifact["sha256"]
+        ).unlink()
+        errors = cli_impl.delivery_integrity_errors(paths, state, verify_remote=True)
+        self.assertTrue(
+            any("missing or unreadable" in item for item in errors), errors
+        )
+
+    def test_policy_change_requires_current_tip_receipt_for_known_delivery(
+        self,
+    ) -> None:
+        home = Path(self.backup_temp.name) / "policy-change-home.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(home)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "remote", "add", "origin", str(home)],
+            check=True,
+        )
+        self.init_task("pre-policy-delivery")
+        tracked = self.root / ".harness-test-root"
+        tracked.write_text("test root\npre-policy delivery\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", ".harness-test-root"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", "pre-policy delivery"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.root), "push", "origin", "main:refs/heads/main"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.cli(
+            "set-delivery",
+            "--task",
+            "pre-policy-delivery",
+            "--mode",
+            "pushed",
+            "--detail",
+            "delivery predates selective protection",
+            "--commit",
+            commit,
+            "--remote",
+            "origin",
+            "--remote-ref",
+            "refs/heads/main",
+        )
+        state = h.load_task(h.get_paths(self.root), "pre-policy-delivery")
+        with (self.root / "aoi.toml").open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n[confidentiality]\n"
+                'mode = "local_files"\n'
+                "protected = [{ path = \"private/future.bin\", kind = \"file\", "
+                "policy = \"home_remote_only\", home_remote = \"origin\", "
+                f'home_destination = "{home.as_posix()}" }}]\n'
+            )
+        paths = h.get_paths(self.root)
+        errors = cli_impl.confidentiality_remote_tip_coverage_errors(paths, [state])
+        self.assertTrue(
+            any("for the current policy" in item for item in errors), errors
+        )
+
     def test_terminal_delivery_accepts_only_synced_descendant_branch(self) -> None:
         task_id = "terminal-delivery-lineage"
         self.init_task(task_id)

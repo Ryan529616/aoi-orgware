@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 
 from aoi_orgware import codex_transport_contracts as contracts
+from aoi_orgware.semantic_events import canonical_json_bytes
 
 
 SHA_A = "a" * 64
@@ -187,19 +188,129 @@ def to_turn_started() -> tuple[str, str, list[dict[str, object]]]:
 
 def test_packaged_runtime_pin_and_strict_manifest_guards() -> None:
     pin = contracts.pinned_runtime_binding()
-    assert pin["app_server_executable_sha256"] == "94884f0f00d4e1b9fdd2d70670169c4dd3d6533ef93002cea963ced863101e57"
-    assert pin["executable_size_bytes"] == 283340080
-    root = Path(contracts.__file__).resolve().parent / "resources" / "codex_app_server" / "0.144.6"
+    assert pin["app_server_executable_sha256"] == "5163c75ed88d460b35b03c8d8f4ef190b3bdd09971d7ac2bd90b48c435f1cf14"
+    assert pin["executable_size_bytes"] == 299117872
+    root = Path(contracts.__file__).resolve().parent / "resources" / "codex_app_server" / "0.145.0"
     pin_bytes = (root / "runtime-pin.json").read_bytes()
     manifest = json.loads((root / "schema-manifest.json").read_bytes())
     combined = (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
     bad = copy.deepcopy(manifest)
     bad[0]["path"] = "../schema.json"
     with pytest.raises(contracts.CodexTransportContractError):
-        contracts._validate_packaged_runtime_payload(pin_bytes, contracts.canonical_json_bytes(bad), combined)
+        contracts._validate_packaged_runtime_payload(pin_bytes, canonical_json_bytes(bad), combined)
     reordered = list(reversed(manifest))
     with pytest.raises(contracts.CodexTransportContractError):
-        contracts._validate_packaged_runtime_payload(pin_bytes, contracts.canonical_json_bytes(reordered), combined)
+        contracts._validate_packaged_runtime_payload(pin_bytes, canonical_json_bytes(reordered), combined)
+
+
+def _replace_pin_field(pin: dict[str, object], path: tuple[str | int, ...], value: object) -> None:
+    target: object = pin
+    for part in path[:-1]:
+        if isinstance(part, str):
+            assert isinstance(target, dict)
+            target = target[part]
+        else:
+            assert isinstance(target, list)
+            target = target[part]
+    if isinstance(path[-1], str):
+        assert isinstance(target, dict)
+        target[path[-1]] = value
+    else:
+        assert isinstance(target, list)
+        target[path[-1]] = value
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("schema_version",), 2),
+        (("release_tag",), "rust-v0.145.0-forged"),
+        (("release_url",), "https://example.invalid/release"),
+        (("codex_cli_version",), "codex-cli 0.145.0-forged"),
+        (("codex_app_server_version",), "codex-app-server 0.145.0-forged"),
+        (("app_server_asset", "name"), "forged-app-server.zip"),
+        (("app_server_asset", "size"), 1),
+        (("app_server_asset", "sha256"), SHA_A),
+        (("app_server_asset", "url"), "https://example.invalid/app.zip"),
+        (("app_server_executable", "name"), "forged-app-server.exe"),
+        (("app_server_executable", "size"), 1),
+        (("app_server_executable", "sha256"), SHA_A),
+        (("schema_generator_asset", "name"), "forged-codex.zip"),
+        (("schema_generator_asset", "size"), 1),
+        (("schema_generator_asset", "sha256"), SHA_A),
+        (("schema_generator_asset", "url"), "https://example.invalid/codex.zip"),
+        (("schema_generator_executable", "name"), "forged-codex.exe"),
+        (("schema_generator_executable", "size"), 1),
+        (("schema_generator_executable", "sha256"), SHA_A),
+        (("stable_schema", "generator_arguments"), ["forged"]),
+        (("stable_schema", "experimental"), True),
+        (("stable_schema", "file_count"), 1),
+        (("stable_schema", "manifest_format"), "forged"),
+        (("stable_schema", "manifest_size"), 1),
+        (("stable_schema", "manifest_sha256"), SHA_A),
+        (("stable_schema", "combined_v2_schema_size"), 1),
+        (("stable_schema", "combined_v2_schema_sha256"), SHA_A),
+    ),
+)
+def test_packaged_runtime_pin_rejects_every_pinned_field_mutation(
+    path: tuple[str | int, ...], replacement: object
+) -> None:
+    root = Path(contracts.__file__).resolve().parent / "resources" / "codex_app_server" / "0.145.0"
+    pin = json.loads((root / "runtime-pin.json").read_bytes())
+    manifest = (root / "schema-manifest.json").read_bytes()
+    combined = (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
+    _replace_pin_field(pin, path, replacement)
+    with pytest.raises(contracts.CodexTransportContractError, match="stable contract"):
+        contracts._validate_packaged_runtime_payload(
+            canonical_json_bytes(pin), manifest, combined
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("schema_version",), True),
+        (("app_server_asset", "size"), True),
+        (("stable_schema", "experimental"), 0),
+        (("stable_schema", "generator_arguments"), "app-server"),
+    ),
+)
+def test_packaged_runtime_pin_rejects_equal_but_wrong_scalar_or_container_types(
+    path: tuple[str | int, ...], replacement: object
+) -> None:
+    root = Path(contracts.__file__).resolve().parent / "resources" / "codex_app_server" / "0.145.0"
+    pin = json.loads((root / "runtime-pin.json").read_bytes())
+    manifest = (root / "schema-manifest.json").read_bytes()
+    combined = (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
+    _replace_pin_field(pin, path, replacement)
+    with pytest.raises(contracts.CodexTransportContractError, match="stable contract"):
+        contracts._validate_packaged_runtime_payload(
+            canonical_json_bytes(pin), manifest, combined
+        )
+
+
+def test_packaged_runtime_pin_rejects_duplicate_json_keys() -> None:
+    root = Path(contracts.__file__).resolve().parent / "resources" / "codex_app_server" / "0.145.0"
+    pin = (root / "runtime-pin.json").read_bytes()
+    manifest = (root / "schema-manifest.json").read_bytes()
+    combined = (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
+    duplicate = pin.replace(
+        b'{\n  "schema_version": 1,',
+        b'{\n  "schema_version": 1,\n  "schema_version": 1,',
+        1,
+    )
+    assert duplicate != pin
+    with pytest.raises(contracts.CodexTransportContractError, match="duplicate key"):
+        contracts._validate_packaged_runtime_payload(duplicate, manifest, combined)
+
+
+def test_packaged_runtime_resource_reader_is_bounded(tmp_path: Path) -> None:
+    resource = tmp_path / "resource.bin"
+    resource.write_bytes(b"1234")
+    with pytest.raises(contracts.CodexTransportContractError, match="byte bound"):
+        contracts._read_bounded_packaged_resource(
+            resource, maximum_bytes=3, label="test resource"
+        )
 
 
 @pytest.mark.parametrize(

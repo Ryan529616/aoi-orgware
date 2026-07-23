@@ -93,7 +93,7 @@ initialize_result = {
     "codexHome": os.path.abspath(os.environ.get("CODEX_HOME", os.getcwd())),
     "platformFamily": "windows" if os.name == "nt" else "unix",
     "platformOs": platform.system().lower(),
-    "userAgent": "fake-codex-app-server/0.144.6",
+    "userAgent": "fake-codex-app-server/0.145.0",
     "secret_present": "AOI_CHIEF_CREDENTIAL_FILE" in os.environ,
     "publication_secret_present": "GITHUB_TOKEN" in os.environ,
 }
@@ -152,7 +152,7 @@ if scenario == "error_response":
     send({"id":thread["id"],"error":{"code":-32000,"message":"no"}})
     raise SystemExit(0)
 thread_value = {
-    "cliVersion": "0.144.6",
+    "cliVersion": "0.145.0",
     "createdAt": 1,
     "cwd": thread["params"]["cwd"],
     "ephemeral": True,
@@ -282,7 +282,7 @@ def _fake_runtime_pin(
     *,
     executable_sha256: str | None = None,
     executable_size_bytes: int | None = None,
-    app_server_version: str = "fake-app-server 0.144.6",
+    app_server_version: str = "fake-app-server 0.145.0",
 ) -> RuntimePin:
     executable = Path(sys.executable).resolve()
     binding = contracts.pinned_runtime_binding()
@@ -324,7 +324,7 @@ def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwarg
         max_line_bytes=max_line_bytes,
         runtime_pin=runtime_pin,  # type: ignore[arg-type]
         _test_launch_args=("-u", str(fake_server)),
-        _test_version_args=("-c", "print('fake-app-server 0.144.6')"),
+        _test_version_args=("-c", "print('fake-app-server 0.145.0')"),
         **kwargs,
     )
 
@@ -554,7 +554,7 @@ def test_pinned_notification_and_item_allowlists_match_generated_schema() -> Non
         Path(contracts.__file__).resolve().parent
         / "resources"
         / "codex_app_server"
-        / "0.144.6"
+        / "0.145.0"
     )
     schema = json.loads(
         (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
@@ -604,7 +604,7 @@ def test_pinned_rpc_envelopes_do_not_define_jsonrpc_member() -> None:
         Path(contracts.__file__).resolve().parent
         / "resources"
         / "codex_app_server"
-        / "0.144.6"
+        / "0.145.0"
     )
     schema = json.loads(
         (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()

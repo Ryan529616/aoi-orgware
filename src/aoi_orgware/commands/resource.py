@@ -95,7 +95,11 @@ from ..routing_authority import (
     startup_resource_files_match,
     validate_session_registration,
 )
-from ..session_receipts import load_startup_receipt, load_startup_receipt_locked
+from ..session_receipts import (
+    load_startup_receipt,
+    load_startup_receipt_locked,
+    scan_startup_receipts_locked,
+)
 from ..state_lookup import require_open_task
 
 
@@ -466,7 +470,9 @@ def _latest_registration_times(state: dict[str, Any]) -> list[dt.datetime]:
     return times
 
 
-def _next_resource_transition_time(state: dict[str, Any]) -> str:
+def _next_resource_transition_time(
+    paths: HarnessPaths, state: dict[str, Any]
+) -> str:
     """Return a strictly monotonic timestamp for a resource-state transition.
 
     Resource commands commonly run in separate processes or host layers.  A
@@ -476,6 +482,13 @@ def _next_resource_transition_time(state: dict[str, Any]) -> str:
 
     latest = latest_resource_transition_at(state)
     references = _latest_registration_times(state)
+    for receipt in scan_startup_receipts_locked(paths):
+        observed = parse_tz_aware_time(str(receipt.get("observed_at", "")))
+        if observed is None:
+            # The receipt scanner already validates canonical receipt content;
+            # retain a local fail-closed guard at the timestamp boundary.
+            raise HarnessError("startup receipt observation time is invalid")
+        references.append(observed)
     if latest is not None:
         references.append(latest)
     return _bounded_strict_time_after(
@@ -625,7 +638,7 @@ def cmd_codex_config_apply(
         if plan["plan_sha256"] != expected_plan:
             raise HarnessError("Codex resource plan changed after Chief review")
         _require_task_lock_coverage(paths, state, plan["required_locks"])
-        recorded = _next_resource_transition_time(state)
+        recorded = _next_resource_transition_time(paths, state)
         receipt = make_resource_receipt(
             event_id=event_id,
             plan=plan,
@@ -1166,7 +1179,7 @@ def cmd_codex_config_rollback(
             args.reason, "resource config rollback reason"
         )
         prior_event = copy.deepcopy(event)
-        recorded = _next_resource_transition_time(state)
+        recorded = _next_resource_transition_time(paths, state)
         rollback_files_from_receipt(
             root=_task_resource_worktree(paths, state), receipt=receipt
         )

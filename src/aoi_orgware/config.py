@@ -73,6 +73,19 @@ CAPABILITY_TIERS = frozenset(
 NON_CLOSE_QUALIFYING_EVIDENCE = frozenset(
     {"engineering_inference", "historical_terminal_readback"}
 )
+MAX_PROTECTED_PATH_RULES = 256
+MAX_PUBLICATION_DESTINATION_CHARS = 2_048
+
+
+@dataclass(frozen=True)
+class ProtectedPathRule:
+    """One exact user-designated file/tree publication boundary."""
+
+    path: str
+    kind: str
+    policy: str
+    home_remote: str | None = None
+    home_destination: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,10 +99,15 @@ class ConfidentialityConfig:
     artifact_upload: str
     external_export: str
     local_cas: bool
+    protected: tuple[ProtectedPathRule, ...] = ()
 
     @property
     def local_files(self) -> bool:
         return self.mode == "local_files"
+
+    @property
+    def selective_protection(self) -> bool:
+        return self.local_files and bool(self.protected)
 
 
 @dataclass(frozen=True)
@@ -223,8 +241,101 @@ def _safe_project_relative_prefix(value: Any, label: str) -> str:
 
 
 def _prefix_covers_path(prefix: str, path: str) -> bool:
-    canonical = prefix.rstrip("/")
-    return path == canonical or path.startswith(canonical + "/")
+    # One cross-platform identity prevents a policy accepted on POSIX from
+    # becoming overlapping or bypassable on a case-insensitive Windows tree.
+    canonical = prefix.rstrip("/").casefold()
+    candidate = path.casefold()
+    return candidate == canonical or candidate.startswith(canonical + "/")
+
+
+def _publication_destination(value: Any, label: str) -> str:
+    """Validate a credential-free exact Git publication destination string."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > MAX_PUBLICATION_DESTINATION_CHARS
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"{label} must be a bounded exact destination")
+    if any(character in value for character in "\r\n\x00"):
+        raise ValueError(f"{label} must be a bounded exact destination")
+    # HTTPS userinfo is commonly a token.  Never persist it in project policy.
+    if re.match(r"^https?://[^/]*@", value, flags=re.IGNORECASE):
+        raise ValueError(f"{label} may not contain HTTP(S) userinfo")
+    if re.search(r"://[^/]*:[^/@]+@", value):
+        raise ValueError(f"{label} may not contain a password")
+    return value
+
+
+def _protected_rules(value: Any, *, mode: str) -> tuple[ProtectedPathRule, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("confidentiality.protected must be an array of tables")
+    if len(value) > MAX_PROTECTED_PATH_RULES:
+        raise ValueError(
+            "confidentiality.protected exceeds the configured rule bound"
+        )
+    if value and mode != "local_files":
+        raise ValueError(
+            "confidentiality.protected requires mode = 'local_files'"
+        )
+    rules: list[ProtectedPathRule] = []
+    for index, raw_rule in enumerate(value):
+        label = f"confidentiality.protected[{index}]"
+        if not isinstance(raw_rule, dict):
+            raise ValueError(f"{label} must be a table")
+        _reject_unknown(
+            raw_rule,
+            {"path", "kind", "policy", "home_remote", "home_destination"},
+            label,
+        )
+        path = _safe_project_relative_path(raw_rule.get("path"), f"{label}.path")
+        kind = raw_rule.get("kind")
+        if kind not in {"file", "tree"}:
+            raise ValueError(f"{label}.kind must be 'file' or 'tree'")
+        publication_policy = raw_rule.get("policy")
+        if publication_policy not in {"home_remote_only", "local_only"}:
+            raise ValueError(
+                f"{label}.policy must be 'home_remote_only' or 'local_only'"
+            )
+        home_remote = raw_rule.get("home_remote")
+        home_destination = raw_rule.get("home_destination")
+        if publication_policy == "home_remote_only":
+            if (
+                not isinstance(home_remote, str)
+                or not SAFE_ID.fullmatch(home_remote)
+            ):
+                raise ValueError(
+                    f"{label}.home_remote must be a simple remote name"
+                )
+            home_destination = _publication_destination(
+                home_destination, f"{label}.home_destination"
+            )
+        elif home_remote is not None or home_destination is not None:
+            raise ValueError(
+                f"{label} local_only rules may not define a home destination"
+            )
+        for earlier in rules:
+            if _prefix_covers_path(earlier.path, path) or _prefix_covers_path(
+                path, earlier.path
+            ):
+                raise ValueError(
+                    "confidentiality.protected contains overlapping paths: "
+                    f"{earlier.path!r} and {path!r}"
+                )
+        rules.append(
+            ProtectedPathRule(
+                path=path,
+                kind=kind,
+                policy=publication_policy,
+                home_remote=home_remote,
+                home_destination=home_destination,
+            )
+        )
+    return tuple(rules)
 
 
 def _reject_unknown(table: dict[str, Any], allowed: set[str], label: str) -> None:
@@ -378,6 +489,7 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
             "artifact_upload",
             "external_export",
             "local_cas",
+            "protected",
         },
         "confidentiality",
     )
@@ -387,6 +499,7 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
             "confidentiality.mode must be 'standard' or 'local_files'"
         )
     restrictive = mode == "local_files"
+    protected = _protected_rules(confidentiality_table.get("protected"), mode=mode)
     confidentiality = ConfidentialityConfig(
         mode=mode,
         model_context=confidentiality_table.get("model_context", "allowed"),
@@ -403,6 +516,7 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
             "external_export", "permit_required" if restrictive else "allow"
         ),
         local_cas=confidentiality_table.get("local_cas", True),
+        protected=protected,
     )
     exact_local_files = ConfidentialityConfig(
         mode="local_files",
@@ -412,6 +526,7 @@ def _parse_config(root: Path, raw: bytes, source: Path) -> ProjectConfig:
         artifact_upload="deny",
         external_export="permit_required",
         local_cas=True,
+        protected=protected,
     )
     if restrictive and confidentiality != exact_local_files:
         raise ValueError(

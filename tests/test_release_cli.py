@@ -20,6 +20,7 @@ sys.path.insert(0, str(SRC))
 
 from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
+from aoi_orgware import publication_policy  # noqa: E402
 from aoi_orgware import release_artifacts  # noqa: E402
 from aoi_orgware import release_runtime  # noqa: E402
 from aoi_orgware import semantic_events as semantic  # noqa: E402
@@ -294,6 +295,33 @@ class ReleaseCliTests(unittest.TestCase):
         )
         self.assertIn(b"duplicate JSON key", duplicate.stderr)
 
+        protected = self.root / "private" / "secret.bin"
+        protected.parent.mkdir()
+        protected.write_bytes(b"must not leave through an unrelated publication")
+        config_path = self.root / "aoi.toml"
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8")
+            + """
+
+[confidentiality]
+mode = "local_files"
+model_context = "allowed"
+git_push = "deny"
+remote_ci = "deny"
+artifact_upload = "deny"
+external_export = "permit_required"
+local_cas = true
+
+[[confidentiality.protected]]
+path = "private/secret.bin"
+kind = "file"
+policy = "local_only"
+""",
+            encoding="utf-8",
+        )
+
+        # release-promote records already observed evidence in local semantic
+        # state; it is not itself an upload of the protected file.
         result = self.cli(*common, head)
         bundle = json.loads(result.stdout)
         self.assertEqual(result.stdout, semantic.canonical_json_bytes(bundle))
@@ -329,6 +357,57 @@ class ReleaseCliTests(unittest.TestCase):
             store.semantic_head(self.paths, TASK)["event_sha256"],
             bundle["semantic_event"]["event_sha256"],
         )
+
+    def test_local_files_empty_snapshot_does_not_block_release_promotion(self) -> None:
+        config_path = self.root / "aoi.toml"
+        config_path.write_text(
+            default_config_text("Release CLI")
+            + '\n[confidentiality]\nmode = "local_files"\n',
+            encoding="utf-8",
+        )
+        current_paths = h.get_paths(self.root)
+        snapshot = publication_policy.build_publication_policy_snapshot(
+            self.root,
+            current_paths.project.confidentiality,
+            current_paths.project.sha256,
+        )
+        release_dir = self.root / "release"
+        release_dir.mkdir()
+        (release_dir / "publication-policy.json").write_bytes(
+            publication_policy.canonical_publication_policy_snapshot_bytes(snapshot)
+        )
+
+        manifest = promotion_manifest()
+        observation_result_path = self.write_canonical(
+            "local-files-observation-result.json",
+            {
+                "manifest": manifest,
+                "observation_receipt": promotion_observation(manifest),
+            },
+        )
+        receipt_path = self.write_canonical(
+            "local-files-receipt.json",
+            promotion_receipt(
+                manifest,
+                promotion_id="release-cli-local-files-empty",
+                registry_observed_at=self.iso(self.now - timedelta(seconds=20)),
+                installed_observed_at=self.iso(self.now - timedelta(seconds=10)),
+            ),
+        )
+        head = store.semantic_head(self.paths, TASK)["event_sha256"]
+        result = self.cli(
+            "release-promote",
+            "--task", TASK,
+            "--observation-result-file", str(observation_result_path),
+            "--promotion-receipt-file", str(receipt_path),
+            "--command-id", "release-cli-local-files-empty",
+            "--recorded-at", self.iso(self.now),
+            "--expected-semantic-head-sha256", head,
+        )
+        bundle = json.loads(result.stdout)
+        self.assertEqual(bundle["semantic_event"]["event_type"], "release_promoted")
+        self.assertEqual(snapshot["protected_rule_count"], 0)
+        self.assertEqual(snapshot["protected_content_count"], 0)
 
     def test_release_promotion_rejects_stale_and_expired_chief_credentials(self) -> None:
         head = store.semantic_head(self.paths, TASK)["event_sha256"]

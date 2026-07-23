@@ -921,7 +921,19 @@ def _validate_posix_absolute_path(
         or not PurePosixPath(raw).is_absolute()
         or any(
             character in raw
-            for character in {'"', "'", "\r", "\n", "\x00", "$", "`", "%", "!", "^"}
+            for character in {
+                '"',
+                "'",
+                "\\",
+                "\r",
+                "\n",
+                "\x00",
+                "$",
+                "`",
+                "%",
+                "!",
+                "^",
+            }
         )
     ):
         raise CodexOnboardingError(f"{label} must be a safe absolute POSIX path")

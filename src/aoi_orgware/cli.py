@@ -137,6 +137,9 @@ from .commands.coordination import (
     register_cross_lane_commands,
 )
 from .commands.confidentiality import (
+    cmd_confidentiality_git_push_preflight,
+    cmd_confidentiality_policy_snapshot,
+    cmd_confidentiality_publication_preflight,
     cmd_external_export_permit_consume,
     cmd_external_export_permit_issue,
     register_confidentiality_commands,
@@ -712,6 +715,9 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "codebase-memory-benchmark-validate",
     "codex-config-plan",
     "codex-startup-receipt-show",
+    "confidentiality-git-push-preflight",
+    "confidentiality-policy-snapshot",
+    "confidentiality-publication-preflight",
     "cohort-round-prepare",
     "cohort-round-preview",
     "cohort-show",
@@ -1469,11 +1475,35 @@ def verification_migration_integrity_errors(
     )
 
 
+def remote_ref_destination_snapshot(
+    worktree: Path, remote: str, remote_ref: str
+) -> tuple[str, str]:
+    """Observe one ref through one stable effective push destination alias."""
+
+    try:
+        destination_before = confidentiality_impl.effective_git_push_destination(
+            worktree, remote
+        )
+        tip = remote_ref_tip(worktree, remote, remote_ref)
+        destination_after = confidentiality_impl.effective_git_push_destination(
+            worktree, remote
+        )
+    except confidentiality_impl.ConfidentialityError as exc:
+        raise HarnessError(str(exc)) from exc
+    if destination_before != destination_after:
+        raise HarnessError(
+            f"remote {remote} effective push destination changed while observing "
+            f"{remote_ref}"
+        )
+    return destination_before, tip
+
+
 def delivery_integrity_errors(
     paths: HarnessPaths,
     state: dict[str, Any],
     *,
     verify_remote: bool,
+    allow_terminal_remote_advance: bool = False,
 ) -> list[str]:
     delivery = state.get("delivery", {})
     mode = delivery.get("mode")
@@ -1519,22 +1549,202 @@ def delivery_integrity_errors(
         )
     if remote_sha != commit:
         errors.append("recorded pushed remote SHA differs from delivery commit")
+    preflight_sha256 = str(
+        delivery.get("confidentiality_preflight_sha256", "")
+    )
+    preflight_artifact = delivery.get("confidentiality_preflight_artifact")
+    binding_value = delivery.get("confidentiality_policy_binding")
+    validated_binding: dict[str, Any] | None = None
+    if binding_value is None:
+        receipt_required = paths.project.confidentiality.selective_protection
+        if receipt_required:
+            errors.append(
+                "protected-content pushed delivery lacks its delivery-time policy binding"
+            )
+    else:
+        try:
+            if not isinstance(binding_value, dict):
+                raise confidentiality_impl.ConfidentialityError(
+                    "confidentiality policy binding schema is invalid"
+                )
+            validated_binding = (
+                confidentiality_impl.validate_confidentiality_policy_binding(
+                    binding_value
+                )
+            )
+            receipt_required = validated_binding["protected_rule_count"] > 0
+        except confidentiality_impl.ConfidentialityError as exc:
+            errors.append(str(exc))
+            receipt_required = True
+    if receipt_required:
+        if re.fullmatch(r"[0-9a-f]{64}", preflight_sha256) is None:
+            errors.append(
+                "pushed delivery with protected paths lacks an exact confidentiality preflight receipt"
+            )
+    elif preflight_sha256 and re.fullmatch(
+        r"[0-9a-f]{64}", preflight_sha256
+    ) is None:
+        errors.append("pushed delivery confidentiality preflight SHA-256 is invalid")
     if not remote or not remote_ref or not delivery.get("verified_at"):
         errors.append("pushed delivery lacks remote/ref verification receipt")
         return errors
+    if preflight_sha256:
+        try:
+            if not isinstance(preflight_artifact, dict):
+                raise HarnessError(
+                    "pushed delivery confidentiality preflight CAS reference is missing"
+                )
+            raw = evidence_artifacts_impl.verify_generated_artifact_blob(
+                paths,
+                str(state["task_id"]),
+                preflight_artifact,
+                label="Git push confidentiality preflight receipt",
+                max_bytes=confidentiality_impl.MAX_GIT_PREFLIGHT_RECEIPT_BYTES,
+            )
+            receipt = confidentiality_impl.parse_git_push_preflight_receipt_bytes(raw)
+            if validated_binding is None:
+                durable_sha256 = (
+                    confidentiality_impl.validate_git_push_preflight_receipt_contract(
+                        receipt,
+                        root=state_worktree(paths, state),
+                        policy=paths.project.confidentiality,
+                        config_sha256=paths.project.sha256,
+                        remote=remote,
+                        destination=str(receipt.get("destination", "")),
+                        commit=commit,
+                        remote_ref=remote_ref,
+                    )
+                )
+            else:
+                durable_sha256 = (
+                    confidentiality_impl.validate_git_push_preflight_receipt_binding(
+                        receipt,
+                        root=state_worktree(paths, state),
+                        binding=validated_binding,
+                        remote=remote,
+                        destination=str(receipt.get("destination", "")),
+                        commit=commit,
+                        remote_ref=remote_ref,
+                    )
+                )
+            if durable_sha256 != preflight_sha256:
+                raise HarnessError(
+                    "pushed delivery confidentiality preflight digest differs from its CAS receipt"
+                )
+            effective_destination = (
+                confidentiality_impl.effective_git_push_destination(
+                    state_worktree(paths, state), remote
+                )
+            )
+            if effective_destination != receipt["destination"]:
+                raise HarnessError(
+                    "pushed delivery effective remote destination differs from its "
+                    "persisted confidentiality preflight receipt"
+                )
+        except (HarnessError, confidentiality_impl.ConfidentialityError) as exc:
+            errors.append(str(exc))
+    elif preflight_artifact is not None:
+        errors.append(
+            "pushed delivery has a confidentiality preflight CAS reference without its receipt digest"
+        )
     if verify_remote:
         try:
-            actual_tip = remote_ref_tip(state_worktree(paths, state), remote, remote_ref)
+            _destination, actual_tip = remote_ref_destination_snapshot(
+                state_worktree(paths, state), remote, remote_ref
+            )
         except HarnessError as exc:
             errors.append(str(exc))
         else:
             expected_tip = current["head_sha"] if terminal else commit
-            if actual_tip != expected_tip:
+            if actual_tip != expected_tip and not (
+                terminal and allow_terminal_remote_advance
+            ):
                 errors.append(
                     f"remote {remote} {remote_ref} points to {actual_tip}, "
                     f"not the {'terminal task worktree HEAD' if terminal else 'delivery commit'} "
                     f"{expected_tip}"
                 )
+    return errors
+
+
+def confidentiality_remote_tip_coverage_errors(
+    paths: HarnessPaths, tasks: Iterable[dict[str, Any]]
+) -> list[str]:
+    """Require every known remote tip to have an exact current-policy receipt."""
+
+    if not paths.project.confidentiality.selective_protection:
+        return []
+    try:
+        current_binding = confidentiality_impl.confidentiality_policy_binding(
+            paths.project.confidentiality, paths.project.sha256
+        )
+    except confidentiality_impl.ConfidentialityError as exc:
+        return [str(exc)]
+    groups: dict[tuple[str, str], list[tuple[dict[str, Any], str]]] = {}
+    errors: list[str] = []
+    for task in tasks:
+        delivery = task.get("delivery", {})
+        if not isinstance(delivery, dict) or delivery.get("mode") != "pushed":
+            continue
+        remote = str(delivery.get("remote", ""))
+        remote_ref = str(delivery.get("remote_ref", ""))
+        if not remote or not remote_ref:
+            continue
+        try:
+            worktree = state_worktree(paths, task).resolve(strict=True)
+            destination, actual_tip = remote_ref_destination_snapshot(
+                worktree, remote, remote_ref
+            )
+        except (HarnessError, OSError, confidentiality_impl.ConfidentialityError) as exc:
+            errors.append(
+                f"protected-content remote destination could not be resolved for "
+                f"{remote} {remote_ref}: {exc}"
+            )
+            continue
+        groups.setdefault((destination, remote_ref), []).append((task, actual_tip))
+
+    for (destination, remote_ref), observations in sorted(groups.items()):
+        observed_tips = {tip for _task, tip in observations}
+        if len(observed_tips) != 1:
+            errors.append(
+                "protected-content remote tip observations disagree for "
+                f"{destination} {remote_ref}: {sorted(observed_tips)}"
+            )
+            continue
+        actual_tip = next(iter(observed_tips))
+        exact_candidates = [
+            task
+            for task, _tip in observations
+            if str(task.get("delivery", {}).get("commit", "")).lower()
+            == actual_tip
+            and isinstance(
+                task.get("delivery", {}).get("confidentiality_policy_binding"),
+                dict,
+            )
+        ]
+        covered = False
+        for task in exact_candidates:
+            try:
+                binding = confidentiality_impl.validate_confidentiality_policy_binding(
+                    task["delivery"]["confidentiality_policy_binding"]
+                )
+            except confidentiality_impl.ConfidentialityError:
+                continue
+            if (
+                binding["protected_rule_count"] < 1
+                or binding["protected_policy_sha256"]
+                != current_binding["protected_policy_sha256"]
+            ):
+                continue
+            if not delivery_integrity_errors(paths, task, verify_remote=False):
+                covered = True
+                break
+        if not covered:
+            errors.append(
+                "protected-content remote tip lacks an exact persisted preflight "
+                f"delivery for the current policy: {destination} "
+                f"{remote_ref} {actual_tip}"
+            )
     return errors
 
 
@@ -2087,11 +2297,6 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         raise HarnessError(
             "Codex install provenance preflight failed before mutation: supply "
             "exactly one complete proof pair: promoted release or reviewed local install"
-        )
-    if public_complete:
-        confidentiality_impl.require_publication_action_allowed(
-            paths.project.confidentiality,
-            "release_publish",
         )
     try:
         if public_complete:
@@ -5667,11 +5872,20 @@ def prepare_delivery(
 
     detail = require_text(args.detail, "delivery detail")
     commit = args.commit or ""
+    preflight_file = cast(
+        str | None, getattr(args, "confidentiality_preflight_file", None)
+    )
+    preflight_sha256 = ""
+    confidentiality_binding: dict[str, Any] | None = None
     if args.mode == "pushed":
-        confidentiality_impl.require_publication_action_allowed(
-            paths.project.confidentiality,
-            "git_push",
-        )
+        try:
+            confidentiality_binding = (
+                confidentiality_impl.confidentiality_policy_binding(
+                    paths.project.confidentiality, paths.project.sha256
+                )
+            )
+        except confidentiality_impl.ConfidentialityError as exc:
+            raise HarnessError(str(exc)) from exc
         if not COMMIT_RE.fullmatch(commit):
             raise HarnessError("pushed delivery requires a 7-64 hex --commit")
         if not args.remote or not args.remote_ref:
@@ -5713,9 +5927,41 @@ def prepare_delivery(
             raise HarnessError(
                 f"remote {args.remote} {args.remote_ref} points to {remote_sha}, not {commit}"
             )
-    elif commit or args.remote or args.remote_ref:
+        if paths.project.confidentiality.selective_protection and not preflight_file:
+            raise HarnessError(
+                "pushed delivery with protected paths requires "
+                "--confidentiality-preflight-file"
+            )
+        if preflight_file:
+            try:
+                receipt = confidentiality_impl.load_git_push_preflight_receipt(
+                    Path(preflight_file)
+                )
+                preflight_sha256 = (
+                    confidentiality_impl.validate_git_push_preflight_receipt(
+                        receipt,
+                        root=state_worktree(paths, state),
+                        policy=paths.project.confidentiality,
+                        config_sha256=paths.project.sha256,
+                        remote=str(args.remote),
+                        destination=str(receipt.get("destination", "")),
+                        commit=commit,
+                        remote_ref=str(args.remote_ref),
+                    )
+                )
+            except confidentiality_impl.ConfidentialityError as exc:
+                raise HarnessError(
+                    f"Git push confidentiality preflight is invalid: {exc}"
+                ) from exc
+        else:
+            confidentiality_impl.require_publication_action_allowed(
+                paths.project.confidentiality,
+                "git_push",
+            )
+    elif commit or args.remote or args.remote_ref or preflight_file:
         raise HarnessError(
-            "--commit/--remote/--remote-ref are valid only with --mode pushed"
+            "--commit/--remote/--remote-ref/--confidentiality-preflight-file "
+            "are valid only with --mode pushed"
         )
     return {
         "mode": args.mode,
@@ -5725,7 +5971,65 @@ def prepare_delivery(
         "remote_ref": args.remote_ref or "",
         "remote_sha": commit if args.mode == "pushed" else "",
         "verified_at": now_iso() if args.mode == "pushed" else "",
+        "confidentiality_policy_binding": confidentiality_binding,
+        "confidentiality_preflight_sha256": preflight_sha256,
+        "confidentiality_preflight_artifact": None,
     }
+
+
+def _persist_delivery_confidentiality_preflight(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    delivery: dict[str, Any],
+) -> None:
+    """Persist a freshly revalidated pre-push receipt in the task-local CAS."""
+
+    preflight_file = cast(
+        str | None, getattr(args, "confidentiality_preflight_file", None)
+    )
+    if not preflight_file:
+        return
+    try:
+        receipt = confidentiality_impl.load_git_push_preflight_receipt(
+            Path(preflight_file)
+        )
+        receipt_sha256 = confidentiality_impl.validate_git_push_preflight_receipt(
+            receipt,
+            root=state_worktree(paths, state),
+            policy=paths.project.confidentiality,
+            config_sha256=paths.project.sha256,
+            remote=str(args.remote),
+            destination=str(receipt.get("destination", "")),
+            commit=str(delivery["commit"]),
+            remote_ref=str(args.remote_ref),
+        )
+        if receipt_sha256 != delivery["confidentiality_preflight_sha256"]:
+            raise HarnessError(
+                "Git push confidentiality preflight changed before CAS persistence"
+            )
+        raw = confidentiality_impl.canonical_git_push_preflight_receipt_bytes(receipt)
+        artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+            paths,
+            str(state["task_id"]),
+            raw,
+            label="Git push confidentiality preflight receipt",
+            max_bytes=confidentiality_impl.MAX_GIT_PREFLIGHT_RECEIPT_BYTES,
+        )
+        verified = evidence_artifacts_impl.verify_generated_artifact_blob(
+            paths,
+            str(state["task_id"]),
+            artifact,
+            label="Git push confidentiality preflight receipt",
+            max_bytes=confidentiality_impl.MAX_GIT_PREFLIGHT_RECEIPT_BYTES,
+        )
+        if verified != raw:
+            raise HarnessError(
+                "Git push confidentiality preflight CAS readback differs"
+            )
+    except confidentiality_impl.ConfidentialityError as exc:
+        raise HarnessError(f"Git push confidentiality preflight is invalid: {exc}") from exc
+    delivery["confidentiality_preflight_artifact"] = artifact
 
 
 def cmd_set_delivery(
@@ -5737,7 +6041,9 @@ def cmd_set_delivery(
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "set delivery for")
-        state["delivery"] = prepare_delivery(paths, state, args)
+        delivery = prepare_delivery(paths, state, args)
+        _persist_delivery_confidentiality_preflight(paths, state, args, delivery)
+        state["delivery"] = delivery
         bump_task(state)
         write_task(paths, state)
         write_index(paths)
@@ -6696,6 +7002,15 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             claims = []
             errors.append(str(exc))
 
+    coverage_tasks = tasks
+    if scoped and paths.project.confidentiality.selective_protection:
+        try:
+            coverage_tasks = load_all_tasks(paths)
+        except HarnessError as exc:
+            errors.append(
+                f"could not inspect repository-wide protected publication coverage: {exc}"
+            )
+
     seen: dict[str, str] = {}
     structured_by_task: dict[str, set[str]] = {}
     for claim in claims:
@@ -7052,8 +7367,20 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         if task.get("delivery", {}).get("mode") == "pushed":
             errors.extend(
                 f"task {task_id}: {item}"
-                for item in delivery_integrity_errors(paths, task, verify_remote=True)
+                for item in delivery_integrity_errors(
+                    paths,
+                    task,
+                    verify_remote=True,
+                    allow_terminal_remote_advance=(
+                        paths.project.confidentiality.selective_protection
+                        and task.get("status") in {"done", "cancelled"}
+                    ),
+                )
             )
+
+    errors.extend(
+        confidentiality_remote_tip_coverage_errors(paths, coverage_tasks)
+    )
 
     for claim in claims:
         if not claim.get("legacy") and claim.get("task_id") not in task_ids:
@@ -7368,7 +7695,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             )
         except (OSError, HarnessError) as exc:
             confidentiality_report = {
-                "schema_version": 1,
+                "schema_version": (
+                    confidentiality_impl.CONFIDENTIALITY_REPORT_SCHEMA_VERSION
+                ),
                 "mode": paths.project.confidentiality.mode,
                 "errors": [str(exc)],
                 "warnings": [],
@@ -7385,7 +7714,9 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             )
     else:
         confidentiality_report = {
-            "schema_version": 1,
+            "schema_version": (
+                confidentiality_impl.CONFIDENTIALITY_REPORT_SCHEMA_VERSION
+            ),
             "mode": paths.project.confidentiality.mode,
             "model_context": paths.project.confidentiality.model_context,
             "guarantee": "standard_publication_policy",
@@ -7661,6 +7992,15 @@ def build_parser(
     register_confidentiality_commands(
         argparse_subparsers,
         handlers={
+            "confidentiality_git_push_preflight": (
+                cmd_confidentiality_git_push_preflight
+            ),
+            "confidentiality_policy_snapshot": (
+                cmd_confidentiality_policy_snapshot
+            ),
+            "confidentiality_publication_preflight": (
+                cmd_confidentiality_publication_preflight
+            ),
             "external_export_permit_consume": cmd_external_export_permit_consume,
             "external_export_permit_issue": cmd_external_export_permit_issue,
         },
@@ -7919,6 +8259,13 @@ def build_parser(
     p.add_argument("--commit")
     p.add_argument("--remote")
     p.add_argument("--remote-ref")
+    p.add_argument(
+        "--confidentiality-preflight-file",
+        help=(
+            "exact JSON receipt emitted before push by "
+            "confidentiality-git-push-preflight"
+        ),
+    )
     add_json_argument(p)
     p.set_defaults(handler=cmd_set_delivery)
 

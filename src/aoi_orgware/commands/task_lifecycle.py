@@ -446,6 +446,16 @@ def _config_summary(config: ProjectConfig, source: Path) -> dict[str, Any]:
             "artifact_upload": config.confidentiality.artifact_upload,
             "external_export": config.confidentiality.external_export,
             "local_cas": config.confidentiality.local_cas,
+            "protected": [
+                {
+                    "path": rule.path,
+                    "kind": rule.kind,
+                    "policy": rule.policy,
+                    "home_remote": rule.home_remote,
+                    "home_destination": rule.home_destination,
+                }
+                for rule in config.confidentiality.protected
+            ],
         },
         "hooks_enabled": config.codex_hooks_enabled,
         "legacy_enabled": config.legacy_enabled,
@@ -2387,6 +2397,13 @@ def register_task_lifecycle_commands(
     )
     parser.add_argument("--remote")
     parser.add_argument("--remote-ref")
+    parser.add_argument(
+        "--confidentiality-preflight-file",
+        help=(
+            "exact JSON receipt emitted before push by "
+            "confidentiality-git-push-preflight"
+        ),
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["finish_mini"])
 

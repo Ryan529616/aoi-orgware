@@ -1,19 +1,41 @@
-"""Static safety contract for the manual release workflow."""
+"""Static safety contract for the manually dispatched release workflow."""
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tarfile
 from pathlib import Path
 
 
 WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "publish.yml"
 )
+TEST_WORKFLOW = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "test.yml"
+)
+DOCS_WORKFLOW = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "docs.yml"
+)
 RELEASE_TOOLS_LOCK = Path(__file__).resolve().parents[1] / "requirements" / "release-tools.lock"
 
 
 def _workflow() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def _test_workflow() -> str:
+    return TEST_WORKFLOW.read_text(encoding="utf-8")
+
+
+def _docs_workflow() -> str:
+    return DOCS_WORKFLOW.read_text(encoding="utf-8")
 
 
 def _job(text: str, name: str) -> str:
@@ -47,19 +69,35 @@ def test_release_dag_has_one_linux_producer_then_windows_rebuild_observe() -> No
     assert "needs: [producer-linux, verify-windows, rebuild-linux]" in observe
     assert "release-manifest-observe" in observe
     assert "release_inventory.py stage" in observe
+    stage = _job(text, "verify-pypi-stage")
+    assert "needs: [assemble-observe, producer-linux]" in stage
+    github_release = _job(text, "publish-github-release")
+    assert "needs: [verify-pypi-stage, producer-linux]" in github_release
+    release_readback = _job(text, "verify-github-release")
+    assert (
+        "needs: [publish-github-release, verify-pypi-stage, producer-linux]"
+        in release_readback
+    )
+    publish = _job(text, "publish-pypi")
+    assert (
+        "needs: [verify-pypi-stage, verify-github-release, producer-linux]"
+        in publish
+    )
 
 
 def test_windows_and_rebuild_bind_to_the_producer_inventory_bytes() -> None:
     text = _workflow()
     windows = _job(text, "verify-windows")
+    assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in windows
     assert "name: release-producer" in windows
-    assert "release_inventory.py verify --inventory producer/inventory-linux.json" in windows
+    assert "release_inventory.py verify --inventory release/inventory-linux.json" in windows
     assert "release_inventory.py capture --dist-dir windows/dist" in windows
     assert "scripts/verify_dist.py --dist-dir windows/dist" in windows
     rebuild = _job(text, "rebuild-linux")
+    assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in rebuild
     assert "name: release-producer" in rebuild
-    assert "cmp \"$RUNNER_TEMP/producer/inventory-linux.json\" \"$RUNNER_TEMP/rebuild/inventory-rebuild.json\"" in rebuild
-    assert "release_inventory.py verify --inventory \"$RUNNER_TEMP/producer/inventory-linux.json\" --root \"$RUNNER_TEMP/rebuild/dist\"" in rebuild
+    assert "cmp release/inventory-linux.json \"$RUNNER_TEMP/rebuild/inventory-rebuild.json\"" in rebuild
+    assert "release_inventory.py verify --inventory release/inventory-linux.json --root \"$RUNNER_TEMP/rebuild/dist\"" in rebuild
 
 
 def test_producer_gate_uses_pinned_pytest_and_honest_sdist_derivation() -> None:
@@ -141,26 +179,386 @@ def test_release_tools_lock_is_complete_hashed_and_used_offline_everywhere() -> 
     assert "aoi-orgware" not in producer[toolchain_start:toolchain_end]
 
 
-def test_publish_is_intent_gated_and_only_receives_exact_stage() -> None:
+def test_producer_requires_an_annotated_exact_tag_and_all_checkouts_use_its_commit() -> None:
     text = _workflow()
+    producer = _job(text, "producer-linux")
+    assert 'test "$GITHUB_SERVER_URL" = "https://github.com"' in producer
+    assert 'test "$GITHUB_REPOSITORY" = "Ryan529616/aoi-orgware"' in producer
+    assert "ref: refs/tags/${{ inputs.tag }}" in producer
+    assert 'exact_tag_ref="refs/tags/$RELEASE_TAG"' in producer
+    assert 'git cat-file -t "$exact_tag_object"' in producer
+    assert 'test "$(git cat-file -t "$exact_tag_object")" = tag' in producer
+    assert 'test "$GITHUB_SHA" = "$exact_commit"' in producer
+    assert "exact-commit: ${{ steps.bind-source.outputs.exact-commit }}" in producer
+    assert "exact-tag-object: ${{ steps.bind-source.outputs.exact-tag-object }}" in producer
+    assert "EXACT_TAG_OBJECT: ${{ steps.bind-source.outputs.exact-tag-object }}" in producer
+    assert "release/evidence/source-tag-binding.json" in producer
+    assert '"kind": "annotated_tag_binding"' in producer
+    assert "annotated tag object does not peel to the exact source commit" in _job(text, "assemble-observe")
+    for job_name in (
+        "verify-windows",
+        "rebuild-linux",
+        "assemble-observe",
+        "verify-pypi-stage",
+        "verify-github-release",
+        "post-pypi-readback",
+    ):
+        assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in _job(text, job_name)
+    assert "ref: ${{ inputs.tag }}" not in text
+
+
+def test_verify_stage_seals_a_minimal_exact_envelope_before_oidc_publish() -> None:
+    text = _workflow()
+    verify = _job(text, "verify-pypi-stage")
     publish = _job(text, "publish-pypi")
+    assert "if: ${{ inputs.intent == 'publish' }}" in verify
+    assert "Verify the staged artifact-upload receipt without self-inclusion" in verify
+    assert "uses: actions/checkout@" in verify
+    assert 'python-version: "3.11"' in verify
+    assert "staged artifact does not match inventory" in verify
+    assert "release manifest producer chain does not match receipt and inventory" in verify
+    assert "publication policy snapshot self-digest is invalid" in verify
+    assert "load_publication_policy_snapshot" in verify
+    assert 'PYTHONPATH="$GITHUB_WORKSPACE/src" python - <<\'PY\'' in verify
+    assert "staged publication policy snapshot does not equal the trusted candidate snapshot" in verify
+    assert "staged publication policy snapshot must use canonical JSON plus one LF" in verify
+    assert "snapshot[\"snapshot_sha256\"] != os.environ[\"PUBLICATION_POLICY_SHA256\"]" in verify
+    assert "staged publication policy snapshot does not match the trusted expected digest" in verify
+    assert "PyPI package preflight receipt containers do not bind the exact inventory artifacts" in verify
+    assert "name: pypi-publish-envelope" in verify
+    assert "--subject \"dist/$wheel_name\" --subject \"dist/$sdist_name\" --subject evidence/pypi-package-preflight.json" in verify
+    assert 'cp "$stage/evidence/pypi-package-preflight.json" "$envelope/evidence/pypi-package-preflight.json"' in verify
+    assert "--expected-snapshot-sha256 \"$PUBLICATION_POLICY_SHA256\"" in verify
+    for output in ("artifact-id", "artifact-digest", "wheel-name", "wheel-sha256", "sdist-name", "sdist-sha256", "package-preflight-sha256"):
+        assert f"{output}: ${{{{" in verify
     assert "if: ${{ inputs.intent == 'publish' }}" in publish
-    assert "name: pypi-exact-stage" in publish
-    assert "path: publish-input" in publish
+    assert "artifact-ids: ${{ needs.verify-pypi-stage.outputs.artifact-id }}" in publish
+    assert "Verify the exact envelope file set and SHA-256 values" in publish
+    assert "sha256sum" in publish
+    assert "evidence/pypi-package-preflight.json" in publish
+    assert "PACKAGE_PREFLIGHT_SHA256" in publish
+    assert "packages-dir: ${{ runner.temp }}/pypi-upload" in publish
     assert "uses: actions/checkout@" not in publish
-    assert "packages-dir: publish-input/dist" in publish
-    assert "inventory-linux.json" in publish
-    assert "release-manifest.json" in publish
-    assert "evidence/producer-receipt.json" in publish
-    assert "staged artifact does not match inventory" in publish
-    assert "release manifest distribution/version does not match inventory" in publish
-    assert "producer receipt does not bind the Linux inventory" in publish
-    assert "release manifest producer chain does not match receipt and inventory" in publish
+    assert "contents: read" not in publish
+    assert "PYTHONPATH" not in publish
+    assert "aoi_orgware" not in publish
     stage = _job(text, "assemble-observe")
     assert 'destination-root "$RUNNER_TEMP/publish-stage/dist"' in stage
     assert 'cp "$ARTIFACT_ROOT/inventory-linux.json" "$RUNNER_TEMP/publish-stage/inventory-linux.json"' in stage
     assert 'cp "$ARTIFACT_ROOT/release-manifest.json" "$RUNNER_TEMP/publish-stage/release-manifest.json"' in stage
+    assert 'cp release/publication-policy.json "$RUNNER_TEMP/publish-stage/release/publication-policy.json"' in stage
+    assert "aoi_orgware.publication_gate preflight" in stage
+    assert "--action package_publish" in stage
+    assert "--destination https://pypi.org/project/aoi-orgware" in stage
+    assert '"${preflight_args[@]}"' in stage
+    assert "> evidence/pypi-package-preflight.json" in stage
     assert "path: ${{ runner.temp }}/publish-stage/" in stage
+    assert 'cp "$ARTIFACT_ROOT/observation-result.json" "$RUNNER_TEMP/artifact/observation-result.json"' in stage
+
+
+def test_github_release_is_gated_exact_and_verified_before_pypi() -> None:
+    text = _workflow()
+    verify = _job(text, "verify-pypi-stage")
+    publisher = _job(text, "publish-github-release")
+    readback = _job(text, "verify-github-release")
+    pypi = _job(text, "publish-pypi")
+
+    for output in (
+        "github-release-artifact-id",
+        "github-release-artifact-digest",
+        "release-checksums-sha256",
+        "release-preflight-sha256",
+        "release-envelope-preflight-sha256",
+    ):
+        assert f"{output}: ${{{{" in verify
+    assert "--action release_publish" in verify
+    assert "--destination https://github.com/Ryan529616/aoi-orgware/releases" in verify
+    assert "github-release-publication-preflight.json" in verify
+    assert "github-release-envelope-publication-receipt.json" in verify
+    assert "name: github-release-publish-envelope" in verify
+
+    assert "contents: write" in publisher
+    assert "id-token: write" not in publisher
+    assert "uses: actions/checkout@" not in publisher
+    assert (
+        "artifact-ids: ${{ needs.verify-pypi-stage.outputs.github-release-artifact-id }}"
+        in publisher
+    )
+    assert "git/ref/tags/$RELEASE_TAG" in publisher
+    assert "git/tags/$EXACT_TAG_OBJECT" in publisher
+    assert 'test "$(python -c' in publisher
+    assert '" = "$EXACT_TAG_OBJECT"' in publisher
+    assert '" = "$EXACT_COMMIT"' in publisher
+    assert 'gh_api_json --method POST "repos/$GITHUB_REPOSITORY/releases"' in publisher
+    assert "-F draft=true" in publisher
+    assert "-F prerelease=true" in publisher
+    assert "AOI-Release-Contract: v1" in publisher
+    assert "release_envelope_preflight_sha256=$RELEASE_ENVELOPE_PREFLIGHT_SHA256" in publisher
+    assert "release_artifact_digest=" not in publisher
+    assert 'https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name' in publisher
+    assert "gh release create" not in publisher
+    assert "gh release upload" not in publisher
+    assert "--clobber" not in publisher
+    assert "gh_api_json --paginate --slurp" in publisher
+    assert "X-GitHub-Api-Version: $GH_API_VERSION" in publisher
+    assert 'test "$fetch_status" -eq 3' in publisher
+    assert 'return 2' in publisher
+    assert publisher.count("assert_tag_binding") >= 7
+    assert "GitHub Release contains duplicate or unexpected assets" in publisher
+    assert "GitHub Release asset names or sizes do not match the sealed envelope" in publisher
+    assert "Published GitHub Release is incomplete; refusing to mutate public release state" in publisher
+    assert 'rows[0].get("state")=="starter" and rows[0].get("size")==0' in publisher
+    assert 'gh_api_json --method DELETE --silent "repos/$GITHUB_REPOSITORY/releases/assets/$starter_id"' in publisher
+    assert "Accept: application/octet-stream" in publisher
+    assert "gh release download" not in publisher
+    assert "SHA256SUMS.txt" in publisher
+    verify_existing_at = publisher.index("missing_assets=()")
+    stable_state_at = publisher.index(
+        'test "$release_state_after" = "$release_state_before"'
+    )
+    tag_recheck_at = publisher.index("assert_tag_binding", stable_state_at)
+    upload_missing_at = publisher.index(
+        'for name in "${missing_assets[@]}"; do'
+    )
+    assert verify_existing_at < stable_state_at < tag_recheck_at < upload_missing_at
+    draft_readback_at = publisher.index('ready_state_before="$(release_state_sha)"')
+    publish_draft_at = publisher.index(
+        'gh_api_json --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id"'
+    )
+    published_validation_at = publisher.index(
+        "GitHub Release was not published as a prerelease"
+    )
+    final_download_at = publisher.index(
+        'final_readback="$RUNNER_TEMP/github-release-published-readback"'
+    )
+    assert (
+        upload_missing_at
+        < draft_readback_at
+        < publish_draft_at
+        < published_validation_at
+        < final_download_at
+    )
+
+    assert "contents: read" in readback
+    assert "contents: write" not in readback
+    assert "id-token: write" not in readback
+    assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in readback
+    assert "aoi_orgware.publication_gate verify" in readback
+    assert "--action release_publish" in readback
+    assert "github-release-readback.json" in readback
+    assert "release_envelope_artifact_id" in readback
+    assert "release_publication_preflight_sha256" in readback
+    assert "github-release-readback-publication-receipt.json" in readback
+    assert "AOI-Release-Contract: v1" in readback
+    assert 'release.get("body") != os.environ["RELEASE_NOTES"]' in readback
+    assert "X-GitHub-Api-Version: $GH_API_VERSION" in readback
+
+    assert (
+        "needs: [verify-pypi-stage, verify-github-release, producer-linux]"
+        in pypi
+    )
+    recheck_at = pypi.index("Recheck the exact GitHub Release immediately before PyPI")
+    publish_at = pypi.index("Publish the exact missing files with Trusted Publishing")
+    assert recheck_at < publish_at
+    assert "https://api.github.com/repos/Ryan529616/aoi-orgware" in pypi
+    assert "GitHub tag object changed before PyPI publication" in pypi
+    assert "GitHub Release asset set changed before PyPI publication" in pypi
+    assert "AOI-Release-Contract: v1" in pypi
+    assert 'release.get("body") != os.environ["RELEASE_NOTES"]' in pypi
+    assert "X-GitHub-Api-Version: 2026-03-10" in pypi
+    assert "verify-pypi-state.py" in pypi
+    assert "PyPI provenance does not bind the trusted publisher and artifact" in pypi
+    assert "continue-on-error: true" in pypi
+    assert "Reconcile the exact PyPI state after the publication attempt" in pypi
+    assert "--require-complete" in pypi
+    assert "skip-existing" not in pypi
+    assert text.index("  publish-github-release:") < text.index("  publish-pypi:")
+
+
+def test_complete_pypi_retry_emits_no_phantom_missing_filename() -> None:
+    emitter = (
+        'import json,sys; rows=json.loads(sys.stdin.read())["missing"]; '
+        'sys.stdout.write("" if not rows else "\\n".join(rows)+"\\n")'
+    )
+    assert emitter in _job(_workflow(), "publish-pypi")
+    complete = subprocess.run(
+        [sys.executable, "-c", emitter],
+        input='{"missing":[]}',
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert complete.stdout == ""
+    partial = subprocess.run(
+        [sys.executable, "-c", emitter],
+        input='{"missing":["one.whl"]}',
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert partial.stdout == "one.whl\n"
+
+    bash = shutil.which("bash")
+    if bash is not None:
+        shell = subprocess.run(
+            [
+                bash,
+                "-c",
+                f'readarray -t missing < <("{sys.executable}" -c \'{emitter}\' <<< \'{{"missing":[]}}\'); printf "%s" "${{#missing[@]}}"',
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        assert shell.stdout == "0"
+
+
+def test_every_artifact_upload_has_an_immediately_preceding_preflight() -> None:
+    text = _workflow()
+    expected_uploads = {
+        "Preflight producer artifact publication": "Upload producer bytes and receipts",
+        "Preflight Windows artifact publication": "Upload Windows evidence",
+        "Preflight rebuild artifact publication": "Upload clean rebuild bytes",
+        "Preflight rehearsal observation artifact publication": "Upload rehearsal observation candidate",
+        "Preflight staged publication artifact upload": "Upload the exact staged publication evidence",
+        "Build the exact PyPI publication envelope": "Upload the sealed PyPI publication envelope",
+        "Build the exact GitHub Release publication envelope": "Upload the sealed GitHub Release publication envelope",
+        "Preflight GitHub Release readback artifact publication": "Upload the GitHub Release readback candidate",
+        "Preflight readback artifact publication": "Upload the readback candidate",
+    }
+    assert text.count("uses: actions/upload-artifact@") == len(expected_uploads)
+    for preflight_name, upload_name in expected_uploads.items():
+        match = re.search(
+            rf"^      - name: {re.escape(preflight_name)}\n"
+            rf"(?P<body>.*?)"
+            rf"^      - name: {re.escape(upload_name)}\n"
+            rf"(?:        (?:if|id): .*\n)*"
+            rf"        uses: actions/upload-artifact@",
+            text,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        assert match, f"{upload_name!r} lacks its immediately preceding preflight"
+        body = match.group("body")
+        assert "aoi_orgware.publication_gate preflight" in body
+        assert "--policy-snapshot" in body
+        assert "release/publication-policy.json" in body
+        assert "--action artifact_upload" in body
+        assert "--destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts" in body
+        assert "--subject" in body
+        assert "--json" in body
+        assert "publication-receipt.json" in body
+
+
+def test_release_workflow_uses_no_ignored_root_aoi_config() -> None:
+    text = _workflow()
+    assert "aoi.toml" not in text
+    assert text.count("aoi_orgware.publication_gate preflight") == 11
+    assert text.count("--expected-snapshot-sha256") >= 11
+    snapshot = json.loads(
+        (Path(__file__).resolve().parents[1] / "release" / "publication-policy.json")
+        .read_text(encoding="utf-8")
+    )
+    assert f"PUBLICATION_POLICY_SHA256: {snapshot['snapshot_sha256']}" in text
+
+
+def test_normal_ci_package_upload_is_snapshot_gated_and_reverified() -> None:
+    text = _test_workflow()
+    snapshot = json.loads(
+        (Path(__file__).resolve().parents[1] / "release" / "publication-policy.json")
+        .read_text(encoding="utf-8")
+    )
+    assert f"PUBLICATION_POLICY_SHA256: {snapshot['snapshot_sha256']}" in text
+    package = _job(text, "package")
+    preflight_at = package.index("Preflight verified distribution artifact upload")
+    upload_at = package.index("Upload verified distributions")
+    assert preflight_at < upload_at
+    assert "aoi_orgware.publication_gate preflight" in package[preflight_at:upload_at]
+    assert "--policy-snapshot release/publication-policy.json" in package
+    assert '--expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256"' in package
+    assert "--action artifact_upload" in package
+    assert '--destination "https://github.com/$GITHUB_REPOSITORY/actions/artifacts"' in package
+    assert "--subject dist/" in package
+    assert "> ci-package-publication-receipt.json" in package
+    assert "ci-package-publication-receipt.json" in package[upload_at:]
+    windows = _job(text, "package-windows-smoke")
+    assert "path: package-artifact" in windows
+    assert "aoi_orgware.publication_gate verify" in windows
+    assert "--receipt ci-package-publication-receipt.json" in windows
+    assert "--subject dist/" in windows
+    assert '--destination "https://github.com/$env:GITHUB_REPOSITORY/actions/artifacts"' in windows
+    assert "--dist-dir package-artifact/dist" in windows
+
+
+def test_docs_pages_artifact_upload_is_snapshot_gated() -> None:
+    text = _docs_workflow()
+    snapshot = json.loads(
+        (Path(__file__).resolve().parents[1] / "release" / "publication-policy.json")
+        .read_text(encoding="utf-8")
+    )
+    assert f"PUBLICATION_POLICY_SHA256: {snapshot['snapshot_sha256']}" in text
+    build = _job(text, "build")
+    preflight_at = build.index("Preflight GitHub Pages artifact publication")
+    upload_at = build.index("uses: actions/upload-pages-artifact@")
+    assert preflight_at < upload_at
+    boundary = build[preflight_at:upload_at]
+    assert "aoi_orgware.publication_gate preflight" in boundary
+    assert "--policy-snapshot release/publication-policy.json" in boundary
+    assert '--expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256"' in boundary
+    assert "--action artifact_upload" in boundary
+    assert '--destination "https://github.com/$GITHUB_REPOSITORY/actions/artifacts"' in boundary
+    assert "--subject site/" in boundary
+    assert "docs-pages-publication-receipt.json" in boundary
+    deploy = _job(text, "deploy")
+    assert "uses: actions/checkout@" not in deploy
+    assert "aoi_orgware" not in deploy
+
+
+def test_standalone_gate_runs_from_a_clean_tracked_checkout_without_aoi_toml(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    archive = subprocess.run(
+        ["git", "-C", str(root), "archive", "--format=tar", "HEAD"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as contents:
+        contents.extractall(checkout, filter="data")
+    assert not (checkout / "aoi.toml").exists()
+    policy = checkout / "release" / "publication-policy.json"
+    assert policy.is_file(), "the exact tag must carry its reviewed publication snapshot"
+    snapshot_sha256 = json.loads(policy.read_text(encoding="utf-8"))[
+        "snapshot_sha256"
+    ]
+    subject = checkout / "sample.txt"
+    subject.write_text("public sample\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aoi_orgware.publication_gate",
+            "preflight",
+            "--policy-snapshot",
+            "release/publication-policy.json",
+            "--expected-snapshot-sha256",
+            snapshot_sha256,
+            "--action",
+            "artifact_upload",
+            "--destination",
+            "https://example.invalid/artifacts",
+            "--subject",
+            "sample.txt",
+            "--json",
+        ],
+        cwd=checkout,
+        env={**os.environ, "PYTHONPATH": str(checkout / "src")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout)["decision"] == "allowed"
 
 
 def test_oidc_is_exclusive_to_protected_publish_job_and_readback_is_post_publish() -> None:
@@ -170,8 +568,13 @@ def test_oidc_is_exclusive_to_protected_publish_job_and_readback_is_post_publish
     assert "id-token: write" in publish
     assert "environment:\n      name: pypi" in publish
     assert "attestations: true" in publish
+    assert (
+        "needs: [verify-pypi-stage, verify-github-release, producer-linux]"
+        in publish
+    )
     readback = _job(text, "post-pypi-readback")
-    assert "needs: publish-pypi" in readback
+    assert "needs: [publish-pypi, producer-linux]" in readback
+    assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in readback
     assert "scripts/release_pypi_readback.py" in readback
     assert "pypi-readback-candidate" in readback
     assert "--trusted-publisher-repository Ryan529616/aoi-orgware" in readback

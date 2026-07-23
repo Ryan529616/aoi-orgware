@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -267,6 +268,50 @@ def _issue(
     with h.state_lock(paths, create_layout=False):
         token, _ = h.load_chief_credential(paths, session_id=chief["session_id"], epoch=chief["epoch"], credential_file=credential_path)
         return runtime.issue_codex_launch_transaction(paths, transaction, store.load_semantic_events(paths, "task-1"), chief_session_id=chief["session_id"], chief_epoch=chief["epoch"], chief_token=token, current_time=NOW, packet_integrity_services=object(), pre_git_endpoint_cas_sha256=pre_git_endpoint_cas_sha256)  # type: ignore[arg-type]
+
+
+def _release_issuing_chief(
+    paths: h.HarnessPaths,
+    chief: dict[str, Any],
+    credential_path: Path,
+) -> dict[str, Any]:
+    with h.state_lock(paths, create_layout=False):
+        token, _ = h.load_chief_credential(
+            paths,
+            session_id=chief["session_id"],
+            epoch=chief["epoch"],
+            credential_file=credential_path,
+        )
+        return h.release_chief_authority(
+            paths,
+            session_id=chief["session_id"],
+            epoch=chief["epoch"],
+            token=token,
+            reason="Codex process-start test release",
+            now=NOW,
+        )
+
+
+def _reserve_and_load_launch(
+    paths: h.HarnessPaths,
+    chief: dict[str, Any],
+    credential_path: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    transaction = _live_transaction(paths, chief)
+    _issue(paths, chief, credential_path, transaction)
+    with h.state_lock(paths, create_layout=False):
+        runtime.reserve_codex_launch(
+            paths,
+            transaction,
+            store.load_semantic_events(paths, "task-1"),
+            current_time=NOW,
+            packet_integrity_services=object(),  # type: ignore[arg-type]
+        )
+    events = store.load_semantic_events(paths, "task-1")
+    launch = runtime.load_codex_transport_launch(
+        paths, "task-1", "launch-1", events
+    )
+    return transaction, events, launch
 
 
 def test_filesystem_read_only_issue_requires_pre_git_endpoint_cas() -> None:
@@ -660,26 +705,170 @@ def test_process_start_window_uses_earliest_permit_or_arm_expiry() -> None:
         )
 
 
+def test_process_start_authority_requires_exact_released_issuing_chief() -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        _tx, events, launch = _reserve_and_load_launch(
+            paths, chief, credential_path
+        )
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="exact release of the issuing Chief",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths, launch, events, current_time=NOW
+                )
+
+        _release_issuing_chief(paths, chief, credential_path)
+        with h.state_lock(paths, create_layout=False):
+            runtime.require_codex_process_start_authority(
+                paths, launch, events, current_time=NOW
+            )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_process_start_authority_rejects_later_active_and_released_chief() -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        _tx, events, launch = _reserve_and_load_launch(
+            paths, chief, credential_path
+        )
+        _release_issuing_chief(paths, chief, credential_path)
+        alternate_home = Path(credential_temp.name) / "alternate-credentials"
+        with h.state_lock(paths, create_layout=False):
+            later, later_credential = h.acquire_chief_authority(
+                paths,
+                session_id="chief-2",
+                ttl_seconds=3600,
+                credential_home=alternate_home,
+                now=NOW,
+            )
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="exact release of the issuing Chief",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths, launch, events, current_time=NOW
+                )
+            later_token, _ = h.load_chief_credential(
+                paths,
+                session_id=later["session_id"],
+                epoch=later["epoch"],
+                credential_file=later_credential,
+            )
+            h.release_chief_authority(
+                paths,
+                session_id=later["session_id"],
+                epoch=later["epoch"],
+                token=later_token,
+                reason="later Chief process-start test release",
+                now=NOW,
+            )
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="exact release of the issuing Chief",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths, launch, events, current_time=NOW
+                )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_process_start_authority_rejects_wrong_release_audit_and_missing_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        _tx, events, launch = _reserve_and_load_launch(
+            paths, chief, credential_path
+        )
+        released = _release_issuing_chief(paths, chief, credential_path)
+        wrong_release = copy.deepcopy(released)
+        wrong_release["audit_tail"][-1]["session_id"] = "other-chief"
+        wrong_release["audit_tail"][-1]["previous_session_id"] = "other-chief"
+        with monkeypatch.context() as context:
+            context.setattr(
+                h,
+                "load_chief_authority",
+                lambda *args, **kwargs: wrong_release,
+            )
+            with h.state_lock(paths, create_layout=False):
+                with pytest.raises(
+                    runtime.CodexTransportRuntimeError,
+                    match="exact release of the issuing Chief",
+                ):
+                    runtime.require_codex_process_start_authority(
+                        paths, launch, events, current_time=NOW
+                    )
+
+        with h.state_lock(paths, create_layout=False):
+            paths.chief_authority.unlink()
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="cannot validate released issuing Chief",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths, launch, events, current_time=NOW
+                )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
+def test_process_start_authority_rejects_malformed_marker_issuer() -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        tx, events, launch = _reserve_and_load_launch(
+            paths, chief, credential_path
+        )
+        _release_issuing_chief(paths, chief, credential_path)
+        marker_path = runtime._issuance_path(
+            paths, "task-1", tx["permit"]["permit_sha256"]
+        )
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["issuer_chief_authority"] = {
+            "session_id": "chief-1",
+            "epoch": True,
+        }
+        base = {
+            key: value for key, value in marker.items() if key != "issuance_sha256"
+        }
+        marker["issuance_sha256"] = semantic.canonical_sha256(
+            base, max_bytes=runtime.MAX_ISSUANCE_BYTES
+        )
+        marker_path.write_bytes(
+            semantic.canonical_json_bytes(
+                marker, max_bytes=runtime.MAX_ISSUANCE_BYTES
+            )
+        )
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="issuing Chief authority is invalid",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths, launch, events, current_time=NOW
+                )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
 def test_process_start_authority_rejects_packet_and_ownership_only_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del tmp_path
     temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
     try:
-        tx = _live_transaction(paths, chief)
-        _issue(paths, chief, credential_path, tx)
-        with h.state_lock(paths, create_layout=False):
-            runtime.reserve_codex_launch(
-                paths,
-                tx,
-                store.load_semantic_events(paths, "task-1"),
-                current_time=NOW,
-                packet_integrity_services=object(),  # type: ignore[arg-type]
-            )
-        events = store.load_semantic_events(paths, "task-1")
-        launch = runtime.load_codex_transport_launch(
-            paths, "task-1", "launch-1", events
+        _tx, events, launch = _reserve_and_load_launch(
+            paths, chief, credential_path
         )
+        _release_issuing_chief(paths, chief, credential_path)
         with h.state_lock(paths, create_layout=False):
             runtime.require_codex_process_start_authority(
                 paths, launch, events, current_time=NOW

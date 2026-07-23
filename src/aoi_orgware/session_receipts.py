@@ -341,6 +341,12 @@ def load_startup_receipt_locked(
     return _load_startup_receipt_locked(paths, _session_id(session_id))
 
 
+def scan_startup_receipts_locked(paths: h.HarnessPaths) -> list[dict[str, Any]]:
+    """Validate all receipts while the caller already owns the state lock."""
+
+    return _scan_startup_receipts_locked(paths)
+
+
 def load_startup_receipt(paths: h.HarnessPaths, session_id: str) -> dict[str, Any]:
     """Load one exact startup receipt under the project lock, failing closed."""
 
@@ -353,7 +359,7 @@ def scan_startup_receipts(paths: h.HarnessPaths) -> list[dict[str, Any]]:
     """Return every valid canonical receipt, or fail before accepting ambiguity."""
 
     with h.state_lock(paths, create_layout=False):
-        return _scan_startup_receipts_locked(paths)
+        return scan_startup_receipts_locked(paths)
 
 
 def _same_startup_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:

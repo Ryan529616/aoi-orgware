@@ -19,6 +19,12 @@ on:
 # No job receives a token scope unless it declares the one it needs.
 permissions: {}
 
+env:
+  # External policy authority for the exact reviewed local snapshot. Updating
+  # release/publication-policy.json requires updating this pin in the same
+  # reviewed candidate.
+  PUBLICATION_POLICY_SHA256: 11ad65c25fee5d4060422001a344faa7c8e06b427e452bd7d48a76231e4b905f
+
 concurrency:
   group: release-${{ inputs.tag }}
   cancel-in-progress: false
@@ -28,31 +34,45 @@ jobs:
     name: Build one Linux release candidate
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      exact-commit: ${{ steps.bind-source.outputs.exact-commit }}
+      exact-tag-object: ${{ steps.bind-source.outputs.exact-tag-object }}
     permissions:
       contents: read
     steps:
-      - name: Check out the requested tag
+      - name: Check out the requested exact tag ref
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
-      - name: Bind tag, source version, and checked-out commit
+      - name: Bind the exact annotated tag object, peeled commit, and source version
+        id: bind-source
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REPOSITORY" = "Ryan529616/aoi-orgware"
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z]+[0-9]+)?([.]post[0-9]+)?([.]dev[0-9]+)?$ ]]
+          exact_tag_ref="refs/tags/$RELEASE_TAG"
+          git show-ref --verify --quiet "$exact_tag_ref"
+          exact_tag_object="$(git rev-parse "$exact_tag_ref")"
+          test "$(git cat-file -t "$exact_tag_object")" = tag
+          exact_commit="$(git rev-parse "$exact_tag_object^{commit}")"
+          test "$exact_commit" = "$(git rev-parse HEAD)"
+          test "$GITHUB_SHA" = "$exact_commit"
           version="$(python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])")"
           test "$RELEASE_TAG" = "v$version"
-          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
           test -z "$(git status --porcelain=v2 --untracked-files=all)"
           printf '%s\n' "$version" > .release-version
+          printf 'exact-commit=%s\n' "$exact_commit" >> "$GITHUB_OUTPUT"
+          printf 'exact-tag-object=%s\n' "$exact_tag_object" >> "$GITHUB_OUTPUT"
       - name: Build and verify the producer pair
         shell: bash
         run: |
@@ -125,12 +145,35 @@ jobs:
           .release-tools/bin/python -I scripts/verify_dist.py --dist-dir release/dist --expected-version "$version" --build-python "$GITHUB_WORKSPACE/.release-tools/bin/python" --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
       - name: Record Linux producer evidence
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXACT_TAG_OBJECT: ${{ steps.bind-source.outputs.exact-tag-object }}
+          EXACT_COMMIT: ${{ steps.bind-source.outputs.exact-commit }}
         run: |
           set -euo pipefail
           version="$(<.release-version)"
           inventory_sha256="$(python -c "import json; print(json.load(open('release/inventory-linux.json'))['inventory_sha256'])")"
           mkdir -p release/evidence release/meta .release-install
           source_epoch="$(git show -s --format=%ct HEAD)"
+          test "$(git cat-file -t "$EXACT_TAG_OBJECT")" = tag
+          test "$(git rev-parse "$EXACT_TAG_OBJECT^{commit}")" = "$EXACT_COMMIT"
+          .release-tools/bin/python -I - <<'PY' > release/evidence/source-tag-binding.json
+          import hashlib, json, os, subprocess
+
+          def git(*arguments):
+              return subprocess.check_output(["git", *arguments], text=True).strip()
+
+          base = {
+              "schema_version": 1,
+              "kind": "annotated_tag_binding",
+              "tag_ref": f"refs/tags/{os.environ['RELEASE_TAG']}",
+              "tag_object_oid": os.environ["EXACT_TAG_OBJECT"],
+              "commit_oid": os.environ["EXACT_COMMIT"],
+              "tree_oid": git("rev-parse", f"{os.environ['EXACT_COMMIT']}^{{tree}}"),
+          }
+          raw = json.dumps(base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+          print(json.dumps({**base, "receipt_sha256": hashlib.sha256(raw).hexdigest()}, sort_keys=True, separators=(",", ":")))
+          PY
           .release-tools/bin/python -I - <<'PY' > release/evidence/release-toolchain.json
           import hashlib, importlib.metadata as metadata, json, re
           from pathlib import Path
@@ -211,6 +254,13 @@ jobs:
           printf '{}\n' > release/meta/attestation.json
           python scripts/release_rehearsal.py placeholder --kind sbom --location meta/sbom.json --input-file release/meta/sbom.json --output release/evidence/sbom-receipt.json
           python scripts/release_rehearsal.py placeholder --kind attestation --location meta/attestation.json --input-file release/meta/attestation.json --output release/evidence/attestation-receipt.json
+      - name: Preflight producer artifact publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/release-producer-publication-receipt.json"
+          .release-tools/bin/python -I -m aoi_orgware.publication_gate preflight --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject release/ --json > "$receipt"
+          mv "$receipt" release/evidence/release-producer-publication-receipt.json
       - name: Upload producer bytes and receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -231,7 +281,7 @@ jobs:
       - name: Check out the requested tag for verification tools
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
           fetch-depth: 1
           persist-credentials: false
       - name: Set up Python
@@ -242,29 +292,52 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-producer
-          path: producer
+          path: release
+      - name: Verify the producer artifact publication receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = 'src'
+          $receipt = Join-Path $env:RUNNER_TEMP 'release-producer-publication-receipt.json'
+          Move-Item release/evidence/release-producer-publication-receipt.json $receipt
+          try {
+            python -m aoi_orgware.publication_gate verify --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 $env:PUBLICATION_POLICY_SHA256 --receipt $receipt --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject release/ --json
+            if ($LASTEXITCODE -ne 0) { throw 'producer publication receipt verification failed' }
+          } finally {
+            Move-Item $receipt release/evidence/release-producer-publication-receipt.json
+          }
       - name: Stage, hash, and install exactly those bytes
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
            $version = (Get-Content .release-version -ErrorAction SilentlyContinue)
-           if (-not $version) { $version = (python -c "import json; print(json.load(open('producer/inventory-linux.json'))['package_version'])") }
+           if (-not $version) { $version = (python -c "import json; print(json.load(open('release/inventory-linux.json'))['package_version'])") }
            New-Item -ItemType Directory -Force windows | Out-Null
-          python scripts/release_inventory.py verify --inventory producer/inventory-linux.json --root producer/dist
-          python scripts/release_inventory.py stage --inventory producer/inventory-linux.json --source-root producer/dist --destination-root windows/dist | Out-File -Encoding ascii windows/stage-receipt.json
+          python scripts/release_inventory.py verify --inventory release/inventory-linux.json --root release/dist
+          python scripts/release_inventory.py stage --inventory release/inventory-linux.json --source-root release/dist --destination-root windows/dist | Out-File -Encoding ascii windows/stage-receipt.json
            python scripts/release_inventory.py capture --dist-dir windows/dist --distribution-name aoi-orgware --package-version $version --output windows/inventory-windows.json
-           python scripts/release_inventory.py verify --inventory producer/inventory-linux.json --root windows/dist
+           python scripts/release_inventory.py verify --inventory release/inventory-linux.json --root windows/dist
            python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
            python -m venv .release-tools
            $backendPython = (Resolve-Path .release-tools/Scripts/python.exe).Path
            & $backendPython -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$PWD/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
            & $backendPython -I -c "import importlib.metadata as metadata; expected={'build':'1.5.0','colorama':'0.4.6','hatchling':'1.27.0','iniconfig':'2.3.0','packaging':'26.2','pathspec':'1.1.1','pluggy':'1.6.0','pygments':'2.20.0','pyproject-hooks':'1.2.0','pytest':'8.4.2','trove-classifiers':'2026.6.1.19'}; assert {name: metadata.version(name) for name in expected} == expected"
            python scripts/verify_dist.py --dist-dir windows/dist --expected-version $version --build-python $backendPython --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
-          $inventory = Get-Content producer/inventory-linux.json | ConvertFrom-Json
-           $contract = Get-Content producer/evidence/dist-verify-contract-receipt.json | ConvertFrom-Json
+          $inventory = Get-Content release/inventory-linux.json | ConvertFrom-Json
+           $contract = Get-Content release/evidence/dist-verify-contract-receipt.json | ConvertFrom-Json
           New-Item -ItemType Directory -Force windows/evidence | Out-Null
            python scripts/release_rehearsal.py platform-gate --platform windows --gate-id dist-verify --check-contract-sha256 $contract.check_contract_sha256 --inventory-sha256 $inventory.inventory_sha256 --details-json '{"command":"scripts/verify_dist.py","sdist_verification":"derived-wheel-offline-install","status":"pass"}' --output windows/evidence/windows-dist-verify-receipt.json
            python -c "import json,pathlib; p=pathlib.Path('windows/evidence/windows-dist-verify-receipt.json'); v=json.loads(p.read_text()); pathlib.Path('windows/evidence/windows-dist-verify.json').write_text(json.dumps({k:x for k,x in v.items() if k!='receipt_sha256'},sort_keys=True,separators=(',',':')))"
+      - name: Preflight Windows artifact publication
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = 'src'
+          $receipt = Join-Path $env:RUNNER_TEMP 'release-windows-publication-receipt.json'
+          $output = & python -m aoi_orgware.publication_gate preflight --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 $env:PUBLICATION_POLICY_SHA256 --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject windows/ --json
+          if ($LASTEXITCODE -ne 0) { throw 'Windows publication preflight failed' }
+          [IO.File]::WriteAllText($receipt, $output + "`n", [Text.UTF8Encoding]::new($false))
+          Move-Item $receipt windows/evidence/release-windows-publication-receipt.json
       - name: Upload Windows evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -285,23 +358,37 @@ jobs:
       - name: Check out the requested tag in a clean worktree
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
-      - name: Download producer inventory only
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: release-producer
-          path: ${{ runner.temp }}/producer
-      - name: Rebuild and require the producer inventory exactly
+      - name: Confirm the checkout is clean before producer download
         shell: bash
         run: |
           set -euo pipefail
           test -z "$(git status --porcelain=v2 --untracked-files=all)"
+      - name: Download producer inventory only
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-producer
+          path: release
+      - name: Verify the producer artifact publication receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/release-producer-publication-receipt.json"
+          mv release/evidence/release-producer-publication-receipt.json "$receipt"
+          trap 'mv "$receipt" release/evidence/release-producer-publication-receipt.json' EXIT
+          PYTHONPATH=src python -m aoi_orgware.publication_gate verify --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt "$receipt" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject release/ --json
+          mv "$receipt" release/evidence/release-producer-publication-receipt.json
+          trap - EXIT
+      - name: Rebuild and require the producer inventory exactly
+        shell: bash
+        run: |
+          set -euo pipefail
           python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
           python -m venv .release-tools
           .release-tools/bin/python -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$GITHUB_WORKSPACE/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
@@ -312,10 +399,18 @@ jobs:
           PY
           epoch="$(git show -s --format=%ct HEAD)"
           SOURCE_DATE_EPOCH="$epoch" .release-tools/bin/python -I -m build --sdist --wheel --no-isolation --outdir "$RUNNER_TEMP/rebuild/dist"
-          version="$(python -c "import json; print(json.load(open('$RUNNER_TEMP/producer/inventory-linux.json'))['package_version'])")"
+          version="$(python -c "import json; print(json.load(open('release/inventory-linux.json'))['package_version'])")"
           python scripts/release_inventory.py capture --dist-dir "$RUNNER_TEMP/rebuild/dist" --distribution-name aoi-orgware --package-version "$version" --output "$RUNNER_TEMP/rebuild/inventory-rebuild.json"
-          cmp "$RUNNER_TEMP/producer/inventory-linux.json" "$RUNNER_TEMP/rebuild/inventory-rebuild.json"
-          python scripts/release_inventory.py verify --inventory "$RUNNER_TEMP/producer/inventory-linux.json" --root "$RUNNER_TEMP/rebuild/dist"
+          cmp release/inventory-linux.json "$RUNNER_TEMP/rebuild/inventory-rebuild.json"
+          python scripts/release_inventory.py verify --inventory release/inventory-linux.json --root "$RUNNER_TEMP/rebuild/dist"
+      - name: Preflight rebuild artifact publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rebuild/evidence"
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject rebuild/ --json > release-rebuild-publication-receipt.json
+          mv release-rebuild-publication-receipt.json rebuild/evidence/release-rebuild-publication-receipt.json
       - name: Upload clean rebuild bytes
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -336,7 +431,7 @@ jobs:
       - name: Check out the observed tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
@@ -347,7 +442,18 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-producer
-          path: ${{ runner.temp }}/artifact
+          path: ${{ runner.temp }}/producer-root/release
+      - name: Verify the producer artifact publication receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/producer-root"
+          receipt="$RUNNER_TEMP/release-producer-publication-receipt.json"
+          mv release/evidence/release-producer-publication-receipt.json "$receipt"
+          trap 'mv "$receipt" release/evidence/release-producer-publication-receipt.json' EXIT
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate verify --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt "$receipt" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject release/ --json
+          mv "$receipt" release/evidence/release-producer-publication-receipt.json
+          trap - EXIT
       - name: Download Windows evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -358,11 +464,24 @@ jobs:
         with:
           name: release-rebuild
           path: ${{ runner.temp }}/rebuild
+      - name: Verify Windows and rebuild publication receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          for payload in windows rebuild; do
+            receipt="$RUNNER_TEMP/${payload}-publication-receipt.json"
+            mv "$payload/evidence/release-${payload}-publication-receipt.json" "$receipt"
+            trap 'mv "$receipt" "$payload/evidence/release-${payload}-publication-receipt.json"' EXIT
+            PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate verify --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt "$receipt" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject "$payload/" --json
+            mv "$receipt" "$payload/evidence/release-${payload}-publication-receipt.json"
+            trap - EXIT
+          done
       - name: Assemble, observe, and stage the exact pair
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-          ARTIFACT_ROOT: ${{ runner.temp }}/artifact
+          ARTIFACT_ROOT: ${{ runner.temp }}/producer-root/release
           WINDOWS_ROOT: ${{ runner.temp }}/windows
           REBUILD_ROOT: ${{ runner.temp }}/rebuild
         run: |
@@ -381,6 +500,18 @@ jobs:
           version = inventory["package_version"]
           tag = os.environ["RELEASE_TAG"]
           if tag != f"v{version}": raise SystemExit("tag/version mismatch")
+          source_binding = json.loads((artifact / "evidence/source-tag-binding.json").read_text())
+          source_fields = {"schema_version", "kind", "tag_ref", "tag_object_oid", "commit_oid", "tree_oid", "receipt_sha256"}
+          if set(source_binding) != source_fields or source_binding.get("schema_version") != 1 or source_binding.get("kind") != "annotated_tag_binding":
+              raise SystemExit("annotated tag source binding schema is invalid")
+          source_base = {key: source_binding[key] for key in source_fields - {"receipt_sha256"}}
+          source_raw = json.dumps(source_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+          if hashlib.sha256(source_raw).hexdigest() != source_binding["receipt_sha256"]:
+              raise SystemExit("annotated tag source binding digest is invalid")
+          if source_binding["tag_ref"] != f"refs/tags/{tag}" or source_binding["commit_oid"] != git("rev-parse", "HEAD") or source_binding["tree_oid"] != git("rev-parse", "HEAD^{tree}"):
+              raise SystemExit("annotated tag source binding does not match the exact checkout")
+          if git("cat-file", "-t", source_binding["tag_object_oid"]) != "tag" or git("rev-parse", f"{source_binding['tag_object_oid']}^{{commit}}") != source_binding["commit_oid"]:
+              raise SystemExit("annotated tag object does not peel to the exact source commit")
           matrix = {}
           for platform, receipt in (("linux", "evidence/linux-dist-verify.json"), ("windows", "evidence/windows-dist-verify.json")):
               contract = f"evidence/{platform}-dist-verify-contract.json"
@@ -396,23 +527,70 @@ jobs:
               "outputs": {"release_manifest": str((artifact / "release-manifest.json").resolve()), "observation_request": str((artifact / "observation-request.json").resolve())}}
           (artifact.parent / "assemble-request.json").write_text(json.dumps(request, sort_keys=True, separators=(",", ":")), encoding="utf-8")
           PY
-          PYTHONPATH=src python scripts/release_rehearsal.py assemble --request-file "$RUNNER_TEMP/assemble-request.json"
+          PYTHONPATH=src python scripts/release_rehearsal.py assemble --request-file "$RUNNER_TEMP/producer-root/assemble-request.json"
           PYTHONPATH=src python -m aoi_orgware.cli release-manifest-observe --request-file "$ARTIFACT_ROOT/observation-request.json" > "$ARTIFACT_ROOT/observation-result.json"
+          mkdir -p "$RUNNER_TEMP/artifact"
+          cp "$ARTIFACT_ROOT/observation-result.json" "$RUNNER_TEMP/artifact/observation-result.json"
           rm -rf "$RUNNER_TEMP/publish-stage"
           mkdir -p "$RUNNER_TEMP/publish-stage"
           python scripts/release_inventory.py stage --inventory "$ARTIFACT_ROOT/inventory-linux.json" --source-root "$ARTIFACT_ROOT/dist" --destination-root "$RUNNER_TEMP/publish-stage/dist" > "$ARTIFACT_ROOT/publish-stage-receipt.json"
           cp "$ARTIFACT_ROOT/inventory-linux.json" "$RUNNER_TEMP/publish-stage/inventory-linux.json"
           cp "$ARTIFACT_ROOT/release-manifest.json" "$RUNNER_TEMP/publish-stage/release-manifest.json"
+          mkdir -p "$RUNNER_TEMP/publish-stage/release"
+          cp release/publication-policy.json "$RUNNER_TEMP/publish-stage/release/publication-policy.json"
           mkdir "$RUNNER_TEMP/publish-stage/evidence"
           cp "$ARTIFACT_ROOT/evidence/producer-receipt.json" "$RUNNER_TEMP/publish-stage/evidence/producer-receipt.json"
+          mapfile -t staged_artifacts < <(python - "$RUNNER_TEMP/publish-stage" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          inventory = json.loads((root / "inventory-linux.json").read_text(encoding="utf-8"))
+          artifacts = inventory.get("artifacts")
+          if not isinstance(artifacts, list) or len(artifacts) != 2:
+              raise SystemExit("staged inventory must identify exactly two artifacts")
+          for artifact in artifacts:
+              if not isinstance(artifact, dict) or not isinstance(artifact.get("name"), str):
+                  raise SystemExit("staged inventory artifact is invalid")
+              path = root / "dist" / artifact["name"]
+              if not path.is_file():
+                  raise SystemExit(f"staged inventory artifact is missing: {artifact['name']}")
+              print((Path("dist") / artifact["name"]).as_posix())
+          PY
+          )
+          test "${#staged_artifacts[@]}" -eq 2
+          preflight_args=()
+          for staged_artifact in "${staged_artifacts[@]}"; do
+            preflight_args+=(--subject "$staged_artifact")
+          done
+          (
+            cd "$RUNNER_TEMP/publish-stage"
+            PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action package_publish --destination https://pypi.org/project/aoi-orgware "${preflight_args[@]}" --json > evidence/pypi-package-preflight.json
+          )
+      - name: Preflight rehearsal observation artifact publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/artifact/evidence"
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject artifact/observation-result.json --json > artifact/evidence/release-observation-publication-receipt.json
       - name: Upload rehearsal observation candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-observation-candidate
-          path: ${{ runner.temp }}/artifact/observation-result.json
+          path: ${{ runner.temp }}/artifact/
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+      - name: Preflight staged publication artifact upload
+        if: ${{ inputs.intent == 'publish' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject publish-stage/ --json > pypi-exact-stage-publication-receipt.json
+          mv pypi-exact-stage-publication-receipt.json publish-stage/evidence/pypi-exact-stage-publication-receipt.json
       - name: Upload the exact staged publication evidence
         if: ${{ inputs.intent == 'publish' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -423,38 +601,84 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  publish-pypi:
-    name: Publish the staged pair to PyPI
+  verify-pypi-stage:
+    name: Verify and seal the PyPI publication envelope
     if: ${{ inputs.intent == 'publish' }}
-    needs: assemble-observe
+    needs: [assemble-observe, producer-linux]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment:
-      name: pypi
-      url: https://pypi.org/p/aoi-orgware
+    timeout-minutes: 20
     permissions:
-      id-token: write
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload-envelope.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload-envelope.outputs.artifact-digest }}
+      github-release-artifact-id: ${{ steps.upload-github-release-envelope.outputs.artifact-id }}
+      github-release-artifact-digest: ${{ steps.upload-github-release-envelope.outputs.artifact-digest }}
+      wheel-name: ${{ steps.build-envelope.outputs.wheel-name }}
+      wheel-sha256: ${{ steps.build-envelope.outputs.wheel-sha256 }}
+      sdist-name: ${{ steps.build-envelope.outputs.sdist-name }}
+      sdist-sha256: ${{ steps.build-envelope.outputs.sdist-sha256 }}
+      package-preflight-sha256: ${{ steps.build-envelope.outputs.package-preflight-sha256 }}
+      preflight-sha256: ${{ steps.build-envelope.outputs.preflight-sha256 }}
+      release-checksums-sha256: ${{ steps.build-github-release-envelope.outputs.release-checksums-sha256 }}
+      release-preflight-sha256: ${{ steps.build-github-release-envelope.outputs.release-preflight-sha256 }}
+      release-envelope-preflight-sha256: ${{ steps.build-github-release-envelope.outputs.release-envelope-preflight-sha256 }}
     steps:
+      - name: Check out the producer's exact peeled commit for standalone verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up fixed Python for standalone verification
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
       - name: Download the staged publication evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: pypi-exact-stage
-          path: publish-input
-      - name: Re-verify the exact staged producer bytes before upload
+          path: ${{ runner.temp }}/publish-stage
+      - name: Verify the staged artifact-upload receipt without self-inclusion
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
+          receipt="$RUNNER_TEMP/pypi-exact-stage-publication-receipt.json"
+          mv "$RUNNER_TEMP/publish-stage/evidence/pypi-exact-stage-publication-receipt.json" "$receipt"
+          trap 'mv "$receipt" "$RUNNER_TEMP/publish-stage/evidence/pypi-exact-stage-publication-receipt.json"' EXIT
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate verify --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt "$receipt" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject publish-stage/ --json
+          mv "$receipt" "$RUNNER_TEMP/publish-stage/evidence/pypi-exact-stage-publication-receipt.json"
+          trap - EXIT
+      - name: Re-verify the exact staged producer bytes before sealing
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python - <<'PY'
           import hashlib
           import json
+          import os
           import re
           from pathlib import Path
 
-          root = Path("publish-input").resolve()
+          from aoi_orgware.publication_policy import load_publication_policy_snapshot
+
+          root = (Path(os.environ["RUNNER_TEMP"]) / "publish-stage").resolve()
+          trusted_snapshot_path = Path(os.environ["GITHUB_WORKSPACE"]) / "release" / "publication-policy.json"
+          staged_snapshot_path = root / "release" / "publication-policy.json"
+          trusted_snapshot = load_publication_policy_snapshot(trusted_snapshot_path)
+          staged_snapshot = load_publication_policy_snapshot(staged_snapshot_path)
+          if staged_snapshot != trusted_snapshot:
+              raise SystemExit("staged publication policy snapshot does not equal the trusted candidate snapshot")
+          if trusted_snapshot["snapshot_sha256"] != os.environ["PUBLICATION_POLICY_SHA256"]:
+              raise SystemExit("trusted publication policy snapshot does not match the workflow digest pin")
           expected_paths = {
               "inventory-linux.json",
               "release-manifest.json",
+              "release/publication-policy.json",
               "evidence/producer-receipt.json",
+              "evidence/pypi-package-preflight.json",
+              "evidence/pypi-exact-stage-publication-receipt.json",
           }
           def pairs(items):
               value = {}
@@ -469,7 +693,8 @@ jobs:
               path = root / relative
               raw = path.read_bytes()
               value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
-              if raw != canonical(value):
+              encoded = canonical(value)
+              if raw not in (encoded, encoded + b"\n"):
                   raise SystemExit(f"{relative} is not canonical JSON")
               return value
           def sha(raw):
@@ -528,31 +753,918 @@ jobs:
           }
           if manifest.get("producer_results") != [{"producer_id": producer["producer_id"], "result_sha256": sha(canonical(producer_binding))}]:
               raise SystemExit("release manifest producer chain does not match receipt and inventory")
+          snapshot = load("release/publication-policy.json")
+          if (root / "release/publication-policy.json").read_bytes() != canonical(snapshot) + b"\n":
+              raise SystemExit("staged publication policy snapshot must use canonical JSON plus one LF")
+          snapshot_fields = {"schema_version", "source_config_sha256", "mode", "protected_rules", "protected_rule_count", "protected_policy_sha256", "protected_content", "protected_content_count", "snapshot_sha256"}
+          if set(snapshot) != snapshot_fields or snapshot.get("schema_version") != 1:
+              raise SystemExit("publication policy snapshot schema is invalid")
+          for key in ("source_config_sha256", "protected_policy_sha256", "snapshot_sha256"):
+              if not isinstance(snapshot.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", snapshot[key]) is None:
+                  raise SystemExit(f"publication policy snapshot {key} is invalid")
+          if not isinstance(snapshot.get("protected_rules"), list) or snapshot.get("protected_rule_count") != len(snapshot["protected_rules"]):
+              raise SystemExit("publication policy snapshot protected-rule count is invalid")
+          if sha(canonical({"protected_rules": snapshot["protected_rules"]})) != snapshot["protected_policy_sha256"]:
+              raise SystemExit("publication policy snapshot protected-policy SHA-256 is invalid")
+          if not isinstance(snapshot.get("protected_content"), list) or snapshot.get("protected_content_count") != len(snapshot["protected_content"]):
+              raise SystemExit("publication policy snapshot protected-content count is invalid")
+          if sha(canonical({key: snapshot[key] for key in snapshot_fields - {"snapshot_sha256"}})) != snapshot["snapshot_sha256"]:
+              raise SystemExit("publication policy snapshot self-digest is invalid")
+          if snapshot["snapshot_sha256"] != os.environ["PUBLICATION_POLICY_SHA256"]:
+              raise SystemExit("staged publication policy snapshot does not match the trusted expected digest")
+          preflight = load("evidence/pypi-package-preflight.json")
+          receipt_fields = {"schema_version", "policy_snapshot_sha256", "action", "remote", "destination", "inventory", "protected_exposures", "decision", "receipt_sha256"}
+          if set(preflight) != receipt_fields or preflight.get("schema_version") != 1:
+              raise SystemExit("PyPI package preflight receipt schema is invalid")
+          if preflight.get("policy_snapshot_sha256") != snapshot["snapshot_sha256"]:
+              raise SystemExit("PyPI package preflight receipt does not bind the policy snapshot")
+          if preflight.get("action") != "package_publish" or preflight.get("remote") != "" or preflight.get("destination") != "https://pypi.org/project/aoi-orgware" or preflight.get("decision") != "allowed":
+              raise SystemExit("PyPI package preflight receipt action, destination, or decision is invalid")
+          if sha(canonical({key: preflight[key] for key in receipt_fields - {"receipt_sha256"}})) != preflight.get("receipt_sha256"):
+              raise SystemExit("PyPI package preflight receipt self-digest is invalid")
+          preflight_inventory = preflight.get("inventory")
+          if not isinstance(preflight_inventory, dict) or set(preflight_inventory) != {"containers", "subjects", "manifest_sha256"}:
+              raise SystemExit("PyPI package preflight receipt inventory schema is invalid")
+          if sha(canonical({"containers": preflight_inventory["containers"], "subjects": preflight_inventory["subjects"]})) != preflight_inventory.get("manifest_sha256"):
+              raise SystemExit("PyPI package preflight receipt inventory SHA-256 is invalid")
+          if preflight.get("protected_exposures") != []:
+              raise SystemExit("PyPI package preflight receipt has unexpected protected exposures")
+          containers = preflight_inventory.get("containers")
+          if not isinstance(containers, list) or len(containers) != 2:
+              raise SystemExit("PyPI package preflight receipt must name exactly two containers")
+          expected_containers = [{"path": f"dist/{item['name']}", "size_bytes": item["size_bytes"], "sha256": item["sha256"]} for item in artifacts]
+          if containers != expected_containers:
+              raise SystemExit("PyPI package preflight receipt containers do not bind the exact inventory artifacts")
           observed_paths = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
           if observed_paths != expected_paths:
               raise SystemExit("staged publication evidence contains missing or unexpected files")
           PY
-      - name: Publish the exact staged pair with Trusted Publishing
+      - name: Build the exact PyPI publication envelope
+        id: build-envelope
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/publish-stage"
+          envelope="$RUNNER_TEMP/pypi-publish-envelope"
+          readarray -t artifacts < <(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          inventory = json.loads((Path(os.environ["RUNNER_TEMP"]) / "publish-stage" / "inventory-linux.json").read_text(encoding="utf-8"))
+          rows = inventory["artifacts"]
+          wheel = next(row for row in rows if row["name"].endswith(".whl"))
+          sdist = next(row for row in rows if row["name"].endswith(".tar.gz"))
+          for row in (wheel, sdist):
+              print(row["name"])
+              print(row["sha256"])
+          PY
+          )
+          wheel_name="${artifacts[0]}"
+          wheel_sha256="${artifacts[1]}"
+          sdist_name="${artifacts[2]}"
+          sdist_sha256="${artifacts[3]}"
+          mkdir -p "$envelope/dist" "$envelope/evidence"
+          cp "$stage/dist/$wheel_name" "$envelope/dist/$wheel_name"
+          cp "$stage/dist/$sdist_name" "$envelope/dist/$sdist_name"
+          cp "$stage/evidence/pypi-package-preflight.json" "$envelope/evidence/pypi-package-preflight.json"
+          cd "$envelope"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject "dist/$wheel_name" --subject "dist/$sdist_name" --subject evidence/pypi-package-preflight.json --json > evidence/pypi-publish-envelope-publication-receipt.json
+          printf 'wheel-name=%s\nwheel-sha256=%s\nsdist-name=%s\nsdist-sha256=%s\npackage-preflight-sha256=%s\npreflight-sha256=%s\n' "$wheel_name" "$wheel_sha256" "$sdist_name" "$sdist_sha256" "$(sha256sum evidence/pypi-package-preflight.json | awk '{print $1}')" "$(sha256sum evidence/pypi-publish-envelope-publication-receipt.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Upload the sealed PyPI publication envelope
+        id: upload-envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-publish-envelope
+          path: ${{ runner.temp }}/pypi-publish-envelope/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Build the exact GitHub Release publication envelope
+        id: build-github-release-envelope
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/publish-stage"
+          envelope="$RUNNER_TEMP/github-release-envelope"
+          readarray -t artifacts < <(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          inventory = json.loads((Path(os.environ["RUNNER_TEMP"]) / "publish-stage" / "inventory-linux.json").read_text(encoding="utf-8"))
+          rows = inventory["artifacts"]
+          wheel = next(row for row in rows if row["name"].endswith(".whl"))
+          sdist = next(row for row in rows if row["name"].endswith(".tar.gz"))
+          for row in (wheel, sdist):
+              print(row["name"])
+              print(row["sha256"])
+          PY
+          )
+          wheel_name="${artifacts[0]}"
+          wheel_sha256="${artifacts[1]}"
+          sdist_name="${artifacts[2]}"
+          sdist_sha256="${artifacts[3]}"
+          mkdir -p "$envelope/assets" "$envelope/evidence"
+          cp "$stage/dist/$wheel_name" "$envelope/assets/$wheel_name"
+          cp "$stage/dist/$sdist_name" "$envelope/assets/$sdist_name"
+          printf '%s  %s\n%s  %s\n' "$wheel_sha256" "$wheel_name" "$sdist_sha256" "$sdist_name" | LC_ALL=C sort -k2 > "$envelope/assets/SHA256SUMS.txt"
+          cd "$envelope"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action release_publish --destination https://github.com/Ryan529616/aoi-orgware/releases --subject "assets/$wheel_name" --subject "assets/$sdist_name" --subject assets/SHA256SUMS.txt --json > evidence/github-release-publication-preflight.json
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate preflight --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject "assets/$wheel_name" --subject "assets/$sdist_name" --subject assets/SHA256SUMS.txt --subject evidence/github-release-publication-preflight.json --json > evidence/github-release-envelope-publication-receipt.json
+          printf 'release-checksums-sha256=%s\nrelease-preflight-sha256=%s\nrelease-envelope-preflight-sha256=%s\n' "$(sha256sum assets/SHA256SUMS.txt | awk '{print $1}')" "$(sha256sum evidence/github-release-publication-preflight.json | awk '{print $1}')" "$(sha256sum evidence/github-release-envelope-publication-receipt.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Upload the sealed GitHub Release publication envelope
+        id: upload-github-release-envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: github-release-publish-envelope
+          path: ${{ runner.temp }}/github-release-envelope/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish-github-release:
+    name: Publish the exact GitHub prerelease assets
+    if: ${{ inputs.intent == 'publish' }}
+    needs: [verify-pypi-stage, producer-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the exact sealed GitHub Release publication envelope
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-pypi-stage.outputs.github-release-artifact-id }}
+          path: ${{ runner.temp }}/github-release-envelope
+      - name: Verify the exact GitHub Release envelope file set and hashes
+        shell: bash
+        env:
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+          RELEASE_CHECKSUMS_SHA256: ${{ needs.verify-pypi-stage.outputs.release-checksums-sha256 }}
+          RELEASE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-preflight-sha256 }}
+          RELEASE_ENVELOPE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-envelope-preflight-sha256 }}
+        run: |
+          set -euo pipefail
+          envelope="$RUNNER_TEMP/github-release-envelope"
+          expected_files="$(printf '%s\n' "assets/$SDIST_NAME" "assets/$WHEEL_NAME" "assets/SHA256SUMS.txt" "evidence/github-release-envelope-publication-receipt.json" "evidence/github-release-publication-preflight.json" | LC_ALL=C sort)"
+          test -z "$(find "$envelope" -not -type d -not -type f -print)"
+          observed_files="$(cd "$envelope" && find . -type f -printf '%P\n' | LC_ALL=C sort)"
+          test "$observed_files" = "$expected_files"
+          test "$(sha256sum "$envelope/assets/$WHEEL_NAME" | awk '{print $1}')" = "$WHEEL_SHA256"
+          test "$(sha256sum "$envelope/assets/$SDIST_NAME" | awk '{print $1}')" = "$SDIST_SHA256"
+          test "$(sha256sum "$envelope/assets/SHA256SUMS.txt" | awk '{print $1}')" = "$RELEASE_CHECKSUMS_SHA256"
+          test "$(sha256sum "$envelope/evidence/github-release-publication-preflight.json" | awk '{print $1}')" = "$RELEASE_PREFLIGHT_SHA256"
+          test "$(sha256sum "$envelope/evidence/github-release-envelope-publication-receipt.json" | awk '{print $1}')" = "$RELEASE_ENVELOPE_PREFLIGHT_SHA256"
+          expected_checksums="$(printf '%s  %s\n%s  %s\n' "$WHEEL_SHA256" "$WHEEL_NAME" "$SDIST_SHA256" "$SDIST_NAME" | LC_ALL=C sort -k2)"
+          test "$(cat "$envelope/assets/SHA256SUMS.txt")" = "$expected_checksums"
+      - name: Publish or reconcile the exact GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXACT_TAG_OBJECT: ${{ needs.producer-linux.outputs.exact-tag-object }}
+          EXACT_COMMIT: ${{ needs.producer-linux.outputs.exact-commit }}
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+          RELEASE_CHECKSUMS_SHA256: ${{ needs.verify-pypi-stage.outputs.release-checksums-sha256 }}
+          RELEASE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-preflight-sha256 }}
+          RELEASE_ENVELOPE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-envelope-preflight-sha256 }}
+          GH_API_VERSION: "2026-03-10"
+        run: |
+          set -euo pipefail
+          envelope="$RUNNER_TEMP/github-release-envelope"
+          title="AOI $RELEASE_TAG (alpha)"
+          ref_json="$RUNNER_TEMP/release-tag-ref.json"
+          tag_json="$RUNNER_TEMP/release-tag-object.json"
+          releases_pages_json="$RUNNER_TEMP/github-releases-pages.json"
+          release_json="$RUNNER_TEMP/github-release.json"
+          wheel_size="$(wc -c < "$envelope/assets/$WHEEL_NAME" | tr -d ' ')"
+          sdist_size="$(wc -c < "$envelope/assets/$SDIST_NAME" | tr -d ' ')"
+          checksums_size="$(wc -c < "$envelope/assets/SHA256SUMS.txt" | tr -d ' ')"
+          notes="$(printf '%s\n' \
+            "AOI $RELEASE_TAG alpha release. Exact wheel, source distribution, and SHA-256 checksums are attached." \
+            "" \
+            "AOI-Release-Contract: v1" \
+            "repository=$GITHUB_REPOSITORY" \
+            "tag=$RELEASE_TAG" \
+            "tag_object=$EXACT_TAG_OBJECT" \
+            "commit=$EXACT_COMMIT" \
+            "wheel=$WHEEL_NAME:$wheel_size:$WHEEL_SHA256" \
+            "sdist=$SDIST_NAME:$sdist_size:$SDIST_SHA256" \
+            "checksums=SHA256SUMS.txt:$checksums_size:$RELEASE_CHECKSUMS_SHA256" \
+            "publication_policy_sha256=$PUBLICATION_POLICY_SHA256" \
+            "release_preflight_sha256=$RELEASE_PREFLIGHT_SHA256" \
+            "release_envelope_preflight_sha256=$RELEASE_ENVELOPE_PREFLIGHT_SHA256")"
+          gh_api_json() {
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: $GH_API_VERSION" \
+              "$@"
+          }
+          fetch_release() {
+            if ! gh_api_json --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_pages_json"; then
+              rm -f "$release_json" "$releases_pages_json"
+              return 2
+            fi
+            RELEASE_PAGES_JSON="$releases_pages_json" RELEASE_JSON="$release_json" RELEASE_TAG="$RELEASE_TAG" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          pages = json.load(open(os.environ["RELEASE_PAGES_JSON"], encoding="utf-8"))
+          releases = [release for page in pages for release in page]
+          matches = [release for release in releases if release.get("tag_name") == os.environ["RELEASE_TAG"]]
+          output = Path(os.environ["RELEASE_JSON"])
+          if not matches:
+              output.unlink(missing_ok=True)
+              raise SystemExit(3)
+          if len(matches) != 1:
+              raise SystemExit("GitHub contains duplicate Releases for the exact tag")
+          output.write_text(
+              json.dumps(matches[0], sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          }
+          release_state_sha() {
+            python -c 'import hashlib,json,sys; r=json.load(open(sys.argv[1])); v={"id":r.get("id"),"tag_name":r.get("tag_name"),"name":r.get("name"),"body":r.get("body"),"draft":r.get("draft"),"prerelease":r.get("prerelease"),"assets":sorted(({k:a.get(k) for k in ("id","name","size","digest","state")} for a in r.get("assets",[])),key=lambda a:(a["name"] or ""))}; print(hashlib.sha256(json.dumps(v,sort_keys=True,separators=(",",":")).encode()).hexdigest())' "$release_json"
+          }
+          download_asset() {
+            local name="$1"
+            local destination="$2"
+            local asset_id
+            asset_id="$(python -c 'import json,sys; rows=[a for a in json.load(open(sys.argv[1])).get("assets",[]) if a.get("name")==sys.argv[2]]; assert len(rows)==1 and type(rows[0].get("id")) is int; print(rows[0]["id"])' "$release_json" "$name")"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: $GH_API_VERSION" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$destination"
+          }
+          assert_tag_binding() {
+            gh_api_json "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$ref_json"
+            test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$ref_json")" = tag
+            test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$ref_json")" = "$EXACT_TAG_OBJECT"
+            gh_api_json "repos/$GITHUB_REPOSITORY/git/tags/$EXACT_TAG_OBJECT" > "$tag_json"
+            test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$tag_json")" = commit
+            test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$tag_json")" = "$EXACT_COMMIT"
+          }
+          assert_release_contract() {
+            local expected_draft="$1"
+            RELEASE_JSON="$release_json" \
+              RELEASE_TITLE="$title" \
+              RELEASE_NOTES="$notes" \
+              EXPECTED_DRAFT="$expected_draft" \
+              EXPECTED_RELEASE_ID="${release_id:-}" \
+              python - <<'PY'
+          import json
+          import os
+
+          release = json.load(open(os.environ["RELEASE_JSON"], encoding="utf-8"))
+          expected_names = {os.environ["WHEEL_NAME"], os.environ["SDIST_NAME"], "SHA256SUMS.txt"}
+          if release.get("tag_name") != os.environ["RELEASE_TAG"] or release.get("name") != os.environ["RELEASE_TITLE"] or release.get("body") != os.environ["RELEASE_NOTES"]:
+              raise SystemExit("GitHub Release tag, title, or contract marker does not match the exact release")
+          if type(release.get("id")) is not int or type(release.get("draft")) is not bool or release.get("prerelease") is not True:
+              raise SystemExit("GitHub Release identity or draft/prerelease state is invalid")
+          if os.environ["EXPECTED_RELEASE_ID"] and release.get("id") != int(os.environ["EXPECTED_RELEASE_ID"]):
+              raise SystemExit("GitHub Release identity changed")
+          expected_draft = os.environ["EXPECTED_DRAFT"]
+          if expected_draft != "any" and release.get("draft") is not (expected_draft == "true"):
+              raise SystemExit("GitHub Release visibility changed")
+          assets = release.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("GitHub Release assets are malformed")
+          names = [asset.get("name") for asset in assets]
+          if len(names) != len(set(names)) or not set(names).issubset(expected_names):
+              raise SystemExit("GitHub Release contains duplicate or unexpected assets")
+          for asset in assets:
+              if type(asset.get("id")) is not int or type(asset.get("size")) is not int or asset["size"] < 0:
+                  raise SystemExit("GitHub Release asset identity or size is invalid")
+              if asset.get("state") not in {"starter", "uploaded"}:
+                  raise SystemExit("GitHub Release asset state is unsupported")
+          PY
+          }
+          assert_tag_binding
+          if fetch_release; then
+            :
+          else
+            fetch_status="$?"
+            test "$fetch_status" -eq 3
+            assert_tag_binding
+            gh_api_json --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$RELEASE_TAG" \
+              -f target_commitish="$EXACT_COMMIT" \
+              -f name="$title" \
+              -f body="$notes" \
+              -F draft=true \
+              -F prerelease=true \
+              -f make_latest=false > "$release_json"
+            fetch_release
+          fi
+          assert_release_contract any
+          release_id="$(python -c 'import json,sys; v=json.load(open(sys.argv[1])).get("id"); assert type(v) is int; print(v)' "$release_json")"
+          release_is_draft="$(python -c 'import json,sys; print("true" if json.load(open(sys.argv[1])).get("draft") is True else "false")' "$release_json")"
+          assert_release_contract "$release_is_draft"
+          release_state_before="$(release_state_sha)"
+          declare -A expected_sha=(
+            ["$WHEEL_NAME"]="$WHEEL_SHA256"
+            ["$SDIST_NAME"]="$SDIST_SHA256"
+            ["SHA256SUMS.txt"]="$RELEASE_CHECKSUMS_SHA256"
+          )
+          missing_assets=()
+          starter_assets=()
+          for name in "$WHEEL_NAME" "$SDIST_NAME" SHA256SUMS.txt; do
+            if python -c 'import json,sys; raise SystemExit(0 if sys.argv[2] in {a.get("name") for a in json.load(open(sys.argv[1])).get("assets",[])} else 1)' "$release_json" "$name"; then
+              asset_state="$(python -c 'import json,sys; rows=[a for a in json.load(open(sys.argv[1])).get("assets",[]) if a.get("name")==sys.argv[2]]; assert len(rows)==1; print(rows[0].get("state"))' "$release_json" "$name")"
+              if [[ "$asset_state" = "starter" ]]; then
+                python -c 'import json,sys; rows=[a for a in json.load(open(sys.argv[1])).get("assets",[]) if a.get("name")==sys.argv[2]]; assert len(rows)==1 and rows[0].get("state")=="starter" and rows[0].get("size")==0' "$release_json" "$name"
+                starter_assets+=("$name")
+              else
+                existing="$RUNNER_TEMP/existing-$name"
+                mkdir -p "$existing"
+                download_asset "$name" "$existing/$name"
+                test "$(sha256sum "$existing/$name" | awk '{print $1}')" = "${expected_sha[$name]}"
+              fi
+            else
+              missing_assets+=("$name")
+            fi
+          done
+          fetch_release
+          release_state_after="$(release_state_sha)"
+          test "$release_state_after" = "$release_state_before"
+          assert_release_contract "$release_is_draft"
+          assert_tag_binding
+          if [[ "$release_is_draft" != "true" && "$(( ${#missing_assets[@]} + ${#starter_assets[@]} ))" -ne 0 ]]; then
+            echo "Published GitHub Release is incomplete; refusing to mutate public release state" >&2
+            exit 1
+          fi
+          for name in "${starter_assets[@]}"; do
+            fetch_release
+            assert_release_contract true
+            assert_tag_binding
+            starter_id="$(python -c 'import json,sys; rows=[a for a in json.load(open(sys.argv[1])).get("assets",[]) if a.get("name")==sys.argv[2]]; assert len(rows)==1 and type(rows[0].get("id")) is int and rows[0].get("state")=="starter" and rows[0].get("size")==0; print(rows[0]["id"])' "$release_json" "$name")"
+            gh_api_json --method DELETE --silent "repos/$GITHUB_REPOSITORY/releases/assets/$starter_id"
+            fetch_release
+            assert_release_contract true
+            python -c 'import json,sys; assert sys.argv[2] not in {a.get("name") for a in json.load(open(sys.argv[1])).get("assets",[])}' "$release_json" "$name"
+            missing_assets+=("$name")
+          done
+          for name in "${missing_assets[@]}"; do
+            fetch_release
+            assert_release_contract true
+            assert_tag_binding
+            if python -c 'import json,sys; raise SystemExit(0 if sys.argv[2] in {a.get("name") for a in json.load(open(sys.argv[1])).get("assets",[])} else 1)' "$release_json" "$name"; then
+              raced="$RUNNER_TEMP/raced-$name"
+              download_asset "$name" "$raced"
+              test "$(sha256sum "$raced" | awk '{print $1}')" = "${expected_sha[$name]}"
+              continue
+            fi
+            encoded_name="$(python -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$name")"
+            upload_response="$RUNNER_TEMP/upload-$name.json"
+            curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "X-GitHub-Api-Version: $GH_API_VERSION" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@$envelope/assets/$name" \
+              --output "$upload_response" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name"
+            python -c 'import json,os,sys; a=json.load(open(sys.argv[1])); expected_digest="sha256:"+sys.argv[4]; assert type(a.get("id")) is int and a.get("name")==sys.argv[2] and a.get("state")=="uploaded" and a.get("size")==os.path.getsize(sys.argv[3]) and a.get("digest") in (None,expected_digest)' "$upload_response" "$name" "$envelope/assets/$name" "${expected_sha[$name]}"
+            fetch_release
+            assert_release_contract true
+            uploaded="$RUNNER_TEMP/uploaded-$name"
+            download_asset "$name" "$uploaded"
+            test "$(sha256sum "$uploaded" | awk '{print $1}')" = "${expected_sha[$name]}"
+          done
+          fetch_release
+          assert_release_contract "$release_is_draft"
+          RELEASE_JSON="$release_json" EXPECTED_DRAFT="$release_is_draft" EXPECTED_RELEASE_ID="$release_id" python - <<'PY'
+          import json
+          import os
+
+          release = json.load(open(os.environ["RELEASE_JSON"], encoding="utf-8"))
+          expected = {
+              os.environ["WHEEL_NAME"]: os.path.getsize(os.path.join(os.environ["RUNNER_TEMP"], "github-release-envelope", "assets", os.environ["WHEEL_NAME"])),
+              os.environ["SDIST_NAME"]: os.path.getsize(os.path.join(os.environ["RUNNER_TEMP"], "github-release-envelope", "assets", os.environ["SDIST_NAME"])),
+              "SHA256SUMS.txt": os.path.getsize(os.path.join(os.environ["RUNNER_TEMP"], "github-release-envelope", "assets", "SHA256SUMS.txt")),
+          }
+          observed = {asset.get("name"): asset.get("size") for asset in release.get("assets", []) if asset.get("state") == "uploaded"}
+          if observed != expected:
+              raise SystemExit("GitHub Release asset names or sizes do not match the sealed envelope")
+          if release.get("id") != int(os.environ["EXPECTED_RELEASE_ID"]):
+              raise SystemExit("GitHub Release identity changed during draft staging")
+          expected_draft = os.environ["EXPECTED_DRAFT"] == "true"
+          if release.get("draft") is not expected_draft:
+              raise SystemExit("GitHub Release visibility changed during draft staging")
+          PY
+          readback="$RUNNER_TEMP/github-release-immediate-readback"
+          mkdir -p "$readback"
+          for name in "$WHEEL_NAME" "$SDIST_NAME" SHA256SUMS.txt; do
+            download_asset "$name" "$readback/$name"
+          done
+          test "$(find "$readback" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)" = "$(printf '%s\n' "$SDIST_NAME" "$WHEEL_NAME" SHA256SUMS.txt | LC_ALL=C sort)"
+          test "$(sha256sum "$readback/$WHEEL_NAME" | awk '{print $1}')" = "$WHEEL_SHA256"
+          test "$(sha256sum "$readback/$SDIST_NAME" | awk '{print $1}')" = "$SDIST_SHA256"
+          test "$(sha256sum "$readback/SHA256SUMS.txt" | awk '{print $1}')" = "$RELEASE_CHECKSUMS_SHA256"
+          ready_state_before="$(release_state_sha)"
+          fetch_release
+          ready_state_after="$(release_state_sha)"
+          test "$ready_state_after" = "$ready_state_before"
+          assert_release_contract "$release_is_draft"
+          assert_tag_binding
+          if [[ "$release_is_draft" = "true" ]]; then
+            gh_api_json --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -F prerelease=true -f make_latest=false > "$release_json"
+          fi
+          fetch_release
+          assert_release_contract false
+          RELEASE_JSON="$release_json" RELEASE_TITLE="$title" RELEASE_NOTES="$notes" EXPECTED_RELEASE_ID="$release_id" python - <<'PY'
+          import json
+          import os
+
+          release = json.load(open(os.environ["RELEASE_JSON"], encoding="utf-8"))
+          expected_names = {os.environ["WHEEL_NAME"], os.environ["SDIST_NAME"], "SHA256SUMS.txt"}
+          names = [asset.get("name") for asset in release.get("assets", [])]
+          if release.get("id") != int(os.environ["EXPECTED_RELEASE_ID"]):
+              raise SystemExit("Published GitHub Release identity changed")
+          if release.get("tag_name") != os.environ["RELEASE_TAG"] or release.get("name") != os.environ["RELEASE_TITLE"] or release.get("body") != os.environ["RELEASE_NOTES"]:
+              raise SystemExit("Published GitHub Release metadata changed")
+          if release.get("draft") is not False or release.get("prerelease") is not True:
+              raise SystemExit("GitHub Release was not published as a prerelease")
+          if len(names) != len(set(names)) or set(names) != expected_names:
+              raise SystemExit("Published GitHub Release asset set changed")
+          PY
+          final_readback="$RUNNER_TEMP/github-release-published-readback"
+          mkdir -p "$final_readback"
+          for name in "$WHEEL_NAME" "$SDIST_NAME" SHA256SUMS.txt; do
+            download_asset "$name" "$final_readback/$name"
+          done
+          test "$(sha256sum "$final_readback/$WHEEL_NAME" | awk '{print $1}')" = "$WHEEL_SHA256"
+          test "$(sha256sum "$final_readback/$SDIST_NAME" | awk '{print $1}')" = "$SDIST_SHA256"
+          test "$(sha256sum "$final_readback/SHA256SUMS.txt" | awk '{print $1}')" = "$RELEASE_CHECKSUMS_SHA256"
+          assert_tag_binding
+
+  verify-github-release:
+    name: Independently read back the exact GitHub prerelease
+    if: ${{ inputs.intent == 'publish' }}
+    needs: [publish-github-release, verify-pypi-stage, producer-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the producer's exact peeled commit for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up fixed Python for release verification
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Download the exact sealed GitHub Release publication envelope
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-pypi-stage.outputs.github-release-artifact-id }}
+          path: ${{ runner.temp }}/github-release-envelope
+      - name: Verify both GitHub Release publication receipts
+        shell: bash
+        env:
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/github-release-envelope"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate verify --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt evidence/github-release-envelope-publication-receipt.json --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject "assets/$WHEEL_NAME" --subject "assets/$SDIST_NAME" --subject assets/SHA256SUMS.txt --subject evidence/github-release-publication-preflight.json --json
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate verify --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt evidence/github-release-publication-preflight.json --action release_publish --destination https://github.com/Ryan529616/aoi-orgware/releases --subject "assets/$WHEEL_NAME" --subject "assets/$SDIST_NAME" --subject assets/SHA256SUMS.txt --json
+      - name: Read back the exact tag, release, and asset bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXACT_TAG_OBJECT: ${{ needs.producer-linux.outputs.exact-tag-object }}
+          EXACT_COMMIT: ${{ needs.producer-linux.outputs.exact-commit }}
+          RELEASE_ENVELOPE_ARTIFACT_ID: ${{ needs.verify-pypi-stage.outputs.github-release-artifact-id }}
+          RELEASE_ENVELOPE_ARTIFACT_DIGEST: ${{ needs.verify-pypi-stage.outputs.github-release-artifact-digest }}
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+          RELEASE_CHECKSUMS_SHA256: ${{ needs.verify-pypi-stage.outputs.release-checksums-sha256 }}
+          RELEASE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-preflight-sha256 }}
+          RELEASE_ENVELOPE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-envelope-preflight-sha256 }}
+          GH_API_VERSION: "2026-03-10"
+        run: |
+          set -euo pipefail
+          envelope="$RUNNER_TEMP/github-release-envelope"
+          ref_json="$RUNNER_TEMP/readback-tag-ref.json"
+          tag_json="$RUNNER_TEMP/readback-tag-object.json"
+          release_json="$RUNNER_TEMP/readback-release.json"
+          readback="$RUNNER_TEMP/github-release-readback"
+          release_notes="$(printf '%s\n' \
+            "AOI $RELEASE_TAG alpha release. Exact wheel, source distribution, and SHA-256 checksums are attached." \
+            "" \
+            "AOI-Release-Contract: v1" \
+            "repository=$GITHUB_REPOSITORY" \
+            "tag=$RELEASE_TAG" \
+            "tag_object=$EXACT_TAG_OBJECT" \
+            "commit=$EXACT_COMMIT" \
+            "wheel=$WHEEL_NAME:$(wc -c < "$envelope/assets/$WHEEL_NAME" | tr -d ' '):$WHEEL_SHA256" \
+            "sdist=$SDIST_NAME:$(wc -c < "$envelope/assets/$SDIST_NAME" | tr -d ' '):$SDIST_SHA256" \
+            "checksums=SHA256SUMS.txt:$(wc -c < "$envelope/assets/SHA256SUMS.txt" | tr -d ' '):$RELEASE_CHECKSUMS_SHA256" \
+            "publication_policy_sha256=$PUBLICATION_POLICY_SHA256" \
+            "release_preflight_sha256=$RELEASE_PREFLIGHT_SHA256" \
+            "release_envelope_preflight_sha256=$RELEASE_ENVELOPE_PREFLIGHT_SHA256")"
+          gh_api_args=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: $GH_API_VERSION")
+          gh api "${gh_api_args[@]}" "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$ref_json"
+          gh api "${gh_api_args[@]}" "repos/$GITHUB_REPOSITORY/git/tags/$EXACT_TAG_OBJECT" > "$tag_json"
+          gh api "${gh_api_args[@]}" "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$ref_json")" = tag
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$ref_json")" = "$EXACT_TAG_OBJECT"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$tag_json")" = commit
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$tag_json")" = "$EXACT_COMMIT"
+          mkdir -p "$readback"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$readback"
+          test "$(find "$readback" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)" = "$(printf '%s\n' "$SDIST_NAME" "$WHEEL_NAME" SHA256SUMS.txt | LC_ALL=C sort)"
+          test "$(sha256sum "$readback/$WHEEL_NAME" | awk '{print $1}')" = "$WHEEL_SHA256"
+          test "$(sha256sum "$readback/$SDIST_NAME" | awk '{print $1}')" = "$SDIST_SHA256"
+          test "$(sha256sum "$readback/SHA256SUMS.txt" | awk '{print $1}')" = "$RELEASE_CHECKSUMS_SHA256"
+          RELEASE_JSON="$release_json" RELEASE_NOTES="$release_notes" READBACK_ROOT="$readback" python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+          release = json.load(open(os.environ["RELEASE_JSON"], encoding="utf-8"))
+          expected_hashes = {
+              os.environ["WHEEL_NAME"]: os.environ["WHEEL_SHA256"],
+              os.environ["SDIST_NAME"]: os.environ["SDIST_SHA256"],
+              "SHA256SUMS.txt": os.environ["RELEASE_CHECKSUMS_SHA256"],
+          }
+          if release.get("tag_name") != os.environ["RELEASE_TAG"] or release.get("name") != f"AOI {os.environ['RELEASE_TAG']} (alpha)" or release.get("body") != os.environ["RELEASE_NOTES"] or release.get("draft") is not False or release.get("prerelease") is not True:
+              raise SystemExit("GitHub Release readback state is invalid")
+          assets_by_name = {asset.get("name"): asset for asset in release.get("assets", [])}
+          if set(assets_by_name) != set(expected_hashes) or len(assets_by_name) != len(release.get("assets", [])):
+              raise SystemExit("GitHub Release readback asset set is invalid")
+          root = Path(os.environ["READBACK_ROOT"])
+          assets = []
+          for name in sorted(expected_hashes):
+              path = root / name
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != expected_hashes[name] or assets_by_name[name].get("size") != path.stat().st_size:
+                  raise SystemExit(f"GitHub Release readback asset identity is invalid: {name}")
+              remote_digest = assets_by_name[name].get("digest")
+              if remote_digest not in (None, f"sha256:{digest}"):
+                  raise SystemExit(f"GitHub Release reported a conflicting asset digest: {name}")
+              assets.append({"name": name, "size_bytes": path.stat().st_size, "sha256": digest})
+          base = {
+              "schema_version": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "tag": os.environ["RELEASE_TAG"],
+              "tag_object_oid": os.environ["EXACT_TAG_OBJECT"],
+              "commit_oid": os.environ["EXACT_COMMIT"],
+              "release_id": release.get("id"),
+              "release_url": release.get("html_url"),
+              "release_target_commitish_observed": release.get("target_commitish"),
+              "release_envelope_artifact_id": os.environ["RELEASE_ENVELOPE_ARTIFACT_ID"],
+              "release_envelope_artifact_digest": os.environ["RELEASE_ENVELOPE_ARTIFACT_DIGEST"],
+              "release_publication_preflight_sha256": os.environ["RELEASE_PREFLIGHT_SHA256"],
+              "assets": assets,
+          }
+          if type(base["release_id"]) is not int or not isinstance(base["release_url"], str):
+              raise SystemExit("GitHub Release readback identity is invalid")
+          if not isinstance(base["release_envelope_artifact_id"], str) or re.fullmatch(r"[1-9][0-9]*", base["release_envelope_artifact_id"]) is None:
+              raise SystemExit("GitHub Release envelope artifact ID is invalid")
+          for field in ("release_envelope_artifact_digest", "release_publication_preflight_sha256"):
+              if not isinstance(base[field], str) or re.fullmatch(r"[0-9a-f]{64}", base[field]) is None:
+                  raise SystemExit(f"GitHub Release readback {field} is invalid")
+          receipt = {**base, "receipt_sha256": hashlib.sha256(canonical(base)).hexdigest()}
+          Path("github-release-readback.json").write_bytes(canonical(receipt) + b"\n")
+          PY
+      - name: Preflight GitHub Release readback artifact publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          PYTHONPATH=src python -m aoi_orgware.publication_gate preflight --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject github-release-readback.json --json > evidence/github-release-readback-publication-receipt.json
+      - name: Upload the GitHub Release readback candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: github-release-readback-candidate
+          path: |
+            github-release-readback.json
+            evidence/github-release-readback-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+  publish-pypi:
+    name: Publish the sealed pair to PyPI
+    if: ${{ inputs.intent == 'publish' }}
+    needs: [verify-pypi-stage, verify-github-release, producer-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/aoi-orgware
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the exact sealed PyPI publication envelope
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-pypi-stage.outputs.artifact-id }}
+          path: ${{ runner.temp }}/pypi-publish-envelope
+      - name: Verify the exact envelope file set and SHA-256 values
+        shell: bash
+        env:
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+          PACKAGE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.package-preflight-sha256 }}
+          PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.preflight-sha256 }}
+        run: |
+          set -euo pipefail
+          envelope="$RUNNER_TEMP/pypi-publish-envelope"
+          wheel_name="$WHEEL_NAME"
+          wheel_sha256="$WHEEL_SHA256"
+          sdist_name="$SDIST_NAME"
+          sdist_sha256="$SDIST_SHA256"
+          package_preflight_sha256="$PACKAGE_PREFLIGHT_SHA256"
+          preflight_sha256="$PREFLIGHT_SHA256"
+          expected_files="$(printf '%s\n' "dist/$sdist_name" "dist/$wheel_name" "evidence/pypi-package-preflight.json" "evidence/pypi-publish-envelope-publication-receipt.json" | LC_ALL=C sort)"
+          test -z "$(find "$envelope" -not -type d -not -type f -print)"
+          observed_files="$(cd "$envelope" && find . -type f -printf '%P\n' | LC_ALL=C sort)"
+          test "$observed_files" = "$expected_files"
+          test "$(sha256sum "$envelope/dist/$wheel_name" | awk '{print $1}')" = "$wheel_sha256"
+          test "$(sha256sum "$envelope/dist/$sdist_name" | awk '{print $1}')" = "$sdist_sha256"
+          test "$(sha256sum "$envelope/evidence/pypi-package-preflight.json" | awk '{print $1}')" = "$package_preflight_sha256"
+          test "$(sha256sum "$envelope/evidence/pypi-publish-envelope-publication-receipt.json" | awk '{print $1}')" = "$preflight_sha256"
+      - name: Recheck the exact GitHub Release immediately before PyPI
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXACT_TAG_OBJECT: ${{ needs.producer-linux.outputs.exact-tag-object }}
+          EXACT_COMMIT: ${{ needs.producer-linux.outputs.exact-commit }}
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+          RELEASE_CHECKSUMS_SHA256: ${{ needs.verify-pypi-stage.outputs.release-checksums-sha256 }}
+          RELEASE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-preflight-sha256 }}
+          RELEASE_ENVELOPE_PREFLIGHT_SHA256: ${{ needs.verify-pypi-stage.outputs.release-envelope-preflight-sha256 }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/Ryan529616/aoi-orgware"
+          envelope="$RUNNER_TEMP/pypi-publish-envelope"
+          checksums_size="$(printf '%s  %s\n%s  %s\n' "$WHEEL_SHA256" "$WHEEL_NAME" "$SDIST_SHA256" "$SDIST_NAME" | LC_ALL=C sort -k2 | wc -c | tr -d ' ')"
+          release_notes="$(printf '%s\n' \
+            "AOI $RELEASE_TAG alpha release. Exact wheel, source distribution, and SHA-256 checksums are attached." \
+            "" \
+            "AOI-Release-Contract: v1" \
+            "repository=Ryan529616/aoi-orgware" \
+            "tag=$RELEASE_TAG" \
+            "tag_object=$EXACT_TAG_OBJECT" \
+            "commit=$EXACT_COMMIT" \
+            "wheel=$WHEEL_NAME:$(wc -c < "$envelope/dist/$WHEEL_NAME" | tr -d ' '):$WHEEL_SHA256" \
+            "sdist=$SDIST_NAME:$(wc -c < "$envelope/dist/$SDIST_NAME" | tr -d ' '):$SDIST_SHA256" \
+            "checksums=SHA256SUMS.txt:$checksums_size:$RELEASE_CHECKSUMS_SHA256" \
+            "publication_policy_sha256=$PUBLICATION_POLICY_SHA256" \
+            "release_preflight_sha256=$RELEASE_PREFLIGHT_SHA256" \
+            "release_envelope_preflight_sha256=$RELEASE_ENVELOPE_PREFLIGHT_SHA256")"
+          curl_args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2 -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10')
+          curl "${curl_args[@]}" "$api/git/ref/tags/$RELEASE_TAG" > "$RUNNER_TEMP/pypi-tag-ref.json"
+          curl "${curl_args[@]}" "$api/git/tags/$EXACT_TAG_OBJECT" > "$RUNNER_TEMP/pypi-tag-object.json"
+          curl "${curl_args[@]}" "$api/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/pypi-release.json"
+          RELEASE_JSON="$RUNNER_TEMP/pypi-release.json" RELEASE_NOTES="$release_notes" REF_JSON="$RUNNER_TEMP/pypi-tag-ref.json" TAG_JSON="$RUNNER_TEMP/pypi-tag-object.json" python - <<'PY'
+          import json
+          import os
+
+          ref = json.load(open(os.environ["REF_JSON"], encoding="utf-8"))
+          tag = json.load(open(os.environ["TAG_JSON"], encoding="utf-8"))
+          release = json.load(open(os.environ["RELEASE_JSON"], encoding="utf-8"))
+          if ref.get("object", {}).get("type") != "tag" or ref.get("object", {}).get("sha") != os.environ["EXACT_TAG_OBJECT"]:
+              raise SystemExit("GitHub tag object changed before PyPI publication")
+          if tag.get("object", {}).get("type") != "commit" or tag.get("object", {}).get("sha") != os.environ["EXACT_COMMIT"]:
+              raise SystemExit("GitHub tag peeled commit changed before PyPI publication")
+          if release.get("tag_name") != os.environ["RELEASE_TAG"] or release.get("name") != f"AOI {os.environ['RELEASE_TAG']} (alpha)" or release.get("body") != os.environ["RELEASE_NOTES"] or release.get("draft") is not False or release.get("prerelease") is not True:
+              raise SystemExit("GitHub Release state changed before PyPI publication")
+          expected = {os.environ["WHEEL_NAME"], os.environ["SDIST_NAME"], "SHA256SUMS.txt"}
+          names = [asset.get("name") for asset in release.get("assets", [])]
+          if len(names) != len(set(names)) or set(names) != expected:
+              raise SystemExit("GitHub Release asset set changed before PyPI publication")
+          PY
+          readback="$RUNNER_TEMP/pypi-release-recheck"
+          mkdir -p "$readback"
+          for name in "$WHEEL_NAME" "$SDIST_NAME" SHA256SUMS.txt; do
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "https://github.com/Ryan529616/aoi-orgware/releases/download/$RELEASE_TAG/$name" --output "$readback/$name"
+          done
+          test "$(sha256sum "$readback/$WHEEL_NAME" | awk '{print $1}')" = "$WHEEL_SHA256"
+          test "$(sha256sum "$readback/$SDIST_NAME" | awk '{print $1}')" = "$SDIST_SHA256"
+          test "$(sha256sum "$readback/SHA256SUMS.txt" | awk '{print $1}')" = "$RELEASE_CHECKSUMS_SHA256"
+      - name: Prepare the workflow-owned PyPI reconciliation verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/verify-pypi-state.py" <<'PY'
+          from __future__ import annotations
+
+          import argparse
+          import base64
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          MAX_JSON = 4 * 1024 * 1024
+
+          def pairs(items):
+              value = {}
+              for key, item in items:
+                  if key in value:
+                      raise SystemExit(f"duplicate remote JSON key: {key}")
+                  value[key] = item
+              return value
+
+          def fetch_json(url, *, accept="application/json", allow_404=False):
+              request = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "aoi-orgware-release-workflow"})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      raw = response.read(MAX_JSON + 1)
+              except urllib.error.HTTPError as exc:
+                  if allow_404 and exc.code == 404:
+                      return None
+                  raise SystemExit(f"PyPI state fetch failed: HTTP {exc.code}") from exc
+              if len(raw) > MAX_JSON:
+                  raise SystemExit("PyPI state response exceeds its byte bound")
+              try:
+                  return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+              except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                  raise SystemExit(f"PyPI state is not strict UTF-8 JSON: {exc}") from exc
+
+          def download_identity(url, expected_size, expected_sha256):
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != "https" or parsed.hostname != "files.pythonhosted.org" or parsed.port not in (None, 443):
+                  raise SystemExit("PyPI file URL is outside files.pythonhosted.org HTTPS")
+              request = urllib.request.Request(url, headers={"User-Agent": "aoi-orgware-release-workflow"})
+              digest = hashlib.sha256()
+              total = 0
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  while True:
+                      chunk = response.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      if total > expected_size:
+                          raise SystemExit("PyPI file exceeds its expected size")
+                      digest.update(chunk)
+              if total != expected_size or digest.hexdigest() != expected_sha256:
+                  raise SystemExit("PyPI downloaded file does not match the sealed artifact")
+
+          def provenance_matches(document, filename, sha256):
+              if not isinstance(document, dict) or document.get("version") != 1:
+                  return False
+              for bundle in document.get("attestation_bundles", []):
+                  if not isinstance(bundle, dict):
+                      continue
+                  publisher = bundle.get("publisher")
+                  if not isinstance(publisher, dict) or publisher.get("kind") != "GitHub" or publisher.get("repository") != "Ryan529616/aoi-orgware" or publisher.get("workflow") != "publish.yml" or publisher.get("environment") != "pypi":
+                      continue
+                  for attestation in bundle.get("attestations", []):
+                      if not isinstance(attestation, dict) or attestation.get("version") != 1:
+                          continue
+                      envelope = attestation.get("envelope")
+                      if not isinstance(envelope, dict) or not isinstance(envelope.get("signature"), str) or not envelope.get("signature") or not isinstance(attestation.get("verification_material"), dict) or not attestation.get("verification_material"):
+                          continue
+                      try:
+                          statement_raw = base64.b64decode(envelope.get("statement", ""), validate=True)
+                          statement = json.loads(statement_raw.decode("utf-8"), object_pairs_hook=pairs)
+                      except Exception:
+                          continue
+                      if not isinstance(statement, dict) or statement.get("_type") != "https://in-toto.io/Statement/v1" or statement.get("predicateType") != "https://docs.pypi.org/attestations/publish/v1" or statement.get("predicate") not in (None, {}):
+                          continue
+                      subjects = statement.get("subject")
+                      if isinstance(subjects, list) and len(subjects) == 1 and isinstance(subjects[0], dict) and subjects[0].get("name") == filename and isinstance(subjects[0].get("digest"), dict) and subjects[0]["digest"].get("sha256") == sha256:
+                          return True
+              return False
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--require-complete", action="store_true")
+          args = parser.parse_args()
+          root = Path(os.environ["RUNNER_TEMP"]) / "pypi-publish-envelope" / "dist"
+          expected = {
+              os.environ["WHEEL_NAME"]: {"sha256": os.environ["WHEEL_SHA256"], "size": (root / os.environ["WHEEL_NAME"]).stat().st_size, "type": "bdist_wheel"},
+              os.environ["SDIST_NAME"]: {"sha256": os.environ["SDIST_SHA256"], "size": (root / os.environ["SDIST_NAME"]).stat().st_size, "type": "sdist"},
+          }
+          version = os.environ["RELEASE_TAG"][1:]
+          endpoint = f"https://pypi.org/pypi/aoi-orgware/{urllib.parse.quote(version, safe='')}/json"
+          document = fetch_json(endpoint, allow_404=True)
+          present = {}
+          if document is not None:
+              if not isinstance(document, dict) or not isinstance(document.get("info"), dict) or document["info"].get("name") != "aoi-orgware" or document["info"].get("version") != version or not isinstance(document.get("urls"), list):
+                  raise SystemExit("PyPI project/version state is invalid")
+              for row in document["urls"]:
+                  if not isinstance(row, dict) or not isinstance(row.get("filename"), str) or row["filename"] in present:
+                      raise SystemExit("PyPI release file state is invalid or duplicated")
+                  present[row["filename"]] = row
+              if not set(present).issubset(expected):
+                  raise SystemExit("PyPI release contains an unexpected file")
+              for filename, row in present.items():
+                  item = expected[filename]
+                  digests = row.get("digests")
+                  if row.get("size") != item["size"] or not isinstance(digests, dict) or digests.get("sha256") != item["sha256"] or row.get("packagetype") != item["type"] or row.get("yanked") is not False:
+                      raise SystemExit(f"PyPI release file conflicts with the sealed artifact: {filename}")
+                  download_identity(row.get("url"), item["size"], item["sha256"])
+                  provenance_url = f"https://pypi.org/integrity/aoi-orgware/{urllib.parse.quote(version, safe='')}/{urllib.parse.quote(filename, safe='')}/provenance"
+                  provenance = fetch_json(provenance_url, accept="application/vnd.pypi.integrity.v1+json")
+                  if not provenance_matches(provenance, filename, item["sha256"]):
+                      raise SystemExit(f"PyPI provenance does not bind the trusted publisher and artifact: {filename}")
+          missing = sorted(set(expected) - set(present))
+          if args.require_complete and missing:
+              raise SystemExit("PyPI exact release is not complete")
+          print(json.dumps({"missing": missing, "present": sorted(present)}, sort_keys=True, separators=(",", ":")))
+          PY
+      - name: Reconcile pre-existing exact PyPI state
+        id: pypi-state
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+        run: |
+          set -euo pipefail
+          state="$(python "$RUNNER_TEMP/verify-pypi-state.py")"
+          readarray -t missing < <(python -c 'import json,sys; rows=json.loads(sys.stdin.read())["missing"]; sys.stdout.write("" if not rows else "\n".join(rows)+"\n")' <<< "$state")
+          upload="$RUNNER_TEMP/pypi-upload"
+          mkdir -p "$upload"
+          for name in "${missing[@]}"; do
+            cp "$RUNNER_TEMP/pypi-publish-envelope/dist/$name" "$upload/$name"
+          done
+          if ((${#missing[@]})); then
+            echo 'publish-required=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish-required=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish the exact missing files with Trusted Publishing
+        id: trusted-publish
+        if: ${{ steps.pypi-state.outputs.publish-required == 'true' }}
+        continue-on-error: true
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
-          packages-dir: publish-input/dist
+          packages-dir: ${{ runner.temp }}/pypi-upload
           verify-metadata: true
           attestations: true
           print-hash: true
+      - name: Reconcile the exact PyPI state after the publication attempt
+        if: ${{ steps.pypi-state.outcome == 'success' }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          WHEEL_NAME: ${{ needs.verify-pypi-stage.outputs.wheel-name }}
+          WHEEL_SHA256: ${{ needs.verify-pypi-stage.outputs.wheel-sha256 }}
+          SDIST_NAME: ${{ needs.verify-pypi-stage.outputs.sdist-name }}
+          SDIST_SHA256: ${{ needs.verify-pypi-stage.outputs.sdist-sha256 }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            if python "$RUNNER_TEMP/verify-pypi-state.py" --require-complete; then
+              exit 0
+            fi
+            if ((attempt < 12)); then
+              sleep 10
+            fi
+          done
+          exit 1
 
   post-pypi-readback:
     name: Read back the PyPI candidate
     if: ${{ inputs.intent == 'publish' }}
-    needs: publish-pypi
+    needs: [publish-pypi, producer-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - name: Check out the requested tag for the readback tool
+      - name: Check out the producer's exact peeled commit for the readback tool
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
           fetch-depth: 1
           persist-credentials: false
       - name: Set up Python
@@ -563,18 +1675,32 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-observation-candidate
-          path: observation
+          path: ${{ runner.temp }}/artifact
+      - name: Verify the observation artifact publication receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m aoi_orgware.publication_gate verify --policy-snapshot "$GITHUB_WORKSPACE/release/publication-policy.json" --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --receipt artifact/evidence/release-observation-publication-receipt.json --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject artifact/observation-result.json --json
       - name: Produce a post-PyPI readback candidate
         shell: bash
         run: |
           set -euo pipefail
           observed_at="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
-          PYTHONPATH=src python scripts/release_pypi_readback.py --observation-result-file observation/observation-result.json --promotion-id "pypi-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --observed-at "$observed_at" --trusted-publisher-repository Ryan529616/aoi-orgware --trusted-publisher-workflow publish.yml > pypi-readback-candidate.json
+          PYTHONPATH=src python scripts/release_pypi_readback.py --observation-result-file "$RUNNER_TEMP/artifact/observation-result.json" --promotion-id "pypi-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --observed-at "$observed_at" --trusted-publisher-repository Ryan529616/aoi-orgware --trusted-publisher-workflow publish.yml > pypi-readback-candidate.json
+      - name: Preflight readback artifact publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          PYTHONPATH=src python -m aoi_orgware.publication_gate preflight --policy-snapshot release/publication-policy.json --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" --action artifact_upload --destination https://github.com/Ryan529616/aoi-orgware/actions/artifacts --subject pypi-readback-candidate.json --json > evidence/pypi-readback-publication-receipt.json
       - name: Upload the readback candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pypi-readback-candidate
-          path: pypi-readback-candidate.json
+          path: |
+            pypi-readback-candidate.json
+            evidence/pypi-readback-publication-receipt.json
           if-no-files-found: error
           retention-days: 1
           compression-level: 0

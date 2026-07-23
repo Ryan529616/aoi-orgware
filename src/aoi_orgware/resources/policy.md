@@ -600,39 +600,103 @@ preference, irreversible state, or unresolved high-confidence dissent. The user
 need not approve each implementation step, but the organization must not invent
 the user's preferences.
 
-## Local-files confidentiality
+## Selective local-files confidentiality
 
-The optional `local_files` profile means **model context allowed, file
-publication denied**. It does not promise that the model provider cannot see
-prompt or project context, and it is not DLP, an air gap, or an offline-model
-profile. Fully offline/self-hosted execution is a separate future profile.
+The optional `local_files` profile means **model context allowed, publication
+of user-designated files constrained by destination**. It does not promise that
+the model provider cannot see prompt or project context, and it is not DLP, an
+air gap, or an offline-model profile. Fully offline/self-hosted execution is a
+separate future profile.
 
 Local Git remains normal: branch, status, diff, commit, local bundles, local
-CAS, receipts, and seals are allowed. AOI-managed Git push/LFS upload, remote
-CI, GitHub Release, package publication, external artifact storage, and
-attachment/connector publication fail closed. An intentional export requires a
-Chief-issued one-shot permit bound to the exact task/state head, destination,
-content SHA-256 and size, purpose, nonce, and expiry. The exporter receives no
-reusable Chief credential, and permit consumption is authorization only; it
-does not claim that AOI performed or observed an upload.
+CAS, receipts, and seals are allowed. `confidentiality.protected` classifies
+exact project-relative files or trees. `home_remote_only` permits their exact
+bytes only through the named home remote at its exact configured destination
+and denies other repositories. `local_only` denies every external destination;
+an intentional exception requires a Chief-issued one-shot export permit bound
+to the exact task/state head, destination, content SHA-256 and size, purpose,
+nonce, and expiry. The exporter receives no reusable Chief credential, and
+permit consumption is authorization only; it does not claim that AOI performed
+or observed an upload.
+
+An omitted or empty `protected` list classifies no project files. AOI may then
+update itself normally: Git push/LFS, remote CI, GitHub Release, package
+publication, external artifact storage, and attachment/connector publication
+are not globally disabled merely because `mode = "local_files"`. The closed
+`git_push = "deny"`, `remote_ci = "deny"`, and `artifact_upload = "deny"`
+values are fail-closed defaults for matching protected subjects, not whole-repo
+switches. When rules exist, AOI-managed Git publication requires an exact
+pre-push receipt binding the config digest, named remote and destination, every
+ref update, each read-only observed remote pre-state OID, outgoing commit set,
+and protected path/blob/content identities. Current protected bytes enter the
+Git blob identity set even if their configured path has never been tracked.
+Recording the pushed delivery revalidates the receipt and preserves its
+canonical bytes plus the delivery-time config/policy identity in task-local
+CAS/state; later integrity/doctor checks load those durable bytes rather than
+trusting a bare digest string or reinterpreting an old delivery through a newer
+config. Whenever selective protection is active, doctor groups every previously
+known pushed target by canonical effective destination plus remote ref and
+requires its current observed tip to have an exact persisted delivery receipt
+bound to the current protected-policy digest. Remote aliases and worktree paths
+are not target identity. An unreceipted descendant cannot borrow an older
+task's receipt, and an already-current `B -> B` ref cannot be blessed
+retroactively: policy changes require a genuinely outgoing governed successor
+(an intentionally empty commit is sufficient). A configured
+protected path that disappears before preflight fails closed because an
+untracked deleted origin has no recoverable content identity; restore it or
+explicitly revise the protected-path policy.
+Rewrites, ambiguous LFS routing, unknown scope, rule drift, or protected bytes
+sent to another repository fail closed. Other publication paths require an
+exact file/content subject manifest when protected rules exist.
+`confidentiality-policy-snapshot` reads the live ignored `aoi.toml` plus every
+protected origin locally and emits the sole canonical encoding for tracked
+`release/publication-policy.json`. If that file exists, Git preflight and local
+release promotion require it to equal the live config/rules/content snapshot.
+A clean remote runner consumes the tracked snapshot plus an independently
+supplied expected snapshot digest and deliberately does not require ignored or
+local-only origins to exist there; raw `aoi.toml` is not uploaded.
+
+The standalone `aoi_orgware.publication_gate` inventories regular inputs and
+expands wheel/ZIP and gzip-tar members under bounded link/traversal/type checks,
+then binds the container hashes, member-manifest digest, exact destination,
+snapshot, and matched protected subjects in its receipt. It is not a substitute
+for Git preflight: `home_remote_only` is authorized only by the outgoing-commit
+Git boundary, and caller-supplied remote metadata cannot relabel a package,
+artifact, attachment, or connector upload as a repository push. The release
+workflow invokes this gate before every GitHub Actions artifact upload and
+preserves an exact package-publication receipt whose two container hashes are
+revalidated again immediately before PyPI Trusted Publishing. An upload receipt
+is generated outside its payload subject tree, copied as a sidecar, and moved
+outside again before receiver-side exact recomputation; it never recursively
+claims to hash itself. These are cooperative exact path/content checks, not
+semantic DLP for transformed or encrypted content.
+
+`release-promote` is a local semantic-state transition over already observed
+evidence; it does not itself publish or upload bytes. Destination-aware checks
+belong at the actual Git, package, release-asset, or export boundary. Treating
+the local promotion record as an external publication would incorrectly block
+safe releases whose artifact subject set excludes every protected path.
 
 Under this profile, `doctor` reports effective fetch/push URLs, URL rewrites,
 LFS endpoints, remote workflow files, local/synchronized artifact storage,
-known publish-credential variable names or helpers without values, and
-authenticated push/export receipts. Credential-name matching is a finite
-detector, not secret discovery; an unlisted credential can remain invisible.
-Confirmed external or synchronized publication paths are errors. Windows drive
-letters are checked with `GetDriveTypeW` and DOS-device alias inspection:
-mapped drives are network paths, while a missing root, metadata failure, SUBST
-alias, or link/reparse traversal is explicitly unverified and fails the
-confirmed-local storage/launch gate. File-URI paths are strictly percent-decoded
-before drive classification, and the generic Windows reparse attribute is
-checked in addition to symlink/junction helpers. Caller-visible and resolved
-drives are both classified so resolving a path cannot erase a DOS-device alias;
-malformed URLs become redacted invalid findings. Latent workflow detection remains a
-warning rather than proof that the workflow ran.
-Bridge issue, pre-reserve, and process-pending boundaries also preflight the AOI
-artifact/CAS root and any writable cwd. A confirmed network/sync root is denied
+known publish-credential variable names or helpers without values, configured
+protected rules, and authenticated push/export receipts. External remotes,
+workflows, helpers, and credentials are warnings or inventory unless an exact
+protected-content contradiction is proven. Credential-name matching is a
+finite detector, not secret discovery; an unlisted credential can remain
+invisible. Windows drive letters are checked with `GetDriveTypeW` and DOS-device
+alias inspection: mapped drives are network paths, while a missing root,
+metadata failure, SUBST alias, or link/reparse traversal is explicitly
+unverified and fails the confirmed-local storage/launch gate. File-URI paths are
+strictly percent-decoded before drive classification, and the generic Windows
+reparse attribute is checked in addition to symlink/junction helpers.
+Caller-visible and resolved drives are both classified so resolving a path
+cannot erase a DOS-device alias; malformed URLs become redacted invalid
+findings. Latent workflow detection remains a warning rather than proof that
+the workflow ran.
+Only when protected rules exist, Bridge issue, pre-reserve, and process-pending
+boundaries also preflight the AOI artifact/CAS root and any writable cwd. A
+confirmed network/sync root is denied
 before state publication or Popen; unverified locality is also denied without
 being mislabeled confirmed danger. This is a bounded AOI-managed enforcement
 slice; a same-user process or ungoverned shell can still bypass it.
@@ -652,13 +716,13 @@ implicit disabled mode), and fixes `allow_remote_control=false`, while the turn
 sandbox retains `networkAccess=false`. Any missing, extra, linked, changed, or
 non-exact policy input fails closed.
 
-Promotion is profile-aware. A publication-enabled profile may require exact
-final-SHA remote-main CI. `local_files` forbids that route and instead requires
-an exact local commit/tree, complete Windows and WSL suites, applicable
-authorized local EDA evidence only when the project completion boundary names
-it, independent review, integrity-v2 seal, package/isolated-install smoke, an
-encrypted local bundle, and then stop. A remote PASS from another profile or
-older SHA is historical only.
+Promotion is subject-aware. A project with no protected rules can use the
+normal exact-final-SHA GitHub CI, Release, and package-publication route. A
+`home_remote_only` rule can use its exact home remote after the pre-push gate;
+publishing the protected bytes elsewhere is denied. A `local_only` rule keeps
+those bytes out of all external promotion subjects unless an exact one-shot
+export permit authorizes that separate export. In every case, a remote PASS
+from another SHA or destination is historical only.
 
 ## Optional Codex Transport Bridge
 
@@ -688,10 +752,19 @@ mutual exclusion.
 
 Immediately before the durable `process_start_pending` milestone, AOI
 revalidates the earlier permit/arm expiry, exact live ownership and dispatch-v2
-markers, fresh reserved namespace, confidentiality storage boundary, and any
-writable pre-Git/claim endpoint. That durable pending milestone authorizes the
-bounded exact-binary `--version` probe and the following App Server Popen; no
-child process executes before it. After that boundary, a lost process/thread/
+markers, fresh reserved namespace, confidentiality storage boundary, and the
+required pre-Git/claim endpoint. Under the same state lock it rereads the
+immutable issuance marker and the canonical Chief authority record. The current
+record must be inactive at the marker's exact issuing epoch, and its latest
+audit event must be the non-forced release of that exact issuing session and
+epoch. A still-active issuer, a later active or released Chief, a different
+release holder, or a missing/malformed authority record fails before the
+pending milestone and before Popen. Wrapper checks for an empty known
+credential home are defense in depth only and cannot replace this canonical
+state-record fence. That durable pending milestone authorizes the bounded
+exact-binary `--version` probe and the following App Server Popen; no child
+process executes before it. Once pending is durable, a later Chief transition
+does not retroactively revoke that launch authorization. A lost process/thread/
 turn start outcome is `launch_unknown` and must never trigger an automatic
 restart; loss after an established active turn is `runtime_unknown`.
 `model/list` is a read-only pre-thread request, so a lost or policy-rejected
@@ -706,7 +779,7 @@ a generic JSON-RPC 2.0 envelope. Exact correlated success-response bytes may
 populate both the response and wire digest, but their `wire_method` is the
 actual request method (`initialize`, `model/list`, `thread/start`,
 `turn/start`, or `turn/interrupt`); they may not be labeled as similarly named lifecycle
-notifications. A method-specific success result must satisfy the pinned 0.144.6
+notifications. A method-specific success result must satisfy the pinned 0.145.0
 required shape and sealed cwd/model/approval/sandbox constraints before the
 response journal callback can publish a semantic milestone. Initialize must
 report the exact isolated Codex home. Before `thread/start`, one bounded

@@ -137,7 +137,8 @@ of the apply stack and its receipt/live after-bytes validate. Replay requires
 timezone-aware unique transition instants, apply transitions in event append
 order, and every rollback to pop the current stack top. Writers serialize up to
 five seconds of cross-process wall-clock jitter one microsecond after the latest
-causal resource/registration record; larger rollback fails before mutation.
+validated resource transition, registration, or already-persisted startup
+observation; larger rollback fails before mutation.
 A startup-only Codex hook receipt is registered later by the same task-bound
 Chief session. Registration v2 seals the startup and applied-event snapshots,
 receipt/plan/config/profile-manifest hashes, task plan/worktree, and Chief
@@ -411,14 +412,52 @@ that bypasses AOI.
 
 ## Local-files confidentiality boundary
 
-`local_files` is an AOI publication policy, not a model-isolation claim. Model
-context remains allowed, while governed Git/file/artifact/package/attachment
-publication is denied. State/CAS/receipts remain local. Exact external export
-uses a one-shot Chief permit and never hands reusable Chief credentials to the
-consumer.
+`local_files` is an AOI selective-publication policy, not a model-isolation
+claim. Model context remains allowed. User-designated `file` or `tree` rules
+classify exact repository-relative subjects as either `home_remote_only` or
+`local_only`; an empty rule set classifies nothing and leaves normal repository
+publication enabled. State/CAS/receipts remain local. An exact external
+exception for a local-only file uses a one-shot Chief permit and never hands
+reusable Chief credentials to the consumer.
 
-The doctor and launch-time checks share the same storage classifier. Confirmed
-network or common sync roots fail closed. Windows drive-letter paths use
+The Git publication gate binds the current config digest, named remote, exact
+credential-free destination, complete ref update set, read-only observed remote
+pre-state OIDs, outgoing commits, and protected Git path/blob/content
+identities. Historical path inspection catches
+a protected file that is deleted at the tip, while content identity catches its
+bytes copied to another path. If a never-tracked protected origin is removed
+before preflight, the gate cannot reconstruct its identity and therefore fails
+closed until the path is restored or the reviewed rule is explicitly revised.
+The gate allows `home_remote_only` only at its
+exact home repository and denies `local_only` externally; rewrite or LFS
+ambiguity fails closed. Delivery persists both receipt bytes and the
+delivery-time policy binding, so later config evolution does not rewrite the
+historical claim. While selective protection is active, every known pushed
+target is keyed by canonical effective destination plus ref and its current tip
+must have an exact receipt for the current protected-policy digest. A remote
+alias or worktree change therefore does not split coverage, and a same-tip
+retroactive receipt is rejected; rule changes require a genuinely outgoing
+governed successor (which may be an intentional empty commit).
+
+Generic artifact/package/attachment paths use the same policy evaluator over a
+bounded exact inventory. The publication preflight binds outer container
+hashes, expands wheel/ZIP and gzip-tar regular members, and seals the resulting
+path/content manifest. AOI's release workflow invokes it before each Actions
+artifact upload and rechecks the exact two package-container hashes before
+PyPI. Snapshot generation is a local-authority operation over ignored
+`aoi.toml` plus the protected origins. Remote clean checkouts consume the
+canonical tracked snapshot with an independently supplied expected digest and
+without those origins; this avoids both raw-config publication and an
+empty-policy fallback. Git preflight and local release promotion reject a
+tracked snapshot that differs from current local authority. The standalone
+file/archive gate never grants `home_remote_only` repository-push authority.
+Upload receipts travel as non-recursive sidecars and are moved outside the
+payload before receiver-side exact recomputation. This enforcement is
+cooperative: a same-user process that bypasses AOI remains outside the boundary.
+
+When protected rules exist, the doctor and launch-time checks share the same
+storage classifier and confirmed network or common sync roots fail closed.
+An empty rule set does not activate this launch gate. Windows drive-letter paths use
 `GetDriveTypeW` and DOS-device inspection so mapped drives cannot masquerade as
 local; missing roots, metadata failure, SUBST aliases, and link/reparse
 traversal are separately labelled unverified and also fail a confirmed-local
@@ -427,11 +466,13 @@ Windows reparse attribute is inspected at each existing path ancestor.
 Caller-visible drive classification precedes resolution; the resolved target is
 then checked separately, so DOS-device aliases cannot disappear at the trust
 boundary. Malformed URLs are fail-closed invalid findings.
-Environment checks cover a finite set of known credential names and
-cannot prove that an unlisted secret is absent. This does not intercept an
-ungoverned same-user shell and does not replace OS DLP. Profile-selected
-promotion makes remote CI mandatory only for a publication-enabled route; it
-is forbidden/not applicable for `local_files`.
+Environment checks cover a finite set of known credential names and cannot
+prove that an unlisted secret is absent. External remotes, workflows,
+credentials, and helpers are reported as inventory/warnings unless they form an
+exact protected-rule contradiction; they are not global errors caused by the
+profile name. This does not replace OS DLP. Promotion is subject-aware: empty
+rules use the normal final-SHA remote route, and a `home_remote_only` subject can
+use its exact home repository after the pre-push gate.
 
 The transport adapter turns that profile into a process boundary as well as a
 turn setting. It launches from an isolated, non-linked `CODEX_HOME` with an
@@ -482,7 +523,9 @@ failure becomes `launch_unknown` and no invocation may automatically start a
 replacement process. `reservation_effective_at` is a sealed semantic event
 time, not observed consumption wall time. CLI start fields are derived only
 from the durable journal; `app_server_start_durably_observed` deliberately does
-not infer an unpersisted physical Popen.
+not infer an unpersisted physical Popen. Replays and reconciliation derive the
+same three-state process evidence from the complete persisted journal rather
+than describing only the current CLI invocation.
 
 After initialize rebinds the exact isolated Codex home, the controller performs
 one bounded read-only `model/list` request. Exactly one visible row must match

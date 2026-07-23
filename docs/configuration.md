@@ -114,8 +114,9 @@ The full default file is available at `examples/aoi.toml`.
 
 ## Confidentiality profile
 
-The default is `mode = "standard"`. IC/EDA projects that allow model context
-but prohibit project-file publication use the exact strict profile:
+The default is `mode = "standard"`. Projects that allow model context but need
+destination-aware restrictions for user-selected files use the strict
+`local_files` profile:
 
 ```toml
 [confidentiality]
@@ -126,29 +127,80 @@ remote_ci = "deny"
 artifact_upload = "deny"
 external_export = "permit_required"
 local_cas = true
+protected = [
+  { path = "private/design.bin", kind = "file", policy = "home_remote_only", home_remote = "origin", home_destination = "https://github.com/example/chip.git" },
+  { path = "eda/private", kind = "tree", policy = "local_only" },
+]
 ```
 
-For `local_files`, all seven values are one closed contract; permissive or
-unknown combinations are rejected. Local Git operations remain allowed.
-AOI-managed push/LFS upload, remote CI, release/package publication, artifact
-upload, and connector/attachment publication are denied. External export is
-available only through an exact Chief one-shot permit, and AOI records
-authorization/consumption without claiming that it uploaded the bytes.
+The seven scalar values are one closed contract; permissive or unknown
+combinations are rejected. `protected` is optional. If it is omitted or empty,
+no file is classified and the repository—including AOI itself—may use normal
+push, remote CI, GitHub Release, and package-publication workflows. The `deny`
+values are defaults for matching protected subjects, not global publication
+switches.
 
-`doctor` classifies external remotes and rewrites, LFS endpoints, workflow
-files, synchronized/network artifact roots, known publish credential
-names/helpers, and push/export receipts. Credential matching is a finite
-known-name detector and cannot prove that an unlisted secret is absent.
-Confirmed contradictions fail. On Windows, drive letters are checked with
+Each rule names one canonical project-relative `file` or `tree`; rules may not
+overlap. `home_remote_only` requires an exact simple Git remote name and exact
+credential-free destination. It permits the protected bytes only to that home
+repository and denies other repositories. `local_only` accepts no home fields
+and denies external publication; its only governed exception is an exact Chief
+one-shot export permit. AOI records permit authorization/consumption without
+claiming that it uploaded the bytes. Linked/reparsed protected files and trees,
+path traversal, ambiguous LFS routes, destination rewrites, unknown fields, and
+unbounded scans fail closed. Current protected bytes receive Git blob identities
+even before their configured path is tracked. A validated Git-push receipt is
+copied into task-local CAS when delivery is recorded together with its immutable
+delivery-time policy binding. Later doctor checks do not reinterpret that
+receipt through a changed config. If the configured protected origin is missing
+at publication time, preflight fails closed; restore the file/tree or explicitly
+change the reviewed rule before publication.
+
+For package, release-asset, CI, attachment, connector, or artifact boundaries,
+use `confidentiality-publication-preflight` with every exact file/directory that
+will leave the project. AOI inventories regular files and bounded wheel/ZIP and
+gzip-tar members, then binds their container hashes and member manifest to the
+exact destination. Exact copied content and source-relative member paths remain
+classified after packaging. This does not recognize arbitrary transformed or
+encrypted equivalents and is not a general DLP engine. AOI's own release
+workflow has no protected rules and therefore passes this gate normally before
+GitHub artifact and PyPI publication.
+
+For a clean remote release runner, generate the tracked projection locally and
+review it before committing:
+
+```bash
+PYTHONPATH=src python -m aoi_orgware.cli confidentiality-policy-snapshot \
+  > release/publication-policy.json.new
+cmp release/publication-policy.json.new release/publication-policy.json
+```
+
+Generation verifies the live ignored `aoi.toml` and each protected origin. The
+tracked canonical snapshot contains normalized rules and exact content
+identities; a clean runner consumes it with a separately pinned expected digest,
+without requiring those local-only origins or uploading raw `aoi.toml`. The
+standalone snapshot gate does not authorize Git pushes. `home_remote_only`
+remains exclusively governed by full outgoing-commit Git preflight; passing
+`--remote` to an artifact or package action grants no repository authority.
+
+`doctor` classifies protected rules, external remotes and rewrites, LFS
+endpoints, workflow files, synchronized/network artifact roots, known publish
+credential names/helpers, and push/export receipts. External publication
+capability is inventory or warning by itself; an exact protected-rule/home
+destination contradiction, violating receipt, or unsafe AOI local state/CAS is
+an error only when protected rules activate that selective boundary. Empty
+rules do not turn a synchronized path finding into a publication failure.
+Credential matching is a finite known-name detector and cannot prove
+that an unlisted secret is absent. On Windows, drive letters are checked with
 `GetDriveTypeW` and DOS-device alias inspection. Mapped drives fail as network
 storage; missing roots, metadata failures, SUBST aliases, and link/reparse
 traversal are labelled unverified and fail the confirmed-local gate. `file:` URI
 paths are strictly percent-decoded before classification, and generic Windows
 reparse attributes are checked beyond symlink/junction helpers. Both lexical
 and resolved drives are classified, and malformed URLs are reported as redacted
-invalid destinations instead of aborting doctor. The
-optional Codex bridge
-rechecks the artifact/CAS root and the exact pre-turn Git/tree/status/claim
+invalid destinations instead of aborting doctor. When protected rules exist,
+the optional Codex bridge rechecks the artifact/CAS root. Independently, it
+rechecks the exact pre-turn Git/tree/status/claim
 endpoint for both `readOnly` and `workspaceWrite` at issue, pre-reserve, and
 process-pending. The endpoint contains mutation-path coverage plus a separate
 full live task-claim authority binding, so a clean status still binds every
@@ -159,10 +211,10 @@ as arbitrary workload network permission.
 
 This profile does not claim that a model provider cannot receive prompt or
 context. Use a future offline/self-hosted profile for that different threat
-model. Promotion under `local_files` selects complete local Windows/WSL,
-applicable authorized EDA, independent review, integrity seal, install smoke,
-and encrypted local bundle evidence; remote-main CI/publication is forbidden,
-not missing.
+model. Promotion is subject-aware: empty rules allow the normal exact-final-SHA
+remote route, `home_remote_only` allows its exact home repository after
+preflight, and `local_only` subjects stay out of all external promotion
+artifacts absent their separate exact export permits.
 
 ## Codex v0.4 adapter boundary
 
@@ -183,7 +235,9 @@ WSL onboarding instead emits a direct Linux `command` and a fixed
 
 AOI derives distro from `WSL_DISTRO_NAME`, user from the current passwd entry,
 and requires Microsoft-kernel plus absolute `WSL_INTEROP` evidence. It offers
-no arbitrary shell/prefix override. Partial or contradictory WSL signals and
+no arbitrary shell/prefix override. Values containing spaces remain one quoted
+argument; POSIX backslashes are rejected because they make Windows command-line
+quote boundaries ambiguous. Partial or contradictory WSL signals and
 native-Windows WSL UNC onboarding fail before mutation. Current-command
 validation compares the complete pair byte-for-byte; the tolerant WSL parser
 is retained only to identify legacy AOI-owned hooks during controlled upgrade.

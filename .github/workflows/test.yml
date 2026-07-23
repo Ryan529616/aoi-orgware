@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PUBLICATION_POLICY_SHA256: 11ad65c25fee5d4060422001a344faa7c8e06b427e452bd7d48a76231e4b905f
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -85,6 +88,17 @@ jobs:
             --build-python .release-tools/bin/python \
             --expected-build-version 1.5.0 \
             --expected-hatchling-version 1.27.0
+      - name: Preflight verified distribution artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python -m aoi_orgware.publication_gate preflight \
+            --policy-snapshot release/publication-policy.json \
+            --expected-snapshot-sha256 "$PUBLICATION_POLICY_SHA256" \
+            --action artifact_upload \
+            --destination "https://github.com/$GITHUB_REPOSITORY/actions/artifacts" \
+            --subject dist/ \
+            --json > ci-package-publication-receipt.json
       - name: Upload verified distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -92,6 +106,7 @@ jobs:
           path: |
             dist/*.whl
             dist/*.tar.gz
+            ci-package-publication-receipt.json
           if-no-files-found: error
 
   package-windows-smoke:
@@ -109,7 +124,26 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: python-distributions
-          path: dist
+          path: package-artifact
+      - name: Verify the distribution artifact publication receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONPATH = 'src'
+          Push-Location package-artifact
+          try {
+            python -m aoi_orgware.publication_gate verify `
+              --policy-snapshot "$env:GITHUB_WORKSPACE/release/publication-policy.json" `
+              --expected-snapshot-sha256 $env:PUBLICATION_POLICY_SHA256 `
+              --receipt ci-package-publication-receipt.json `
+              --action artifact_upload `
+              --destination "https://github.com/$env:GITHUB_REPOSITORY/actions/artifacts" `
+              --subject dist/ `
+              --json
+            if ($LASTEXITCODE -ne 0) { throw 'distribution artifact publication receipt verification failed' }
+          } finally {
+            Pop-Location
+          }
       - name: Resolve the hash-locked release-tool wheelhouse
         shell: pwsh
         run: |
@@ -133,7 +167,7 @@ jobs:
         run: |
           $expectedVersion = python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])"
           python scripts/verify_dist.py `
-            --dist-dir dist `
+            --dist-dir package-artifact/dist `
             --expected-version $expectedVersion `
             --build-python .\.release-tools\Scripts\python.exe `
             --expected-build-version 1.5.0 `

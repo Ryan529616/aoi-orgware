@@ -407,6 +407,18 @@ def _read_marker(paths: h.HarnessPaths, task_id: str, permit_sha256: str) -> dic
         base = {key: value[key] for key in value if key != "issuance_sha256"}
         if set(base) != {"schema_version", "task_id", "launch_id", "command_id", "recorded_at", "permit_sha256", "intent_sha256", "launch_authority_sha256", "reservation_sha256", "expected_semantic_head_sha256", "planned_event_sha256", "binding_sha256", "pre_git_endpoint_cas_sha256", "issuer_chief_authority"} or value.get("schema_version") != ISSUANCE_SCHEMA_VERSION or value.get("issuance_sha256") != semantic.canonical_sha256(base, max_bytes=MAX_ISSUANCE_BYTES):
             raise CodexTransportRuntimeError("issuance marker schema or digest is invalid")
+        issuer = value["issuer_chief_authority"]
+        if (
+            not isinstance(issuer, dict)
+            or set(issuer) != {"session_id", "epoch"}
+            or not isinstance(issuer.get("session_id"), str)
+            or not issuer["session_id"]
+            or type(issuer.get("epoch")) is not int
+            or issuer["epoch"] < 1
+        ):
+            raise CodexTransportRuntimeError(
+                "issuance marker issuing Chief authority is invalid"
+            )
         _sha(value["launch_authority_sha256"], "launch authority SHA-256")
         pre_endpoint = value["pre_git_endpoint_cas_sha256"]
         if pre_endpoint is not None:
@@ -1142,6 +1154,67 @@ def require_codex_process_start_window(
         )
 
 
+def _require_released_issuing_chief(
+    paths: h.HarnessPaths, marker: Mapping[str, Any]
+) -> None:
+    """Require the marker's issuer to be the exact latest released Chief."""
+
+    h._require_chief_lock(paths)
+    try:
+        issuer = marker["issuer_chief_authority"]
+        if not isinstance(issuer, Mapping):
+            raise CodexTransportRuntimeError(
+                "issuance marker issuing Chief authority is invalid"
+            )
+        issuer_session = issuer["session_id"]
+        issuer_epoch = issuer["epoch"]
+        if (
+            not isinstance(issuer_session, str)
+            or not issuer_session
+            or type(issuer_epoch) is not int
+            or issuer_epoch < 1
+        ):
+            raise CodexTransportRuntimeError(
+                "issuance marker issuing Chief authority is invalid"
+            )
+        current = h.load_chief_authority(paths)
+        audit_tail = current["audit_tail"]
+        if not isinstance(audit_tail, list) or not audit_tail:
+            raise CodexTransportRuntimeError(
+                "current Chief authority lacks a release audit event"
+            )
+        latest = audit_tail[-1]
+    except CodexTransportRuntimeError:
+        raise
+    except (KeyError, TypeError, h.HarnessError) as exc:
+        raise _fail(
+            "cannot validate released issuing Chief for Codex process start", exc
+        ) from exc
+
+    if (
+        current.get("status") != "inactive"
+        or current.get("epoch") != issuer_epoch
+        or current.get("session_id") != ""
+        or current.get("token_sha256") != ""
+        or current.get("issued_at") != ""
+        or current.get("renewed_at") != ""
+        or current.get("expires_at") != ""
+        or current.get("renewal_count") != 0
+        or not isinstance(latest, Mapping)
+        or latest.get("action") != "release"
+        or latest.get("seq") != current.get("transition_seq")
+        or latest.get("at") != current.get("updated_at")
+        or latest.get("session_id") != issuer_session
+        or latest.get("previous_session_id") != issuer_session
+        or latest.get("old_epoch") != issuer_epoch
+        or latest.get("new_epoch") != issuer_epoch
+        or latest.get("forced_live") is not False
+    ):
+        raise CodexTransportRuntimeError(
+            "Codex process start requires exact release of the issuing Chief"
+        )
+
+
 def require_codex_process_start_authority(
     paths: h.HarnessPaths,
     launch: Mapping[str, Any],
@@ -1167,6 +1240,20 @@ def require_codex_process_start_authority(
             launch["launch_permit"]
         )
         reservation = contracts.validate_reservation(launch["reservation"])
+        marker = _read_marker(paths, task_id, launch_permit["permit_sha256"])
+        if (
+            marker["task_id"] != task_id
+            or marker["launch_id"] != launch_id
+            or marker["permit_sha256"] != launch_permit["permit_sha256"]
+            or marker["intent_sha256"] != intent["intent_sha256"]
+            or marker["launch_authority_sha256"]
+            != authority_contract["launch_authority_sha256"]
+            or marker["reservation_sha256"] != reservation["reservation_sha256"]
+        ):
+            raise CodexTransportRuntimeError(
+                "Codex process-start issuance marker is not bound to this launch"
+            )
+        _require_released_issuing_chief(paths, marker)
         namespace = projection.codex_transport_namespace_from_projection(state)
         row = namespace["launches"].get(launch_id)
         if (

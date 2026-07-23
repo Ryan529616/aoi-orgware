@@ -12,10 +12,10 @@ import sys
 from typing import Any
 
 from .. import harnesslib as h
-from .. import confidentiality
 from .. import release_artifacts
 from .. import release_manifest
 from .. import release_runtime
+from .. import publication_policy
 from .. import semantic_events as semantic
 from .. import semantic_store as store
 
@@ -155,10 +155,24 @@ def _chief_identity(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_release_promote(args: argparse.Namespace, paths: h.HarnessPaths) -> int:
-    confidentiality.require_publication_action_allowed(
-        paths.project.confidentiality,
-        "release_publish",
-    )
+    # This command records an already observed exact release in local semantic
+    # state. It does not upload artifacts or publish a release. The external
+    # Git/package boundary applies the destination-aware subject gate before
+    # bytes leave the project.
+    snapshot_path = paths.root / "release" / "publication-policy.json"
+    if snapshot_path.is_file():
+        try:
+            snapshot = publication_policy.load_publication_policy_snapshot(
+                snapshot_path
+            )
+            publication_policy.require_current_publication_policy_snapshot(
+                paths.root,
+                paths.project.confidentiality,
+                paths.project.sha256,
+                snapshot,
+            )
+        except publication_policy.PublicationPolicyError as exc:
+            raise h.HarnessError(str(exc)) from exc
     task_id = h.validate_id(args.task, "task id")
     observation_result = _read_canonical_json(
         args.observation_result_file,

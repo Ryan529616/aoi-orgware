@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,14 +27,97 @@ REQUIRED_PACKAGE_FILES = (
     "aoi_orgware/resources/codex/SKILL.md",
     "aoi_orgware/resources/claude/SKILL.md",
     "aoi_orgware/resources/pilot/run-record.template.json",
-    "aoi_orgware/resources/codex_app_server/0.144.6/runtime-pin.json",
-    "aoi_orgware/resources/codex_app_server/0.144.6/schema-manifest.json",
-    "aoi_orgware/resources/codex_app_server/0.144.6/codex_app_server_protocol.v2.schemas.json",
+    "aoi_orgware/resources/codex_app_server/0.145.0/runtime-pin.json",
+    "aoi_orgware/resources/codex_app_server/0.145.0/schema-manifest.json",
+    "aoi_orgware/resources/codex_app_server/0.145.0/codex_app_server_protocol.v2.schemas.json",
 )
 FORBIDDEN_SDIST_FILES = ("PROVENANCE.md", "IMPORT_MANIFEST.json")
+CODEX_APP_SERVER_RESOURCE_ROOT = (
+    "aoi_orgware/resources/codex_app_server/0.145.0"
+)
+RUNTIME_PIN_MEMBER = f"{CODEX_APP_SERVER_RESOURCE_ROOT}/runtime-pin.json"
+SCHEMA_MANIFEST_MEMBER = f"{CODEX_APP_SERVER_RESOURCE_ROOT}/schema-manifest.json"
+COMBINED_SCHEMA_MEMBER = (
+    f"{CODEX_APP_SERVER_RESOURCE_ROOT}/codex_app_server_protocol.v2.schemas.json"
+)
+RUNTIME_RESOURCE_MEMBERS = (
+    RUNTIME_PIN_MEMBER,
+    SCHEMA_MANIFEST_MEMBER,
+    COMBINED_SCHEMA_MEMBER,
+)
+MAX_RUNTIME_RESOURCE_BYTES = 1 * 1024 * 1024
+EXPECTED_RUNTIME_PIN_SIZE = 1848
+EXPECTED_RUNTIME_PIN_SHA256 = (
+    "190519cd4f6d5792b9fdf26373cdb734fb728fbcc31f84470307b5da4c005fdc"
+)
+EXPECTED_SCHEMA_MANIFEST_SIZE = 36135
+EXPECTED_SCHEMA_MANIFEST_SHA256 = (
+    "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262"
+)
+EXPECTED_COMBINED_SCHEMA_SIZE = 491906
+EXPECTED_COMBINED_SCHEMA_SHA256 = (
+    "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec"
+)
+
+# This is intentionally independent from ``aoi_orgware`` source. A release
+# verifier must anchor the published runtime provenance rather than trust the
+# checkout that invoked it or code contained in a candidate archive.
+EXPECTED_CODEX_RUNTIME_PIN = {
+    "schema_version": 1,
+    "release_tag": "rust-v0.145.0",
+    "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
+    "codex_cli_version": "codex-cli 0.145.0",
+    "codex_app_server_version": "codex-app-server 0.145.0",
+    "app_server_asset": {
+        "name": "codex-app-server-x86_64-pc-windows-msvc.exe.zip",
+        "size": 98743440,
+        "sha256": "dfc57f87b9bc61d1d4503b7a60fbe5bae5f13a5283234c86a4c0da6c97a12961",
+        "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-app-server-x86_64-pc-windows-msvc.exe.zip",
+    },
+    "app_server_executable": {
+        "name": "codex-app-server-x86_64-pc-windows-msvc.exe",
+        "size": 299117872,
+        "sha256": "5163c75ed88d460b35b03c8d8f4ef190b3bdd09971d7ac2bd90b48c435f1cf14",
+    },
+    "schema_generator_asset": {
+        "name": "codex-x86_64-pc-windows-msvc.exe.zip",
+        "size": 119947181,
+        "sha256": "bc6ae808bf5a9cdf113364ac281594d6da76dc103c19129e9d32caed54ec3cda",
+        "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-x86_64-pc-windows-msvc.exe.zip",
+    },
+    "schema_generator_executable": {
+        "name": "codex-x86_64-pc-windows-msvc.exe",
+        "size": 359245096,
+        "sha256": "83751f15cb6a0a7b97df67752c001e3fe1c20e18ffbfec3ff63567296205eb6c",
+    },
+    "stable_schema": {
+        "generator_arguments": [
+            "app-server",
+            "generate-json-schema",
+            "--out",
+            "<fresh-empty-directory>",
+        ],
+        "experimental": False,
+        "file_count": 273,
+        "manifest_format": "canonical-json sorted array of path,sha256,size; POSIX relative paths; ASCII; no trailing newline",
+        "manifest_size": EXPECTED_SCHEMA_MANIFEST_SIZE,
+        "manifest_sha256": EXPECTED_SCHEMA_MANIFEST_SHA256,
+        "combined_v2_schema_size": EXPECTED_COMBINED_SCHEMA_SIZE,
+        "combined_v2_schema_sha256": EXPECTED_COMBINED_SCHEMA_SHA256,
+    },
+}
+EXPECTED_CODEX_RUNTIME_BINDING = {
+    "codex_cli_version": "codex-cli 0.145.0",
+    "codex_app_server_version": "codex-app-server 0.145.0",
+    "app_server_executable_sha256": "5163c75ed88d460b35b03c8d8f4ef190b3bdd09971d7ac2bd90b48c435f1cf14",
+    "executable_size_bytes": 299117872,
+    "schema_manifest_sha256": EXPECTED_SCHEMA_MANIFEST_SHA256,
+    "combined_v2_schema_sha256": EXPECTED_COMBINED_SCHEMA_SHA256,
+}
 INSTALL_PROBE = r"""
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import importlib.resources
 import json
@@ -41,6 +125,7 @@ import sys
 from pathlib import Path
 
 import aoi_orgware
+from aoi_orgware import codex_transport_contracts
 
 distribution_version = importlib.metadata.version("aoi-orgware")
 if distribution_version != aoi_orgware.__version__:
@@ -62,9 +147,9 @@ required_resources = (
     "codex/SKILL.md",
     "claude/SKILL.md",
     "pilot/run-record.template.json",
-    "codex_app_server/0.144.6/runtime-pin.json",
-    "codex_app_server/0.144.6/schema-manifest.json",
-    "codex_app_server/0.144.6/codex_app_server_protocol.v2.schemas.json",
+    "codex_app_server/0.145.0/runtime-pin.json",
+    "codex_app_server/0.145.0/schema-manifest.json",
+    "codex_app_server/0.145.0/codex_app_server_protocol.v2.schemas.json",
 )
 missing = []
 for relative in required_resources:
@@ -76,10 +161,37 @@ for relative in required_resources:
 if missing:
     raise SystemExit("installed package is missing resources: " + ", ".join(missing))
 
+def resource_bytes(relative):
+    resource = resource_root
+    for part in relative.split("/"):
+        resource = resource.joinpath(part)
+    return resource.read_bytes()
+
+runtime_pin_bytes = resource_bytes("codex_app_server/0.145.0/runtime-pin.json")
+schema_manifest_bytes = resource_bytes("codex_app_server/0.145.0/schema-manifest.json")
+combined_schema_bytes = resource_bytes(
+    "codex_app_server/0.145.0/codex_app_server_protocol.v2.schemas.json"
+)
+try:
+    runtime_pin = json.loads(runtime_pin_bytes)
+    runtime_binding = codex_transport_contracts.pinned_runtime_binding()
+except (json.JSONDecodeError, codex_transport_contracts.CodexTransportContractError) as exc:
+    raise SystemExit("installed package Codex runtime binding rejected: " + str(exc))
+
 print(
     json.dumps(
         {
             "package_path": str(package_path),
+            "runtime_binding": runtime_binding,
+            "runtime_resources": {
+                "runtime_pin": runtime_pin,
+                "runtime_pin_sha256": hashlib.sha256(runtime_pin_bytes).hexdigest(),
+                "runtime_pin_size": len(runtime_pin_bytes),
+                "schema_manifest_sha256": hashlib.sha256(schema_manifest_bytes).hexdigest(),
+                "schema_manifest_size": len(schema_manifest_bytes),
+                "combined_schema_sha256": hashlib.sha256(combined_schema_bytes).hexdigest(),
+                "combined_schema_size": len(combined_schema_bytes),
+            },
             "version": distribution_version,
         },
         sort_keys=True,
@@ -90,6 +202,136 @@ print(
 
 class VerificationError(RuntimeError):
     """A distribution artifact failed a release-blocking check."""
+
+
+def _exact_value(actual: object, expected: object) -> bool:
+    """Compare JSON values without accepting bool-as-int substitutions."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return False
+        return set(actual) == set(expected) and all(
+            _exact_value(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return False
+        return len(actual) == len(expected) and all(
+            _exact_value(item, value) for item, value in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def _validate_runtime_resource_payload(
+    runtime_pin_bytes: bytes,
+    schema_manifest_bytes: bytes,
+    combined_schema_bytes: bytes,
+    *,
+    subject: str,
+) -> None:
+    """Anchor exact 0.145.0 provenance and the two generated-schema digests."""
+
+    if any(
+        len(payload) > MAX_RUNTIME_RESOURCE_BYTES
+        for payload in (runtime_pin_bytes, schema_manifest_bytes, combined_schema_bytes)
+    ):
+        raise VerificationError(f"{subject} Codex runtime resource exceeds bound")
+    try:
+        runtime_pin = json.loads(runtime_pin_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VerificationError(f"{subject} runtime-pin.json is invalid JSON") from exc
+    if not _exact_value(runtime_pin, EXPECTED_CODEX_RUNTIME_PIN):
+        raise VerificationError(f"{subject} Codex runtime provenance differs from 0.145.0")
+    if (
+        len(runtime_pin_bytes) != EXPECTED_RUNTIME_PIN_SIZE
+        or hashlib.sha256(runtime_pin_bytes).hexdigest()
+        != EXPECTED_RUNTIME_PIN_SHA256
+    ):
+        raise VerificationError(f"{subject} runtime-pin.json digest differs from 0.145.0")
+
+    expected_digests = (
+        (
+            "schema-manifest.json",
+            schema_manifest_bytes,
+            EXPECTED_SCHEMA_MANIFEST_SIZE,
+            EXPECTED_SCHEMA_MANIFEST_SHA256,
+        ),
+        (
+            "codex_app_server_protocol.v2.schemas.json",
+            combined_schema_bytes,
+            EXPECTED_COMBINED_SCHEMA_SIZE,
+            EXPECTED_COMBINED_SCHEMA_SHA256,
+        ),
+    )
+    for name, payload, expected_size, expected_sha256 in expected_digests:
+        if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
+            raise VerificationError(f"{subject} {name} digest differs from 0.145.0")
+
+
+def _unique_archive_member(members: Sequence[str], suffix: str, *, subject: str) -> str:
+    matches = [member for member in members if member == suffix or member.endswith(f"/{suffix}")]
+    if len(matches) != 1:
+        raise VerificationError(f"{subject} must contain exactly one {suffix}")
+    return matches[0]
+
+
+def _read_zip_member(archive: zipfile.ZipFile, member: str, *, subject: str) -> bytes:
+    info = archive.getinfo(member)
+    if info.file_size > MAX_RUNTIME_RESOURCE_BYTES:
+        raise VerificationError(f"{subject} Codex runtime resource exceeds bound")
+    with archive.open(info, "r") as handle:
+        payload = handle.read(MAX_RUNTIME_RESOURCE_BYTES + 1)
+    if len(payload) != info.file_size or len(payload) > MAX_RUNTIME_RESOURCE_BYTES:
+        raise VerificationError(f"{subject} Codex runtime resource size is invalid")
+    return payload
+
+
+def _read_tar_member(
+    archive: tarfile.TarFile, member: tarfile.TarInfo, *, subject: str
+) -> bytes:
+    if not member.isfile() or member.size > MAX_RUNTIME_RESOURCE_BYTES:
+        raise VerificationError(f"{subject} Codex runtime resource exceeds bound")
+    handle = archive.extractfile(member)
+    if handle is None:
+        raise VerificationError(f"{subject} cannot read Codex runtime resource")
+    payload = handle.read(member.size + 1)
+    if len(payload) != member.size:
+        raise VerificationError(f"{subject} Codex runtime resource size changed while reading")
+    return payload
+
+
+def _validate_archived_runtime_resources(path: Path) -> None:
+    """Validate resources directly from an archive before any build/install code runs."""
+
+    if path.suffix == ".whl":
+        with zipfile.ZipFile(path) as archive:
+            names = tuple(archive.namelist())
+            payloads = tuple(
+                _read_zip_member(
+                    archive,
+                    _unique_archive_member(names, member, subject=path.name),
+                    subject=path.name,
+                )
+                for member in RUNTIME_RESOURCE_MEMBERS
+            )
+    elif path.name.endswith(".tar.gz"):
+        with tarfile.open(path, mode="r:gz") as archive:
+            tar_members = archive.getmembers()
+            by_name = {member.name: member for member in tar_members}
+            names = tuple(member.name for member in tar_members)
+            payloads = tuple(
+                _read_tar_member(
+                    archive,
+                    by_name[_unique_archive_member(names, f"src/{member}", subject=path.name)],
+                    subject=path.name,
+                )
+                for member in RUNTIME_RESOURCE_MEMBERS
+            )
+    else:
+        raise VerificationError(f"unsupported distribution artifact: {path}")
+    _validate_runtime_resource_payload(*payloads, subject=path.name)
 
 
 def _run(
@@ -151,21 +393,21 @@ def _validate_archive_contents(wheel: Path, sdist: Path) -> None:
     _validate_member_names(sdist, sdist_members)
 
     with zipfile.ZipFile(wheel) as archive:
-        for member in archive.infolist():
-            file_type = (member.external_attr >> 16) & 0o170000
+        for zip_member in archive.infolist():
+            file_type = (zip_member.external_attr >> 16) & 0o170000
             if file_type == stat.S_IFLNK:
                 raise VerificationError(
-                    f"wheel contains a symbolic link: {member.filename}"
+                    f"wheel contains a symbolic link: {zip_member.filename}"
                 )
     with tarfile.open(sdist, mode="r:gz") as archive:
-        for member in archive.getmembers():
-            if member.issym() or member.islnk():
+        for tar_member in archive.getmembers():
+            if tar_member.issym() or tar_member.islnk():
                 raise VerificationError(
-                    f"sdist contains an archive link: {member.name}"
+                    f"sdist contains an archive link: {tar_member.name}"
                 )
-            if not (member.isdir() or member.isfile()):
+            if not (tar_member.isdir() or tar_member.isfile()):
                 raise VerificationError(
-                    f"sdist contains an unsupported archive member: {member.name}"
+                    f"sdist contains an unsupported archive member: {tar_member.name}"
                 )
 
     for required in REQUIRED_PACKAGE_FILES:
@@ -178,6 +420,9 @@ def _validate_archive_contents(wheel: Path, sdist: Path) -> None:
     for forbidden in FORBIDDEN_SDIST_FILES:
         if _has_suffix(sdist_members, forbidden):
             raise VerificationError(f"sdist unexpectedly contains: {forbidden}")
+
+    _validate_archived_runtime_resources(wheel)
+    _validate_archived_runtime_resources(sdist)
 
 
 def _venv_executable(environment: Path, name: str) -> Path:
@@ -204,6 +449,39 @@ def _isolated_environment() -> dict[str, str]:
         }
     )
     return env
+
+
+def _validate_installed_runtime_probe(probe: object, *, artifact: Path) -> None:
+    if not isinstance(probe, dict):
+        raise VerificationError(f"{artifact.name} returned an invalid install probe")
+    if not _exact_value(probe.get("runtime_binding"), EXPECTED_CODEX_RUNTIME_BINDING):
+        raise VerificationError(
+            f"{artifact.name} installed Codex runtime binding differs from 0.145.0"
+        )
+    runtime_resources = probe.get("runtime_resources")
+    if not isinstance(runtime_resources, dict):
+        raise VerificationError(
+            f"{artifact.name} returned no installed Codex runtime resource evidence"
+        )
+    runtime_pin = runtime_resources.get("runtime_pin")
+    if not _exact_value(runtime_pin, EXPECTED_CODEX_RUNTIME_PIN):
+        raise VerificationError(
+            f"{artifact.name} installed Codex runtime provenance differs from 0.145.0"
+        )
+    expected = {
+        "runtime_pin_sha256": EXPECTED_RUNTIME_PIN_SHA256,
+        "runtime_pin_size": EXPECTED_RUNTIME_PIN_SIZE,
+        "schema_manifest_sha256": EXPECTED_SCHEMA_MANIFEST_SHA256,
+        "schema_manifest_size": EXPECTED_SCHEMA_MANIFEST_SIZE,
+        "combined_schema_sha256": EXPECTED_COMBINED_SCHEMA_SHA256,
+        "combined_schema_size": EXPECTED_COMBINED_SCHEMA_SIZE,
+    }
+    if not _exact_value(
+        {key: runtime_resources.get(key) for key in expected}, expected
+    ):
+        raise VerificationError(
+            f"{artifact.name} installed Codex runtime schema digest differs from 0.145.0"
+        )
 
 
 def _verify_installed_artifact(artifact: Path) -> str:
@@ -245,6 +523,7 @@ def _verify_installed_artifact(artifact: Path) -> str:
             raise VerificationError(
                 f"{artifact.name} returned an invalid installed version"
             )
+        _validate_installed_runtime_probe(installed, artifact=artifact)
 
         for script_name in CONSOLE_SCRIPTS:
             script = _venv_executable(environment, script_name)
@@ -369,6 +648,10 @@ def _verify_sdist_via_derived_wheel(
                 "building the exact sdist must produce exactly one derived wheel; "
                 f"found {len(wheels)}"
             )
+        # The sdist is candidate-controlled and may produce a wheel whose code
+        # forges its installed probe.  Validate the generated runtime resources
+        # directly from the archive before executing or importing that wheel.
+        _validate_archived_runtime_resources(wheels[0])
         return _verify_installed_artifact(wheels[0])
 
 

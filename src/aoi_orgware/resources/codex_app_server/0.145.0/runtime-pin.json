@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "release_tag": "rust-v0.145.0",
+  "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
+  "codex_cli_version": "codex-cli 0.145.0",
+  "codex_app_server_version": "codex-app-server 0.145.0",
+  "app_server_asset": {
+    "name": "codex-app-server-x86_64-pc-windows-msvc.exe.zip",
+    "size": 98743440,
+    "sha256": "dfc57f87b9bc61d1d4503b7a60fbe5bae5f13a5283234c86a4c0da6c97a12961",
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-app-server-x86_64-pc-windows-msvc.exe.zip"
+  },
+  "app_server_executable": {
+    "name": "codex-app-server-x86_64-pc-windows-msvc.exe",
+    "size": 299117872,
+    "sha256": "5163c75ed88d460b35b03c8d8f4ef190b3bdd09971d7ac2bd90b48c435f1cf14"
+  },
+  "schema_generator_asset": {
+    "name": "codex-x86_64-pc-windows-msvc.exe.zip",
+    "size": 119947181,
+    "sha256": "bc6ae808bf5a9cdf113364ac281594d6da76dc103c19129e9d32caed54ec3cda",
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-x86_64-pc-windows-msvc.exe.zip"
+  },
+  "schema_generator_executable": {
+    "name": "codex-x86_64-pc-windows-msvc.exe",
+    "size": 359245096,
+    "sha256": "83751f15cb6a0a7b97df67752c001e3fe1c20e18ffbfec3ff63567296205eb6c"
+  },
+  "stable_schema": {
+    "generator_arguments": [
+      "app-server",
+      "generate-json-schema",
+      "--out",
+      "<fresh-empty-directory>"
+    ],
+    "experimental": false,
+    "file_count": 273,
+    "manifest_format": "canonical-json sorted array of path,sha256,size; POSIX relative paths; ASCII; no trailing newline",
+    "manifest_size": 36135,
+    "manifest_sha256": "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262",
+    "combined_v2_schema_size": 491906,
+    "combined_v2_schema_sha256": "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec"
+  }
+}

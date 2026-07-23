@@ -450,6 +450,19 @@ def _exact_prompt(prompt: str, intent: Mapping[str, Any]) -> None:
         )
 
 
+def _process_start_evidence(
+    journal: Sequence[Mapping[str, Any]],
+) -> str:
+    """Derive the durable process boundary from the complete launch journal."""
+
+    event_types = {row.get("event_type") for row in journal}
+    if "process_started" in event_types:
+        return "process_started_observed"
+    if "process_start_pending" in event_types:
+        return "process_start_pending_only"
+    return "not_started"
+
+
 def _run_controller(
     paths: h.HarnessPaths,
     launch: dict[str, Any],
@@ -560,10 +573,18 @@ def _run_controller(
     )
     state = controller.state
     if launch["terminal_receipt"] is not None:
-        return None, dict(launch["terminal_receipt"]), "not_started"
+        return (
+            None,
+            dict(launch["terminal_receipt"]),
+            _process_start_evidence(journal),
+        )
     if state.last_event_type != "reserved":
         result = controller.reconcile_after_crash()
-        return result, dict(result.terminal_receipt), "not_started"
+        return (
+            result,
+            dict(result.terminal_receipt),
+            _process_start_evidence(result.journal),
+        )
 
     sealed_executable = Path(str(intent["runtime_pin"]["executable_path"]))
     if not sealed_executable.is_absolute():
@@ -590,16 +611,7 @@ def _run_controller(
         timeout_seconds=timeout_seconds,
         interrupt_after_start=interrupt_after_start,
     )
-    event_types = {row["event_type"] for row in result.journal}
-    process_evidence = (
-        "process_started_observed"
-        if "process_started" in event_types
-        else (
-            "process_start_pending_only"
-            if "process_start_pending" in event_types
-            else "not_started"
-        )
-    )
+    process_evidence = _process_start_evidence(result.journal)
     return result, dict(result.terminal_receipt), process_evidence
 
 

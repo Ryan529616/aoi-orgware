@@ -589,10 +589,13 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
 
     def test_resource_transition_clock_jitter_is_bounded_and_zero_mutation(self) -> None:
         task_id = "session-register-clock-jitter"
-        first, _startup = self._prepare_applied(
+        first, startup = self._prepare_applied(
             task_id=task_id, event_id="resource-clock-a"
         )
         first_at = dt.datetime.fromisoformat(first["applied_at"])
+        startup_at = dt.datetime.fromisoformat(
+            startup["observed_at"].replace("Z", "+00:00")
+        )
         plan = json.loads(
             self.cli(
                 "codex-config-plan",
@@ -632,7 +635,10 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
             if item["event_id"] == "resource-clock-b"
         )
         second_at = dt.datetime.fromisoformat(second["applied_at"])
-        self.assertEqual(second_at, first_at + dt.timedelta(microseconds=1))
+        self.assertEqual(
+            second_at,
+            max(first_at, startup_at) + dt.timedelta(microseconds=1),
+        )
 
         state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
         config_path = self.root / ".codex" / "config.toml"
@@ -691,6 +697,59 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
         )
         self.assertEqual(
             cli_impl.resource_config_integrity_errors(get_paths(self.root), state), []
+        )
+
+    def test_resource_apply_is_causally_after_persisted_startup_observation(
+        self,
+    ) -> None:
+        task_id = "session-register-startup-apply-clock"
+        _first, startup = self._prepare_applied(
+            task_id=task_id,
+            event_id="resource-startup-clock-a",
+        )
+        startup_at = dt.datetime.fromisoformat(
+            startup["observed_at"].replace("Z", "+00:00")
+        )
+        plan = json.loads(
+            self.cli(
+                "codex-config-plan",
+                "--task",
+                task_id,
+                "--event-id",
+                "resource-startup-clock-b",
+                "--role",
+                "explorer",
+                "--json",
+            ).stdout
+        )
+        with mock.patch.object(
+            resource_cmds,
+            "now_iso",
+            return_value=(startup_at - dt.timedelta(seconds=1)).isoformat(
+                timespec="microseconds"
+            ),
+        ), mock.patch.object(resource_cmds.Path, "cwd", return_value=self.root):
+            self.cli_in_process(
+                "codex-config-apply",
+                "--task",
+                task_id,
+                "--event-id",
+                "resource-startup-clock-b",
+                "--role",
+                "explorer",
+                "--expected-plan-sha256",
+                plan["plan_sha256"],
+                "--session-id",
+                "apply-root",
+            )
+        second = next(
+            item
+            for item in self._state(task_id)["resource_config_events"]
+            if item["event_id"] == "resource-startup-clock-b"
+        )
+        self.assertEqual(
+            dt.datetime.fromisoformat(second["applied_at"]),
+            startup_at + dt.timedelta(microseconds=1),
         )
 
     def test_startup_bytes_survive_cross_host_clock_skew_and_order_rollback(self) -> None:

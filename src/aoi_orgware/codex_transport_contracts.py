@@ -1306,7 +1306,95 @@ def validate_terminal_receipt_against_journal(
 
 
 def _resource_root() -> Path:
-    return Path(__file__).resolve().parent / "resources" / "codex_app_server" / "0.144.6"
+    return Path(__file__).resolve().parent / "resources" / "codex_app_server" / "0.145.0"
+
+
+_PACKAGED_RUNTIME_PIN_0_145_0: dict[str, Any] = {
+    "schema_version": 1,
+    "release_tag": "rust-v0.145.0",
+    "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
+    "codex_cli_version": "codex-cli 0.145.0",
+    "codex_app_server_version": "codex-app-server 0.145.0",
+    "app_server_asset": {
+        "name": "codex-app-server-x86_64-pc-windows-msvc.exe.zip",
+        "size": 98743440,
+        "sha256": "dfc57f87b9bc61d1d4503b7a60fbe5bae5f13a5283234c86a4c0da6c97a12961",
+        "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-app-server-x86_64-pc-windows-msvc.exe.zip",
+    },
+    "app_server_executable": {
+        "name": "codex-app-server-x86_64-pc-windows-msvc.exe",
+        "size": 299117872,
+        "sha256": "5163c75ed88d460b35b03c8d8f4ef190b3bdd09971d7ac2bd90b48c435f1cf14",
+    },
+    "schema_generator_asset": {
+        "name": "codex-x86_64-pc-windows-msvc.exe.zip",
+        "size": 119947181,
+        "sha256": "bc6ae808bf5a9cdf113364ac281594d6da76dc103c19129e9d32caed54ec3cda",
+        "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-x86_64-pc-windows-msvc.exe.zip",
+    },
+    "schema_generator_executable": {
+        "name": "codex-x86_64-pc-windows-msvc.exe",
+        "size": 359245096,
+        "sha256": "83751f15cb6a0a7b97df67752c001e3fe1c20e18ffbfec3ff63567296205eb6c",
+    },
+    "stable_schema": {
+        "generator_arguments": ["app-server", "generate-json-schema", "--out", "<fresh-empty-directory>"],
+        "experimental": False,
+        "file_count": 273,
+        "manifest_format": "canonical-json sorted array of path,sha256,size; POSIX relative paths; ASCII; no trailing newline",
+        "manifest_size": 36135,
+        "manifest_sha256": "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262",
+        "combined_v2_schema_size": 491906,
+        "combined_v2_schema_sha256": "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec",
+    },
+}
+_MAX_PACKAGED_RUNTIME_METADATA_BYTES = 64 * 1024
+_MAX_PACKAGED_COMBINED_SCHEMA_BYTES = 1024 * 1024
+
+
+def _require_exact_packaged_pin(actual: Any, expected: Any, field: str) -> None:
+    """Fail closed on every stable-runtime pin value, including scalar types."""
+
+    if isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping) or set(actual) != set(expected):
+            _fail(f"packaged Codex runtime pin field {field} differs from the stable contract")
+        for key, value in expected.items():
+            _require_exact_packaged_pin(actual[key], value, f"{field}.{key}")
+        return
+    if isinstance(expected, list):
+        if not isinstance(actual, list) or len(actual) != len(expected):
+            _fail(f"packaged Codex runtime pin field {field} differs from the stable contract")
+        for index, value in enumerate(expected):
+            _require_exact_packaged_pin(actual[index], value, f"{field}[{index}]")
+        return
+    if type(actual) is not type(expected) or actual != expected:
+        _fail(f"packaged Codex runtime pin field {field} differs from the stable contract")
+
+
+def _reject_packaged_json_duplicates(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            _fail(f"packaged Codex runtime metadata has duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
+def _read_bounded_packaged_resource(
+    path: Path, *, maximum_bytes: int, label: str
+) -> bytes:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise CodexTransportContractError(
+            f"packaged Codex {label} is unreadable"
+        ) from exc
+    if len(raw) > maximum_bytes:
+        _fail(f"packaged Codex {label} exceeds its byte bound")
+    return raw
 
 
 def _validate_packaged_runtime_payload(
@@ -1319,48 +1407,28 @@ def _validate_packaged_runtime_payload(
     tuple must be, without starting a process.
     """
 
-    expected_app_sha = "94884f0f00d4e1b9fdd2d70670169c4dd3d6533ef93002cea963ced863101e57"
-    expected_app_size = 283340080
-    expected_manifest_sha = "2159bf1baca13afcb4a239c0adff84b7d3a23a8ed222cae59aeb72e1621d61de"
-    expected_combined_sha = "a728b892d2d80098dc5cc907355878b99d9e8b6b332bd52e3b94c00e1472cdc0"
+    expected_app = _PACKAGED_RUNTIME_PIN_0_145_0["app_server_executable"]
+    expected_stable = _PACKAGED_RUNTIME_PIN_0_145_0["stable_schema"]
     try:
-        pin = json.loads(pin_bytes)
-        manifest = json.loads(manifest_bytes)
+        pin = json.loads(
+            pin_bytes, object_pairs_hook=_reject_packaged_json_duplicates
+        )
+        manifest = json.loads(
+            manifest_bytes, object_pairs_hook=_reject_packaged_json_duplicates
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexTransportContractError("packaged Codex runtime pin is unreadable") from exc
     if canonical_json_bytes(manifest, max_bytes=MAX_CONTRACT_BYTES) != manifest_bytes:
         _fail("schema-manifest.json is not canonical JSON")
-    pin_fields = {
-        "schema_version", "release_tag", "release_url", "codex_cli_version",
-        "codex_app_server_version", "app_server_asset", "app_server_executable",
-        "schema_generator_asset", "schema_generator_executable", "stable_schema",
-    }
-    if not isinstance(pin, Mapping) or set(pin) != pin_fields or not isinstance(manifest, list):
+    if not isinstance(pin, Mapping) or not isinstance(manifest, list):
         _fail("packaged Codex runtime pin schema is invalid")
-    stable = pin["stable_schema"]
-    app_server = pin["app_server_executable"]
-    stable_fields = {
-        "generator_arguments", "experimental", "file_count", "manifest_format",
-        "manifest_size", "manifest_sha256", "combined_v2_schema_size",
-        "combined_v2_schema_sha256",
-    }
-    if not isinstance(stable, Mapping) or set(stable) != stable_fields:
-        _fail("packaged stable schema pin is invalid")
-    if not isinstance(app_server, Mapping) or set(app_server) != {"name", "size", "sha256"}:
-        _fail("packaged app-server executable pin is invalid")
+    _require_exact_packaged_pin(pin, _PACKAGED_RUNTIME_PIN_0_145_0, "runtime-pin.json")
     if (
-        pin["codex_cli_version"] != "codex-cli 0.144.6"
-        or pin["codex_app_server_version"] != "codex-app-server 0.144.6"
-        or app_server["sha256"] != expected_app_sha
-        or app_server["size"] != expected_app_size
-        or stable["file_count"] != 267
-        or stable["manifest_size"] != len(manifest_bytes)
-        or stable["manifest_sha256"] != expected_manifest_sha
-        or stable["combined_v2_schema_size"] != len(combined_bytes)
-        or stable["combined_v2_schema_sha256"] != expected_combined_sha
-        or hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha
-        or hashlib.sha256(combined_bytes).hexdigest() != expected_combined_sha
-        or len(manifest) != 267
+        expected_stable["manifest_size"] != len(manifest_bytes)
+        or expected_stable["combined_v2_schema_size"] != len(combined_bytes)
+        or hashlib.sha256(manifest_bytes).hexdigest() != expected_stable["manifest_sha256"]
+        or hashlib.sha256(combined_bytes).hexdigest() != expected_stable["combined_v2_schema_sha256"]
+        or len(manifest) != expected_stable["file_count"]
     ):
         _fail("packaged Codex runtime pin/schema digest drifted")
     previous_path: str | None = None
@@ -1384,28 +1452,37 @@ def _validate_packaged_runtime_payload(
             _fail("packaged schema manifest size is invalid")
         _sha256(entry["sha256"], "packaged schema manifest sha256")
     return {
-        "codex_cli_version": "codex-cli 0.144.6",
-        "codex_app_server_version": "codex-app-server 0.144.6",
-        "app_server_executable_sha256": expected_app_sha,
-        "executable_size_bytes": expected_app_size,
-        "schema_manifest_sha256": expected_manifest_sha,
-        "combined_v2_schema_sha256": expected_combined_sha,
+        "codex_cli_version": _PACKAGED_RUNTIME_PIN_0_145_0["codex_cli_version"],
+        "codex_app_server_version": _PACKAGED_RUNTIME_PIN_0_145_0["codex_app_server_version"],
+        "app_server_executable_sha256": expected_app["sha256"],
+        "executable_size_bytes": expected_app["size"],
+        "schema_manifest_sha256": expected_stable["manifest_sha256"],
+        "combined_v2_schema_sha256": expected_stable["combined_v2_schema_sha256"],
     }
 
 
 def pinned_runtime_binding() -> dict[str, str | int]:
-    """Read and verify the packaged 0.144.6 pin and generated schema bytes.
+    """Read and verify the packaged 0.145.0 pin and generated schema bytes.
 
-    This is read-only by design.  It checks the canonical 267-file manifest and
+    This is read-only by design.  It checks the canonical 273-file manifest and
     the combined-v2 schema before returning the only runtime binding accepted by
     the launch-intent contract.
     """
 
     root = _resource_root()
-    try:
-        pin_bytes = (root / "runtime-pin.json").read_bytes()
-        manifest_bytes = (root / "schema-manifest.json").read_bytes()
-        combined_bytes = (root / "codex_app_server_protocol.v2.schemas.json").read_bytes()
-    except OSError as exc:
-        raise CodexTransportContractError("packaged Codex runtime pin is unreadable") from exc
+    pin_bytes = _read_bounded_packaged_resource(
+        root / "runtime-pin.json",
+        maximum_bytes=_MAX_PACKAGED_RUNTIME_METADATA_BYTES,
+        label="runtime pin",
+    )
+    manifest_bytes = _read_bounded_packaged_resource(
+        root / "schema-manifest.json",
+        maximum_bytes=_MAX_PACKAGED_RUNTIME_METADATA_BYTES,
+        label="schema manifest",
+    )
+    combined_bytes = _read_bounded_packaged_resource(
+        root / "codex_app_server_protocol.v2.schemas.json",
+        maximum_bytes=_MAX_PACKAGED_COMBINED_SCHEMA_BYTES,
+        label="combined schema",
+    )
     return _validate_packaged_runtime_payload(pin_bytes, manifest_bytes, combined_bytes)
