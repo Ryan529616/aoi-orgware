@@ -51,6 +51,7 @@ from ..harnesslib import (
     bump_task,
     canonicalize_no_link_traversal,
     claims_owned_by_task,
+    fsync_directory,
     is_expired,
     load_json,
     load_task,
@@ -901,6 +902,22 @@ def _require_current_legacy_migration_plan_approval(
         )
 
 
+def _remove_new_legacy_resource_migration_receipt(path: Path) -> None:
+    """Durably remove a receipt created by the current migration attempt."""
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        fsync_directory(path.parent)
+    except OSError as exc:
+        raise HarnessError(
+            "legacy resource config migration receipt cleanup directory "
+            "durability is ambiguous"
+        ) from exc
+
+
 def cmd_codex_config_migrate_legacy_plan(
     args: argparse.Namespace, paths: HarnessPaths, *, services: ResourceCmdServices
 ) -> int:
@@ -1174,7 +1191,7 @@ def cmd_codex_config_migrate_legacy(
         staged_errors = services.resource_config_integrity_errors(paths, state)
         if staged_errors:
             if receipt_created:
-                migration_path.unlink()
+                _remove_new_legacy_resource_migration_receipt(migration_path)
             raise HarnessError(
                 "legacy resource config migration candidate failed integrity: "
                 + "; ".join(staged_errors)
@@ -1208,10 +1225,7 @@ def cmd_codex_config_migrate_legacy(
                     "the final durability/index step reported an error"
                 ) from exc
             if receipt_created:
-                try:
-                    migration_path.unlink()
-                except FileNotFoundError:
-                    pass
+                _remove_new_legacy_resource_migration_receipt(migration_path)
             raise HarnessError(
                 "legacy resource config migration state publication failed; "
                 + (

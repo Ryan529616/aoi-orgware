@@ -15,6 +15,7 @@ SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import cli as cli_impl  # noqa: E402
+from aoi_orgware.commands import resource as resource_command_impl  # noqa: E402
 from aoi_orgware._version import __version__  # noqa: E402
 from aoi_orgware.harnesslib import (  # noqa: E402
     HarnessError,
@@ -464,15 +465,98 @@ class LegacyResourceConfigMigrationTests(HarnessTestCase):
             / "results"
             / "resource-config-legacy-migration-legacy-write-failure.json"
         )
-        with mock.patch.object(
-            cli_impl,
-            "write_task",
-            side_effect=HarnessError("injected migration state write failure"),
+        real_fsync_directory = resource_command_impl.fsync_directory
+        with (
+            mock.patch.object(
+                cli_impl,
+                "write_task",
+                side_effect=HarnessError("injected migration state write failure"),
+            ),
+            mock.patch.object(
+                resource_command_impl,
+                "fsync_directory",
+                wraps=real_fsync_directory,
+            ) as fsync_directory_mock,
         ):
             failed = self.cli_in_process(
                 *self._migration_args(task_id, event), ok=False
             )
         self.assertIn("newly created receipt was removed", failed.stderr)
+        self.assertEqual(self._state_path(task_id).read_bytes(), state_before)
+        self.assertFalse(migration_path.exists())
+        fsync_directory_mock.assert_called_once_with(migration_path.parent)
+
+        result = json.loads(self.cli(*self._migration_args(task_id, event)).stdout)
+        self.assertFalse(result["idempotent_replay"])
+
+    def test_staged_integrity_failure_durably_cleans_new_receipt(self) -> None:
+        task_id = "legacy-resource-staged-integrity-failure"
+        event, _receipt, _path, _bytes = self._prepare_legacy(
+            task_id=task_id, event_id="legacy-staged-integrity-failure"
+        )
+        state_before = self._state_path(task_id).read_bytes()
+        migration_path = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / task_id
+            / "results"
+            / (
+                "resource-config-legacy-migration-"
+                "legacy-staged-integrity-failure.json"
+            )
+        )
+        real_fsync_directory = resource_command_impl.fsync_directory
+        with (
+            mock.patch.object(
+                cli_impl,
+                "resource_config_integrity_errors",
+                side_effect=[[], ["injected staged migration damage"]],
+            ),
+            mock.patch.object(
+                resource_command_impl,
+                "fsync_directory",
+                wraps=real_fsync_directory,
+            ) as fsync_directory_mock,
+        ):
+            failed = self.cli_in_process(
+                *self._migration_args(task_id, event), ok=False
+            )
+        self.assertIn("candidate failed integrity", failed.stderr)
+        self.assertEqual(self._state_path(task_id).read_bytes(), state_before)
+        self.assertFalse(migration_path.exists())
+        fsync_directory_mock.assert_called_once_with(migration_path.parent)
+
+    def test_cleanup_fsync_failure_is_reported_as_ambiguous(self) -> None:
+        task_id = "legacy-resource-cleanup-fsync-failure"
+        event, _receipt, _path, _bytes = self._prepare_legacy(
+            task_id=task_id, event_id="legacy-cleanup-fsync-failure"
+        )
+        state_before = self._state_path(task_id).read_bytes()
+        migration_path = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / task_id
+            / "results"
+            / "resource-config-legacy-migration-legacy-cleanup-fsync-failure.json"
+        )
+        with (
+            mock.patch.object(
+                cli_impl,
+                "write_task",
+                side_effect=HarnessError("injected migration state write failure"),
+            ),
+            mock.patch.object(
+                resource_command_impl,
+                "fsync_directory",
+                side_effect=OSError("injected cleanup directory fsync failure"),
+            ),
+        ):
+            failed = self.cli_in_process(
+                *self._migration_args(task_id, event), ok=False
+            )
+        self.assertIn("cleanup directory durability is ambiguous", failed.stderr)
         self.assertEqual(self._state_path(task_id).read_bytes(), state_before)
         self.assertFalse(migration_path.exists())
 
