@@ -246,13 +246,14 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
             .rstrip("=")
             + f",{bridge_script.stat().st_size}"
         )
+    direct_url_record_path = os.path.relpath(direct_url, site_root).replace("\\", "/")
     record.write_text(
         record.read_text(encoding="utf-8").replace(
             "\n" + os.path.relpath(record, site_root).replace("\\", "/") + ",,\n",
             "\n"
             + "\n".join(extra_record_rows)
             + "\n"
-            + f"{os.path.relpath(direct_url, site_root).replace('\\', '/')},"
+            + f"{direct_url_record_path},"
             + "sha256="
             + base64.urlsafe_b64encode(
                 hashlib.sha256(direct_url.read_bytes()).digest()

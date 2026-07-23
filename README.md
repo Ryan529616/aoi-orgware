@@ -87,7 +87,7 @@ From the repository you want to govern, paste this into Codex or Claude Code:
 > Inspect https://github.com/Ryan529616/aoi-orgware, the reviewed local install
 > bundle at `<absolute-local-install-bundle-path>` with SHA-256
 > `<approved-local-install-bundle-sha256>`, and my current repository without
-> modifying my project. Use only `aoi-orgware==0.4.0a2` and the wheel whose
+> modifying my project. Use only `aoi-orgware==0.4.0a3` and the wheel whose
 > SHA-256 is bound by that bundle; do not infer unreleased bytes from GitHub or
 > PyPI. Then show
 > me the proposed AOI revision, project files, user-scope files,
@@ -107,17 +107,17 @@ project hooks is a supply-chain and trust decision.
 ### Direct install
 
 > **This README documents the v0.4 alpha line.** Install exactly
-> `aoi-orgware==0.4.0a2` from an exact reviewed local-install bundle. A
+> `aoi-orgware==0.4.0a3` from an exact reviewed local-install bundle. A
 > `reviewed_local_install_bundle` has
 > `proof_scope=exact_local_wheel_install_only`: it is not a release record or
 > promotion, and it makes no tag, GitHub Release, or PyPI claim. Do not use an
 > unpinned install command or substitute a different alpha build.
 
 ```powershell
-$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a2'
+$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a3'
 python -m venv $aoiToolRoot
 $aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
-$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a2-py3-none-any.whl').Path
+$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a3-py3-none-any.whl').Path
 $expectedWheelSha256 = '<reviewed-wheel-sha256>'
 if ((Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant() -ne $expectedWheelSha256) { throw 'wheel SHA-256 mismatch' }
 & $aoiPython -m pip install --isolated --no-index --no-deps $aoiWheel
@@ -135,7 +135,7 @@ $aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
 above, or the public `--promotion-bundle-file` plus
 `--expected-promotion-bundle-sha256` pair. Half a pair, both pairs, or neither
 fails before mutation. On POSIX, invoke `<venv>/bin/aoi codex-init ...`, never
-the module entry point. The package version must report `0.4.0a2`. See the
+the module entry point. The package version must report `0.4.0a3`. See the
 [v0.4 quickstart](docs/quickstart.md) for both routes and the complete
 isolated-install, mini-task, status, and offboarding sequence.
 

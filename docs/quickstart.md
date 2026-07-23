@@ -1,6 +1,6 @@
 # AOI v0.4 quickstart
 
-This guide is for the reviewed alpha `aoi-orgware==0.4.0a2`. Do not substitute
+This guide is for the reviewed alpha `aoi-orgware==0.4.0a3`. Do not substitute
 an unpinned package, a different wheel, or a newer build. The package install,
 Codex hook trust, provider routing, and reviewer identity are separate claims.
 
@@ -25,10 +25,10 @@ being governed. The example below uses PowerShell; replace placeholders with
 reviewed absolute paths and lowercase digests.
 
 ```powershell
-$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a2'
+$aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a3'
 python -m venv $aoiToolRoot
 $aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
-$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a2-py3-none-any.whl').Path
+$aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a3-py3-none-any.whl').Path
 $expectedWheelSha256 = '<reviewed-wheel-sha256>'
 $actualWheelSha256 = (Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant()
 if ($actualWheelSha256 -ne $expectedWheelSha256) { throw 'wheel SHA-256 mismatch' }
@@ -39,7 +39,7 @@ $aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
 & $aoiLauncher --version
 ```
 
-The installed package version must be exactly `0.4.0a2`. The wheel filename is
+The installed package version must be exactly `0.4.0a3`. The wheel filename is
 not sufficient evidence: compare its full SHA-256 before installation. Keep the
 tool environment outside the governed repository so it cannot pollute Git
 mutation snapshots or claim coverage.
@@ -66,10 +66,10 @@ On Linux/WSL, create a repo-external venv and install the same exact local
 wheel without index or dependencies, then invoke its console script directly:
 
 ```bash
-AOI_TOOL_ROOT="$HOME/.local/share/aoi/venvs/0.4.0a2"
+AOI_TOOL_ROOT="$HOME/.local/share/aoi/venvs/0.4.0a3"
 python3 -m venv "$AOI_TOOL_ROOT"
 "$AOI_TOOL_ROOT/bin/python" -m pip install --isolated --no-index --no-deps \
-  /absolute/reviewed-local-install/aoi_orgware-0.4.0a2-py3-none-any.whl
+  /absolute/reviewed-local-install/aoi_orgware-0.4.0a3-py3-none-any.whl
 "$AOI_TOOL_ROOT/bin/aoi" codex-init \
   --project-name 'My Project' \
   --local-artifact-bundle-file /absolute/reviewed-local-install/reviewed-local-install-bundle.json \
