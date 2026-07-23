@@ -1,8 +1,11 @@
 # AOI v0.4 quickstart
 
-This guide is for the reviewed alpha `aoi-orgware==0.4.0a3`. Do not substitute
-an unpinned package, a different wheel, or a newer build. The package install,
-Codex hook trust, provider routing, and reviewer identity are separate claims.
+This guide targets alpha `aoi-orgware==0.4.0a3`. Use it only when the selected
+reviewed proof names that exact version and wheel SHA-256; source presence, a
+tag, workflow success, or PyPI visibility alone is not promotion authority. Do
+not substitute an unpinned package, a different wheel, or a newer build. The
+package install, Codex hook trust, provider routing, and reviewer identity are
+separate claims.
 
 There are two deliberately separate proof routes:
 
@@ -28,6 +31,9 @@ reviewed absolute paths and lowercase digests.
 $aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a3'
 python -m venv $aoiToolRoot
 $aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
+# Python 3.11 may seed executable distutils-precedence.pth. AOI has no
+# Setuptools runtime dependency and provenance intentionally rejects that file.
+& $aoiPython -m pip uninstall --yes setuptools
 $aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a3-py3-none-any.whl').Path
 $expectedWheelSha256 = '<reviewed-wheel-sha256>'
 $actualWheelSha256 = (Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant()
@@ -42,7 +48,11 @@ $aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
 The installed package version must be exactly `0.4.0a3`. The wheel filename is
 not sufficient evidence: compare its full SHA-256 before installation. Keep the
 tool environment outside the governed repository so it cannot pollute Git
-mutation snapshots or claim coverage.
+mutation snapshots or claim coverage. The environment must be dedicated to AOI:
+do not create it with `--system-site-packages` or add unrelated development
+tools. AOI rejects every executable `.pth`; reinstalling Setuptools or another
+such file makes onboarding and runtime hooks fail closed until the environment
+is cleaned and requalified.
 
 ## 2. Initialize Codex with the reviewed local-install proof
 
@@ -68,6 +78,7 @@ wheel without index or dependencies, then invoke its console script directly:
 ```bash
 AOI_TOOL_ROOT="$HOME/.local/share/aoi/venvs/0.4.0a3"
 python3 -m venv "$AOI_TOOL_ROOT"
+"$AOI_TOOL_ROOT/bin/python" -m pip uninstall --yes setuptools
 "$AOI_TOOL_ROOT/bin/python" -m pip install --isolated --no-index --no-deps \
   /absolute/reviewed-local-install/aoi_orgware-0.4.0a3-py3-none-any.whl
 "$AOI_TOOL_ROOT/bin/aoi" codex-init \
@@ -121,8 +132,11 @@ which builder toolchain ran, or that the caller-supplied test summary executed.
 
 ### Public release-promotion route
 
-Use this only when a reviewed public release-promotion bundle exists. Replace
-the two local-proof flags above with this complete pair; do not combine routes:
+Use this only when a reviewed public release-promotion bundle exists. The
+current Chief must have created it with `release-promote` after exact GitHub
+Release and PyPI readback; a workflow result or public package alone is
+insufficient. Replace the two local-proof flags above with this complete pair;
+do not combine routes:
 
 ```powershell
 & $aoiLauncher codex-init `

@@ -101,6 +101,372 @@ class TempGitRepoTests(unittest.TestCase):
             capture_output=True,
         ).stdout
 
+    def _mktag(self, *, target: str, target_type: str, tag: str) -> str:
+        payload = (
+            f"object {target}\n"
+            f"type {target_type}\n"
+            f"tag {tag}\n"
+            "tagger Test User <test@example.invalid> 0 +0000\n"
+            "\n"
+            "release\n"
+        )
+        return subprocess.run(
+            ["git", "-C", str(self.repo), "mktag"],
+            input=payload.encode("ascii"),
+            check=True,
+            capture_output=True,
+        ).stdout.decode("ascii", "strict").strip()
+
+    def test_local_annotated_tag_snapshot_rejects_lightweight_tag(self) -> None:
+        self._git("tag", "lightweight-v1", self.baseline)
+        with self.assertRaisesRegex(HarnessError, "annotated tag object"):
+            gp.local_annotated_tag_snapshot(
+                self.repo, "refs/tags/lightweight-v1"
+            )
+
+        self._git("tag", "-a", "v1.0.0", "-m", "release", self.baseline)
+        snapshot = gp.local_annotated_tag_snapshot(
+            self.repo, "refs/tags/v1.0.0"
+        )
+        self.assertEqual(snapshot["peeled_commit_oid"], self.baseline)
+        self.assertNotEqual(snapshot["tag_object_oid"], self.baseline)
+
+    def test_local_annotated_tag_snapshot_normalizes_non_ascii_failure(self) -> None:
+        with mock.patch.object(
+            gp, "_run_git_bytes_bounded", return_value=b"\xff"
+        ):
+            with self.assertRaisesRegex(HarnessError, "not ASCII"):
+                gp.local_annotated_tag_snapshot(
+                    self.repo, "refs/tags/v1.0.0"
+                )
+
+    def test_local_annotated_tag_snapshot_rejects_wrong_embedded_name(self) -> None:
+        tag_object = self._mktag(
+            target=self.baseline,
+            target_type="commit",
+            tag="another-name",
+        )
+        self._git("update-ref", "refs/tags/v1.0.0", tag_object)
+        with self.assertRaisesRegex(HarnessError, "direct annotated tag object"):
+            gp.local_annotated_tag_snapshot(
+                self.repo, "refs/tags/v1.0.0"
+            )
+
+    def test_local_annotated_tag_snapshot_rejects_tag_of_tag(self) -> None:
+        self._git("tag", "-a", "inner", "-m", "inner", self.baseline)
+        inner = self._git("rev-parse", "refs/tags/inner").strip()
+        outer = self._mktag(
+            target=inner,
+            target_type="tag",
+            tag="v1.0.0",
+        )
+        self._git("update-ref", "refs/tags/v1.0.0", outer)
+        with self.assertRaisesRegex(HarnessError, "direct annotated tag object"):
+            gp.local_annotated_tag_snapshot(
+                self.repo, "refs/tags/v1.0.0"
+            )
+
+    def test_transport_config_audit_removes_only_its_first_synthetic_pins(
+        self,
+    ) -> None:
+        system_config = self.repo / "duplicate-system.gitconfig"
+        audit_identity = f"aoi-audit://{'a' * 64}"
+        alias = f"aoi-transport://{'b' * 64}"
+        self._git(
+            "config",
+            "--file",
+            str(system_config),
+            "--add",
+            f"url.{audit_identity}.insteadOf",
+            alias,
+        )
+        self._git(
+            "config",
+            "--file",
+            str(system_config),
+            "--add",
+            f"url.{audit_identity}.pushInsteadOf",
+            alias,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"GIT_CONFIG_SYSTEM": str(system_config)},
+                clear=False,
+            ),
+            mock.patch.object(
+                gp.secrets,
+                "token_hex",
+                side_effect=("a" * 64, "b" * 64),
+            ),
+        ):
+            raw = gp._git_transport_config_audit_bytes(
+                self.repo,
+                label="test Git transport config audit",
+            )
+
+        records = [record for record in raw.split(b"\x00") if record]
+        self.assertEqual(
+            records.count(
+                f"url.{audit_identity}.insteadof\n{alias}".encode("ascii")
+            ),
+            1,
+        )
+        self.assertEqual(
+            records.count(
+                f"url.{audit_identity}.pushinsteadof\n{alias}".encode("ascii")
+            ),
+            1,
+        )
+
+    def test_remote_annotated_tag_snapshot_requires_exact_peeled_tag(
+        self,
+    ) -> None:
+        remote = self.repo / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(remote)],
+            check=True,
+            capture_output=True,
+        )
+        self._git("remote", "add", "origin", str(remote))
+        with self.assertRaises(HarnessError):
+            gp.remote_annotated_tag_snapshot(
+                self.repo, str(remote), "refs/tags/v1.0.0"
+            )
+
+        self._git("tag", "-a", "v1.0.0", "-m", "release", self.baseline)
+        self._git("push", "-q", "origin", "refs/tags/v1.0.0")
+        local = gp.local_annotated_tag_snapshot(
+            self.repo, "refs/tags/v1.0.0"
+        )
+        remote_snapshot = gp.remote_annotated_tag_snapshot(
+            self.repo, str(remote), "refs/tags/v1.0.0"
+        )
+        self.assertEqual(remote_snapshot, local)
+
+        self._git("tag", "lightweight-v2", self.baseline)
+        self._git("push", "-q", "origin", "refs/tags/lightweight-v2")
+        with self.assertRaisesRegex(
+            HarnessError, "lightweight|annotated"
+        ):
+            gp.remote_annotated_tag_snapshot(
+                self.repo, str(remote), "refs/tags/lightweight-v2"
+            )
+
+    def test_remote_tag_snapshot_identity_pin_overrides_local_and_ambient_rewrites(
+        self,
+    ) -> None:
+        exact_root = self.repo / "exact-root"
+        alternate_root = self.repo / "alternate-root"
+        exact_remote = exact_root / "release.git"
+        alternate_remote = alternate_root / "release.git"
+        exact_root.mkdir()
+        alternate_root.mkdir()
+        for remote in (exact_remote, alternate_remote):
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+                capture_output=True,
+            )
+        transport = exact_remote.as_posix()
+        lower_scope = exact_root.as_posix() + "/"
+        alternate_scope = alternate_root.as_posix() + "/"
+        self._git("tag", "-a", "v1.0.0", "-m", "release", self.baseline)
+        self._git("push", "-q", transport, "refs/tags/v1.0.0")
+        expected = gp.local_annotated_tag_snapshot(self.repo, "refs/tags/v1.0.0")
+
+        # A lower-scope local rewrite can redirect both ordinary fetch and push
+        # transports to the alternate bare repository.
+        self._git(
+            "config",
+            "--local",
+            f"url.{alternate_scope}.insteadOf",
+            lower_scope,
+        )
+        self._git(
+            "config",
+            "--local",
+            f"url.{alternate_scope}.pushInsteadOf",
+            lower_scope,
+        )
+        self._git("tag", "-a", "push-rewrite-probe", "-m", "probe", self.baseline)
+        self._git("push", "-q", transport, "refs/tags/push-rewrite-probe")
+        alternate_probe = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(alternate_remote),
+                "show-ref",
+                "--verify",
+                "refs/tags/push-rewrite-probe",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertEqual(alternate_probe.returncode, 0)
+        exact_probe = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(exact_remote),
+                "show-ref",
+                "--verify",
+                "refs/tags/push-rewrite-probe",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertNotEqual(exact_probe.returncode, 0)
+
+        # The release runbook puts one unguessable full alias in the earliest
+        # system config scope for the actual create-only tag push.  Even an
+        # equal-length local rule must lose the traversal tie to that pin.
+        self._git("tag", "-a", "pinned-push-probe", "-m", "probe", self.baseline)
+        push_alias = "aoi-transport://runbook-pinned-push-probe"
+        push_config = self.repo / "runbook-system.gitconfig"
+        self._git(
+            "config",
+            "--file",
+            str(push_config),
+            "--add",
+            f"url.{transport}.insteadOf",
+            push_alias,
+        )
+        self._git(
+            "config",
+            "--file",
+            str(push_config),
+            "--add",
+            f"url.{transport}.pushInsteadOf",
+            push_alias,
+        )
+        self._git(
+            "config",
+            "--local",
+            f"url.{alternate_scope}.insteadOf",
+            push_alias,
+        )
+        self._git(
+            "config",
+            "--local",
+            f"url.{alternate_scope}.pushInsteadOf",
+            push_alias,
+        )
+        pinned_push_env = os.environ.copy()
+        for name in tuple(pinned_push_env):
+            normalized = name.upper()
+            if (
+                normalized
+                in {
+                    "GIT_CONFIG_COUNT",
+                    "GIT_CONFIG_NOSYSTEM",
+                    "GIT_CONFIG_PARAMETERS",
+                    "GIT_CONFIG_SYSTEM",
+                }
+                or normalized.startswith("GIT_CONFIG_KEY_")
+                or normalized.startswith("GIT_CONFIG_VALUE_")
+            ):
+                pinned_push_env.pop(name)
+        pinned_push_env["GIT_CONFIG_SYSTEM"] = str(push_config)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "push",
+                "-q",
+                "--force-with-lease=refs/tags/pinned-push-probe:",
+                "--",
+                push_alias,
+                "refs/tags/pinned-push-probe",
+            ],
+            env=pinned_push_env,
+            check=True,
+            capture_output=True,
+        )
+        pinned_exact_probe = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(exact_remote),
+                "show-ref",
+                "--verify",
+                "refs/tags/pinned-push-probe",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertEqual(pinned_exact_probe.returncode, 0)
+        pinned_alternate_probe = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(alternate_remote),
+                "show-ref",
+                "--verify",
+                "refs/tags/pinned-push-probe",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertNotEqual(pinned_alternate_probe.returncode, 0)
+
+        # Ambient command-scope config is untrusted input too.  Inject an
+        # equal-length local alias rule after the isolated pin exists but
+        # immediately before ls-remote starts; the system-scope pin must win.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": f"url.{alternate_scope}.insteadOf",
+                "GIT_CONFIG_VALUE_0": lower_scope,
+                "GIT_CONFIG_KEY_1": f"url.{alternate_scope}.pushInsteadOf",
+                "GIT_CONFIG_VALUE_1": lower_scope,
+            },
+            clear=False,
+        ):
+            original_popen = subprocess.Popen
+            injected_aliases: list[str] = []
+
+            def inject_equal_alias_rule(
+                command: object, *args: object, **kwargs: object
+            ) -> subprocess.Popen[bytes]:
+                words = list(command)  # type: ignore[arg-type]
+                if "ls-remote" in words:
+                    alias = next(
+                        word
+                        for word in words
+                        if isinstance(word, str)
+                        and word.startswith("aoi-transport://")
+                    )
+                    injected_aliases.append(alias)
+                    self._git(
+                        "config",
+                        "--local",
+                        f"url.{alternate_scope}.insteadOf",
+                        alias,
+                    )
+                return original_popen(words, *args, **kwargs)
+
+            with mock.patch.object(
+                subprocess, "Popen", side_effect=inject_equal_alias_rule
+            ):
+                observed = gp.remote_annotated_tag_snapshot(
+                    self.repo, transport, "refs/tags/v1.0.0"
+                )
+        self.assertEqual(observed, expected)
+        self.assertEqual(len(injected_aliases), 1)
+
+    def test_release_tag_snapshots_reject_noncanonical_ref_and_destination(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(HarnessError, "tag ref is invalid"):
+            gp.local_annotated_tag_snapshot(self.repo, "v1.0.0")
+        with self.assertRaisesRegex(HarnessError, "transport destination"):
+            gp.remote_annotated_tag_snapshot(
+                self.repo, " bad remote", "refs/tags/v1.0.0"
+            )
+
     def test_status_snapshot_is_deterministic_and_stream_bounded(self) -> None:
         (self.repo / "base.txt").write_bytes(b"drift\n")
         (self.repo / "untracked.txt").write_bytes(b"new\n")

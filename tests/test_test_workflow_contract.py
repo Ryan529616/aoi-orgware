@@ -39,7 +39,7 @@ def _step(job: str, name: str) -> str:
 def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
     unit = _job(_workflow(), "unit")
 
-    assert "timeout-minutes: 45" in unit
+    assert "timeout-minutes: 90" in unit
     assert "os: [ubuntu-latest, windows-latest]" in unit
     assert all(f'"{version}"' in unit for version in ("3.11", "3.12", "3.13", "3.14"))
 

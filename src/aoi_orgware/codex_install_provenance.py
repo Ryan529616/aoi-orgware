@@ -451,6 +451,10 @@ def _installed_mapping_evidence(
 
 
 def _reject_pth_shadows(site_root: Path, package_root: Path) -> None:
+    # Do not allowlist standard-looking executable files such as
+    # ``distutils-precedence.pth``.  Its import executes before this verifier
+    # and reaches bytes outside the AOI wheel RECORD/promotion proof.  A
+    # provenance-qualified AOI tool venv must contain no executable .pth.
     for pth in sorted(site_root.glob("*.pth")):
         checked = _canonical_existing(pth, "site .pth file")
         for line in _stable_read(checked, "site .pth file").decode("utf-8").splitlines():
@@ -468,6 +472,55 @@ def _reject_pth_shadows(site_root: Path, package_root: Path) -> None:
                 _fail("site .pth target is invalid", exc)
             if candidate == package_root or (candidate / "aoi_orgware").exists():
                 _fail(".pth source/package shadow is not admissible")
+
+
+def _require_dedicated_venv(
+    prefix: Path, site_root: Path,
+) -> None:
+    """Require the active runtime to be an isolated venv with one site root."""
+
+    config = _canonical_existing(
+        prefix / "pyvenv.cfg", "active virtual environment configuration"
+    )
+    try:
+        lines = _stable_read(
+            config, "active virtual environment configuration"
+        ).decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError as exc:
+        _fail("active virtual environment configuration is not UTF-8", exc)
+    system_site: str | None = None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            _fail("active virtual environment configuration is invalid")
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "include-system-site-packages":
+            if system_site is not None:
+                _fail("active virtual environment configuration is invalid")
+            system_site = value.strip().lower()
+    if system_site != "false":
+        _fail("active virtual environment must disable system site packages")
+    try:
+        exec_prefix = _canonical_existing(
+            sys.exec_prefix, "active Python executable prefix", directory=True
+        )
+    except AttributeError as exc:
+        _fail("active Python executable prefix is unavailable", exc)
+    if exec_prefix != prefix:
+        _fail("active Python executable prefix differs from virtual environment")
+    for entry in sys.path:
+        if not isinstance(entry, str) or not entry:
+            continue
+        candidate = Path(entry)
+        if candidate.name.lower() not in {"site-packages", "dist-packages"}:
+            continue
+        checked = _canonical_existing(
+            candidate, "active site-package root", directory=True
+        )
+        if checked != site_root:
+            _fail("active external site-package root is not admissible")
 
 
 def _generated_script(
@@ -544,6 +597,7 @@ def validate_codex_install_provenance(
         _fail("installed distribution identity/version differs from promotion bundle")
     prefix = _canonical_existing(sys.prefix, "active Python prefix", directory=True)
     site_root = _canonical_existing(dist_info.parent, "distribution site root", directory=True)
+    _require_dedicated_venv(prefix, site_root)
     _under(dist_info, prefix, "distribution metadata")
     _under(site_root, prefix, "distribution site root")
     record = _record(dist_info, site_root)
@@ -776,6 +830,7 @@ def validate_codex_local_install_provenance(
         _fail("installed distribution identity/version differs from local proof")
     prefix = _canonical_existing(sys.prefix, "active Python prefix", directory=True)
     site_root = _canonical_existing(dist_info.parent, "distribution site root", directory=True)
+    _require_dedicated_venv(prefix, site_root)
     _under(dist_info, prefix, "distribution metadata")
     _under(site_root, prefix, "distribution site root")
     record_path = _canonical_existing(dist_info / "RECORD", "wheel RECORD")
@@ -1097,6 +1152,10 @@ def verify_runtime_hook_provenance(project_root: str | os.PathLike[str], expecte
         _fail("recorded installed METADATA path is invalid")
     site_root = _canonical_existing(dist_info.parent, "recorded distribution site root", directory=True)
     package_root = _canonical_existing(item["package_root"], "recorded runtime package root", directory=True)
+    prefix = _canonical_existing(sys.prefix, "active Python prefix", directory=True)
+    _require_dedicated_venv(prefix, site_root)
+    _under(dist_info, prefix, "recorded distribution metadata")
+    _under(site_root, prefix, "recorded distribution site root")
     if package_root.parent != site_root:
         _fail("recorded runtime package root is cross-site")
     record_path = _canonical_existing(dist_info / "RECORD", "recorded wheel RECORD")
@@ -1178,7 +1237,6 @@ def verify_runtime_hook_provenance(project_root: str | os.PathLike[str], expecte
         evidence = _local_installed_mapping_evidence(dist_info, record, contract["wheel"])
         if evidence != item["installed_mapping_evidence"]:
             _fail("current local installed wheel mapping differs from provenance receipt")
-        _reject_pth_shadows(site_root, package_root)
     if set(item) == _RECEIPT_FIELDS_WITH_INSTALL_MAPPING:
         promotion_wheel = item["promotion_wheel_artifact"]
         mapping_strength, mapping_evidence = _installed_mapping_evidence(
@@ -1189,7 +1247,9 @@ def verify_runtime_hook_provenance(project_root: str | os.PathLike[str], expecte
             or mapping_evidence != item["installed_mapping_evidence"]
         ):
             _fail("current installed wheel mapping differs from provenance receipt")
-        _reject_pth_shadows(site_root, package_root)
+    # Every accepted receipt, including mapping-less schema-v1 receipts, must
+    # reject executable .pth files before trusting the installed runtime.
+    _reject_pth_shadows(site_root, package_root)
     return item
 
 

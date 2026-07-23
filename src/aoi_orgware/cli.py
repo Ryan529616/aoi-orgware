@@ -201,6 +201,8 @@ from .commands.release import (
     cmd_release_manifest_observe,
     cmd_release_promote,
     cmd_release_show,
+    cmd_release_tag_push_preflight,
+    cmd_release_tag_push_verify,
     register_release_commands,
 )
 from .commands.status import (
@@ -725,6 +727,8 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "integrity-show",
     "release-manifest-observe",
     "release-show",
+    "release-tag-push-preflight",
+    "release-tag-push-verify",
     "reconcile",
     "resume",
     "semantic-head",
@@ -8029,6 +8033,8 @@ def build_parser(
             "release_manifest_observe": cmd_release_manifest_observe,
             "release_promote": cmd_release_promote,
             "release_show": cmd_release_show,
+            "release_tag_push_preflight": cmd_release_tag_push_preflight,
+            "release_tag_push_verify": cmd_release_tag_push_verify,
         },
         add_json_argument=add_json_argument,
     )
@@ -8487,6 +8493,8 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "release-abandon-pending",
     "release-promote",
     "release-show",
+    "release-tag-push-preflight",
+    "release-tag-push-verify",
     "resume",
     "semantic-head",
     "semantic-migrate",

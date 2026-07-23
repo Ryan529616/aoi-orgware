@@ -27,7 +27,10 @@ from .config import (
 )
 from . import external_exports
 from . import publication_subjects
-from .git_plumbing import _run_git_bytes_bounded
+from .git_plumbing import (
+    _git_transport_config_audit_bytes,
+    _run_git_bytes_bounded,
+)
 from .harnesslib import HarnessError
 
 
@@ -204,29 +207,68 @@ def _git_lines(root: Path, arguments: Iterable[str], label: str) -> list[str]:
     )
 
 
-def _git_config(root: Path) -> list[tuple[str, str]]:
-    raw = _run_git_bytes_bounded(
-        root,
-        ("config", "--null", "--list"),
-        label="confidentiality Git config inspection",
-    )
+def _parse_git_config(raw: bytes, label: str) -> list[tuple[str, str]]:
     try:
         records = raw.decode("utf-8", errors="strict").split("\x00")
     except UnicodeDecodeError as exc:
-        raise ConfidentialityError("Git config is not strict UTF-8") from exc
+        raise ConfidentialityError(f"{label} is not strict UTF-8") from exc
     result: list[tuple[str, str]] = []
     for record in records:
         if not record:
             continue
         if "\n" not in record:
-            raise ConfidentialityError("Git config output is malformed")
+            raise ConfidentialityError(f"{label} output is malformed")
         key, value = record.split("\n", 1)
         if not key or "\x00" in value:
-            raise ConfidentialityError("Git config entry is malformed")
+            raise ConfidentialityError(f"{label} entry is malformed")
         result.append((key.casefold(), value))
         if len(result) > MAX_CONFIG_ENTRIES:
-            raise ConfidentialityError("Git config exceeds its entry bound")
+            raise ConfidentialityError(f"{label} exceeds its entry bound")
     return result
+
+
+def _git_config(root: Path) -> list[tuple[str, str]]:
+    return _parse_git_config(
+        _run_git_bytes_bounded(
+            root,
+            ("config", "--null", "--list"),
+            label="confidentiality Git config inspection",
+        ),
+        "Git config",
+    )
+
+
+def _git_transport_config(root: Path) -> list[tuple[str, str]]:
+    try:
+        raw = _git_transport_config_audit_bytes(
+            root,
+            label="confidentiality Git transport config inspection",
+        )
+    except HarnessError as exc:
+        raise ConfidentialityError(str(exc)) from exc
+    return _parse_git_config(raw, "Git transport config")
+
+
+def git_url_rewrite_keys(root: Path) -> tuple[str, ...]:
+    """Return bounded, credential-free Git URL rewrite config keys.
+
+    Values are deliberately never returned: Git URL rewrites can contain
+    credentials, while callers need only the existence and exact config-key
+    identity to fail closed for protected push content.  Keys are case-folded
+    by the exact normalized config authority used for isolated Git transport,
+    then sorted deterministically for receipts and tests. Repeated real Git
+    config entries remain visible as repeated keys; the two synthetic
+    unguessable endpoint pins used only for that audit are excluded.
+    """
+
+    return tuple(
+        sorted(
+            key
+            for key, _value in _git_transport_config(root)
+            if key.startswith("url.")
+            and key.endswith((".pushinsteadof", ".insteadof"))
+        )
+    )
 
 
 def _win32_drive_type(volume_root: str) -> int:
@@ -1034,6 +1076,7 @@ def _git_confidentiality_bytes(
     *,
     label: str,
     stdout_limit: int | None = None,
+    transport_identity: str | None = None,
 ) -> bytes:
     try:
         return _run_git_bytes_bounded(
@@ -1041,6 +1084,7 @@ def _git_confidentiality_bytes(
             arguments,
             label=label,
             stdout_limit=stdout_limit,
+            transport_identity=transport_identity,
         )
     except HarnessError as exc:
         raise ConfidentialityError(str(exc)) from exc
@@ -1054,8 +1098,15 @@ def _git_preflight_lines(
     )
 
 
-def effective_git_push_destination(root: Path, remote: str) -> str:
-    """Resolve one remote's exact effective push destination."""
+def effective_git_push_transport(root: Path, remote: str) -> tuple[str, str]:
+    """Resolve one credential-free transport URL and its canonical identity.
+
+    Git permits a remote to have distinct fetch and push URLs.  Publication
+    checks and remote-state observations must therefore use the exact push
+    transport returned by ``git remote get-url --push`` rather than the remote
+    name, which ``git ls-remote`` would otherwise resolve through the fetch
+    URL.
+    """
 
     root = root.resolve(strict=True)
     if (
@@ -1072,7 +1123,15 @@ def effective_git_push_destination(root: Path, remote: str) -> str:
         raise ConfidentialityError(
             "Git push remote must resolve to one exact push destination"
         )
-    return canonical_publication_destination(effective_urls[0], root)
+    transport = effective_urls[0]
+    return transport, canonical_publication_destination(transport, root)
+
+
+def effective_git_push_destination(root: Path, remote: str) -> str:
+    """Resolve one remote's exact canonical effective push destination."""
+
+    _transport, destination = effective_git_push_transport(root, remote)
+    return destination
 
 
 def _require_git_oid(value: object, label: str) -> str:
@@ -1142,17 +1201,18 @@ def _parse_git_push_updates(
 def _pre_push_remote_ref_oid(
     root: Path,
     *,
-    remote: str,
+    transport_destination: str,
     remote_ref: str,
     oid_length: int,
 ) -> str:
-    """Observe one exact remote ref before push without accepting caller scope."""
+    """Observe one exact push-endpoint ref before push."""
 
     raw = _git_confidentiality_bytes(
         root,
-        ("ls-remote", "--refs", remote, remote_ref),
+        ("ls-remote", "--refs", "--", transport_destination, remote_ref),
         label="Git push remote pre-state inspection",
         stdout_limit=4 * 1024,
+        transport_identity=transport_destination,
     )
     lines = _decode_lines(raw, "Git push remote pre-state inspection")
     if not lines:
@@ -1414,6 +1474,8 @@ def preflight_git_push(
     destination: str,
     updates: Iterable[Iterable[str]],
     _verify_remote_state: bool = True,
+    forbid_url_rewrites: bool = False,
+    required_push_transport: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate the exact outgoing commit set before an AOI-managed push.
 
@@ -1422,10 +1484,28 @@ def preflight_git_push(
     """
 
     root = root.resolve(strict=True)
+    if type(forbid_url_rewrites) is not bool:
+        raise ConfidentialityError(
+            "Git push preflight rewrite policy flag is invalid"
+        )
     if not isinstance(config_sha256, str) or _SHA256_RE.fullmatch(config_sha256) is None:
         raise ConfidentialityError("Git push preflight config SHA-256 is invalid")
     canonical_destination = canonical_publication_destination(destination, root)
-    if effective_git_push_destination(root, remote) != canonical_destination:
+    push_transport, effective_destination = effective_git_push_transport(
+        root, remote
+    )
+    if required_push_transport is not None and (
+        not isinstance(required_push_transport, str)
+        or not required_push_transport
+        or required_push_transport != required_push_transport.strip()
+        or len(required_push_transport) > 2_048
+        or any(ord(character) < 32 for character in required_push_transport)
+        or push_transport != required_push_transport
+    ):
+        raise ConfidentialityError(
+            "Git push effective transport differs from its required identity"
+        )
+    if effective_destination != canonical_destination:
         raise ConfidentialityError(
             "Git push supplied destination differs from the effective remote destination"
         )
@@ -1511,12 +1591,11 @@ def preflight_git_push(
                 "Git push combined commit set exceeds the configured bound"
             )
 
-    rewrites = [
-        key
-        for key, _value in _git_config(root)
-        if key.startswith("url.")
-        and key.endswith((".pushinsteadof", ".insteadof"))
-    ]
+    rewrites = git_url_rewrite_keys(root)
+    if forbid_url_rewrites and rewrites:
+        raise ConfidentialityError(
+            "Git push exact transport is unavailable while URL rewrites exist"
+        )
     tree_cache: dict[str, list[dict[str, str]]] = {}
     aggregate_tree_entries = 0
 
@@ -1638,9 +1717,29 @@ def preflight_git_push(
 
     if _verify_remote_state:
         for row in parsed_updates:
+            if forbid_url_rewrites and git_url_rewrite_keys(root):
+                raise ConfidentialityError(
+                    "Git push exact transport is unavailable while URL rewrites exist"
+                )
+            if forbid_url_rewrites:
+                boundary_transport, boundary_destination = (
+                    effective_git_push_transport(root, remote)
+                )
+                if (
+                    boundary_transport != push_transport
+                    or boundary_destination != effective_destination
+                    or (
+                        required_push_transport is not None
+                        and boundary_transport != required_push_transport
+                    )
+                    or git_url_rewrite_keys(root)
+                ):
+                    raise ConfidentialityError(
+                        "Git push exact transport changed at the network boundary"
+                    )
             observed_remote_sha = _pre_push_remote_ref_oid(
                 root,
-                remote=remote,
+                transport_destination=push_transport,
                 remote_ref=row["remote_ref"],
                 oid_length=len(row["remote_sha"]),
             )
@@ -1649,6 +1748,10 @@ def preflight_git_push(
                     f"Git push supplied remote object for {row['remote_ref']} "
                     "differs from the exact pre-push remote state"
                 )
+        if forbid_url_rewrites and git_url_rewrite_keys(root):
+            raise ConfidentialityError(
+                "Git push exact transport is unavailable while URL rewrites exist"
+            )
     for remote_ref, local_sha, local_commit, row_outgoing in required_outgoing:
         if local_commit not in row_outgoing:
             raise ConfidentialityError(
@@ -1678,7 +1781,7 @@ def preflight_git_push(
         "protected_policy_sha256": policy_sha256,
         "protected_rule_count": len(policy.protected),
         "protected_exposures": exposures,
-        "rewrite_keys": sorted(rewrites),
+        "rewrite_keys": list(rewrites),
         "decision": "allowed",
     }
     receipt["receipt_sha256"] = hashlib.sha256(
@@ -1754,6 +1857,202 @@ def canonical_git_push_preflight_receipt_bytes(
     return raw
 
 
+def validate_git_push_preflight_receipt_structure(
+    receipt: Mapping[str, Any],
+) -> str:
+    """Validate receipt-internal structure and canonical self-digest only.
+
+    This pure validator intentionally does not inspect a Git worktree, resolve
+    a destination, or recompute protected content/policy.  Callers that need
+    those stronger guarantees must additionally use the durable binding or
+    current-policy validators below.
+    """
+
+    expected_keys = {
+        "schema_version",
+        "action",
+        "mode",
+        "config_sha256",
+        "boundary",
+        "remote",
+        "destination",
+        "updates",
+        "outgoing_commits",
+        "protected_policy_sha256",
+        "protected_rule_count",
+        "protected_exposures",
+        "rewrite_keys",
+        "decision",
+        "receipt_sha256",
+    }
+    if not isinstance(receipt, Mapping) or set(receipt) != expected_keys:
+        raise ConfidentialityError("Git push preflight receipt schema is invalid")
+    mode = receipt.get("mode")
+    config_sha256 = receipt.get("config_sha256")
+    remote = receipt.get("remote")
+    destination = receipt.get("destination")
+    try:
+        destination_bytes = (
+            destination.encode("utf-8", errors="strict")
+            if isinstance(destination, str)
+            else None
+        )
+    except UnicodeEncodeError:
+        destination_bytes = None
+    if (
+        type(receipt.get("schema_version")) is not int
+        or receipt.get("schema_version") != 1
+        or receipt.get("action") != "git_push_preflight"
+        or receipt.get("boundary") != "aoi_cooperative_preflight_not_system_dlp"
+        or receipt.get("decision") != "allowed"
+        or not isinstance(mode, str)
+        or mode not in {"standard", "local_files"}
+        or not isinstance(config_sha256, str)
+        or _SHA256_RE.fullmatch(config_sha256) is None
+        or not isinstance(remote, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", remote) is None
+        or not isinstance(destination, str)
+        or not destination
+        or destination_bytes is None
+        or len(destination_bytes) > 16 * 1024
+        or any(ord(character) < 32 for character in destination)
+    ):
+        raise ConfidentialityError("Git push preflight receipt identity is invalid")
+
+    updates_value = receipt.get("updates")
+    if not isinstance(updates_value, list):
+        raise ConfidentialityError("Git push preflight receipt updates are invalid")
+    updates: list[tuple[str, str, str, str]] = []
+    for row in updates_value:
+        if not isinstance(row, Mapping) or set(row) != {
+            "local_ref",
+            "local_sha",
+            "remote_ref",
+            "remote_sha",
+        }:
+            raise ConfidentialityError("Git push preflight receipt update is invalid")
+        values = (
+            row["local_ref"],
+            row["local_sha"],
+            row["remote_ref"],
+            row["remote_sha"],
+        )
+        if not all(isinstance(item, str) for item in values):
+            raise ConfidentialityError("Git push preflight receipt update is invalid")
+        updates.append((str(values[0]), str(values[1]), str(values[2]), str(values[3])))
+    if _parse_git_push_updates(updates) != updates_value:
+        raise ConfidentialityError("Git push preflight receipt updates are noncanonical")
+
+    outgoing = receipt.get("outgoing_commits")
+    if (
+        not isinstance(outgoing, list)
+        or len(outgoing) > MAX_GIT_PUSH_COMMITS
+        or any(
+            not isinstance(item, str)
+            or _require_git_oid(item, "Git push preflight outgoing commit")
+            != item
+            for item in outgoing
+        )
+        or sorted(set(outgoing)) != outgoing
+    ):
+        raise ConfidentialityError("Git push preflight receipt outgoing commits are invalid")
+
+    protected_policy_sha256 = receipt.get("protected_policy_sha256")
+    rule_count = receipt.get("protected_rule_count")
+    exposures = receipt.get("protected_exposures")
+    if (
+        not isinstance(protected_policy_sha256, str)
+        or _SHA256_RE.fullmatch(protected_policy_sha256) is None
+        or type(rule_count) is not int
+        or rule_count < 0
+        or rule_count > MAX_PROTECTED_PATH_RULES
+        or not isinstance(exposures, list)
+        or len(exposures) > MAX_GIT_EXPOSURES
+        or (mode == "standard" and rule_count != 0)
+        or (rule_count == 0 and exposures)
+    ):
+        raise ConfidentialityError("Git push preflight receipt protected evidence is invalid")
+    exposure_keys = {
+        "commit",
+        "path",
+        "git_oid",
+        "content_sha256",
+        "size_bytes",
+        "rule_path",
+        "rule_kind",
+        "rule_policy",
+    }
+    for exposure in exposures:
+        if not isinstance(exposure, Mapping) or set(exposure) != exposure_keys:
+            raise ConfidentialityError("Git push preflight receipt protected exposure is invalid")
+        commit = exposure["commit"]
+        git_oid = exposure["git_oid"]
+        content_sha256 = exposure["content_sha256"]
+        size_bytes = exposure["size_bytes"]
+        rule_kind = exposure["rule_kind"]
+        rule_policy = exposure["rule_policy"]
+        if (
+            not isinstance(commit, str)
+            or _require_git_oid(commit, "Git push preflight protected commit") != commit
+            or not isinstance(git_oid, str)
+            or _require_git_oid(git_oid, "Git push preflight protected object") != git_oid
+            or not isinstance(content_sha256, str)
+            or _SHA256_RE.fullmatch(content_sha256) is None
+            or type(size_bytes) is not int
+            or size_bytes < 0
+            or size_bytes > MAX_PROTECTED_BLOB_BYTES
+            or not isinstance(rule_kind, str)
+            or rule_kind not in {"file", "tree"}
+            or not isinstance(rule_policy, str)
+            or rule_policy not in {"local_only", "home_remote_only"}
+        ):
+            raise ConfidentialityError("Git push preflight receipt protected exposure is invalid")
+        try:
+            _canonical_subject_path(
+                exposure["path"], "Git push preflight protected path"
+            )
+            _canonical_subject_path(
+                exposure["rule_path"], "Git push preflight rule path"
+            )
+        except UnicodeEncodeError as exc:
+            raise ConfidentialityError(
+                "Git push preflight receipt protected exposure is invalid"
+            ) from exc
+
+    rewrite_keys = receipt.get("rewrite_keys")
+    if (
+        not isinstance(rewrite_keys, list)
+        or len(rewrite_keys) > MAX_CONFIG_ENTRIES
+        or any(
+            not isinstance(key, str)
+            or key != key.casefold()
+            or re.fullmatch(r"url\..+\.(?:insteadof|pushinsteadof)", key) is None
+            for key in rewrite_keys
+        )
+        or sorted(rewrite_keys) != rewrite_keys
+    ):
+        raise ConfidentialityError("Git push preflight receipt rewrite evidence is invalid")
+
+    claimed = receipt.get("receipt_sha256")
+    if not isinstance(claimed, str) or _SHA256_RE.fullmatch(claimed) is None:
+        raise ConfidentialityError("Git push preflight receipt digest is invalid")
+    base = dict(receipt)
+    del base["receipt_sha256"]
+    expected = hashlib.sha256(
+        json.dumps(
+            base,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+    if claimed != expected:
+        raise ConfidentialityError("Git push preflight receipt digest is invalid")
+    canonical_git_push_preflight_receipt_bytes(receipt)
+    return claimed
+
+
 def load_git_push_preflight_receipt(path: Path) -> dict[str, Any]:
     """Read one bounded single-link JSON receipt without accepting duplicate keys."""
 
@@ -1806,70 +2105,17 @@ def validate_git_push_preflight_receipt_binding(
 ) -> str:
     """Validate durable receipt bytes against a persisted policy binding."""
 
+    claimed = validate_git_push_preflight_receipt_structure(receipt)
     validated_binding = validate_confidentiality_policy_binding(binding)
-
-    expected_keys = {
-        "schema_version",
-        "action",
-        "mode",
-        "config_sha256",
-        "boundary",
-        "remote",
-        "destination",
-        "updates",
-        "outgoing_commits",
-        "protected_policy_sha256",
-        "protected_rule_count",
-        "protected_exposures",
-        "rewrite_keys",
-        "decision",
-        "receipt_sha256",
-    }
-    if set(receipt) != expected_keys:
-        raise ConfidentialityError("Git push preflight receipt schema is invalid")
     if (
-        type(receipt.get("schema_version")) is not int
-        or receipt.get("schema_version") != 1
-        or receipt.get("action") != "git_push_preflight"
-        or receipt.get("boundary") != "aoi_cooperative_preflight_not_system_dlp"
-        or receipt.get("decision") != "allowed"
-        or receipt.get("mode") != validated_binding["mode"]
+        receipt.get("mode") != validated_binding["mode"]
         or receipt.get("config_sha256") != validated_binding["config_sha256"]
         or receipt.get("remote") != remote
         or receipt.get("destination")
         != canonical_publication_destination(destination, root.resolve(strict=True))
     ):
         raise ConfidentialityError("Git push preflight receipt identity is invalid")
-    updates_value = receipt.get("updates")
-    if not isinstance(updates_value, list):
-        raise ConfidentialityError("Git push preflight receipt updates are invalid")
-    updates: list[tuple[str, str, str, str]] = []
-    for row in updates_value:
-        if not isinstance(row, Mapping) or set(row) != {
-            "local_ref",
-            "local_sha",
-            "remote_ref",
-            "remote_sha",
-        }:
-            raise ConfidentialityError("Git push preflight receipt update is invalid")
-        values = (
-            row["local_ref"],
-            row["local_sha"],
-            row["remote_ref"],
-            row["remote_sha"],
-        )
-        if not all(isinstance(item, str) for item in values):
-            raise ConfidentialityError("Git push preflight receipt update is invalid")
-        typed_values = (
-            str(values[0]),
-            str(values[1]),
-            str(values[2]),
-            str(values[3]),
-        )
-        updates.append(typed_values)
-    parsed_updates = _parse_git_push_updates(updates)
-    if parsed_updates != updates_value:
-        raise ConfidentialityError("Git push preflight receipt updates are noncanonical")
+    parsed_updates = receipt["updates"]
     delivered_remote_ref = _require_git_ref(
         remote_ref, "Git push preflight delivered remote ref"
     )
@@ -1900,29 +2146,13 @@ def validate_git_push_preflight_receipt_binding(
         raise ConfidentialityError(
             "Git push preflight receipt local object does not bind the delivered commit"
         )
-    outgoing = receipt.get("outgoing_commits")
-    if (
-        not isinstance(outgoing, list)
-        or len(outgoing) > MAX_GIT_PUSH_COMMITS
-        or any(not isinstance(item, str) for item in outgoing)
-        or sorted(set(outgoing)) != outgoing
-    ):
-        raise ConfidentialityError(
-            "Git push preflight receipt outgoing commits are invalid"
-        )
-    for item in outgoing:
-        _require_git_oid(item, "Git push preflight outgoing commit")
+    outgoing = receipt["outgoing_commits"]
     if delivered_commit not in outgoing:
         raise ConfidentialityError(
             "Git push preflight receipt does not prove the delivered commit was outgoing"
         )
-    if not isinstance(receipt.get("protected_exposures"), list) or not isinstance(
-        receipt.get("rewrite_keys"), list
-    ):
-        raise ConfidentialityError("Git push preflight receipt evidence is invalid")
     if (
-        type(receipt.get("protected_rule_count")) is not int
-        or receipt.get("protected_rule_count")
+        receipt.get("protected_rule_count")
         != validated_binding["protected_rule_count"]
         or receipt.get("protected_policy_sha256")
         != validated_binding["protected_policy_sha256"]
@@ -1930,23 +2160,6 @@ def validate_git_push_preflight_receipt_binding(
         raise ConfidentialityError(
             "Git push preflight receipt protected policy binding is invalid"
         )
-    claimed = receipt.get("receipt_sha256")
-    if not isinstance(claimed, str) or _SHA256_RE.fullmatch(claimed) is None:
-        raise ConfidentialityError("Git push preflight receipt digest is invalid")
-    base = dict(receipt)
-    del base["receipt_sha256"]
-    expected = hashlib.sha256(
-        json.dumps(
-            base,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("ascii")
-    ).hexdigest()
-    if claimed != expected:
-        raise ConfidentialityError("Git push preflight receipt digest is invalid")
-    canonical_git_push_preflight_receipt_bytes(receipt)
     return claimed
 
 
@@ -2607,6 +2820,8 @@ __all__ = [
     "canonical_publication_destination",
     "confidentiality_policy_binding",
     "effective_git_push_destination",
+    "effective_git_push_transport",
+    "git_url_rewrite_keys",
     "inspect_confidentiality",
     "is_publish_credential_environment_name",
     "load_git_push_preflight_receipt",
@@ -2618,5 +2833,6 @@ __all__ = [
     "validate_git_push_preflight_receipt",
     "validate_git_push_preflight_receipt_binding",
     "validate_git_push_preflight_receipt_contract",
+    "validate_git_push_preflight_receipt_structure",
     "validate_confidentiality_policy_binding",
 ]

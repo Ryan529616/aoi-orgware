@@ -480,8 +480,26 @@ policy = "local_only"
         self.assertEqual(store.semantic_head(self.paths, TASK), before)
 
         self.assertIn("release-manifest-observe", cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS)
+        self.assertIn(
+            "release-tag-push-preflight",
+            cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS,
+        )
+        self.assertIn(
+            "release-tag-push-verify",
+            cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS,
+        )
         self.assertIn("release-show", cli_impl.CHIEF_PROJECT_READ_ONLY_COMMANDS)
         self.assertFalse(cli_impl.command_requires_chief("release-manifest-observe", initialized=True))
+        self.assertFalse(
+            cli_impl.command_requires_chief(
+                "release-tag-push-preflight", initialized=True
+            )
+        )
+        self.assertFalse(
+            cli_impl.command_requires_chief(
+                "release-tag-push-verify", initialized=True
+            )
+        )
         self.assertFalse(cli_impl.command_requires_chief("release-show", initialized=True))
         self.assertTrue(cli_impl.command_requires_chief("release-promote", initialized=True))
         self.assertTrue(
@@ -492,6 +510,8 @@ policy = "local_only"
         self.assertTrue(
             {
                 "release-manifest-observe",
+                "release-tag-push-preflight",
+                "release-tag-push-verify",
                 "release-promote",
                 "release-abandon-pending",
                 "release-show",

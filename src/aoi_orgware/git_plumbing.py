@@ -11,15 +11,18 @@ never imports :mod:`aoi_orgware.cli`.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .harnesslib import (
     HarnessError,
@@ -81,15 +84,15 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
-def _run_git_bytes_bounded(
-    worktree: Path,
-    arguments: Iterable[str],
+def _run_git_command_bytes_bounded(
+    command: list[str],
     *,
+    environment: Mapping[str, str],
     label: str,
     timeout: float = 10,
     stdout_limit: int | None = None,
 ) -> bytes:
-    """Run Git while enforcing output limits as bytes arrive, not afterwards.
+    """Run one Git command while enforcing output bounds as bytes arrive.
 
     ``communicate``/``capture_output`` retain the complete child output before a
     caller can apply a limit.  Two small reader threads instead drain both pipes
@@ -97,14 +100,13 @@ def _run_git_bytes_bounded(
     as either stream crosses its cap.  This also avoids a stderr-pipe deadlock.
     """
 
-    command = ["git", "-C", str(worktree), *arguments]
     try:
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=dict(environment),
         )
     except OSError as exc:
         raise HarnessError(f"{label} command failed: {exc}") from exc
@@ -160,6 +162,250 @@ def _run_git_bytes_bounded(
         detail = bytes(outputs["stderr"] or outputs["stdout"]).decode("utf-8", "replace").strip()
         raise HarnessError(f"{label} command failed: {detail or 'unknown error'}")
     return bytes(outputs["stdout"])
+
+
+def _system_git_config_path(worktree: Path) -> Path | None:
+    """Resolve Git's current system config without opening an editor."""
+
+    environment = _git_environment()
+    environment["GIT_EDITOR"] = "echo"
+    raw = _run_git_command_bytes_bounded(
+        ["git", "-C", str(worktree), "config", "--system", "--edit"],
+        environment=environment,
+        label="Git system config discovery",
+        timeout=5,
+        stdout_limit=4 * 1024,
+    )
+    try:
+        text = raw.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError as exc:
+        raise HarnessError("Git system config path is not UTF-8") from exc
+    if (
+        not text
+        or "\n" in text
+        or "\r" in text
+        or "\x00" in text
+        or any(ord(character) < 32 for character in text)
+    ):
+        raise HarnessError("Git system config path is invalid")
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        raise HarnessError("Git system config path is not absolute")
+    return candidate if candidate.is_file() else None
+
+
+def _require_transport_identity(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 2_048
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise HarnessError("invalid Git transport identity")
+    return value
+
+
+@contextmanager
+def _isolated_git_transport_invocation(
+    worktree: Path, transport_identity: str
+) -> Iterator[tuple[dict[str, str], str]]:
+    """Yield an unguessable alias pinned before all mutable Git config scopes.
+
+    Git resolves equal-length ``insteadOf`` matches by config traversal order,
+    so a command-scope identity rewrite does not reliably beat an exact local
+    rewrite.  This temporary system-scope config is read first.  Its random
+    full alias maps once to the exact raw transport; later global, local, or
+    command-scope rules can neither match the raw value on that invocation nor
+    outrank the full alias match.  The ordinary system config is included only
+    after the pin so credential and TLS settings remain available.
+    """
+
+    identity = _require_transport_identity(transport_identity)
+    alias = f"aoi-transport://{secrets.token_hex(32)}"
+    system_config = _system_git_config_path(worktree)
+    with tempfile.TemporaryDirectory(prefix="aoi-git-transport-") as temporary:
+        isolated_config = Path(temporary) / "system.gitconfig"
+        writer_environment = _git_environment()
+        for key, value in (
+            (f"url.{identity}.insteadOf", alias),
+            (f"url.{identity}.pushInsteadOf", alias),
+        ):
+            _run_git_command_bytes_bounded(
+                [
+                    "git",
+                    "config",
+                    "--file",
+                    str(isolated_config),
+                    "--add",
+                    key,
+                    value,
+                ],
+                environment=writer_environment,
+                label="isolated Git transport config",
+                timeout=5,
+                stdout_limit=0,
+            )
+        if system_config is not None:
+            _run_git_command_bytes_bounded(
+                [
+                    "git",
+                    "config",
+                    "--file",
+                    str(isolated_config),
+                    "--add",
+                    "include.path",
+                    str(system_config),
+                ],
+                environment=writer_environment,
+                label="isolated Git transport system include",
+                timeout=5,
+                stdout_limit=0,
+            )
+        try:
+            isolated_config.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot protect isolated Git transport config: {exc}"
+            ) from exc
+
+        environment = _git_environment()
+        for name in tuple(environment):
+            normalized_name = name.upper()
+            if (
+                normalized_name in {
+                    "GIT_CONFIG_COUNT",
+                    "GIT_CONFIG_NOSYSTEM",
+                    "GIT_CONFIG_PARAMETERS",
+                    "GIT_CONFIG_SYSTEM",
+                }
+                or re.fullmatch(
+                    r"GIT_CONFIG_(?:KEY|VALUE)_[0-9]+", normalized_name
+                )
+            ):
+                environment.pop(name, None)
+        environment["GIT_CONFIG_SYSTEM"] = str(isolated_config)
+        yield environment, alias
+
+
+def _git_transport_config_audit_bytes(
+    worktree: Path,
+    *,
+    label: str,
+    stdout_limit: int | None = None,
+) -> bytes:
+    """List the exact normalized Git config authority used for transport.
+
+    The isolated transport subprocess deliberately removes ambient command and
+    system config selectors, prepends two unguessable endpoint-pin rewrites,
+    and then includes the discovered ordinary system config.  A release guard
+    must inspect that same authority, not an ambient ``git config`` view that
+    can be narrowed with (for example) ``GIT_CONFIG_NOSYSTEM=1``.
+
+    This helper enters the same isolated invocation, lists its complete config,
+    and removes exactly the two synthetic pin records.  Any later identical
+    real record remains visible.  The returned payload preserves Git's
+    ``key\\nvalue\\0`` wire format and its configured byte bound.
+    """
+
+    output_limit = MAX_GIT_COMMAND_BYTES if stdout_limit is None else stdout_limit
+    if output_limit < 0:
+        raise HarnessError(f"{label} output limit may not be negative")
+    audit_identity = f"aoi-audit://{secrets.token_hex(32)}"
+    with _isolated_git_transport_invocation(
+        worktree, audit_identity
+    ) as (environment, alias):
+        expected = (
+            (
+                f"url.{audit_identity}.insteadof".encode("ascii"),
+                alias.encode("ascii"),
+            ),
+            (
+                f"url.{audit_identity}.pushinsteadof".encode("ascii"),
+                alias.encode("ascii"),
+            ),
+        )
+        synthetic_bytes = sum(
+            len(key) + 1 + len(value) + 1 for key, value in expected
+        )
+        raw = _run_git_command_bytes_bounded(
+            ["git", "-C", str(worktree), "config", "--null", "--list"],
+            environment=environment,
+            label=label,
+            stdout_limit=output_limit + synthetic_bytes,
+        )
+
+    records = raw.split(b"\x00")
+    if not records or records[-1] != b"":
+        raise HarnessError(f"{label} output is malformed")
+    remaining_expected = list(expected)
+    retained: list[bytes] = []
+    for record in records[:-1]:
+        if b"\n" not in record:
+            raise HarnessError(f"{label} output is malformed")
+        key, value = record.split(b"\n", 1)
+        match = next(
+            (
+                index
+                for index, (expected_key, expected_value) in enumerate(
+                    remaining_expected
+                )
+                if key.lower() == expected_key and value == expected_value
+            ),
+            None,
+        )
+        if match is not None:
+            remaining_expected.pop(match)
+            continue
+        retained.append(record)
+    if remaining_expected:
+        raise HarnessError(f"{label} synthetic transport pins are missing")
+    result = b"\x00".join(retained)
+    if retained:
+        result += b"\x00"
+    if len(result) > output_limit:
+        raise HarnessError(f"{label} output exceeds the configured byte bound")
+    return result
+
+
+def _run_git_bytes_bounded(
+    worktree: Path,
+    arguments: Iterable[str],
+    *,
+    label: str,
+    timeout: float = 10,
+    stdout_limit: int | None = None,
+    transport_identity: str | None = None,
+) -> bytes:
+    """Run Git with bounded output and optional exact transport isolation."""
+
+    argument_list = list(arguments)
+    if transport_identity is None:
+        return _run_git_command_bytes_bounded(
+            ["git", "-C", str(worktree), *argument_list],
+            environment=_git_environment(),
+            label=label,
+            timeout=timeout,
+            stdout_limit=stdout_limit,
+        )
+    identity = _require_transport_identity(transport_identity)
+    if sum(argument == identity for argument in argument_list) != 1:
+        raise HarnessError(
+            f"{label} command must contain the exact Git transport once"
+        )
+    with _isolated_git_transport_invocation(
+        worktree, identity
+    ) as (environment, alias):
+        isolated_arguments = [
+            alias if argument == identity else argument for argument in argument_list
+        ]
+        return _run_git_command_bytes_bounded(
+            ["git", "-C", str(worktree), *isolated_arguments],
+            environment=environment,
+            label=label,
+            timeout=timeout,
+            stdout_limit=stdout_limit,
+        )
 
 
 def _unb64(value: object, label: str) -> bytes:
@@ -1406,6 +1652,186 @@ def remote_ref_tip(worktree: Path, remote: str, remote_ref: str) -> str:
     return tip
 
 
+def _validated_tag_ref(tag_ref: str) -> str:
+    if (
+        not re.fullmatch(r"refs/tags/[A-Za-z0-9._/-]+", tag_ref)
+        or ".." in tag_ref
+        or tag_ref.endswith((".", "/"))
+    ):
+        raise HarnessError(f"release tag ref is invalid: {tag_ref!r}")
+    return tag_ref
+
+
+def _direct_annotated_tag_metadata(
+    worktree: Path,
+    *,
+    tag_object: str,
+    tag_ref: str,
+    label: str,
+) -> dict[str, str]:
+    """Require one tag object to name this ref and directly target a commit."""
+
+    try:
+        object_type = _run_git_bytes_bounded(
+            worktree,
+            ("cat-file", "-t", tag_object),
+            label=f"{label} object type",
+            stdout_limit=128,
+        ).decode("ascii", "strict").strip()
+        raw_tag = _run_git_bytes_bounded(
+            worktree,
+            ("cat-file", "-p", tag_object),
+            label=f"{label} object",
+            stdout_limit=64 * 1024,
+        )
+        peeled_commit = _run_git_bytes_bounded(
+            worktree,
+            ("rev-parse", "--verify", f"{tag_object}^{{commit}}"),
+            label=f"{label} peel",
+            stdout_limit=128,
+        ).decode("ascii", "strict").strip().lower()
+    except UnicodeDecodeError as exc:
+        raise HarnessError(f"{label} metadata is not ASCII") from exc
+    header, separator, _message = raw_tag.partition(b"\n\n")
+    header_lines = header.split(b"\n")
+    expected_tag_name = tag_ref.removeprefix("refs/tags/").encode("ascii")
+    try:
+        direct_object = header_lines[0].removeprefix(b"object ").decode(
+            "ascii", "strict"
+        ).lower()
+    except (IndexError, UnicodeDecodeError) as exc:
+        raise HarnessError(f"{label} object header is invalid") from exc
+    if (
+        object_type != "tag"
+        or not separator
+        or len(header_lines) < 3
+        or not header_lines[0].startswith(b"object ")
+        or header_lines[1] != b"type commit"
+        or header_lines[2] != b"tag " + expected_tag_name
+        or FULL_COMMIT_RE.fullmatch(direct_object) is None
+        or FULL_COMMIT_RE.fullmatch(peeled_commit) is None
+        or len(tag_object) != len(direct_object)
+        or direct_object != peeled_commit
+        or tag_object == peeled_commit
+    ):
+        raise HarnessError(
+            f"{label} must be one direct annotated tag object for {tag_ref}"
+        )
+    return {
+        "tag_ref": tag_ref,
+        "tag_object_oid": tag_object,
+        "peeled_commit_oid": peeled_commit,
+    }
+
+
+def local_annotated_tag_snapshot(worktree: Path, tag_ref: str) -> dict[str, str]:
+    """Resolve one local ref and require an annotated tag peeling to one commit."""
+
+    tag_ref = _validated_tag_ref(tag_ref)
+    try:
+        tag_object = _run_git_bytes_bounded(
+            worktree,
+            ("rev-parse", "--verify", tag_ref),
+            label="local annotated release tag readback",
+            stdout_limit=128,
+        ).decode("ascii", "strict").strip().lower()
+    except UnicodeDecodeError as exc:
+        raise HarnessError("local release tag object id is not ASCII") from exc
+    if FULL_COMMIT_RE.fullmatch(tag_object) is None:
+        raise HarnessError("local release tag object id is invalid")
+    return _direct_annotated_tag_metadata(
+        worktree,
+        tag_object=tag_object,
+        tag_ref=tag_ref,
+        label="local release tag",
+    )
+
+
+def remote_annotated_tag_snapshot(
+    worktree: Path,
+    transport_destination: str,
+    tag_ref: str,
+    *,
+    before_network: Callable[[], None] | None = None,
+) -> dict[str, str]:
+    """Read back an annotated tag from one exact push transport endpoint."""
+
+    if (
+        not isinstance(transport_destination, str)
+        or not transport_destination
+        or transport_destination != transport_destination.strip()
+        or len(transport_destination) > 2_048
+        or any(ord(character) < 32 for character in transport_destination)
+    ):
+        raise HarnessError("invalid Git transport destination")
+    tag_ref = _validated_tag_ref(tag_ref)
+    peeled_ref = f"{tag_ref}^{{}}"
+    if before_network is not None:
+        if not callable(before_network):
+            raise HarnessError("remote annotated tag network guard is invalid")
+        before_network()
+    raw = _run_git_bytes_bounded(
+        worktree,
+        (
+            "ls-remote",
+            "--exit-code",
+            "--",
+            transport_destination,
+            tag_ref,
+            peeled_ref,
+        ),
+        label="remote annotated release tag readback",
+        timeout=30,
+        stdout_limit=8 * 1024,
+        transport_identity=transport_destination,
+    )
+    try:
+        lines = raw.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise HarnessError("remote annotated release tag readback is not ASCII") from exc
+    observed: dict[str, str] = {}
+    for line in lines:
+        try:
+            oid, observed_ref = line.split("\t", 1)
+        except ValueError as exc:
+            raise HarnessError(
+                "remote annotated release tag readback is malformed"
+            ) from exc
+        oid = oid.lower()
+        if (
+            observed_ref not in {tag_ref, peeled_ref}
+            or observed_ref in observed
+            or FULL_COMMIT_RE.fullmatch(oid) is None
+        ):
+            raise HarnessError(
+                "remote annotated release tag readback is ambiguous or invalid"
+            )
+        observed[observed_ref] = oid
+    if set(observed) != {tag_ref, peeled_ref}:
+        raise HarnessError(
+            "remote release tag is absent, lightweight, or lacks one peeled commit"
+        )
+    tag_object = observed[tag_ref]
+    peeled_commit = observed[peeled_ref]
+    if len(tag_object) != len(peeled_commit) or tag_object == peeled_commit:
+        raise HarnessError("remote release tag is not one annotated tag object")
+    local = _direct_annotated_tag_metadata(
+        worktree,
+        tag_object=tag_object,
+        tag_ref=tag_ref,
+        label="remote release tag",
+    )
+    if local["peeled_commit_oid"] != peeled_commit:
+        raise HarnessError(
+            "remote release tag object does not match the local annotated tag"
+        )
+    return {
+        "tag_ref": tag_ref,
+        "tag_object_oid": tag_object,
+        "peeled_commit_oid": peeled_commit,
+    }
+
+
 __all__ = [
     "COMMIT_RE",
     "FULL_COMMIT_RE",
@@ -1432,7 +1858,9 @@ __all__ = [
     "git_status_claim_coverage",
     "git_status_snapshot",
     "legacy_ambiguities",
+    "local_annotated_tag_snapshot",
     "mutation_claim_coverage",
+    "remote_annotated_tag_snapshot",
     "remote_ref_tip",
     "resolve_task_commit",
     "state_worktree",

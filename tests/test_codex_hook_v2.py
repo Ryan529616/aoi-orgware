@@ -87,6 +87,11 @@ def _strict_local_v2_runtime(project: Path):
         scripts = _scripts(prefix)
         for path in (dist, package, scripts):
             path.mkdir(parents=True, exist_ok=True)
+        (prefix / "pyvenv.cfg").write_text(
+            "home = /isolated-python\n"
+            "include-system-site-packages = false\n",
+            encoding="utf-8",
+        )
         (dist / "METADATA").write_text(
             "Name: aoi-orgware\nVersion: 1.2.3\n", encoding="utf-8"
         )
@@ -226,6 +231,20 @@ def _strict_local_v2_runtime(project: Path):
                 side_effect=lambda name: modules[name],
             ),
             mock.patch.object(provenance.sys, "prefix", str(prefix)),
+            mock.patch.object(provenance.sys, "exec_prefix", str(prefix)),
+            mock.patch.object(
+                provenance.sys,
+                "path",
+                [
+                    *(
+                        entry
+                        for entry in sys.path
+                        if Path(entry).name.lower()
+                        not in {"site-packages", "dist-packages"}
+                    ),
+                    str(site),
+                ],
+            ),
             mock.patch.object(provenance, "_local_install_contract", local_contract),
         ):
             receipt = provenance.validate_codex_local_install_provenance(

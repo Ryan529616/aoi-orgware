@@ -9,6 +9,163 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ### v0.4.0a3 (unreleased)
 
+- **v136 sequential full qualification (native runtime passed; wrapper
+  discrepancy reconciled).** Exact frozen tree
+  `620810f9e75cdf6df70ea5e1ea1fb3f91d2483c0` passed sequential Windows with
+  `1913 passed, 22 skipped, 401 subtests passed in 2021.60s` (exit zero; log
+  SHA-256
+  `fbba27af8ccc15ad29731125165e05c475dc3600defb3b6b9f41575c0c385e0d`).
+  A newly reconstructed, committed, clean ext4 checkout with the same tree and
+  a checkout-local hash-locked `.venv` passed native WSL with
+  `1906 passed, 29 skipped in 1426.14s` (exact exit bytes `0\n`; log SHA-256
+  `95308a8eb4855d2afe07aaab1bbbfb1ce7a17cb67f25f9bdd1dac622fdb65563`).
+  An earlier WSL pytest child also passed, but its CRLF-contaminated outer
+  driver failed and remains diagnostic only. The LF-safe rerun recorded
+  `WSL_CLEAN_DRIVER_EXIT=0`; after the Codex nested-cell wrapper nevertheless
+  surfaced status `1`, a separate direct `wsl.exe` native readback returned
+  zero and revalidated the exact exit file, summary, clean checkout, `HEAD`,
+  and tree. This establishes local Windows/native-WSL runtime qualification
+  only; it does not establish independent review, integrity-v2 sealing,
+  package/install acceptance, remote CI, tag creation, publication, promotion,
+  or ARISE installation.
+- **v135 review-evidence correction (formal review accepted).** Formal v134
+  review rejected result SHA
+  `716bbc1af8c08168a595c30ccaa2504b1db843c3683a5017df0c829de4e20fe7`
+  with P0=0/P1=0/P2=2: the plan called five WSL failures four, and the
+  verification record summarized rather than reproduced the two focused
+  commands. The plan now says five; a supplemental task-CAS verification binds
+  the exact Python 3.14 interpreter, four module selectors, `-q --tb=short`,
+  the separate containing-doc invocation, and both existing immutable
+  artifacts. The old record remains intact. The containing documentation
+  contract passes 25 tests. Successor review accepted result SHA
+  `a311e27d47b7ddcf60df70e92b49415fd68c1476e0b956494225dfa793009794`
+  with P0=0/P1=0/P2=0 and permits sequential full Windows then a newly
+  reconstructed committed fresh-ext4 WSL checkout with a local isolated venv.
+  This evidence-only result update still requires its own documentation
+  contract and does not establish full-suite acceptance.
+- **v134 full-qualification fixture/contract repair (evidence pending).** The
+  first v133 full attempt is rejected evidence: WSL tree
+  `f34310fc98b42bda0ad6924f68a4ea5b9db84843` reported
+  `1899 passed, 29 skipped, 401 subtests passed, 5 failed` (log SHA-256
+  `a8b1d723389e8965f290f27eee2f158fb6289c2238eda3baeb6f2e48d734a022`);
+  the parallel Windows runner ended `-1` after partial progress without a
+  pytest failure summary (partial-log SHA-256
+  `2ebcbe1e41704abcd2713ea34bc61ac0906266542c1f5612703cb95046d14b08`).
+  v134 gives the fresh WSL tree a real `HEAD` and checkout-local isolated venv,
+  completes the strict local-provenance test fixture, scopes two onboarding
+  doctor tests to a mocked already-validated runtime prerequisite, and aligns
+  the stale unit-timeout assertion with the intended 90-minute workflow
+  (coverage remains 120). Production behavior is unchanged. The four
+  source-level regressions pass on Windows; the expanded affected-module
+  matrix passes `96 passed, 1 skipped, 57 subtests passed` (artifact SHA-256
+  `d7b686ef301280ed0971e99970c9ab51774bf9a2403857d2a563a2e2a910db7e`).
+  This remains focused dirty-byte evidence. Formal review later rejected only
+  its evidence narration/reproducibility record; complete sequential
+  Windows/WSL evidence was still pending at that checkpoint and is recorded
+  separately by v136.
+- **v133 normalized transport-config authority successor (formal review
+  accepted for dirty bytes).**
+  Formal v132 review rejected result SHA
+  `cacfc7726af7680888f26bec4ef8deb76d30456cf3c416e5d37fae824ad18a2f`
+  with P0=0/P1=0/P2=1: the endpoint pin prevented redirection, but ambient
+  `GIT_CONFIG_NOSYSTEM=1` could hide a system rewrite from the guard while the
+  isolated network subprocess scrubbed that selector and included the
+  discovered system config. v133 makes the guard enumerate that exact
+  normalized transport-config authority, excluding exactly its two synthetic
+  endpoint pins while preserving any identical real entries. Negative tests
+  cover the hidden-system-rewrite case and first-only synthetic filtering.
+  Fresh dirty-byte matrices pass `112 passed, 2 subtests passed` (targeted
+  artifact
+  `d5cbcb2de77484ff99195fbc45fbea928939af394be631a4cec7fad58868c113`)
+  and `224 passed, 8 skipped, 2 subtests passed` (expanded focused artifact
+  `6f0c2b28efbd2ab938e2e21ee895aca676a6f1403266aa634d0a682d9c091eab`).
+  Native and emulated-win32 mypy pass seven source files; compileall and
+  diff-check pass. The containing documentation contract passed. Independent
+  formal review accepted result SHA
+  `f148f8733dd6a2ec95d03619e38b8d2af3bab1c8cbdb174fe9e3824d61b05655`
+  with P0=0/P1=0/P2=0 and permits full Windows/fresh-ext4 WSL qualification.
+  This evidence-only verdict update still requires its own documentation
+  contract and later exact-candidate review; no candidate, seal, tag,
+  publication, promotion, or installation claim follows from this entry.
+- **v132 release-tag rewrite-race successor (formal review rejected).** The v131
+  formal review rejected result SHA
+  `14e2f9db8ce9506068bad456ce901bcec86d34a1403043de49e4ccfb81835e89`
+  with P0=0/P1=1/P2=0: a Git
+  URL rewrite could appear after the last audit and before `ls-remote`, then
+  redirect that first network subprocess. The v132 design requires the final
+  rewrite guard immediately adjacent to each Git network subprocess, followed
+  by an unguessable full alias mapped once to the exact raw transport from the
+  earliest temporary system config scope. This supersedes the rejected
+  command-scope prototype, which could lose an equal-length Git rewrite tie. A
+  rewrite observed before the boundary still fails before network access. A
+  post-guard equal-length rewrite cannot redirect the pinned subprocess away
+  from the exact endpoint, but the subsequent recheck rejects the receipt
+  rather than claiming an atomic Git-config lock. Fresh dirty-byte evidence is
+  `109 passed, 2 subtests passed` (targeted artifact
+  `931ef80a342310e298f7f3fe2d3f3b48e94a943ae7d5e62b05ffe304149bcfbe`)
+  and `220 passed, 8 skipped, 2 subtests passed` (expanded focused artifact
+  `31c1230cb449fb248114d910ab56791917805655b1ae865fe6c6d28dd5637ae2`).
+  Strict native/Win32 mypy, compileall, and diff checks also pass. Formal review
+  result SHA
+  `cacfc7726af7680888f26bec4ef8deb76d30456cf3c416e5d37fae824ad18a2f`
+  rejected those bytes with P0=0/P1=0/P2=1 because guard and subprocess config
+  authority differed. These remain superseded diagnostic evidence; no v132
+  candidate, seal, tag, remote CI, publication, promotion, or installation
+  claim follows from this entry.
+- **v131 release-tag fail-closed successor (implementation candidate;
+  formal review rejected).** The exact release-tag route now requires a network-free
+  rejection whenever any Git `insteadOf` or `pushInsteadOf` rewrite is present;
+  this is unconditional for the release route and is not relaxed by an empty
+  protected-subject set. Exact-CI and recorded-preflight artifacts must be
+  canonical task-CAS snapshots, with legacy live references rejected before
+  remote observation. Public release-tag receipt validation also strictly
+  validates the embedded confidentiality-preflight schema and its canonical
+  self-digest, not only the enclosing receipt or a copied digest field. The
+  v130 focused `205 passed, 8 skipped, 2 subtests` result is superseded
+  diagnostic evidence only. Fresh v131 targeted and expanded focused matrices
+  passed `105 passed, 2 subtests` and
+  `215 passed, 8 skipped, 2 subtests`, respectively; the evidence-only
+  documentation update is covered by its separate contract rerun. These are
+  superseded diagnostic results, not v131 acceptance: formal review result SHA
+  `14e2f9db8ce9506068bad456ce901bcec86d34a1403043de49e4ccfb81835e89`
+  rejected the bytes with P0=0/P1=1/P2=0. No candidate, seal,
+  tag, remote CI, publication, promotion, or installation claim transfers to
+  v131.
+- **Rejected remote candidate and exact release-CI gate.** Exact commit
+  `054d1b6cf877fda8d24372318508614be28efe98` is not the release candidate.
+  GitHub docs run `29987095149` passed at that SHA, but test run `29987095165`
+  failed two Ubuntu Python 3.11 install-provenance cases because the standard
+  venv contained Setuptools' executable `distutils-precedence.pth`; the
+  remaining matrix was cancelled at the former 45-minute timeout. No PASS,
+  seal, tag, publication, or install authority transfers from that commit. The
+  successor keeps all executable `.pth` files inadmissible, requires a
+  dedicated venv with system site packages disabled, removes Setuptools before
+  AOI installation, and tests both initial and post-receipt `.pth` drift. Unit
+  and coverage timeouts are now 90 and 120 minutes without removing coverage.
+  A stdlib-only exact-CI verifier binds successful completed canonical
+  `test.yml` and main-only `docs.yml` push runs to the exact peeled `main`
+  commit, repository, workflow paths, and event. The first GitHub Release
+  writer depends on that read-only gate, and PyPI remains transitively blocked.
+  Local fresh-ext4 WSL remains separate WSL evidence; tag-push tests are
+  supplementary and cannot replace exact-main-push test/docs observations.
+  Before tag creation, the authenticated exact-CI receipt must also be stored
+  through a current passing task-CAS `delivery_check`. New read-only
+  `release-tag-push-preflight` and `release-tag-push-verify` commands bind that
+  record to the approved plan/current HEAD, one unused annotated tag object,
+  peeled commit, destination-aware confidentiality decision, and exact remote
+  object readback at the effective push URL rather than a possibly distinct
+  fetch URL. The preflight receipt binds both the canonical destination
+  identity and the credential-free raw transport. Mutation-adjacent recheck
+  mode reopens the named current passing task-CAS verification and artifact,
+  repeats the live checks, and emits only byte-identical preflight bytes.
+  Promotion then pushes the receipt-bound tag object OID directly to that raw
+  transport with a create-only lease.
+  Local and workflow checks require that object to directly name the expected
+  commit and embed the same tag name as its ref; GitHub readback rechecks both
+  fields before release and PyPI mutations. The delivery receipt binds the
+  precise preflight task-CAS verification record and artifact. The composite
+  preflight and delivery receipt are recorded separately; neither is a GitHub
+  Release, PyPI, seal, or task-completion claim.
 - **O1 — semantic commit v2.** Event-authoritative task state, replayable
   projections, exact retry, and recovery are covered by focused semantic tests.
 - **O2 — legacy migration.** Byte-preserving legacy snapshots, quiescence
@@ -196,8 +353,11 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   diagnostic canary are not release, package-install, or downstream ARISE
   evidence. The selected release target is exact final-SHA GitHub CI, immutable
   tag/Release readback, and exact wheel/sdist PyPI Trusted Publishing with
-  remote hash/install readback. The same sealed task owns those gates and the
-  released ARISE install; no confidentiality-profile migration is required.
+  remote hash/install readback. The same sealed task owns those gates; after
+  public observation, the current Chief must create the exact
+  `release-promote` bundle consumed by ARISE `codex-init`. Workflow success or
+  PyPI visibility alone cannot authorize that install, and no
+  confidentiality-profile migration is required.
 - **Selective local-files confidentiality (implementation candidate; promotion
   pending).** `mode = "local_files"` means model context allowed and
   user-designated file/tree publication constrained by destination. An omitted
@@ -253,8 +413,10 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   while an item remains started, except that `runtime_unknown` preserves it as
   incomplete evidence. This is not DLP, an air gap, or a claim that model
   providers cannot see prompt/context. With the AOI repo's empty protected-rule
-  set, the active promotion route includes exact final-SHA GitHub and PyPI gates
-  after local Windows/WSL, review, seal, package/install, and canary evidence.
+  set, the active promotion route includes local Windows and fresh-ext4 WSL
+  evidence first, then review, seal, package/install, canaries, exact-main-push
+  GitHub Linux/Windows test plus docs, immutable GitHub/PyPI readback, and the
+  Chief-created promotion bundle.
 - **Deterministic cross-process timestamp fixtures.** Synthetic verification
   supersession now makes each replacement timestamp strictly later than its
   source before hashing; the manual-dispatch expiry test uses a fixed valid

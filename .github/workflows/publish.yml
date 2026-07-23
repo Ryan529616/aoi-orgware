@@ -65,6 +65,11 @@ jobs:
           exact_tag_object="$(git rev-parse "$exact_tag_ref")"
           test "$(git cat-file -t "$exact_tag_object")" = tag
           exact_commit="$(git rev-parse "$exact_tag_object^{commit}")"
+          mapfile -t tag_header < <(git cat-file -p "$exact_tag_object" | sed -n '1,3p')
+          test "${#tag_header[@]}" -eq 3
+          test "${tag_header[0]}" = "object $exact_commit"
+          test "${tag_header[1]}" = "type commit"
+          test "${tag_header[2]}" = "tag $RELEASE_TAG"
           test "$exact_commit" = "$(git rev-parse HEAD)"
           test "$GITHUB_SHA" = "$exact_commit"
           version="$(python -c "import runpy; print(runpy.run_path('src/aoi_orgware/_version.py')['__version__'])")"
@@ -141,7 +146,10 @@ jobs:
             tests/test_release_pypi_readback.py \
             tests/test_release_rehearsal.py \
             tests/test_release_runtime.py \
-            tests/test_release_workflow_contract.py
+            tests/test_release_tag_cli.py \
+            tests/test_release_tag_receipt.py \
+            tests/test_release_workflow_contract.py \
+            tests/test_verify_release_ci.py
           .release-tools/bin/python -I scripts/verify_dist.py --dist-dir release/dist --expected-version "$version" --build-python "$GITHUB_WORKSPACE/.release-tools/bin/python" --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
       - name: Record Linux producer evidence
         shell: bash
@@ -157,6 +165,11 @@ jobs:
           source_epoch="$(git show -s --format=%ct HEAD)"
           test "$(git cat-file -t "$EXACT_TAG_OBJECT")" = tag
           test "$(git rev-parse "$EXACT_TAG_OBJECT^{commit}")" = "$EXACT_COMMIT"
+          mapfile -t tag_header < <(git cat-file -p "$EXACT_TAG_OBJECT" | sed -n '1,3p')
+          test "${#tag_header[@]}" -eq 3
+          test "${tag_header[0]}" = "object $EXACT_COMMIT"
+          test "${tag_header[1]}" = "type commit"
+          test "${tag_header[2]}" = "tag $RELEASE_TAG"
           .release-tools/bin/python -I - <<'PY' > release/evidence/source-tag-binding.json
           import hashlib, json, os, subprocess
 
@@ -512,6 +525,16 @@ jobs:
               raise SystemExit("annotated tag source binding does not match the exact checkout")
           if git("cat-file", "-t", source_binding["tag_object_oid"]) != "tag" or git("rev-parse", f"{source_binding['tag_object_oid']}^{{commit}}") != source_binding["commit_oid"]:
               raise SystemExit("annotated tag object does not peel to the exact source commit")
+          tag_header = subprocess.check_output(
+              ["git", "cat-file", "-p", source_binding["tag_object_oid"]]
+          ).split(b"\n", 3)[:3]
+          expected_header = [
+              f"object {source_binding['commit_oid']}".encode("ascii"),
+              b"type commit",
+              f"tag {tag}".encode("ascii"),
+          ]
+          if tag_header != expected_header:
+              raise SystemExit("annotated tag object does not directly name the exact tag and commit")
           matrix = {}
           for platform, receipt in (("linux", "evidence/linux-dist-verify.json"), ("windows", "evidence/windows-dist-verify.json")):
               contract = f"evidence/{platform}-dist-verify-contract.json"
@@ -884,10 +907,69 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  verify-exact-ci:
+    name: Verify exact main-push CI before release mutation
+    if: ${{ inputs.intent == 'publish' }}
+    needs: producer-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the producer's exact peeled commit for CI verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.producer-linux.outputs.exact-commit }}
+          persist-credentials: false
+      - name: Set up fixed Python for exact-CI verification
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Require successful exact-commit test and docs push runs
+        shell: bash
+        env:
+          EXACT_COMMIT: ${{ needs.producer-linux.outputs.exact-commit }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_API_VERSION: "2026-03-10"
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_API_URL" = "https://api.github.com"
+          test "$GITHUB_REPOSITORY" = "Ryan529616/aoi-orgware"
+          [[ "$EXACT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          fetch_workflow_runs() {
+            local workflow="$1"
+            local output="$2"
+            curl --fail-with-body --silent --show-error --get \
+              --proto '=https' --tlsv1.2 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GITHUB_TOKEN" \
+              --header "X-GitHub-Api-Version: $GH_API_VERSION" \
+              --data-urlencode "head_sha=$EXACT_COMMIT" \
+              --data-urlencode "branch=main" \
+              --data-urlencode "event=push" \
+              --data-urlencode "status=success" \
+              --data-urlencode "per_page=100" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs" \
+              --output "$output"
+          }
+          fetch_workflow_runs test.yml "$RUNNER_TEMP/test-runs.json"
+          fetch_workflow_runs docs.yml "$RUNNER_TEMP/docs-runs.json"
+          python -I scripts/verify_release_ci.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXACT_COMMIT" \
+            --branch main \
+            --workflow ".github/workflows/test.yml=$RUNNER_TEMP/test-runs.json" \
+            --workflow ".github/workflows/docs.yml=$RUNNER_TEMP/docs-runs.json" \
+            > "$RUNNER_TEMP/exact-ci-receipt.json"
+          test -s "$RUNNER_TEMP/exact-ci-receipt.json"
+          cat "$RUNNER_TEMP/exact-ci-receipt.json"
+
   publish-github-release:
     name: Publish the exact GitHub prerelease assets
     if: ${{ inputs.intent == 'publish' }}
-    needs: [verify-pypi-stage, producer-linux]
+    needs: [verify-pypi-stage, producer-linux, verify-exact-ci]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -1011,6 +1093,7 @@ jobs:
             test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$ref_json")" = tag
             test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$ref_json")" = "$EXACT_TAG_OBJECT"
             gh_api_json "repos/$GITHUB_REPOSITORY/git/tags/$EXACT_TAG_OBJECT" > "$tag_json"
+            test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag"])' "$tag_json")" = "$RELEASE_TAG"
             test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$tag_json")" = commit
             test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$tag_json")" = "$EXACT_COMMIT"
           }
@@ -1287,6 +1370,7 @@ jobs:
           gh api "${gh_api_args[@]}" "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
           test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$ref_json")" = tag
           test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$ref_json")" = "$EXACT_TAG_OBJECT"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag"])' "$tag_json")" = "$RELEASE_TAG"
           test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["type"])' "$tag_json")" = commit
           test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["object"]["sha"])' "$tag_json")" = "$EXACT_COMMIT"
           mkdir -p "$readback"
@@ -1456,7 +1540,7 @@ jobs:
           release = json.load(open(os.environ["RELEASE_JSON"], encoding="utf-8"))
           if ref.get("object", {}).get("type") != "tag" or ref.get("object", {}).get("sha") != os.environ["EXACT_TAG_OBJECT"]:
               raise SystemExit("GitHub tag object changed before PyPI publication")
-          if tag.get("object", {}).get("type") != "commit" or tag.get("object", {}).get("sha") != os.environ["EXACT_COMMIT"]:
+          if tag.get("tag") != os.environ["RELEASE_TAG"] or tag.get("object", {}).get("type") != "commit" or tag.get("object", {}).get("sha") != os.environ["EXACT_COMMIT"]:
               raise SystemExit("GitHub tag peeled commit changed before PyPI publication")
           if release.get("tag_name") != os.environ["RELEASE_TAG"] or release.get("name") != f"AOI {os.environ['RELEASE_TAG']} (alpha)" or release.get("body") != os.environ["RELEASE_NOTES"] or release.get("draft") is not False or release.get("prerelease") is not True:
               raise SystemExit("GitHub Release state changed before PyPI publication")

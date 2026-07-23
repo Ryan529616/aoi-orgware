@@ -84,12 +84,12 @@ question is unmeasured — see
 
 From the repository you want to govern, paste this into Codex or Claude Code:
 
-> Inspect https://github.com/Ryan529616/aoi-orgware, the reviewed local install
-> bundle at `<absolute-local-install-bundle-path>` with SHA-256
-> `<approved-local-install-bundle-sha256>`, and my current repository without
-> modifying my project. Use only `aoi-orgware==0.4.0a3` and the wheel whose
-> SHA-256 is bound by that bundle; do not infer unreleased bytes from GitHub or
-> PyPI. Then show
+> Inspect https://github.com/Ryan529616/aoi-orgware, one complete reviewed
+> install proof at `<absolute-proof-path>` with canonical SHA-256
+> `<approved-proof-sha256>`, and my current repository without modifying my
+> project. Use only the exact `aoi-orgware` version and wheel SHA-256 named by
+> that proof; do not infer release or promotion status from source, a tag, or
+> PyPI visibility alone. Then show
 > me the proposed AOI revision, project files, user-scope files,
 > hooks, and trust boundary. Wait for my approval. Install that exact reviewed
 > version in an isolated tool environment, use AOI's bootstrap flow when a
@@ -106,8 +106,9 @@ project hooks is a supply-chain and trust decision.
 
 ### Direct install
 
-> **This README documents the v0.4 alpha line.** Install exactly
-> `aoi-orgware==0.4.0a3` from an exact reviewed local-install bundle. A
+> **This README documents the v0.4 alpha line, whose current version target is
+> `0.4.0a3`.** Install it only when an exact reviewed proof names that version
+> and wheel SHA-256. A
 > `reviewed_local_install_bundle` has
 > `proof_scope=exact_local_wheel_install_only`: it is not a release record or
 > promotion, and it makes no tag, GitHub Release, or PyPI claim. Do not use an
@@ -117,6 +118,9 @@ project hooks is a supply-chain and trust decision.
 $aoiToolRoot = Join-Path $env:LOCALAPPDATA 'AOI\venvs\0.4.0a3'
 python -m venv $aoiToolRoot
 $aoiPython = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\python.exe')).Path
+# AOI provenance rejects every executable .pth. Python 3.11 venvs may seed
+# Setuptools' distutils-precedence.pth; AOI has no runtime dependency on it.
+& $aoiPython -m pip uninstall --yes setuptools
 $aoiWheel = (Resolve-Path 'C:\reviewed-local-install\aoi_orgware-0.4.0a3-py3-none-any.whl').Path
 $expectedWheelSha256 = '<reviewed-wheel-sha256>'
 if ((Get-FileHash -Algorithm SHA256 $aoiWheel).Hash.ToLowerInvariant() -ne $expectedWheelSha256) { throw 'wheel SHA-256 mismatch' }
@@ -135,7 +139,14 @@ $aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
 above, or the public `--promotion-bundle-file` plus
 `--expected-promotion-bundle-sha256` pair. Half a pair, both pairs, or neither
 fails before mutation. On POSIX, invoke `<venv>/bin/aoi codex-init ...`, never
-the module entry point. The package version must report `0.4.0a3`. See the
+the module entry point. Use a dedicated venv without `--system-site-packages`
+or unrelated development tools. Reinstalling Setuptools or another executable
+`.pth` makes onboarding and every governed hook fail closed until the tool
+environment is cleaned and requalified. A public pair is valid only when the
+current Chief created it through `release-promote` after exact GitHub Release
+and PyPI readback; workflow success alone is insufficient. The installed
+package version must equal the version named by the selected proof (for this
+line, `0.4.0a3`). See the
 [v0.4 quickstart](docs/quickstart.md) for both routes and the complete
 isolated-install, mini-task, status, and offboarding sequence.
 

@@ -18,6 +18,7 @@ from aoi_orgware import confidentiality
 from aoi_orgware.confidentiality import (
     ConfidentialityError,
     confidentiality_policy_binding,
+    git_url_rewrite_keys,
     inspect_confidentiality,
     load_git_push_preflight_receipt,
     preflight_git_push,
@@ -26,6 +27,7 @@ from aoi_orgware.confidentiality import (
     require_publication_action_allowed,
     validate_git_push_preflight_receipt,
     validate_git_push_preflight_receipt_binding,
+    validate_git_push_preflight_receipt_structure,
 )
 from aoi_orgware.config import (
     ConfidentialityConfig,
@@ -118,6 +120,20 @@ def _commit(root: Path, message: str) -> str:
     _git(root, "add", "-A")
     _git(root, "commit", "-m", message)
     return _git(root, "rev-parse", "HEAD")
+
+
+def _redigest_git_push_preflight_receipt(receipt: dict[str, object]) -> None:
+    payload = dict(receipt)
+    del payload["receipt_sha256"]
+    receipt["receipt_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
 
 
 def _report(
@@ -735,6 +751,170 @@ def test_git_preflight_empty_rules_allow_aoi_publication(tmp_path: Path) -> None
     assert receipt["protected_rule_count"] == 0
     assert receipt["protected_exposures"] == []
     assert receipt["outgoing_commits"] == [head]
+
+
+def test_git_url_rewrite_keys_are_bounded_sorted_and_credential_free(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path / "project")
+    _git(
+        root,
+        "config",
+        "url.ssh://git@mirror.example.invalid/team/.insteadOf",
+        "https://example.invalid/team/",
+    )
+    _git(
+        root,
+        "config",
+        "--add",
+        "url.https://push.example.invalid/team/.pushInsteadOf",
+        "ssh://git@example.invalid/team/",
+    )
+    _git(
+        root,
+        "config",
+        "--add",
+        "url.https://push.example.invalid/team/.pushInsteadOf",
+        "https://example.invalid/team/",
+    )
+
+    assert git_url_rewrite_keys(root) == (
+        "url.https://push.example.invalid/team/.pushinsteadof",
+        "url.https://push.example.invalid/team/.pushinsteadof",
+        "url.ssh://git@mirror.example.invalid/team/.insteadof",
+    )
+
+
+def test_git_url_rewrite_guard_uses_transport_config_authority_when_ambient_hides_system(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path / "project")
+    system_config = tmp_path / "hidden-system.gitconfig"
+    rewrite_key = "url.https://alternate.example.invalid/.insteadOf"
+    _git(
+        root,
+        "config",
+        "--file",
+        system_config.as_posix(),
+        "--add",
+        rewrite_key,
+        "https://source.example.invalid/",
+    )
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    ambient = subprocess.run(
+        ["git", "-C", str(root), "config", "--null", "--list"],
+        env=os.environ.copy(),
+        check=True,
+        capture_output=True,
+    )
+    assert rewrite_key.encode("ascii") not in ambient.stdout
+    assert git_url_rewrite_keys(root) == (rewrite_key.casefold(),)
+
+
+def test_git_push_preflight_rejects_rewrite_injected_at_remote_network_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path / "project")
+    destination = _bare_repo(tmp_path / "destination.git")
+    (root / "aoi.py").write_text("print('release')\n", encoding="utf-8")
+    head = _commit(root, "release")
+    _git(root, "remote", "add", "origin", destination.as_posix())
+    assert git_url_rewrite_keys(root) == ()
+
+    original_git = confidentiality._git_confidentiality_bytes
+    network_calls: list[tuple[str, ...]] = []
+    transport_calls = 0
+
+    original_transport = confidentiality.effective_git_push_transport
+
+    def inject_rewrite_at_network_boundary(
+        project: Path, remote: str
+    ) -> tuple[str, str]:
+        nonlocal transport_calls
+        result = original_transport(project, remote)
+        transport_calls += 1
+        if transport_calls == 2:
+            # The second lookup is the re-resolution adjacent to the remote
+            # ref inspection, after the ordinary preflight audit passed.
+            _git(
+                root,
+                "config",
+                "url.https://rewrite.invalid/.insteadOf",
+                "https://source.invalid/",
+            )
+        return result
+
+    def observe_network(
+        project: Path, arguments: object, **kwargs: object
+    ) -> bytes:
+        command = tuple(arguments)  # type: ignore[arg-type]
+        if command[:2] == ("ls-remote", "--refs"):
+            network_calls.append(command)
+        return original_git(project, command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        confidentiality,
+        "effective_git_push_transport",
+        inject_rewrite_at_network_boundary,
+    )
+    monkeypatch.setattr(confidentiality, "_git_confidentiality_bytes", observe_network)
+    with pytest.raises(ConfidentialityError, match="network boundary|rewrites exist"):
+        preflight_git_push(
+            root=root,
+            policy=LOCAL_FILES,
+            config_sha256="a" * 64,
+            remote="origin",
+            destination=destination.as_posix(),
+            updates=[
+                ("refs/heads/main", head, "refs/heads/main", "0" * len(head))
+            ],
+            forbid_url_rewrites=True,
+        )
+    assert transport_calls >= 2
+    assert network_calls == []
+
+
+def test_git_push_preflight_receipt_structure_is_pure_and_strict(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path / "project")
+    home = _bare_repo(tmp_path / "aoi.git")
+    (root / "aoi.py").write_text("print('release')\n", encoding="utf-8")
+    head = _commit(root, "release")
+    _git(root, "remote", "add", "origin", home.as_posix())
+    receipt = preflight_git_push(
+        root=root,
+        policy=LOCAL_FILES,
+        config_sha256="a" * 64,
+        remote="origin",
+        destination=home.as_posix(),
+        updates=[("refs/heads/main", head, "refs/heads/main", "0" * len(head))],
+    )
+
+    assert validate_git_push_preflight_receipt_structure(receipt) == receipt[
+        "receipt_sha256"
+    ]
+
+    tampered = json.loads(json.dumps(receipt))
+    tampered["mode"] = "offline"
+    _redigest_git_push_preflight_receipt(tampered)
+    with pytest.raises(ConfidentialityError, match="identity is invalid"):
+        validate_git_push_preflight_receipt_structure(tampered)
+
+    wrong_schema = json.loads(json.dumps(receipt))
+    wrong_schema["unexpected"] = True
+    _redigest_git_push_preflight_receipt(wrong_schema)
+    with pytest.raises(ConfidentialityError, match="schema is invalid"):
+        validate_git_push_preflight_receipt_structure(wrong_schema)
+
+    wrong_digest = json.loads(json.dumps(receipt))
+    wrong_digest["receipt_sha256"] = "0" * 64
+    with pytest.raises(ConfidentialityError, match="digest is invalid"):
+        validate_git_push_preflight_receipt_structure(wrong_digest)
 
 
 def test_git_preflight_peels_lightweight_and_annotated_tag_objects(

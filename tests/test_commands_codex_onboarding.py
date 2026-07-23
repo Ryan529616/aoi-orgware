@@ -1650,7 +1650,12 @@ class CodexInitCliTests(HarnessTestCase):
         self.assertIn("Govern work with AOI", skill_text)
         self.assertEqual(result["skill"]["scope"], "user")
         self.assertFalse((self.root / ".agents" / "skills" / "aoi").exists())
-        doctor = json.loads(self.cli("doctor", "--json").stdout)
+        with mock.patch.object(
+            cli_impl.codex_install_provenance_impl,
+            "verify_runtime_hook_provenance",
+            return_value=self.provenance_receipt,
+        ):
+            doctor = json.loads(self.cli_in_process("doctor", "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
 
     def test_codex_init_is_idempotent(self) -> None:
@@ -1924,7 +1929,12 @@ class CodexInitCliTests(HarnessTestCase):
             0, {"hooks": [{"type": "command", "command": "other-stop"}]}
         )
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        doctor = json.loads(self.cli("doctor", "--json").stdout)
+        with mock.patch.object(
+            cli_impl.codex_install_provenance_impl,
+            "verify_runtime_hook_provenance",
+            return_value=self.provenance_receipt,
+        ):
+            doctor = json.loads(self.cli_in_process("doctor", "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
 
     def test_doctor_rejects_platform_command_pair_drift(self) -> None:

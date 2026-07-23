@@ -35,6 +35,39 @@ def _scripts(prefix: Path) -> Path:
     return prefix / ("Scripts" if os.name == "nt" else "bin")
 
 
+def _create_pth_clean_pip_venv(prefix: Path) -> Path:
+    """Create the dedicated AOI tool venv used by provenance-qualified installs."""
+
+    venv.EnvBuilder(with_pip=True).create(prefix)
+    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        [str(python), "-m", "pip", "uninstall", "--yes", "setuptools"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    probe = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            (
+                "import json, pathlib, sysconfig; "
+                "root=pathlib.Path(sysconfig.get_paths()['purelib']); "
+                "bad=[p.name for p in root.glob('*.pth') "
+                "if any(line.strip().startswith(('import ', 'import\\t')) "
+                "for line in p.read_text(encoding='utf-8').splitlines())]; "
+                "print(json.dumps(sorted(bad)))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(probe.stdout) == []
+    return python
+
+
 def _launcher(prefix: Path, name: str) -> Path:
     suffix = ".exe" if os.name == "nt" else ""
     return _scripts(prefix) / f"{name}{suffix}"
@@ -63,6 +96,10 @@ def _environment(
 ) -> tuple[Path, Path, dict[str, object]]:
     prefix = tmp_path / "venv"; site = _site_packages(prefix); dist = site / "aoi_orgware-1.2.3.dist-info"; package = site / "aoi_orgware"; scripts = _scripts(prefix)
     for path in (dist, package, scripts): path.mkdir(parents=True, exist_ok=True)
+    (prefix / "pyvenv.cfg").write_text(
+        "home = /isolated-python\ninclude-system-site-packages = false\n",
+        encoding="utf-8",
+    )
     (dist / "METADATA").write_text("Name: aoi-orgware\nVersion: 1.2.3\n", encoding="utf-8")
     for name in (
         "__init__.py",
@@ -87,6 +124,19 @@ def _environment(
     monkeypatch.setattr(provenance.metadata, "distribution", lambda _: fake_dist)
     monkeypatch.setattr(provenance.importlib, "import_module", lambda name: modules[name])
     monkeypatch.setattr(provenance.sys, "prefix", str(prefix))
+    monkeypatch.setattr(provenance.sys, "exec_prefix", str(prefix))
+    monkeypatch.setattr(
+        provenance.sys,
+        "path",
+        [
+            *(
+                entry
+                for entry in sys.path
+                if Path(entry).name.lower() not in {"site-packages", "dist-packages"}
+            ),
+            str(site),
+        ],
+    )
     bundle = {"bundle_sha256": "a" * 64, "manifest": {"distribution_name": "aoi-orgware", "package_version": "1.2.3", "artifacts": [{"name": "aoi-orgware-1.2.3-py3-none-any.whl", "sha256": "b" * 64}], "interfaces": {"installed_metadata_sha256": hashlib.sha256((dist / "METADATA").read_bytes()).hexdigest(), "console_entry_point": {"name": "aoi", "target": "aoi_orgware.cli:main"}, "codex_hook_entry_point": {"name": "aoi-codex-hook", "target": "aoi_orgware.codex_hook:main"}, "hook_protocol_version": 6}}}
     monkeypatch.setattr(provenance.release_runtime, "validate_promotion_bundle", lambda value, expected: bundle)
     bundle_file = tmp_path / "bundle.json"; bundle_file.write_text("{}", encoding="utf-8")
@@ -228,6 +278,108 @@ def test_failures_do_not_mutate_project(tmp_path: Path, monkeypatch: pytest.Monk
     with pytest.raises(provenance.CodexInstallProvenanceError, match=expected): provenance.validate_codex_install_provenance(bundle_file, "a" * 64, invoked)
     after = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
     assert after == before
+
+
+def test_real_setuptools_distutils_precedence_pth_is_not_allowlisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    (_site_packages(prefix) / "distutils-precedence.pth").write_text(
+        (
+            "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
+            "enabled = os.environ.get(var, 'local') == 'local'; "
+            "enabled and __import__('_distutils_hack').add_shim();\n"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        provenance.CodexInstallProvenanceError,
+        match="executable .pth shadow is not admissible",
+    ):
+        provenance.validate_codex_install_provenance(
+            bundle_file, "a" * 64, _launcher(prefix, "aoi")
+        )
+
+
+def test_runtime_hook_rejects_executable_pth_added_after_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    receipt = provenance.validate_codex_install_provenance(
+        bundle_file, "a" * 64, _launcher(prefix, "aoi")
+    )
+    project = tmp_path / "project"
+    target = project / provenance.CODEX_INSTALL_PROVENANCE_RECEIPT
+    target.parent.mkdir(parents=True)
+    target.write_bytes(canonical_json_bytes(receipt))
+    (_site_packages(prefix) / "late-shadow.pth").write_text(
+        "import os\n", encoding="utf-8"
+    )
+    with pytest.raises(
+        provenance.CodexInstallProvenanceError,
+        match="executable .pth shadow is not admissible",
+    ):
+        provenance.verify_runtime_hook_provenance(
+            project,
+            receipt["provenance_receipt_sha256"],
+            _launcher(prefix, "aoi-codex-hook"),
+        )
+
+
+def test_runtime_hook_rejects_executable_pth_for_mappingless_v1_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    receipt = provenance.validate_codex_install_provenance(
+        bundle_file, "a" * 64, _launcher(prefix, "aoi")
+    )
+    legacy = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {
+            "promotion_wheel_artifact",
+            "installed_distribution_identity",
+            "installed_mapping_strength",
+            "installed_mapping_evidence",
+            "provenance_receipt_sha256",
+        }
+    }
+    legacy["provenance_receipt_sha256"] = canonical_sha256(legacy)
+    assert provenance.validate_codex_install_provenance_receipt(legacy) == legacy
+    project = tmp_path / "project"
+    target = project / provenance.CODEX_INSTALL_PROVENANCE_RECEIPT
+    target.parent.mkdir(parents=True)
+    target.write_bytes(canonical_json_bytes(legacy))
+    (_site_packages(prefix) / "legacy-shadow.pth").write_text(
+        "import os\n", encoding="utf-8"
+    )
+    with pytest.raises(
+        provenance.CodexInstallProvenanceError,
+        match="executable .pth shadow is not admissible",
+    ):
+        provenance.verify_runtime_hook_provenance(
+            project,
+            legacy["provenance_receipt_sha256"],
+            _launcher(prefix, "aoi-codex-hook"),
+        )
+
+
+def test_rejects_active_external_site_package_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    external = tmp_path / "external" / "site-packages"
+    external.mkdir(parents=True)
+    monkeypatch.setattr(
+        provenance.sys, "path", [_site_packages(prefix).as_posix(), external.as_posix()]
+    )
+    with pytest.raises(
+        provenance.CodexInstallProvenanceError,
+        match="active external site-package root is not admissible",
+    ):
+        provenance.validate_codex_install_provenance(
+            bundle_file, "a" * 64, _launcher(prefix, "aoi")
+        )
 
 
 def test_runtime_hook_receipt_is_exact_canonical_and_rechecks_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -449,8 +601,7 @@ def test_real_built_wheel_isolated_pip_install_emits_runtime_receipt(tmp_path: P
     assert len(wheels) == 1
     wheel = wheels[0]
     prefix = tmp_path / "isolated"
-    venv.EnvBuilder(with_pip=True).create(prefix)
-    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python = _create_pth_clean_pip_venv(prefix)
     subprocess.run(
         [
             str(python),
@@ -527,6 +678,68 @@ print(json.dumps(receipt, sort_keys=True))
         assert hook_script["record_sha256"]
 
 
+def test_real_system_site_packages_venv_is_rejected(tmp_path: Path) -> None:
+    """A real venv with inherited base site-packages is never admissible."""
+
+    repository = Path(__file__).resolve().parents[1]
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--isolated",
+            "--no-deps",
+            "--wheel-dir",
+            str(wheelhouse),
+            str(repository),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheel = next(wheelhouse.glob("aoi_orgware-*.whl"))
+    prefix = tmp_path / "system-site"
+    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(prefix)
+    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--isolated",
+            "--no-index",
+            "--no-deps",
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    script = """
+import sys
+import sysconfig
+from pathlib import Path
+from aoi_orgware import codex_install_provenance as provenance
+
+provenance._require_dedicated_venv(
+    Path(sys.prefix), Path(sysconfig.get_paths()['purelib'])
+)
+"""
+    completed = subprocess.run(
+        [str(python), "-I", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert completed.returncode != 0
+    assert "must disable system site packages" in completed.stderr
+
+
 def test_real_isolated_wheel_install_emits_local_v2_receipt(tmp_path: Path) -> None:
     """Exercise the local proof loader against pip's real direct_url/RECORD."""
     repository = Path(__file__).resolve().parents[1]
@@ -560,8 +773,8 @@ def test_real_isolated_wheel_install_emits_local_v2_receipt(tmp_path: Path) -> N
     review = local_install_proof.create_review_assertion(subject=subject, reviewer="independent-reviewer", reviewed_at="2026-07-19T12:34:56.000000Z", outcome="PASS", clean=True, limitations=["cooperative assertion"])
     bundle = local_install_proof.seal_bundle(source_root=source, store_root=store, subject=subject, review_assertion=review, sealed_at="2026-07-19T12:35:56.000000Z")
     bundle_file = store / "evidence/local-install-bundle.json"; bundle_file.write_bytes(local_install_proof._canonical(bundle))
-    prefix = tmp_path / "isolated"; venv.EnvBuilder(with_pip=True).create(prefix)
-    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    prefix = tmp_path / "isolated"
+    python = _create_pth_clean_pip_venv(prefix)
     subprocess.run([str(python), "-m", "pip", "install", "--isolated", "--no-index", "--no-deps", str(wheel)], check=True, capture_output=True, text=True)
     script = """
 import json

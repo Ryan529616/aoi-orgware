@@ -23,6 +23,9 @@ TEST_WORKFLOW = (
 DOCS_WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "docs.yml"
 )
+RELEASE_RUNBOOK = Path(__file__).resolve().parents[1] / "docs" / "RELEASE.md"
+CHANGELOG = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+V04_PLAN = Path(__file__).resolve().parents[1] / "docs" / "v0.4-plan.md"
 RELEASE_TOOLS_LOCK = Path(__file__).resolve().parents[1] / "requirements" / "release-tools.lock"
 
 
@@ -36,6 +39,14 @@ def _test_workflow() -> str:
 
 def _docs_workflow() -> str:
     return DOCS_WORKFLOW.read_text(encoding="utf-8")
+
+
+def _release_runbook() -> str:
+    return RELEASE_RUNBOOK.read_text(encoding="utf-8")
+
+
+def _release_history() -> str:
+    return CHANGELOG.read_text(encoding="utf-8") + V04_PLAN.read_text(encoding="utf-8")
 
 
 def _job(text: str, name: str) -> str:
@@ -71,8 +82,13 @@ def test_release_dag_has_one_linux_producer_then_windows_rebuild_observe() -> No
     assert "release_inventory.py stage" in observe
     stage = _job(text, "verify-pypi-stage")
     assert "needs: [assemble-observe, producer-linux]" in stage
+    exact_ci = _job(text, "verify-exact-ci")
+    assert "needs: producer-linux" in exact_ci
     github_release = _job(text, "publish-github-release")
-    assert "needs: [verify-pypi-stage, producer-linux]" in github_release
+    assert (
+        "needs: [verify-pypi-stage, producer-linux, verify-exact-ci]"
+        in github_release
+    )
     release_readback = _job(text, "verify-github-release")
     assert (
         "needs: [publish-github-release, verify-pypi-stage, producer-linux]"
@@ -112,7 +128,10 @@ def test_producer_gate_uses_pinned_pytest_and_honest_sdist_derivation() -> None:
         "tests/test_release_pypi_readback.py",
         "tests/test_release_rehearsal.py",
         "tests/test_release_runtime.py",
+        "tests/test_release_tag_cli.py",
+        "tests/test_release_tag_receipt.py",
         "tests/test_release_workflow_contract.py",
+        "tests/test_verify_release_ci.py",
     ):
         assert module in producer
     assert ".release-tools/bin/python -I -m pytest -q" in producer
@@ -188,6 +207,9 @@ def test_producer_requires_an_annotated_exact_tag_and_all_checkouts_use_its_comm
     assert 'exact_tag_ref="refs/tags/$RELEASE_TAG"' in producer
     assert 'git cat-file -t "$exact_tag_object"' in producer
     assert 'test "$(git cat-file -t "$exact_tag_object")" = tag' in producer
+    assert 'test "${tag_header[0]}" = "object $exact_commit"' in producer
+    assert 'test "${tag_header[1]}" = "type commit"' in producer
+    assert 'test "${tag_header[2]}" = "tag $RELEASE_TAG"' in producer
     assert 'test "$GITHUB_SHA" = "$exact_commit"' in producer
     assert "exact-commit: ${{ steps.bind-source.outputs.exact-commit }}" in producer
     assert "exact-tag-object: ${{ steps.bind-source.outputs.exact-tag-object }}" in producer
@@ -195,6 +217,12 @@ def test_producer_requires_an_annotated_exact_tag_and_all_checkouts_use_its_comm
     assert "release/evidence/source-tag-binding.json" in producer
     assert '"kind": "annotated_tag_binding"' in producer
     assert "annotated tag object does not peel to the exact source commit" in _job(text, "assemble-observe")
+    assert (
+        "annotated tag object does not directly name the exact tag and commit"
+        in _job(text, "assemble-observe")
+    )
+    assert text.count('json.load(open(sys.argv[1]))["tag"]') >= 2
+    assert 'tag.get("tag") != os.environ["RELEASE_TAG"]' in text
     for job_name in (
         "verify-windows",
         "rebuild-linux",
@@ -205,6 +233,222 @@ def test_producer_requires_an_annotated_exact_tag_and_all_checkouts_use_its_comm
     ):
         assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in _job(text, job_name)
     assert "ref: ${{ inputs.tag }}" not in text
+
+
+def test_release_tag_runbook_fails_closed_before_exact_object_push() -> None:
+    text = _release_runbook()
+    assert (
+        'test "$(sha256sum "$tag_preflight" | awk \'{print $1}\')" = \\\n'
+        '  "$tag_preflight_sha256" || exit 1'
+    ) in text
+    assert (
+        'test "$(sha256sum "$tag_preflight_recheck" | awk \'{print $1}\')" = \\\n'
+        '  "$tag_preflight_sha256" || exit 1'
+    ) in text
+    assert (
+        'cmp --silent "$tag_preflight" "$tag_preflight_recheck" || exit 1'
+        in text
+    )
+    assert (
+        "--recorded-preflight-verification-index "
+        "<tag-preflight-verification-index>"
+    ) in text
+    assert (
+        '--recorded-preflight-artifact-sha256 "$tag_preflight_sha256"'
+        in text
+    )
+    extraction_start = text.index('tag_object_oid="$(python -I -c')
+    extraction_end = text.index("git push --porcelain")
+    extraction = text[extraction_start:extraction_end]
+    assert extraction.count('"$tag_preflight_recheck"') == 3
+    assert '"$tag_preflight")' not in extraction
+    assert '["push_transport"]' in extraction
+    assert '--force-with-lease="$tag_ref:"' in text
+    assert '  -- \\\n  "$transport_alias" \\\n' in text
+    assert '"$tag_object_oid:$tag_ref"' in text
+    assert '"$receipt_destination"' not in text
+    assert 'git push github "refs/tags/$tag:refs/tags/$tag"' not in text
+
+
+def test_v131_release_tag_runbook_preserves_route_cas_and_receipt_boundaries() -> None:
+    runbook = _release_runbook()
+    history = _release_history()
+
+    assert "Any configured Git `insteadOf` or `pushInsteadOf` rewrite" in runbook
+    assert "before network observation or push" in runbook
+    assert "legacy live artifact references" in runbook
+    assert "canonical task-CAS snapshots" in runbook
+    assert "embedded confidentiality\npreflight's exact schema and canonical self-digest" in runbook
+    assert "v130 focused `205 passed, 8 skipped, 2 subtests` result is superseded" in history
+    assert "Fresh v131 targeted and expanded focused matrices" in history
+    assert "`215 passed, 8 skipped, 2 subtests`" in history
+    assert "formal review rejected" in history
+
+
+def test_v132_release_tag_runbook_pins_transport_and_states_rewrite_race_boundary() -> None:
+    runbook = _release_runbook()
+    history = _release_history()
+    normalized_runbook = " ".join(runbook.split())
+
+    assert 'transport_alias="aoi-transport://' in runbook
+    assert 'transport_system_config="$(mktemp)"' in runbook
+    assert '"url.${push_transport}.insteadOf" "$transport_alias"' in runbook
+    assert '"url.${push_transport}.pushInsteadOf" "$transport_alias"' in runbook
+    assert 'GIT_CONFIG_SYSTEM="$transport_system_config"' in runbook
+    assert 'GIT_CONFIG_COUNT=0 \\' in runbook
+    assert '"$transport_alias" \\' in runbook
+    assert 'include.path "$existing_system_config"' in runbook
+    assert "command-scope identity rule could lose to an exact\nrepository rewrite" in history
+    assert (
+        "ambient rewrite observed before the network boundary is a failure "
+        "before network access"
+    ) in normalized_runbook
+    assert (
+        "post-guard race cannot redirect the already pinned subprocess away "
+        "from the exact endpoint"
+    ) in normalized_runbook
+    assert (
+        "must not be described as, an atomic lock over Git configuration"
+        in normalized_runbook
+    )
+    assert (
+        "14e2f9db8ce9506068bad456ce901bcec86d34a1403043de49e4ccfb81835e89"
+        in history
+    )
+    assert "P0=0/P1=1/P2=0" in history
+    assert "109 passed, 2 subtests passed" in history
+    assert (
+        "931ef80a342310e298f7f3fe2d3f3b48e94a943ae7d5e62b05ffe304149bcfbe"
+        in history
+    )
+    assert "220 passed, 8 skipped, 2 subtests passed" in history
+    assert (
+        "31c1230cb449fb248114d910ab56791917805655b1ae865fe6c6d28dd5637ae2"
+        in history
+    )
+    assert "Formal review" in history
+
+
+def test_v133_release_guard_and_network_use_same_normalized_config_authority() -> None:
+    runbook = _release_runbook()
+    history = _release_history()
+    normalized_runbook = " ".join(runbook.split())
+    normalized_history = " ".join(history.split())
+
+    assert "same normalized config authority as that subprocess" in normalized_runbook
+    assert (
+        "ambient command-count, parameter, no-system, and system-file selectors "
+        "are scrubbed"
+    ) in normalized_runbook
+    assert "temporary endpoint pins themselves are removed" in normalized_runbook
+    assert (
+        "`GIT_CONFIG_NOSYSTEM=1` cannot hide a system rewrite"
+        in normalized_runbook
+    )
+    assert (
+        "cacfc7726af7680888f26bec4ef8deb76d30456cf3c416e5d37fae824ad18a2f"
+        in history
+    )
+    assert "P0=0/P1=0/P2=1" in history
+    assert "v133 normalized transport-config authority successor" in normalized_history
+    assert "preserving any identical real entries" in normalized_history
+    assert "112 passed, 2 subtests passed" in normalized_history
+    assert (
+        "d5cbcb2de77484ff99195fbc45fbea928939af394be631a4cec7fad58868c113"
+        in normalized_history
+    )
+    assert "224 passed, 8 skipped, 2 subtests passed" in normalized_history
+    assert (
+        "6f0c2b28efbd2ab938e2e21ee895aca676a6f1403266aa634d0a682d9c091eab"
+        in normalized_history
+    )
+    assert (
+        "f148f8733dd6a2ec95d03619e38b8d2af3bab1c8cbdb174fe9e3824d61b05655"
+        in normalized_history
+    )
+    assert "P0=0/P1=0/P2=0" in normalized_history
+    assert (
+        "permits full Windows/fresh-ext4 WSL qualification"
+        in normalized_history
+    )
+    assert "later exact-candidate review" in normalized_history
+
+
+def test_v134_full_qualification_failure_is_not_reused_as_acceptance() -> None:
+    history = " ".join(_release_history().split())
+
+    assert "v134 full-qualification fixture/contract repair" in history
+    assert "Five WSL failures exposed" in history
+    assert "Four WSL failures exposed" not in history
+    assert "1899 passed, 29 skipped, 401 subtests passed, 5 failed" in history
+    assert (
+        "a8b1d723389e8965f290f27eee2f158fb6289c2238eda3baeb6f2e48d734a022"
+        in history
+    )
+    assert "ended `-1` after partial progress" in history
+    assert (
+        "2ebcbe1e41704abcd2713ea34bc61ac0906266542c1f5612703cb95046d14b08"
+        in history
+    )
+    assert "Production behavior is unchanged" in history
+    assert "96 passed, 1 skipped, 57 subtests passed" in history
+    assert (
+        "d7b686ef301280ed0971e99970c9ab51774bf9a2403857d2a563a2e2a910db7e"
+        in history
+    )
+    assert (
+        "complete sequential Windows/WSL evidence was still pending at that "
+        "checkpoint"
+        in history
+    )
+
+
+def test_v135_records_the_rejected_review_and_exact_command_correction() -> None:
+    history = " ".join(_release_history().split())
+
+    assert "v135 review-evidence correction" in history
+    assert (
+        "716bbc1af8c08168a595c30ccaa2504b1db843c3683a5017df0c829de4e20fe7"
+        in history
+    )
+    assert "P0=0/P1=0/P2=2" in history
+    assert "supplemental task-CAS verification" in history
+    assert "exact Python 3.14 interpreter, four module selectors" in history
+    assert "The old record remains intact" in history
+    assert (
+        "a311e27d47b7ddcf60df70e92b49415fd68c1476e0b956494225dfa793009794"
+        in history
+    )
+    assert "P0=0/P1=0/P2=0" in history
+    assert "permits sequential full Windows" in history
+    assert "does not establish full-suite acceptance" in history
+
+
+def test_v136_records_exact_native_full_qualification_without_promotion() -> None:
+    history = " ".join(_release_history().split())
+
+    assert "v136 sequential Windows/WSL qualification" in history
+    assert "620810f9e75cdf6df70ea5e1ea1fb3f91d2483c0" in history
+    assert "1913 passed, 22 skipped, 401 subtests passed in 2021.60s" in history
+    assert (
+        "fbba27af8ccc15ad29731125165e05c475dc3600defb3b6b9f41575c0c385e0d"
+        in history
+    )
+    assert "1906 passed, 29 skipped in 1426.14s" in history
+    assert (
+        "95308a8eb4855d2afe07aaab1bbbfb1ce7a17cb67f25f9bdd1dac622fdb65563"
+        in history
+    )
+    assert "WSL_CLEAN_DRIVER_EXIT=0" in history
+    assert "Codex nested-cell wrapper surfaced status `1`" in history
+    assert "direct `wsl.exe` native readback" in history
+    assert "reconciled native WSL runtime verdict" in history
+    assert (
+        "do not establish independent review, integrity-v2 sealing, "
+        "package/install acceptance, remote CI, tag creation, publication, "
+        "promotion, or ARISE installation"
+        in history
+    )
 
 
 def test_verify_stage_seals_a_minimal_exact_envelope_before_oidc_publish() -> None:
@@ -373,6 +617,55 @@ def test_github_release_is_gated_exact_and_verified_before_pypi() -> None:
     assert "--require-complete" in pypi
     assert "skip-existing" not in pypi
     assert text.index("  publish-github-release:") < text.index("  publish-pypi:")
+
+
+def test_release_mutation_requires_exact_successful_main_push_test_and_docs() -> None:
+    text = _workflow()
+    gate = _job(text, "verify-exact-ci")
+    publisher = _job(text, "publish-github-release")
+
+    assert "if: ${{ inputs.intent == 'publish' }}" in gate
+    assert "needs: producer-linux" in gate
+    assert "actions: read" in gate
+    assert "contents: read" in gate
+    assert "contents: write" not in gate
+    assert "id-token: write" not in gate
+    assert "ref: ${{ needs.producer-linux.outputs.exact-commit }}" in gate
+    assert "persist-credentials: false" in gate
+    assert "EXACT_COMMIT: ${{ needs.producer-linux.outputs.exact-commit }}" in gate
+    assert 'test "$GITHUB_API_URL" = "https://api.github.com"' in gate
+    assert 'test "$GITHUB_REPOSITORY" = "Ryan529616/aoi-orgware"' in gate
+    assert "Authorization: Bearer $GITHUB_TOKEN" in gate
+    assert "X-GitHub-Api-Version: $GH_API_VERSION" in gate
+    assert '--data-urlencode "head_sha=$EXACT_COMMIT"' in gate
+    assert '--data-urlencode "branch=main"' in gate
+    assert '--data-urlencode "event=push"' in gate
+    assert '--data-urlencode "status=success"' in gate
+    assert "actions/workflows/$workflow/runs" in gate
+    assert "fetch_workflow_runs test.yml" in gate
+    assert "fetch_workflow_runs docs.yml" in gate
+    assert "python -I scripts/verify_release_ci.py" in gate
+    assert (
+        '--workflow ".github/workflows/test.yml=$RUNNER_TEMP/test-runs.json"'
+        in gate
+    )
+    assert (
+        '--workflow ".github/workflows/docs.yml=$RUNNER_TEMP/docs-runs.json"'
+        in gate
+    )
+    assert (
+        "needs: [verify-pypi-stage, producer-linux, verify-exact-ci]"
+        in publisher
+    )
+    assert text.index("  verify-exact-ci:") < text.index(
+        "  publish-github-release:"
+    )
+
+
+def test_full_ci_timeouts_cover_the_observed_long_matrix_runtime() -> None:
+    text = _test_workflow()
+    assert "timeout-minutes: 90" in _job(text, "unit")
+    assert "timeout-minutes: 120" in _job(text, "coverage")
 
 
 def test_complete_pypi_retry_emits_no_phantom_missing_filename() -> None:
