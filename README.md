@@ -106,10 +106,10 @@ project hooks is a supply-chain and trust decision.
 
 ### Direct install
 
-> **This README documents the v0.4 alpha line, whose current source target is
-> the unreleased successor `0.4.0a4`.** This is not a release-ready or promoted
-> build. Install it only when an exact reviewed proof names that version
-> and wheel SHA-256. A
+> **This README documents the v0.4 alpha line, whose current target is
+> `0.4.0a4`.** Before public promotion, install it only when an exact reviewed
+> local proof names that version and wheel SHA-256. After publication, use only
+> the exact public promotion bundle and package version it binds. A
 > `reviewed_local_install_bundle` has
 > `proof_scope=exact_local_wheel_install_only`: it is not a release record or
 > promotion, and it makes no tag, GitHub Release, or PyPI claim. Do not use an

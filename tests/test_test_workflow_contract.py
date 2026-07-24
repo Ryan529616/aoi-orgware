@@ -68,8 +68,12 @@ def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
 
     tests = _step(unit, "Run unit tests")
     assert re.search(
-        r"^\s*run:\s*python -m pytest -q tests\s*$", tests, re.MULTILINE
+        r"^\s*run:\s*python -m pytest -q tests "
+        r"--ignore=tests/test_coverage_combine\.py\s*$",
+        tests,
+        re.MULTILINE,
     )
+    assert "requirements/coverage-tools.lock" not in unit
     assert "unittest discover" not in unit
     assert "PYTHONPATH" not in tests
 
