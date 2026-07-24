@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import MappingProxyType
 import unicodedata
 import uuid
 from typing import Any, NoReturn
@@ -54,7 +55,6 @@ _ENV_ALLOWLIST = frozenset(
     }
 )
 _WSL_ENV = frozenset({"WSL_DISTRO_NAME", "WSL_INTEROP"})
-_HISTORICAL_ENV_ALLOWLIST = _ENV_ALLOWLIST - _WSL_ENV
 _WINDOWS_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))})
 _PYTEST_TRACEBACK = re.compile(r"--tb=(?:auto|long|short|line|native|no)\Z")
 _MAX_PYTEST_ARGUMENTS = 256
@@ -75,6 +75,98 @@ _PYTEST_FIXED_ENV = frozenset(
         "PYTHONDONTWRITEBYTECODE",
     }
 )
+_V1_ALLOWED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "PYTHONHASHSEED",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+)
+_V1_REQUIRED_ENVIRONMENT_NAMES: frozenset[str] = frozenset()
+_V2_ALLOWED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+)
+_V2_REQUIRED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+)
+_V3_ALLOWED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "WSL_DISTRO_NAME",
+        "WSL_INTEROP",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+)
+_V3_REQUIRED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+)
+_RUNNER_ENVIRONMENT_GRAMMARS = MappingProxyType(
+    {
+        "1": (_V1_ALLOWED_ENVIRONMENT_NAMES, _V1_REQUIRED_ENVIRONMENT_NAMES),
+        "2": (_V2_ALLOWED_ENVIRONMENT_NAMES, _V2_REQUIRED_ENVIRONMENT_NAMES),
+        "3": (_V3_ALLOWED_ENVIRONMENT_NAMES, _V3_REQUIRED_ENVIRONMENT_NAMES),
+    }
+)
+_RUNNER_INVOCATION_CONTRACTS = MappingProxyType(
+    {
+        "1": "pytest-arg-vector-v1",
+        "2": "pytest-contained-argv-v2",
+        "3": "pytest-contained-argv-v2",
+    }
+)
+_WSL_PLATFORM_BOUND_RUNNER_VERSIONS = frozenset({"3"})
 
 
 class ExactTestReceiptError(ValueError):
@@ -417,13 +509,12 @@ def _structured_invocation_payload(
     *,
     runner_version: str,
 ) -> dict[str, Any]:
-    if runner_version == LEGACY_RUNNER_VERSION:
+    invocation_contract = _runner_invocation_contract(runner_version)
+    if invocation_contract == "pytest-arg-vector-v1":
         return {
             "pytest_argv": list(invocation["argv"]),
-            "protocol": "pytest-arg-vector-v1",
+            "protocol": invocation_contract,
         }
-    if runner_version not in {PREVIOUS_RUNNER_VERSION, RUNNER_VERSION}:
-        _fail("producer version is invalid")
     return {
         "argument_contract": invocation["argument_contract"],
         "config": dict(invocation["config"]),
@@ -431,11 +522,31 @@ def _structured_invocation_payload(
         "cwd_role": invocation["cwd_role"],
         "environment_names": list(invocation["environment_names"]),
         "environment_sha256": invocation["environment_sha256"],
-        "protocol": PYTEST_ARGUMENT_CONTRACT,
+        "protocol": invocation_contract,
         "pytest_argv": list(invocation["argv"]),
         "requested_pytest_argv": list(invocation["requested_argv"]),
         "rootdir_role": invocation["rootdir_role"],
     }
+
+
+def _environment_name_grammar(
+    runner_version: str,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the producer's allowed names and its required fixed subset."""
+
+    grammar = _RUNNER_ENVIRONMENT_GRAMMARS.get(runner_version)
+    if grammar is None:
+        _fail("producer version is invalid")
+    return grammar
+
+
+def _runner_invocation_contract(runner_version: str) -> str:
+    """Return the immutable invocation contract for one literal producer version."""
+
+    contract = _RUNNER_INVOCATION_CONTRACTS.get(runner_version)
+    if contract is None:
+        _fail("producer version is invalid")
+    return contract
 
 
 def validate_exact_test_receipt(
@@ -471,7 +582,7 @@ def validate_exact_test_receipt(
     if producer["invoker"] is not None:
         invoker = _exact(producer["invoker"], {"path", "sha256"}, "producer invoker")
         _absolute_path(invoker["path"], "producer invoker path"); _sha256(invoker["sha256"], "producer invoker SHA-256")
-    if producer["version"] not in {LEGACY_RUNNER_VERSION, PREVIOUS_RUNNER_VERSION, RUNNER_VERSION}: _fail("producer version is invalid")
+    if producer["version"] not in _RUNNER_ENVIRONMENT_GRAMMARS or producer["version"] not in _RUNNER_INVOCATION_CONTRACTS: _fail("producer version is invalid")
     if require_current_protocol and producer["version"] != RUNNER_VERSION:
         _fail("new exact-test evidence requires the current contained pytest protocol")
     _sha256(producer["structured_invocation_sha256"], "producer structured invocation SHA-256")
@@ -484,7 +595,8 @@ def validate_exact_test_receipt(
     interpreter = _exact(item["interpreter"], {"path", "sha256", "implementation", "version"}, "interpreter")
     _absolute_path(interpreter["path"], "interpreter path"); _sha256(interpreter["sha256"], "interpreter SHA-256")
     _string(interpreter["implementation"], "interpreter implementation"); _string(interpreter["version"], "interpreter version")
-    if producer["version"] == LEGACY_RUNNER_VERSION:
+    invocation_contract = _runner_invocation_contract(producer["version"])
+    if invocation_contract == "pytest-arg-vector-v1":
         invocation = _exact(item["invocation"], {"argv", "cwd_role", "environment_names", "environment_sha256"}, "legacy invocation")
     else:
         invocation = _exact(
@@ -502,7 +614,7 @@ def validate_exact_test_receipt(
             },
             "invocation",
         )
-        if invocation["argument_contract"] != PYTEST_ARGUMENT_CONTRACT:
+        if invocation["argument_contract"] != invocation_contract:
             _fail("pytest argument contract is invalid")
         if not isinstance(invocation["requested_argv"], list):
             _fail("requested pytest argv is invalid")
@@ -527,13 +639,11 @@ def validate_exact_test_receipt(
             _fail("pytest confcutdir role is invalid")
     if not isinstance(invocation["argv"], list) or not all(isinstance(x, str) for x in invocation["argv"]): _fail("pytest argv is invalid")
     if invocation["cwd_role"] != _PYTEST_SNAPSHOT_ROLE: _fail("pytest cwd role is invalid")
-    allowed_environment_names = (
-        _ENV_ALLOWLIST
-        if producer["version"] == RUNNER_VERSION
-        else _HISTORICAL_ENV_ALLOWLIST
-    ) | _PYTEST_FIXED_ENV
+    allowed_environment_names, required_fixed_environment_names = (
+        _environment_name_grammar(producer["version"])
+    )
     if not isinstance(invocation["environment_names"], list) or invocation["environment_names"] != sorted(invocation["environment_names"]) or len(invocation["environment_names"]) != len(set(invocation["environment_names"])) or any(x not in allowed_environment_names for x in invocation["environment_names"]): _fail("environment names are invalid")
-    if producer["version"] in {PREVIOUS_RUNNER_VERSION, RUNNER_VERSION} and not _PYTEST_FIXED_ENV.issubset(invocation["environment_names"]):
+    if not required_fixed_environment_names.issubset(invocation["environment_names"]):
         _fail("contained pytest environment is incomplete")
     _sha256(invocation["environment_sha256"], "environment SHA-256")
     if producer["structured_invocation_sha256"] != _sha256_bytes(
@@ -549,7 +659,7 @@ def validate_exact_test_receipt(
     if domain["domain"] not in {"windows", "wsl", "linux"}: _fail("platform domain is invalid")
     for key in ("system", "release", "wsl_distro", "kernel"):
         if not isinstance(domain[key], str): _fail(f"platform {key} is invalid")
-    if producer["version"] == RUNNER_VERSION:
+    if producer["version"] in _WSL_PLATFORM_BOUND_RUNNER_VERSIONS:
         _require_current_platform_environment(domain, invocation["environment_names"])
     log = _exact(item["log"], {"sha256", "size", "path_role"}, "log")
     _sha256(log["sha256"], "log SHA-256"); _int(log["size"], "log size")

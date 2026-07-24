@@ -845,6 +845,212 @@ def test_historical_v2_structured_receipts_remain_readable_but_not_current(
     assert parse_exact_test_receipt_bytes(historical_non_wsl_raw) == historical_non_wsl
 
 
+def test_historical_producer_environment_grammars_are_versioned(
+    tmp_path: Path,
+) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+
+    legacy_invocation = {
+        "argv": receipt["invocation"]["argv"],
+        "cwd_role": receipt["invocation"]["cwd_role"],
+        "environment_names": sorted(
+            {
+                "PYTHONHASHSEED",
+                "PYTHONPATH",
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+                "PYTHONDONTWRITEBYTECODE",
+            }
+        ),
+        "environment_sha256": receipt["invocation"]["environment_sha256"],
+    }
+    legacy = _reseal_with_structured_invocation(
+        receipt,
+        legacy_invocation,
+        runner_version=receipts.LEGACY_RUNNER_VERSION,
+    )
+    assert canonical_exact_test_receipt_bytes(legacy)
+
+    v2 = copy.deepcopy(receipt)
+    v2["invocation"]["environment_names"] = sorted(
+        set(v2["invocation"]["environment_names"]) - receipts._WSL_ENV
+    )
+    v2 = _reseal_with_structured_invocation(
+        v2,
+        v2["invocation"],
+        runner_version=receipts.PREVIOUS_RUNNER_VERSION,
+    )
+    assert "PYTHONNOUSERSITE" in v2["invocation"]["environment_names"]
+    assert canonical_exact_test_receipt_bytes(v2)
+
+
+def test_environment_name_grammar_is_frozen_per_runner_version() -> None:
+    base = {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+    }
+    v1_fixed = {
+        "PYTHONHASHSEED",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+    v2_fixed = v1_fixed | {"PYTHONNOUSERSITE"}
+    expected = {
+        "1": (
+            frozenset(base | v1_fixed),
+            frozenset(),
+        ),
+        "2": (
+            frozenset(base | v2_fixed),
+            frozenset(v2_fixed),
+        ),
+        "3": (
+            frozenset(base | v2_fixed | {"WSL_DISTRO_NAME", "WSL_INTEROP"}),
+            frozenset(v2_fixed),
+        ),
+    }
+    assert {
+        version: receipts._environment_name_grammar(version)
+        for version in expected
+    } == expected
+    assert (
+        receipts.LEGACY_RUNNER_VERSION,
+        receipts.PREVIOUS_RUNNER_VERSION,
+        receipts.RUNNER_VERSION,
+    ) == ("1", "2", "3")
+    assert {
+        version: receipts._runner_invocation_contract(version)
+        for version in expected
+    } == {
+        "1": "pytest-arg-vector-v1",
+        "2": "pytest-contained-argv-v2",
+        "3": "pytest-contained-argv-v2",
+    }
+    current_allowed, current_required = expected["3"]
+    assert receipts._ENV_ALLOWLIST | receipts._PYTEST_FIXED_ENV == current_allowed
+    assert receipts._PYTEST_FIXED_ENV == current_required
+    with pytest.raises(ExactTestReceiptError):
+        receipts._environment_name_grammar("4")
+    with pytest.raises(ExactTestReceiptError):
+        receipts._runner_invocation_contract("4")
+
+
+def test_historical_dispatch_does_not_follow_moving_role_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    v2 = copy.deepcopy(receipt)
+    v2["invocation"]["environment_names"] = sorted(
+        set(v2["invocation"]["environment_names"]) - receipts._WSL_ENV
+    )
+    v2 = _reseal_with_structured_invocation(
+        v2,
+        v2["invocation"],
+        runner_version="2",
+    )
+    v3_missing_wsl = copy.deepcopy(receipt)
+    v3_missing_wsl["platform"] = {
+        "domain": "wsl",
+        "system": "Linux",
+        "release": "6.6.0-microsoft-standard-WSL2",
+        "wsl_distro": "Ubuntu",
+        "kernel": "6.6.0-microsoft-standard-WSL2",
+    }
+    v3_missing_wsl["invocation"]["environment_names"] = sorted(
+        set(v3_missing_wsl["invocation"]["environment_names"]) - receipts._WSL_ENV
+    )
+    v3_missing_wsl = _reseal_with_structured_invocation(
+        v3_missing_wsl,
+        v3_missing_wsl["invocation"],
+        runner_version="3",
+    )
+    v2_grammar = receipts._environment_name_grammar("2")
+    v3_grammar = receipts._environment_name_grammar("3")
+    monkeypatch.setattr(receipts, "PREVIOUS_RUNNER_VERSION", "3")
+    monkeypatch.setattr(receipts, "RUNNER_VERSION", "4")
+    monkeypatch.setattr(
+        receipts,
+        "PYTEST_ARGUMENT_CONTRACT",
+        "pytest-contained-argv-v3",
+    )
+    assert receipts._environment_name_grammar("2") == v2_grammar
+    assert receipts._environment_name_grammar("3") == v3_grammar
+    assert (
+        receipts._runner_invocation_contract("2")
+        == "pytest-contained-argv-v2"
+    )
+    assert (
+        receipts._runner_invocation_contract("3")
+        == "pytest-contained-argv-v2"
+    )
+    assert receipts._structured_invocation_payload(
+        receipt["invocation"],
+        runner_version="3",
+    )["protocol"] == "pytest-contained-argv-v2"
+    assert canonical_exact_test_receipt_bytes(v2)
+    assert canonical_exact_test_receipt_bytes(receipt)
+    with pytest.raises(ExactTestReceiptError):
+        canonical_exact_test_receipt_bytes(
+            receipt,
+            require_current_protocol=True,
+        )
+    with pytest.raises(ExactTestReceiptError):
+        canonical_exact_test_receipt_bytes(v3_missing_wsl)
+    with pytest.raises(ExactTestReceiptError):
+        receipts._environment_name_grammar("4")
+
+
+def test_resealed_v1_receipt_rejects_v2_pythonnousersite(
+    tmp_path: Path,
+) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    legacy_invocation = {
+        "argv": receipt["invocation"]["argv"],
+        "cwd_role": receipt["invocation"]["cwd_role"],
+        "environment_names": sorted(
+            {
+                "PYTHONHASHSEED",
+                "PYTHONNOUSERSITE",
+                "PYTHONPATH",
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+                "PYTHONDONTWRITEBYTECODE",
+            }
+        ),
+        "environment_sha256": receipt["invocation"]["environment_sha256"],
+    }
+    legacy = _reseal_with_structured_invocation(
+        receipt,
+        legacy_invocation,
+        runner_version=receipts.LEGACY_RUNNER_VERSION,
+    )
+    with pytest.raises(ExactTestReceiptError):
+        canonical_exact_test_receipt_bytes(legacy)
+
+
 @pytest.mark.parametrize(
     ("runner_version", "wsl_name"),
     [

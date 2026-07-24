@@ -87,13 +87,18 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 - **Historical exact-test replay keeps the producer's original environment
   grammar.** Exact `bcd3dcb` is rejected after its clean-commit review found
   that runner v3's new `WSL_DISTRO_NAME` and `WSL_INTEROP` allowlist entries
-  were also admitted on resealed runner-v1/v2 receipts. The successor uses a
-  producer-version-specific environment allowlist: authentic v1/v2 receipts
-  without those names remain readable, while impossible historical receipts
-  carrying either v3-only name fail closed. The `bcd3dcb` package outputs are
-  diagnostic only, and its first Windows full attempt is also inadmissible
-  because a sibling package pytest began after the zero-sibling preflight.
-  Every release gate must be restarted on the next clean successor.
+  were also admitted on resealed runner-v1/v2 receipts. Exact `596fae9` is
+  separately rejected because runner v1 replay still admitted
+  `PYTHONNOUSERSITE`, which runner v2 introduced. The successor freezes both
+  environment-name admission and invocation-contract dispatch by literal
+  producer version: authentic historical receipts remain readable, v1 rejects
+  the v2-only name, v1/v2 reject both v3-only WSL names, and future current
+  protocol aliases cannot rewrite historical receipt digests or validation.
+  The `bcd3dcb` and `596fae9` package outputs are diagnostic only.
+  `bcd3dcb`'s first Windows full attempt is also inadmissible because a sibling
+  package pytest began after the zero-sibling preflight; `596fae9`'s package
+  O7 run was terminated after its review rejection. Every release gate must
+  restart on the next clean successor.
 - **AOI repository publication authority stays distinct from project file
   protection.** This repository's effective confidentiality mode is
   `standard`, so its reviewed source, Git refs, release artifacts, and PyPI
