@@ -308,7 +308,7 @@ def _external_absolute(path: Path, repo: Path, label: str) -> Path:
     return path.resolve(strict=False)
 
 
-def _status(repo: Path) -> dict[str, str]:
+def _status(repo: Path) -> dict[str, Any]:
     head = _git(repo, ["rev-parse", "--verify", "HEAD"]).decode("ascii").strip()
     index_tree = _git(repo, ["write-tree"]).decode("ascii").strip()
     status = _git(repo, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])
