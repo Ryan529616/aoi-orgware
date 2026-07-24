@@ -50,6 +50,7 @@ class PermitCliTests(HarnessTestCase):
         self.init_task(TASK, session_id="harness-test-chief")
         self.paths = h.get_paths(self.root)
         self._apply_and_register_resource()
+        self._remove_legacy_resource_claim()
         for packet_id in sorted(_PACKET_IDS):
             self.cli(
                 "create-packet",
@@ -197,6 +198,22 @@ class PermitCliTests(HarnessTestCase):
             event["receipt_sha256"],
             "--json",
         )
+
+    def _remove_legacy_resource_claim(self) -> None:
+        """Make this legacy fixture quiescent before semantic migration."""
+
+        token = "permit-cli-resource-files"
+        with h.state_lock(self.paths, create_layout=False):
+            state_path = h.task_state_path(self.paths, TASK)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            claims = state.get("claims")
+            self.assertIsInstance(claims, list)
+            self.assertEqual(claims.count(token), 1)
+            state["claims"] = [item for item in claims if item != token]
+            h.atomic_write_json(state_path, state)
+            active = h.claim_path(self.paths, token, active=True)
+            self.assertTrue(active.is_file())
+            active.unlink()
 
     def tearDown(self) -> None:
         super().tearDown()

@@ -1119,16 +1119,29 @@ def git_observation_authority(
             "Git observation common Git dir",
         )
     worktree_refs_dir: Path | None = None
+    worktree_refs_present: bool | None = None
     if linked_layout is not None:
         worktree_refs_dir = git_dir / "refs"
-        _require_observation_directory(
-            worktree_refs_dir,
-            "Git observation worktree refs",
-        )
-        _validate_observation_tree_links(
-            worktree_refs_dir,
-            "Git observation worktree refs",
-        )
+        try:
+            worktree_refs_dir.lstat()
+        except FileNotFoundError:
+            # Git creates this per-worktree namespace lazily.  Absence is a
+            # canonical empty state, distinct from an existing empty tree.
+            worktree_refs_present = False
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot inspect Git observation worktree refs: {exc}"
+            ) from exc
+        else:
+            _require_observation_directory(
+                worktree_refs_dir,
+                "Git observation worktree refs",
+            )
+            _validate_observation_tree_links(
+                worktree_refs_dir,
+                "Git observation worktree refs",
+            )
+            worktree_refs_present = True
     head_identity = _observation_file_identity(
         git_dir / "HEAD",
         "Git observation HEAD",
@@ -1270,9 +1283,31 @@ def git_observation_authority(
     }
     if linked_layout is not None:
         assert worktree_refs_dir is not None
-        linked_layout["worktree_refs_dir"] = str(
-            worktree_refs_dir.resolve(strict=True)
-        )
+        assert worktree_refs_present is not None
+        if worktree_refs_present:
+            _require_observation_directory(
+                worktree_refs_dir,
+                "Git observation worktree refs",
+            )
+            resolved_worktree_refs: str | None = str(
+                worktree_refs_dir.resolve(strict=True)
+            )
+        else:
+            try:
+                worktree_refs_dir.lstat()
+            except FileNotFoundError:
+                resolved_worktree_refs = None
+            except OSError as exc:
+                raise HarnessError(
+                    f"cannot recheck Git observation worktree refs: {exc}"
+                ) from exc
+            else:
+                raise HarnessError(
+                    "Git observation worktree refs appeared while authority "
+                    "was captured"
+                )
+        linked_layout["worktree_refs_present"] = worktree_refs_present
+        linked_layout["worktree_refs_dir"] = resolved_worktree_refs
         base.update(linked_layout)
     return {
         **base,

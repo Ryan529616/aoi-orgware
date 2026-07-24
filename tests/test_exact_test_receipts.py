@@ -79,7 +79,7 @@ def test_stable_regular_read_rejects_linked_symlinked_and_changed_files(tmp_path
     def mutate_after_open(descriptor: int, size: int) -> bytes:
         nonlocal changed
         if not changed:
-            changed = True; changing.write_bytes(b"after!")
+            changed = True; changing.write_bytes(b"after mutation")
         return original_read(descriptor, size)
     monkeypatch.setattr(receipts.os, "read", mutate_after_open)
     with pytest.raises(ExactTestReceiptError): receipts._stable_regular_read(changing.resolve(), "changing fixture")

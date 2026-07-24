@@ -54,9 +54,31 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   pins are regenerated from that exact unchanged live config. User projects
   may independently select `local_files` and designate protected paths; making
   AOI updateable does not weaken those per-project destination rules.
-- **The disposable transport canary now binds its declared launcher inputs.**
-  Its wire-breaking v3 spec names the exact isolated `CODEX_HOME` policy and
-  exact Codex, Bridge, and Git executable bytes. Executables use bounded
+- **The disposable transport canary now binds the launched installation and
+  has a truthful non-consuming preflight.** Its wire-breaking v4 spec names
+  the exact isolated `CODEX_HOME` policy; exact Codex, Bridge, and Git
+  executable bytes; and the local package receipt, source commit/tree, wheel,
+  PEP 610 archive binding, installed `RECORD`, and complete AOI package and
+  dist-info namespace. The exact bounded wheel bytes being parsed must match
+  the expected SHA-256; wheel ZIP members close against the wheel's own
+  `RECORD`, and every installed wheel-owned member is byte-compared with that
+  payload. Installer metadata plus all four exact AOI console launchers
+  declared by wheel `entry_points.txt` are the only additional installed
+  `RECORD` surface, and the Bridge launcher is separately spec-pinned. The
+  driver independently rejects self-consistent installed-package rewrites,
+  package drift, unrecorded files, `.pth`/top-level import and startup shadows,
+  extra AOI distributions, and link/reparse/hardlink aliases before and after
+  each Bridge subprocess. It does not execute an installer-generated launcher:
+  the trusted canary base Python is path/size/hash bound and invoked with
+  isolated/no-site/no-bytecode flags plus a fixed exact-installed-module
+  bootstrap; the exact site root is appended after standard-library paths so
+  installed top-level files cannot shadow the standard library. `pyvenv.cfg`
+  is parsed as a unique-key mapping and must bind the same base
+  home/executable/version, disabled system-site packages, and exact terminal
+  venv prefix.
+  Dry-run now calls Bridge `preflight` and accepts only
+  `issued_unconsumed`/`permit_consumed=false`; only `--execute` reaches the
+  one-shot reservation and App Server boundary. Executables use bounded
   streaming hashes plus stable before/open/after identity and are revalidated
   at each relevant subprocess boundary. Git runs with ambient `GIT_*` and SSH
   control removed and a closed noninteractive config; exact repo-local config
@@ -91,12 +113,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   non-following traversal that rejects symlinks, hard links, Windows
   reparses/junctions, special files, and identity drift. The shared
   publication scrub now includes GitHub Actions OIDC/runtime/results/cache
-  authority. AOI authority and ambient Python path/home/venv remain removed,
-  user-site and unsafe-path insertion remain disabled, and model-service
-  authentication remains available. These are verify-before-spawn file
+  authority. Bridge subprocesses use an explicit constructed environment
+  rather than an ambient denylist; loader, proxy, Node, Python, Git, SSH,
+  publication/OIDC/OpenAI, and unknown ambient names are not forwarded.
+  Windows system paths come from the native API. User-site and unsafe-path
+  insertion remain disabled, while the exact isolated `CODEX_HOME` retains
+  model-service authentication. These are verify-before-spawn file
   observations, not an atomic hostile-writer lock or proof of the OS-loaded
-  image, DLLs, dynamic dependencies, or code-signing trust. Older v1/v2 canary
-  specs are unsupported.
+  image, DLLs, dynamic dependencies, or code-signing trust. Older v1/v2/v3
+  canary specs are unsupported.
 
 ### v0.4.0a3 (unreleased)
 

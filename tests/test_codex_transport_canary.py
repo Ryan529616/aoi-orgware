@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from typing import Any
+import zipfile
 
 import pytest
 
@@ -30,6 +33,15 @@ SHA_B = "b" * 64
 BRIDGE_BYTES = b"fake bridge entry point"
 BRIDGE_SAME_SIZE_DRIFT = b"drifted bridge payload!"
 assert len(BRIDGE_SAME_SIZE_DRIFT) == len(BRIDGE_BYTES)
+SOURCE_COMMIT = "c" * 40
+SOURCE_TREE = "d" * 40
+PACKAGE_VERSION = "0.4.0a4"
+CONSOLE_SCRIPTS = {
+    "aoi": "aoi_orgware.cli:main",
+    "aoi-claude-hook": "aoi_orgware.claude_hook:main",
+    "aoi-codex-bridge": "aoi_orgware.codex_transport_cli:main",
+    "aoi-codex-hook": "aoi_orgware.codex_hook:main",
+}
 
 
 def test_canary_policy_constants_match_runtime_enforcement() -> None:
@@ -54,6 +66,7 @@ def test_canary_policy_constants_match_runtime_enforcement() -> None:
         canary._PUBLISH_CREDENTIAL_PREFIXES
         == confidentiality._STRONG_PUBLISH_CREDENTIAL_PREFIXES
     )
+    assert canary._EXPECTED_CONSOLE_SCRIPTS == CONSOLE_SCRIPTS
 
 
 def _git() -> Path:
@@ -96,13 +109,197 @@ def _repository(root: Path, mode: str) -> None:
     _run_git(root, "commit", "-m", "seed disposable canary")
 
 
+def _record_hash(data: bytes) -> str:
+    return (
+        base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+
+def _record_name(path: Path, site_root: Path) -> str:
+    return os.path.relpath(path, site_root).replace(os.sep, "/")
+
+
+def _minimal_wheel_bytes() -> bytes:
+    dist_info = f"aoi_orgware-{PACKAGE_VERSION}.dist-info"
+    members = {
+        "aoi_orgware/__init__.py": f'__version__ = "{PACKAGE_VERSION}"\n'.encode(),
+        "aoi_orgware/codex_transport_cli.py": (
+            b"import argparse\n"
+            b"def main(argv=None):\n"
+            b"    print('{}')\n"
+            b"    return 0\n"
+        ),
+        f"{dist_info}/METADATA": (
+            "Metadata-Version: 2.4\n"
+            "Name: aoi-orgware\n"
+            f"Version: {PACKAGE_VERSION}\n"
+        ).encode(),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\n"
+            "Generator: deterministic-test\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ).encode(),
+        f"{dist_info}/entry_points.txt": (
+            "[console_scripts]\n"
+            + "".join(
+                f"{name} = {target}\n"
+                for name, target in CONSOLE_SCRIPTS.items()
+            )
+        ).encode(),
+    }
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\n")
+    for name, payload in sorted(members.items()):
+        writer.writerow([name, f"sha256={_record_hash(payload)}", str(len(payload))])
+    writer.writerow([f"{dist_info}/RECORD", "", ""])
+    members[f"{dist_info}/RECORD"] = stream.getvalue().encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, payload in sorted(members.items()):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_STORED
+            archive.writestr(info, payload)
+    return output.getvalue()
+
+
+def _bridge_installation(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, Any]]:
+    prefix = tmp_path / "bridge-venv"
+    scripts = prefix / ("Scripts" if os.name == "nt" else "bin")
+    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_root = (
+        prefix / "Lib" / "site-packages"
+        if os.name == "nt"
+        else prefix / "lib" / python_version / "site-packages"
+    )
+    package_root = site_root / "aoi_orgware"
+    dist_info = site_root / f"aoi_orgware-{PACKAGE_VERSION}.dist-info"
+    scripts.mkdir(parents=True)
+    package_root.mkdir(parents=True)
+    dist_info.mkdir(parents=True)
+    base_python = Path(
+        getattr(sys, "_base_executable", None) or sys.executable
+    ).resolve()
+    version = ".".join(str(value) for value in sys.version_info[:3])
+    (prefix / "pyvenv.cfg").write_text(
+        f"home = {base_python.parent}\n"
+        "include-system-site-packages = false\n"
+        f"version = {version}\n"
+        f"executable = {base_python}\n"
+        f"command = {base_python} -m venv {prefix}\n",
+        encoding="utf-8",
+    )
+    launcher_suffix = ".exe" if os.name == "nt" else ""
+    launcher_paths: dict[str, Path] = {}
+    for name in CONSOLE_SCRIPTS:
+        launcher = scripts / f"{name}{launcher_suffix}"
+        launcher.write_bytes(
+            BRIDGE_BYTES
+            if name == "aoi-codex-bridge"
+            else f"fake {name} entry point".encode()
+        )
+        launcher_paths[name] = launcher
+    bridge = launcher_paths["aoi-codex-bridge"]
+    wheel = tmp_path / f"aoi_orgware-{PACKAGE_VERSION}-py3-none-any.whl"
+    wheel.write_bytes(_minimal_wheel_bytes())
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    with zipfile.ZipFile(wheel) as archive:
+        for name in archive.namelist():
+            if name.endswith("/RECORD"):
+                continue
+            target = site_root / Path(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(name))
+    (dist_info / "INSTALLER").write_bytes(b"pip\n")
+    (dist_info / "REQUESTED").write_bytes(b"")
+    direct_url = {
+        "archive_info": {
+            "hash": f"sha256={wheel_sha}",
+            "hashes": {"sha256": wheel_sha},
+        },
+        "url": wheel.resolve().as_uri(),
+    }
+    (dist_info / "direct_url.json").write_text(
+        json.dumps(direct_url, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    record_path = dist_info / "RECORD"
+    installed_files = sorted(
+        [
+            *(path for path in package_root.rglob("*") if path.is_file()),
+            *(
+                path
+                for path in dist_info.rglob("*")
+                if path.is_file() and path != record_path
+            ),
+            *launcher_paths.values(),
+        ],
+        key=lambda path: _record_name(path, site_root),
+    )
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\n")
+    for path in installed_files:
+        data = path.read_bytes()
+        writer.writerow(
+            [
+                _record_name(path, site_root),
+                f"sha256={_record_hash(data)}",
+                str(len(data)),
+            ]
+        )
+    writer.writerow([_record_name(record_path, site_root), "", ""])
+    record_path.write_text(stream.getvalue(), encoding="utf-8", newline="")
+
+    package_receipt = {
+        "schema": canary._PACKAGE_RECEIPT_SCHEMA,
+        "head": SOURCE_COMMIT,
+        "tree": SOURCE_TREE,
+        "version": PACKAGE_VERSION,
+        "source_date_epoch": 1,
+        "release_tools_lock_sha256": SHA_A,
+        "bootstrap_python": sys.executable,
+        "build_python": sys.executable,
+        "source_clean": True,
+        "verify_dist_exit_code": 0,
+        "artifacts": [
+            {
+                "name": wheel.name,
+                "size_bytes": wheel.stat().st_size,
+                "sha256": wheel_sha,
+            }
+        ],
+        "recorded_at": "2026-07-24T00:00:00Z",
+    }
+    receipt = tmp_path / "package-receipt.json"
+    receipt.write_text(
+        json.dumps(package_receipt, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    binding = {
+        "package_receipt_file": str(receipt.resolve()),
+        "package_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        "expected_source_commit_oid": SOURCE_COMMIT,
+        "expected_source_tree_oid": SOURCE_TREE,
+        "expected_wheel_sha256": wheel_sha,
+        "wheel_file": str(wheel.resolve()),
+        "site_packages_root": str(site_root.resolve()),
+        "distribution_info_root": str(dist_info.resolve()),
+    }
+    return bridge.resolve(), binding
+
+
 def _spec(tmp_path: Path, mode: str) -> tuple[Path, dict[str, Any]]:
     root = tmp_path / "scratch"
     _repository(root, mode)
     codex = tmp_path / "codex.exe"
     codex.write_bytes(b"exact pinned fake Codex executable")
-    bridge = tmp_path / "aoi-codex-bridge.exe"
-    bridge.write_bytes(BRIDGE_BYTES)
+    bridge, bridge_install_binding = _bridge_installation(tmp_path)
     codex_home = tmp_path / "isolated-codex-home"
     codex_home.mkdir()
     (codex_home / "auth.json").write_text(
@@ -142,6 +339,7 @@ def _spec(tmp_path: Path, mode: str) -> tuple[Path, dict[str, Any]]:
         "bridge_executable": str(bridge.resolve()),
         "bridge_executable_sha256": hashlib.sha256(bridge.read_bytes()).hexdigest(),
         "bridge_executable_size_bytes": bridge.stat().st_size,
+        "bridge_install_binding": bridge_install_binding,
         "git_executable": str(_git()),
         "git_executable_sha256": hashlib.sha256(_git().read_bytes()).hexdigest(),
         "git_executable_size_bytes": _git().stat().st_size,
@@ -207,6 +405,57 @@ def _inspect(spec: dict[str, Any], *, completed: bool) -> dict[str, Any]:
     }
 
 
+def _issued_preflight(spec: dict[str, Any]) -> dict[str, Any]:
+    intent = {
+        "packet_id": "canary-packet",
+        "intent_sha256": SHA_A,
+        "cwd": canary._contract_path(Path(spec["scratch_root"])),
+        "sandbox": canary._MODES[spec["mode"]],
+        "approval": "never",
+        "network_access": False,
+        "runtime_pin": dict(spec["runtime_pin"]),
+    }
+    return {
+        "task_id": spec["task_id"],
+        "launch_id": spec["launch_id"],
+        "packet_id": intent["packet_id"],
+        "packet_status": "armed",
+        "permit_sha256": spec["permit_sha256"],
+        "intent": intent,
+        "issuance": {
+            "task_id": spec["task_id"],
+            "launch_id": spec["launch_id"],
+            "permit_sha256": spec["permit_sha256"],
+            "intent_sha256": intent["intent_sha256"],
+            "issuance_sha256": SHA_B,
+        },
+        "semantic_head_sha256": "e" * 64,
+        "status": "issued_unconsumed",
+        "evidence_level": "transport_issued",
+        "permit_consumed": False,
+        "runtime_evidence": "none",
+        "confidentiality_warnings": [],
+        "task_completion": "not_inferred",
+    }
+
+
+def _run_result(spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": spec["task_id"],
+        "launch_id": spec["launch_id"],
+        "permit_sha256": spec["permit_sha256"],
+        "terminal_state": "completed",
+        "terminal_receipt_sha256": SHA_A,
+        "evidence_level": "codex_runtime_observed",
+        "runtime_completed": True,
+        "process_start_evidence": "process_started_observed",
+        "app_server_start_durably_observed": True,
+        "runtime_process_boundary_reached": True,
+        "confidentiality_warnings": [],
+        "task_completion": "not_inferred",
+    }
+
+
 def _verified_mutation(
     spec: dict[str, Any],
     *paths: str,
@@ -242,14 +491,14 @@ def test_policy_accepts_authenticated_contract_paths_on_native_windows(
 ) -> None:
     spec_path, _raw = _spec(tmp_path, "read_only")
     spec = canary.load_spec(spec_path)
-    inspected = _inspect(spec, completed=False)
+    inspected = _inspect(spec, completed=True)
 
     assert inspected["intent"]["cwd"] == Path(spec["scratch_root"]).as_posix()
     assert (
         inspected["intent"]["runtime_pin"]["executable_path"]
         == Path(spec["codex_executable"]).as_posix()
     )
-    canary._validate_policy(spec, inspected, fresh=True)
+    canary._validate_policy(spec, inspected)
 
 
 @pytest.mark.parametrize("section", ["reservation", "issuance"])
@@ -259,14 +508,14 @@ def test_policy_rejects_same_task_cross_permit_launch(
 ) -> None:
     spec_path, _raw = _spec(tmp_path, "read_only")
     spec = canary.load_spec(spec_path)
-    inspected = _inspect(spec, completed=False)
+    inspected = _inspect(spec, completed=True)
     inspected[section]["permit_sha256"] = SHA_A
 
     with pytest.raises(
         canary.CanaryError,
         match="not bound to the exact permit",
     ):
-        canary._validate_policy(spec, inspected, fresh=True)
+        canary._validate_policy(spec, inspected)
 
 
 def test_v2_spec_is_rejected_after_git_authority_fields_changed(
@@ -392,6 +641,30 @@ def test_bridge_executable_bytes_are_bound(tmp_path: Path) -> None:
         canary.load_spec(spec_path)
 
 
+def test_bridge_invocation_uses_fixed_installed_module_not_launcher(
+    tmp_path: Path,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+
+    assert Path(raw["bridge_executable"]).read_bytes() == BRIDGE_BYTES
+    assert canary._bridge_json(spec, ["inspect"]) == {}
+
+
+def test_bridge_invocation_keeps_stdlib_ahead_of_installed_site_root(
+    tmp_path: Path,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    site_root = Path(raw["bridge_install_binding"]["site_packages_root"])
+    (site_root / "argparse.py").write_text(
+        "raise RuntimeError('installed stdlib shadow executed')\n",
+        encoding="utf-8",
+    )
+    spec = canary.load_spec(spec_path)
+
+    assert canary._bridge_json(spec, ["inspect"]) == {}
+
+
 def test_bridge_revalidates_binary_and_codex_home_before_subprocess(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -427,6 +700,389 @@ def test_bridge_revalidates_binary_and_codex_home_before_subprocess(
         handle.write(bytes([first[0] ^ 0xFF]))
     with pytest.raises(canary.CanaryError, match="runtime_pin executable bytes drifted"):
         canary._bridge_json(codex_spec, ["inspect"])
+
+
+def test_bridge_install_binding_records_exact_package_closure(
+    tmp_path: Path,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    binding = spec["bridge_install_binding"]
+    closure = binding["closure"]
+
+    assert closure["source_commit_oid"] == SOURCE_COMMIT
+    assert closure["source_tree_oid"] == SOURCE_TREE
+    assert closure["wheel_sha256"] == binding["expected_wheel_sha256"]
+    assert closure["package_receipt_sha256"] == binding["package_receipt_sha256"]
+    assert closure["record_rows"] >= 9
+    assert closure["namespace"]["file_count"] >= 9
+    assert {
+        row["name"]: row["target"] for row in closure["console_scripts"]
+    } == CONSOLE_SCRIPTS
+    assert len(closure["console_scripts"]) == 4
+    assert all(
+        Path(row["path"]).is_file() and row["sha256"] and row["size_bytes"] > 0
+        for row in closure["console_scripts"]
+    )
+    assert closure["bridge_runtime_python"]["execution_mode"] == (
+        "isolated_no_site_fixed_module"
+    )
+    assert Path(closure["bridge_runtime_python"]["path"]).is_file()
+    assert closure["pyvenv_configuration"][
+        "include-system-site-packages"
+    ] == "false"
+    assert closure["closure_sha256"] == canary._digest(
+        {key: value for key, value in closure.items() if key != "closure_sha256"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("package", "installed RECORD member bytes drifted"),
+        ("package_hardlink", "regular non-linked file"),
+        ("unrecorded", "differs from exact RECORD closure"),
+        ("record", "installed RECORD"),
+        ("direct_url", "installed RECORD member bytes drifted"),
+        ("other_launcher", "installed RECORD member bytes drifted"),
+        ("wheel", "release wheel bytes drifted"),
+        ("receipt", "release package receipt bytes drifted"),
+        ("pyvenv", "installed-distribution binding drifted"),
+        ("pth", "may not contain a .pth authority path"),
+        ("shadow", "AOI import shadow"),
+        ("extra_dist", "another AOI distribution"),
+    ],
+)
+def test_bridge_install_binding_rejects_distribution_drift(
+    tmp_path: Path,
+    change: str,
+    message: str,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    binding = spec["bridge_install_binding"]
+    site_root = Path(binding["site_packages_root"])
+    dist_info = Path(binding["distribution_info_root"])
+
+    if change == "package":
+        target = site_root / "aoi_orgware" / "codex_transport_cli.py"
+        data = target.read_bytes()
+        target.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif change == "package_hardlink":
+        target = site_root / "aoi_orgware" / "codex_transport_cli.py"
+        os.link(target, tmp_path / "installed-package-hardlink.py")
+    elif change == "unrecorded":
+        (site_root / "aoi_orgware" / "unexpected.py").write_text(
+            "not in RECORD\n",
+            encoding="utf-8",
+        )
+    elif change == "record":
+        with (dist_info / "RECORD").open("ab") as handle:
+            handle.write(b"\n")
+    elif change == "direct_url":
+        target = dist_info / "direct_url.json"
+        data = target.read_bytes()
+        target.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif change == "other_launcher":
+        bridge = Path(spec["bridge_executable"])
+        suffix = ".exe" if os.name == "nt" else ""
+        target = bridge.parent / f"aoi{suffix}"
+        data = target.read_bytes()
+        target.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif change == "wheel":
+        target = Path(binding["wheel_file"])
+        data = target.read_bytes()
+        target.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif change == "receipt":
+        target = Path(binding["package_receipt_file"])
+        data = target.read_bytes()
+        target.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    elif change == "pyvenv":
+        prefix = Path(spec["bridge_executable"]).parent.parent
+        with (prefix / "pyvenv.cfg").open("a", encoding="utf-8") as handle:
+            handle.write("prompt = drift\n")
+    elif change == "pth":
+        (site_root / "authority.pth").write_text(
+            "import aoi_orgware\n",
+            encoding="utf-8",
+        )
+    elif change == "shadow":
+        (site_root / "aoi_orgware.py").write_text(
+            "raise RuntimeError('shadow')\n",
+            encoding="utf-8",
+        )
+    else:
+        (site_root / "aoi_orgware-copy.dist-info").mkdir()
+
+    with pytest.raises(canary.CanaryError, match=message):
+        canary._revalidate_bridge_binding(spec)
+
+
+def test_bridge_install_binding_rejects_self_consistent_installed_record_rewrite(
+    tmp_path: Path,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    binding = spec["bridge_install_binding"]
+    site_root = Path(binding["site_packages_root"])
+    target = site_root / "aoi_orgware" / "codex_transport_cli.py"
+    target.write_bytes(b"def main():\n    return 1\n")
+    record_path = Path(binding["distribution_info_root"]) / "RECORD"
+    rows = list(csv.reader(record_path.read_text(encoding="utf-8").splitlines()))
+    target_name = _record_name(target, site_root)
+    for row in rows:
+        if row[0] == target_name:
+            payload = target.read_bytes()
+            row[1] = f"sha256={_record_hash(payload)}"
+            row[2] = str(len(payload))
+    stream = io.StringIO(newline="")
+    csv.writer(stream, lineterminator="\n").writerows(rows)
+    record_path.write_text(stream.getvalue(), encoding="utf-8", newline="")
+
+    with pytest.raises(
+        canary.CanaryError,
+        match="installed payload differs from exact wheel bytes",
+    ):
+        canary._revalidate_bridge_binding(spec)
+
+
+def test_bridge_install_binding_hashes_the_exact_wheel_bytes_it_parses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    original = canary._bounded_regular_bytes
+
+    def substitute_wheel_bytes(
+        path: Path,
+        label: str,
+        **kwargs: Any,
+    ) -> bytes:
+        if label == "release wheel":
+            return b"self-consistent alternate wheel bytes"
+        return original(path, label, **kwargs)
+
+    monkeypatch.setattr(canary, "_bounded_regular_bytes", substitute_wheel_bytes)
+    with pytest.raises(canary.CanaryError, match="release wheel bytes drifted"):
+        canary._revalidate_bridge_binding(spec)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "include-system-site-packages = true\n",
+        "home = C:/hostile-runtime\n",
+    ],
+)
+def test_bridge_install_binding_rejects_ambiguous_pyvenv_authority(
+    tmp_path: Path,
+    extra: str,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    prefix = Path(raw["bridge_executable"]).parent.parent
+    with (prefix / "pyvenv.cfg").open("a", encoding="utf-8") as handle:
+        handle.write(extra)
+
+    with pytest.raises(
+        canary.CanaryError,
+        match="pyvenv.cfg is ambiguous or invalid",
+    ):
+        canary.load_spec(spec_path)
+
+
+def test_bridge_install_binding_rejects_pyvenv_prefix_superstring(
+    tmp_path: Path,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    prefix = Path(raw["bridge_executable"]).parent.parent
+    config_path = prefix / "pyvenv.cfg"
+    config = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        config.replace(
+            f" -m venv {prefix}\n",
+            f" -m venv {prefix}-hostile\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        canary.CanaryError,
+        match="pyvenv.cfg creation command drifted",
+    ):
+        canary.load_spec(spec_path)
+
+
+def _rebind_wheel_fixture(
+    spec_path: Path,
+    raw: dict[str, Any],
+    wheel_bytes: bytes,
+) -> None:
+    binding = raw["bridge_install_binding"]
+    wheel_path = Path(binding["wheel_file"])
+    wheel_path.write_bytes(wheel_bytes)
+    wheel_sha = hashlib.sha256(wheel_bytes).hexdigest()
+    receipt_path = Path(binding["package_receipt_file"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["artifacts"] = [
+        {"name": wheel_path.name, "size_bytes": len(wheel_bytes), "sha256": wheel_sha}
+    ]
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    binding["expected_wheel_sha256"] = wheel_sha
+    binding["package_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    spec_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("duplicate", "duplicate or case-colliding"),
+        ("traversal", "wheel member path is invalid"),
+        ("symlink", "special"),
+    ],
+)
+def test_bridge_install_binding_rejects_malformed_wheel_members(
+    tmp_path: Path,
+    kind: str,
+    message: str,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_STORED) as archive:
+        if kind == "duplicate":
+            archive.writestr("aoi_orgware/__init__.py", b"one\n")
+            archive.writestr("aoi_orgware/__init__.py", b"two\n")
+        elif kind == "traversal":
+            archive.writestr("../escape.py", b"escape\n")
+        else:
+            info = zipfile.ZipInfo("aoi_orgware/linked.py")
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, b"target")
+    _rebind_wheel_fixture(spec_path, raw, payload.getvalue())
+
+    with pytest.raises(canary.CanaryError, match=message):
+        canary.load_spec(spec_path)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sitecustomize.py",
+        "sitecustomize.pyc",
+        "sitecustomize.pyd",
+        "sitecustomize.so",
+        "usercustomize.py",
+        "usercustomize.pyc",
+    ],
+)
+def test_bridge_install_binding_rejects_startup_injection(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    Path(spec["bridge_install_binding"]["site_packages_root"], name).write_text(
+        "raise RuntimeError('startup injection')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(canary.CanaryError, match="startup injection"):
+        canary._revalidate_bridge_binding(spec)
+
+
+@pytest.mark.parametrize("name", ["sitecustomize", "usercustomize"])
+def test_bridge_install_binding_rejects_startup_injection_package(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    Path(spec["bridge_install_binding"]["site_packages_root"], name).mkdir()
+
+    with pytest.raises(canary.CanaryError, match="startup injection"):
+        canary._revalidate_bridge_binding(spec)
+
+
+def test_bridge_install_binding_rejects_linked_ancestor(
+    tmp_path: Path,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    binding = raw["bridge_install_binding"]
+    actual_lib = Path(binding["site_packages_root"]).parent
+    alias = tmp_path / "linked-lib"
+    if os.name == "nt":
+        completed = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(alias),
+                str(actual_lib),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            pytest.skip("Windows junction creation is unavailable")
+    else:
+        alias.symlink_to(actual_lib, target_is_directory=True)
+    try:
+        site_alias = alias / "site-packages"
+        binding["site_packages_root"] = str(site_alias.absolute())
+        binding["distribution_info_root"] = str(
+            (
+                site_alias
+                / Path(binding["distribution_info_root"]).name
+            ).absolute()
+        )
+        spec_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+        with pytest.raises(
+            canary.CanaryError,
+            match="resolves through a link or reparse boundary",
+        ):
+            canary.load_spec(spec_path)
+    finally:
+        if os.name == "nt":
+            alias.rmdir()
+        else:
+            alias.unlink()
+
+
+def test_bridge_revalidates_installed_package_after_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    package_file = (
+        Path(spec["bridge_install_binding"]["site_packages_root"])
+        / "aoi_orgware"
+        / "codex_transport_cli.py"
+    )
+
+    def mutate_during_subprocess(
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> subprocess.CompletedProcess[bytes]:
+        data = package_file.read_bytes()
+        package_file.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+        return subprocess.CompletedProcess([], 0, b"{}", b"")
+
+    monkeypatch.setattr(canary, "_run_process", mutate_during_subprocess)
+    with pytest.raises(
+        canary.CanaryError,
+        match="installed RECORD member bytes drifted",
+    ):
+        canary._bridge_json(spec, ["inspect"])
 
 
 def test_git_executable_load_time_drift_is_rejected(tmp_path: Path) -> None:
@@ -651,6 +1307,15 @@ def test_allowed_local_git_config_drift_cannot_mix_snapshot_evidence(
     root = Path(spec["scratch_root"])
     original = canary._git
     calls = 0
+    filemode = subprocess.run(
+        [str(_git()), "-C", str(root), "config", "--get", "core.filemode"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip().casefold()
+    assert filemode in {"true", "false"}
+    drifted_filemode = "false" if filemode == "true" else "true"
 
     def drift_after_first_command(
         current: dict[str, Any],
@@ -662,7 +1327,7 @@ def test_allowed_local_git_config_drift_cannot_mix_snapshot_evidence(
         result = original(current, args, allow_codes=allow_codes)
         calls += 1
         if calls == 1:
-            _run_git(root, "config", "core.filemode", "true")
+            _run_git(root, "config", "core.filemode", drifted_filemode)
         return result
 
     monkeypatch.setattr(canary, "_git", drift_after_first_command)
@@ -831,6 +1496,15 @@ def test_scratch_marker_rejects_stat_drift(
 @pytest.mark.parametrize(
     "args",
     [
+        [
+            "preflight",
+            "--task",
+            "canary-task",
+            "--permit-sha256",
+            SHA_B,
+            "--prompt-file",
+            "prompt.txt",
+        ],
         ["inspect", "--task", "canary-task", "--launch-id", "canary-launch"],
         ["run", "--task", "canary-task", "--permit-sha256", SHA_B],
         ["verify-mutation", "--task", "canary-task", "--launch-id", "canary-launch"],
@@ -843,6 +1517,7 @@ def test_all_bridge_subprocesses_use_isolated_redacted_environment(
     spec = canary.load_spec(spec_path)
     ambient_home = tmp_path / "ambient-codex-home"
     seen: dict[str, str] = {}
+    seen_argv: list[str] = []
 
     def fake_run(
         argv: list[str],
@@ -850,6 +1525,7 @@ def test_all_bridge_subprocesses_use_isolated_redacted_environment(
         environment: dict[str, str],
         **_kwargs: Any,
     ) -> subprocess.CompletedProcess[bytes]:
+        seen_argv.extend(argv)
         seen.update(environment)
         return subprocess.CompletedProcess([], 0, b"{}", b"")
 
@@ -872,15 +1548,44 @@ def test_all_bridge_subprocesses_use_isolated_redacted_environment(
     monkeypatch.setenv("SSH_AUTH_SOCK", "must-not-pass")
     monkeypatch.setenv("PYTHONPATH", "must-not-influence-bridge")
     monkeypatch.setenv("PYTHONHOME", "must-not-influence-bridge")
+    monkeypatch.setenv("PYTHONSTARTUP", "must-not-influence-bridge")
     monkeypatch.setenv("VIRTUAL_ENV", "must-not-influence-bridge")
-    monkeypatch.setenv("OPENAI_API_KEY", "model-auth-must-pass")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-pass")
+    monkeypatch.setenv("LD_PRELOAD", "must-not-pass")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "must-not-pass")
+    monkeypatch.setenv("NODE_OPTIONS", "must-not-pass")
+    monkeypatch.setenv("HTTP_PROXY", "must-not-pass")
+    monkeypatch.setenv("HTTPS_PROXY", "must-not-pass")
+    monkeypatch.setenv("NO_PROXY", "must-not-pass")
+    monkeypatch.setenv("UNRELATED_AMBIENT_AUTHORITY", "must-not-pass")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "ambient-system-root"))
+    monkeypatch.setenv("WINDIR", str(tmp_path / "ambient-windir"))
 
     canary._bridge_json(spec, args)
 
+    runtime_python = spec["bridge_install_binding"]["closure"][
+        "bridge_runtime_python"
+    ]
+    assert seen_argv[:9] == [
+        runtime_python["path"],
+        "-I",
+        "-S",
+        "-B",
+        "-X",
+        "utf8",
+        "-c",
+        canary._BRIDGE_MODULE_BOOTSTRAP,
+        spec["bridge_install_binding"]["site_packages_root"],
+    ]
+    assert str(raw["bridge_executable"]) not in seen_argv[:1]
+    assert seen_argv[9:11] == ["--root", str(spec["aoi_root"])]
     assert seen["CODEX_HOME"] == Path(raw["codex_home"]).as_posix()
-    assert seen["OPENAI_API_KEY"] == "model-auth-must-pass"
+    assert seen["HOME"] == seen["CODEX_HOME"]
+    assert seen["USERPROFILE"] == seen["CODEX_HOME"]
+    assert seen["PYTHONDONTWRITEBYTECODE"] == "1"
     assert seen["PYTHONNOUSERSITE"] == "1"
     assert seen["PYTHONSAFEPATH"] == "1"
+    assert seen["PYTHONUTF8"] == "1"
     assert "PYTHONPATH" not in seen
     assert "PYTHONHOME" not in seen
     assert "VIRTUAL_ENV" not in seen
@@ -889,6 +1594,17 @@ def test_all_bridge_subprocesses_use_isolated_redacted_environment(
     assert "GIT_CONFIG_KEY_0" not in seen
     assert "GIT_CONFIG_VALUE_0" not in seen
     assert "SSH_AUTH_SOCK" not in seen
+    for name in (
+        "OPENAI_API_KEY",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "NODE_OPTIONS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "UNRELATED_AMBIENT_AUTHORITY",
+    ):
+        assert name not in seen
     assert seen["GIT_CONFIG_NOSYSTEM"] == "1"
     assert seen["GIT_CONFIG_GLOBAL"] == os.devnull
     assert seen["GIT_ATTR_NOSYSTEM"] == "1"
@@ -901,6 +1617,41 @@ def test_all_bridge_subprocesses_use_isolated_redacted_environment(
         or canary._is_publish_credential_name(name)
         for name in seen
     )
+    expected_keys = {
+        "CODEX_HOME",
+        "HOME",
+        "USERPROFILE",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONNOUSERSITE",
+        "PYTHONSAFEPATH",
+        "PYTHONUTF8",
+        "LANG",
+        "LC_ALL",
+        "TEMP",
+        "TMP",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_TERMINAL_PROMPT",
+        "GCM_INTERACTIVE",
+    }
+    if os.name == "nt":
+        assert seen["SYSTEMROOT"] != str(tmp_path / "ambient-system-root")
+        assert seen["WINDIR"] != str(tmp_path / "ambient-windir")
+        expected_keys.update(
+            {
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "SYSTEMROOT",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+            }
+        )
+    assert set(seen) == expected_keys
 
 
 def test_preflight_is_read_only_and_does_not_start_app_server(
@@ -912,8 +1663,8 @@ def test_preflight_is_read_only_and_does_not_start_app_server(
 
     def fake_bridge(current: dict[str, Any], args: list[str]) -> dict[str, Any]:
         calls.append(args)
-        assert args[0] == "inspect"
-        return _inspect(current, completed=False)
+        assert args[0] == "preflight"
+        return _issued_preflight(current)
 
     monkeypatch.setattr(canary, "_bridge_json", fake_bridge)
     result = canary.run_canary(spec, execute=False)
@@ -938,15 +1689,54 @@ def test_preflight_is_read_only_and_does_not_start_app_server(
         "runtime_pin",
         "codex_home_policy",
         "bridge_executable",
+        "bridge_install_binding",
         "git_executable",
         "scratch_root",
         "pre_git_snapshot",
-        "reserved_inspect_sha256",
+        "issued_preflight_sha256",
         "status",
         "live_app_server_started",
         "task_completion",
     }
-    assert [call[0] for call in calls] == ["inspect"]
+    assert [call[0] for call in calls] == ["preflight"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra_field", "consumed", "wrong_launch", "network_enabled"],
+)
+def test_preflight_rejects_noncanonical_or_consumed_issuance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    spec_path, _raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    observed = _issued_preflight(spec)
+    if mutation == "extra_field":
+        observed["unexpected"] = True
+        message = "fields differ"
+    elif mutation == "consumed":
+        observed["permit_consumed"] = True
+        message = "unconsumed launch"
+    elif mutation == "wrong_launch":
+        observed["launch_id"] = "another-launch"
+        message = "exact launch"
+    else:
+        observed["intent"]["network_access"] = True
+        message = "intent differs"
+
+    monkeypatch.setattr(
+        canary,
+        "_bridge_json",
+        lambda _spec, args: (
+            observed
+            if args[0] == "preflight"
+            else pytest.fail("preflight failure must not reach another command")
+        ),
+    )
+    with pytest.raises(canary.CanaryError, match=message):
+        canary.run_canary(spec, execute=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink regression")
@@ -1078,9 +1868,11 @@ def test_read_only_canary_requires_an_exact_unchanged_workload(
 
     def fake_bridge(current: dict[str, Any], args: list[str]) -> dict[str, Any]:
         nonlocal completed
+        if args[0] == "preflight":
+            return _issued_preflight(current)
         if args[0] == "run":
             completed = True
-            return {"terminal_state": "completed"}
+            return _run_result(current)
         assert args[0] == "inspect"
         return _inspect(current, completed=completed)
 
@@ -1100,10 +1892,11 @@ def test_read_only_canary_requires_an_exact_unchanged_workload(
         "runtime_pin",
         "codex_home_policy",
         "bridge_executable",
+        "bridge_install_binding",
         "git_executable",
         "scratch_root",
         "pre_git_snapshot",
-        "reserved_inspect_sha256",
+        "issued_preflight_sha256",
         "status",
         "live_app_server_started",
         "run_result_sha256",
@@ -1126,12 +1919,14 @@ def test_writable_canary_requires_mutation_and_separate_elevation(
     def fake_bridge(current: dict[str, Any], args: list[str]) -> dict[str, Any]:
         nonlocal completed
         commands.append(args[0])
+        if args[0] == "preflight":
+            return _issued_preflight(current)
         if args[0] == "run":
             (Path(current["scratch_root"]) / "workload.txt").write_text(
                 "after\n", encoding="utf-8"
             )
             completed = True
-            return {"terminal_state": "completed"}
+            return _run_result(current)
         if args[0] == "verify-mutation":
             assert "--sealed-claim-scope" in args
             assert args[args.index("--git-executable") + 1] == str(
@@ -1150,7 +1945,7 @@ def test_writable_canary_requires_mutation_and_separate_elevation(
     monkeypatch.setattr(canary, "_bridge_json", fake_bridge)
     result = canary.run_canary(spec, execute=True)
 
-    assert commands == ["inspect", "run", "inspect", "verify-mutation"]
+    assert commands == ["preflight", "run", "inspect", "verify-mutation"]
     assert result["evidence_level"] == "verified_mutation"
     assert result["pre_git_snapshot"] != result["post_git_snapshot"]
     assert result["task_completion"] == "not_inferred"
@@ -1163,10 +1958,11 @@ def test_writable_canary_requires_mutation_and_separate_elevation(
         "runtime_pin",
         "codex_home_policy",
         "bridge_executable",
+        "bridge_install_binding",
         "git_executable",
         "scratch_root",
         "pre_git_snapshot",
-        "reserved_inspect_sha256",
+        "issued_preflight_sha256",
         "status",
         "live_app_server_started",
         "run_result_sha256",
@@ -1189,11 +1985,13 @@ def test_writable_canary_rejects_git_metadata_only_mutation(
     def fake_bridge(current: dict[str, Any], args: list[str]) -> dict[str, Any]:
         nonlocal completed
         commands.append(args[0])
+        if args[0] == "preflight":
+            return _issued_preflight(current)
         if args[0] == "run":
             exclude = Path(current["scratch_root"]) / ".git" / "info" / "exclude"
             exclude.write_text("metadata-only-change\n", encoding="utf-8")
             completed = True
-            return {"terminal_state": "completed"}
+            return _run_result(current)
         if args[0] == "verify-mutation":
             pytest.fail("metadata-only mutation must not be elevated")
         assert args[0] == "inspect"
@@ -1206,7 +2004,7 @@ def test_writable_canary_rejects_git_metadata_only_mutation(
         match="made no workload mutation",
     ):
         canary.run_canary(spec, execute=True)
-    assert commands == ["inspect", "run", "inspect"]
+    assert commands == ["preflight", "run", "inspect"]
 
 
 def test_writable_canary_rejects_git_authority_change_with_workload_mutation(
@@ -1220,6 +2018,8 @@ def test_writable_canary_rejects_git_authority_change_with_workload_mutation(
     def fake_bridge(current: dict[str, Any], args: list[str]) -> dict[str, Any]:
         nonlocal completed
         commands.append(args[0])
+        if args[0] == "preflight":
+            return _issued_preflight(current)
         if args[0] == "run":
             root = Path(current["scratch_root"])
             (root / "workload.txt").write_text("after\n", encoding="utf-8")
@@ -1228,7 +2028,7 @@ def test_writable_canary_rejects_git_authority_change_with_workload_mutation(
                 encoding="utf-8",
             )
             completed = True
-            return {"terminal_state": "completed"}
+            return _run_result(current)
         if args[0] == "verify-mutation":
             pytest.fail("Git-authority mutation must not be elevated")
         assert args[0] == "inspect"
@@ -1241,7 +2041,7 @@ def test_writable_canary_rejects_git_authority_change_with_workload_mutation(
         match="changed Git repository authority",
     ):
         canary.run_canary(spec, execute=True)
-    assert commands == ["inspect", "run", "inspect"]
+    assert commands == ["preflight", "run", "inspect"]
 
 
 @pytest.mark.parametrize(
@@ -1265,6 +2065,8 @@ def test_writable_canary_rejects_workload_paths_omitted_from_git_evidence(
 
     def fake_bridge(current: dict[str, Any], args: list[str]) -> dict[str, Any]:
         nonlocal completed
+        if args[0] == "preflight":
+            return _issued_preflight(current)
         if args[0] == "run":
             root = Path(current["scratch_root"])
             (root / "ignored.txt").write_text("hidden delta\n", encoding="utf-8")
@@ -1274,7 +2076,7 @@ def test_writable_canary_rejects_workload_paths_omitted_from_git_evidence(
                     encoding="utf-8",
                 )
             completed = True
-            return {"terminal_state": "completed"}
+            return _run_result(current)
         if args[0] == "verify-mutation":
             return _verified_mutation(
                 current,

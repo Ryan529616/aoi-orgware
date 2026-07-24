@@ -9,21 +9,26 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
+import io
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import tomllib
 from typing import Any, Mapping, Sequence
+from urllib.parse import unquote, urlsplit
+import zipfile
 
 
-SCHEMA_VERSION = "aoi.codex-transport-canary.v3"
+SCHEMA_VERSION = "aoi.codex-transport-canary.v4"
 ROOT_MARKER = ".aoi-codex-transport-canary.json"
 ROOT_MARKER_SCHEMA = "aoi.codex-transport-canary-root.v1"
 _MODES = {
@@ -39,8 +44,41 @@ _MAX_FILE_BYTES = 16 * 1024 * 1024
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _MAX_EXECUTABLE_BYTES = 1024 * 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
+_MAX_PACKAGE_RECEIPT_BYTES = 1024 * 1024
+_MAX_WHEEL_BYTES = 256 * 1024 * 1024
+_MAX_WHEEL_ENTRIES = 4096
+_MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+_MAX_WHEEL_COMPRESSION_RATIO = 128
+_MAX_RECORD_BYTES = 2 * 1024 * 1024
+_MAX_RECORD_ROWS = 4096
+_MAX_INSTALLED_FILES = 4096
+_MAX_INSTALLED_BYTES = 64 * 1024 * 1024
 _LOCAL_FILES_MAX_BYTES = 1_048_576
 _ROOT_MARKER_MAX_BYTES = 4096
+_CONSOLE_SCRIPT_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})")
+_EXPECTED_CONSOLE_SCRIPTS = {
+    "aoi": "aoi_orgware.cli:main",
+    "aoi-claude-hook": "aoi_orgware.claude_hook:main",
+    "aoi-codex-bridge": "aoi_orgware.codex_transport_cli:main",
+    "aoi-codex-hook": "aoi_orgware.codex_hook:main",
+}
+_BRIDGE_MODULE_BOOTSTRAP = (
+    "import sys;"
+    "site_packages=sys.argv[1];"
+    "sys.path.append(site_packages);"
+    "from aoi_orgware.codex_transport_cli import main;"
+    "raise SystemExit(main(sys.argv[2:]))"
+)
+_PYVENV_CONFIG_KEYS = frozenset(
+    {
+        "home",
+        "include-system-site-packages",
+        "version",
+        "executable",
+        "command",
+        "prompt",
+    }
+)
 _LOCAL_FILES_HOME_NAMES = frozenset(
     {"auth.json", "config.toml", "managed_config.toml"}
 )
@@ -142,6 +180,33 @@ _LOCAL_GIT_CONFIG_KEYS = frozenset(
 _GIT_EXECUTABLE_BINDING_SCHEMA = "aoi.git-executable-binding.v1"
 _GIT_EXECUTABLE_PROVENANCE_SCOPE = "bridge_verify_mutation_git_observation"
 _GIT_MUTATION_PATHS_SCHEMA = "aoi.codex-transport.git-mutation-paths.v1"
+_PACKAGE_RECEIPT_SCHEMA = "aoi.release-package-local-gate.v1"
+_BRIDGE_INSTALL_BINDING_FIELDS = {
+    "package_receipt_file",
+    "package_receipt_sha256",
+    "expected_source_commit_oid",
+    "expected_source_tree_oid",
+    "expected_wheel_sha256",
+    "wheel_file",
+    "site_packages_root",
+    "distribution_info_root",
+}
+_PACKAGE_RECEIPT_FIELDS = {
+    "schema",
+    "head",
+    "tree",
+    "version",
+    "source_date_epoch",
+    "release_tools_lock_sha256",
+    "bootstrap_python",
+    "build_python",
+    "source_clean",
+    "verify_dist_exit_code",
+    "artifacts",
+    "recorded_at",
+}
+_PACKAGE_ARTIFACT_FIELDS = {"name", "size_bytes", "sha256"}
+_STARTUP_INJECTION_STEMS = frozenset({"sitecustomize", "usercustomize", "site"})
 
 
 class CanaryError(ValueError):
@@ -230,11 +295,21 @@ def _absolute_file(value: Any, label: str) -> Path:
         or _is_reparse(path, label=label)
     ):
         raise CanaryError(f"{label} must be an existing absolute regular file")
-    return path.resolve()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError(f"could not resolve {label}") from exc
+    if not _same_physical_path(path, resolved):
+        raise CanaryError(f"{label} resolves through a link or reparse boundary")
+    return resolved
 
 
 def _absolute_directory(value: Any, label: str) -> Path:
-    raw = _text(value, label, limit=4096)
+    raw = (
+        str(value)
+        if isinstance(value, os.PathLike)
+        else _text(value, label, limit=4096)
+    )
     path = Path(raw)
     if (
         not path.is_absolute()
@@ -243,7 +318,13 @@ def _absolute_directory(value: Any, label: str) -> Path:
         or _is_reparse(path, label=label)
     ):
         raise CanaryError(f"{label} must be an existing absolute directory")
-    return path.resolve()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError(f"could not resolve {label}") from exc
+    if not _same_physical_path(path, resolved):
+        raise CanaryError(f"{label} resolves through a link or reparse boundary")
+    return resolved
 
 
 def _is_reparse(path: Path, *, label: str) -> bool:
@@ -395,11 +476,856 @@ def _verify_executable_binding(
         raise CanaryError(f"{label} bytes drifted")
 
 
+def _git_oid(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _GIT_OID.fullmatch(value) is None:
+        raise CanaryError(f"{label} is not a full Git object ID")
+    return value
+
+
+def _record_candidate(
+    site_root: Path,
+    prefix: Path,
+    relative: str,
+) -> Path:
+    if "\\" in relative:
+        raise CanaryError("installed RECORD path is not canonical POSIX")
+    parsed = PurePosixPath(relative)
+    if parsed.is_absolute() or not parsed.parts:
+        raise CanaryError("installed RECORD path is invalid")
+    parent_count = 0
+    for part in parsed.parts:
+        if part != "..":
+            break
+        parent_count += 1
+    if any(part in {"", ".", ".."} for part in parsed.parts[parent_count:]):
+        raise CanaryError("installed RECORD path is invalid")
+    candidate = site_root
+    for _ in range(parent_count):
+        candidate = candidate.parent
+    candidate = candidate.joinpath(*parsed.parts[parent_count:])
+    path = _absolute_file(candidate, "installed RECORD member")
+    if not _under(path, prefix):
+        raise CanaryError("installed RECORD member escapes the isolated venv")
+    return path
+
+
+def _record_digest(value: str, *, label: str) -> str:
+    if not value.startswith("sha256="):
+        raise CanaryError(f"{label} lacks a SHA-256 digest")
+    encoded = value[7:]
+    if not encoded or "=" in encoded:
+        raise CanaryError(f"{label} has a non-canonical SHA-256 digest")
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise CanaryError(f"{label} has an invalid SHA-256 digest") from exc
+    if len(decoded) != 32 or base64.urlsafe_b64encode(decoded).rstrip(b"=").decode(
+        "ascii"
+    ) != encoded:
+        raise CanaryError(f"{label} has a non-canonical SHA-256 digest")
+    return decoded.hex()
+
+
+def _wheel_member_name(value: str) -> str:
+    if not value or "\\" in value or "\x00" in value:
+        raise CanaryError("wheel member name is not canonical POSIX")
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts or any(
+        part in {"", ".", ".."} for part in path.parts
+    ):
+        raise CanaryError("wheel member path is invalid")
+    return path.as_posix()
+
+
+def _wheel_record_rows(raw: bytes, *, record_name: str) -> dict[str, tuple[str | None, int | None]]:
+    try:
+        rows = list(csv.reader(raw.decode("utf-8", errors="strict").splitlines()))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise CanaryError("wheel RECORD is not strict CSV") from exc
+    if not rows or len(rows) > _MAX_RECORD_ROWS:
+        raise CanaryError("wheel RECORD row count is outside the bound")
+    result: dict[str, tuple[str | None, int | None]] = {}
+    for row in rows:
+        if len(row) != 3:
+            raise CanaryError("wheel RECORD row is invalid")
+        name = _wheel_member_name(row[0])
+        if name in result:
+            raise CanaryError("wheel RECORD repeats a canonical path")
+        digest, size = row[1], row[2]
+        if name == record_name:
+            if digest or size:
+                raise CanaryError("wheel RECORD self-row must be unhashed")
+            result[name] = (None, None)
+            continue
+        if not digest or not size.isdecimal():
+            raise CanaryError("wheel RECORD row lacks verifiable SHA-256 and size")
+        result[name] = (_record_digest(digest, label="wheel RECORD row"), int(size))
+    return result
+
+
+def _wheel_payload(
+    wheel_path: Path,
+    *,
+    expected_dist_info: str,
+    expected_sha256: str,
+) -> tuple[dict[str, bytes], int]:
+    """Read one bounded, closed wheel and validate its own RECORD oracle."""
+
+    raw = _bounded_regular_bytes(
+        wheel_path,
+        "release wheel",
+        max_bytes=_MAX_WHEEL_BYTES,
+    )
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise CanaryError("release wheel bytes drifted")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise CanaryError("release wheel is not one valid ZIP archive") from exc
+    with archive:
+        infos = archive.infolist()
+        if not infos or len(infos) > _MAX_WHEEL_ENTRIES:
+            raise CanaryError("release wheel entry count is outside the bound")
+        files: dict[str, bytes] = {}
+        folded: set[str] = set()
+        total_size = 0
+        for info in infos:
+            original = getattr(info, "orig_filename", info.filename)
+            if original != info.filename:
+                raise CanaryError("wheel member contains a NUL byte")
+            name = _wheel_member_name(info.filename)
+            name_folded = name.casefold()
+            if name in files or name_folded in folded:
+                raise CanaryError("wheel contains duplicate or case-colliding members")
+            folded.add(name_folded)
+            mode = info.external_attr >> 16
+            kind = stat.S_IFMT(mode)
+            if (
+                info.is_dir()
+                or info.flag_bits & 0x1
+                or (kind and kind != stat.S_IFREG)
+            ):
+                raise CanaryError("wheel contains an encrypted, special, or directory member")
+            if info.file_size < 0 or info.file_size > _MAX_WHEEL_UNCOMPRESSED_BYTES:
+                raise CanaryError("wheel member exceeds the byte bound")
+            if info.file_size and (
+                not info.compress_size
+                or info.file_size > info.compress_size * _MAX_WHEEL_COMPRESSION_RATIO
+            ):
+                raise CanaryError("wheel member exceeds the compression-ratio bound")
+            total_size += info.file_size
+            if total_size > _MAX_WHEEL_UNCOMPRESSED_BYTES:
+                raise CanaryError("wheel payload exceeds the byte bound")
+            try:
+                payload = archive.read(info)
+            except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+                raise CanaryError("could not read wheel member") from exc
+            if len(payload) != info.file_size:
+                raise CanaryError("wheel member size drifted while reading")
+            files[name] = payload
+
+    package_prefix = "aoi_orgware/"
+    dist_prefix = f"{expected_dist_info}/"
+    record_name = f"{expected_dist_info}/RECORD"
+    if record_name not in files or not any(
+        name.startswith(package_prefix) for name in files
+    ):
+        raise CanaryError("wheel lacks the expected AOI package or dist-info RECORD")
+    if any(
+        not (name.startswith(package_prefix) or name.startswith(dist_prefix))
+        for name in files
+    ):
+        raise CanaryError("wheel contains a member outside the expected distribution")
+    if any(
+        name.rsplit("/", 1)[-1].endswith(".pyc")
+        or "__pycache__" in PurePosixPath(name).parts
+        for name in files
+    ):
+        raise CanaryError("wheel contains bytecode cache payload")
+    rows = _wheel_record_rows(files[record_name], record_name=record_name)
+    if set(rows) != set(files):
+        raise CanaryError("wheel RECORD does not close every wheel member")
+    for name, payload in files.items():
+        expected = rows[name]
+        if name == record_name:
+            continue
+        if expected != (hashlib.sha256(payload).hexdigest(), len(payload)):
+            raise CanaryError("wheel RECORD member bytes drifted")
+    wheel_metadata_name = f"{expected_dist_info}/WHEEL"
+    try:
+        wheel_metadata = files[wheel_metadata_name].decode(
+            "utf-8",
+            errors="strict",
+        )
+    except KeyError as exc:
+        raise CanaryError("wheel lacks its WHEEL metadata") from exc
+    except UnicodeDecodeError as exc:
+        raise CanaryError("wheel WHEEL metadata is not UTF-8") from exc
+    root_is_purelib = [
+        line.partition(":")[2].strip().casefold()
+        for line in wheel_metadata.splitlines()
+        if line.partition(":")[0].strip().casefold() == "root-is-purelib"
+    ]
+    if root_is_purelib != ["true"]:
+        raise CanaryError("wheel must be one Root-Is-Purelib distribution")
+    return files, len(raw)
+
+
+def _wheel_console_scripts(raw: bytes) -> dict[str, str]:
+    """Parse the exact, closed console-script surface shipped by AOI."""
+
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise CanaryError("wheel entry_points.txt is not UTF-8") from exc
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or lines[0].casefold() != "[console_scripts]":
+        raise CanaryError("wheel console-script metadata is invalid")
+    scripts: dict[str, str] = {}
+    folded_names: set[str] = set()
+    for line in lines[1:]:
+        if line.startswith(("#", ";", "[")) or line.count("=") != 1:
+            raise CanaryError("wheel console-script metadata is invalid")
+        name, target = (part.strip() for part in line.split("=", 1))
+        folded = name.casefold()
+        if (
+            _CONSOLE_SCRIPT_NAME.fullmatch(name) is None
+            or folded in folded_names
+            or not target
+            or len(target) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in target)
+        ):
+            raise CanaryError("wheel console-script metadata is invalid")
+        folded_names.add(folded)
+        scripts[name] = target
+    if scripts != _EXPECTED_CONSOLE_SCRIPTS:
+        raise CanaryError("wheel console-script surface or target drifted")
+    return scripts
+
+
+def _trusted_bridge_python_binding() -> dict[str, Any]:
+    """Bind the already-trusted interpreter running this canary."""
+
+    value = getattr(sys, "_base_executable", None) or sys.executable
+    if not isinstance(value, str) or not value:
+        raise CanaryError("canary base Python executable is unavailable")
+    raw_path = Path(value)
+    if not raw_path.is_absolute():
+        raise CanaryError("canary base Python executable is not absolute")
+    try:
+        resolved = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError("could not resolve canary base Python executable") from exc
+    executable = _absolute_file(resolved, "canary base Python executable")
+    size, digest = _stable_regular_file_sha256(
+        executable,
+        "canary base Python executable",
+        max_bytes=_MAX_EXECUTABLE_BYTES,
+    )
+    return {
+        "path": _contract_path(executable),
+        "size_bytes": size,
+        "sha256": digest,
+        "execution_mode": "isolated_no_site_fixed_module",
+    }
+
+
+def _pyvenv_configuration(
+    raw: bytes,
+    *,
+    prefix: Path,
+    trusted_python: Path,
+) -> dict[str, str]:
+    """Parse one unambiguous pyvenv.cfg and bind it to the trusted base runtime."""
+
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise CanaryError("bridge pyvenv.cfg is not UTF-8") from exc
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        key, separator, value = line.partition("=")
+        normalized_key = key.strip().casefold()
+        normalized_value = value.strip()
+        if (
+            not separator
+            or not normalized_key
+            or normalized_key not in _PYVENV_CONFIG_KEYS
+            or normalized_key in result
+            or not normalized_value
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in normalized_value
+            )
+        ):
+            raise CanaryError("bridge pyvenv.cfg is ambiguous or invalid")
+        result[normalized_key] = normalized_value
+    required = {
+        "home",
+        "include-system-site-packages",
+        "version",
+        "executable",
+        "command",
+    }
+    if not required.issubset(result):
+        raise CanaryError("bridge pyvenv.cfg lacks required keys")
+    if result["include-system-site-packages"].casefold() != "false":
+        raise CanaryError("bridge venv must disable system site packages")
+    expected_version = ".".join(str(value) for value in sys.version_info[:3])
+    if result["version"] != expected_version:
+        raise CanaryError("bridge pyvenv.cfg Python version drifted")
+    home = _absolute_directory(result["home"], "bridge pyvenv.cfg home")
+    try:
+        executable_path = Path(result["executable"]).resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError("could not resolve bridge pyvenv.cfg executable") from exc
+    executable = _absolute_file(executable_path, "bridge pyvenv.cfg executable")
+    if not _same_path(home, trusted_python.parent) or not _same_path(
+        executable,
+        trusted_python,
+    ):
+        raise CanaryError("bridge pyvenv.cfg base Python authority drifted")
+    command = result["command"]
+    if (
+        " -m venv " not in command
+        or not command.endswith(f" {prefix}")
+    ):
+        raise CanaryError("bridge pyvenv.cfg creation command drifted")
+    return result
+
+
+def _file_url_path(value: Any) -> Path:
+    raw = _text(value, "direct_url.url", limit=8192)
+    try:
+        parsed = urlsplit(raw)
+        decoded = unquote(parsed.path, errors="strict")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CanaryError("direct_url URL is invalid") from exc
+    if (
+        parsed.scheme.lower() != "file"
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or not decoded
+    ):
+        raise CanaryError("direct_url URL is not one local file URL")
+    if (
+        os.name == "nt"
+        and len(decoded) >= 3
+        and decoded[0] == "/"
+        and decoded[2] == ":"
+    ):
+        decoded = decoded[1:]
+    return _absolute_file(decoded, "direct_url wheel archive")
+
+
+def _installed_namespace_closure(
+    roots: Sequence[Path],
+    *,
+    prefix: Path,
+    expected_files: set[Path],
+) -> dict[str, Any]:
+    actual_files: set[Path] = set()
+    actual_directories: set[Path] = set()
+    manifest: list[dict[str, Any]] = []
+    total_bytes = 0
+
+    def visit(directory: Path) -> None:
+        nonlocal total_bytes
+        checked = _absolute_directory(directory, "installed namespace directory")
+        if not _under(checked, prefix):
+            raise CanaryError("installed namespace directory escapes the venv")
+        actual_directories.add(checked)
+        try:
+            entries = sorted(
+                os.scandir(checked),
+                key=lambda entry: (entry.name.casefold(), entry.name),
+            )
+        except OSError as exc:
+            raise CanaryError("could not enumerate installed namespace") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(prefix)
+            if (
+                entry.name.endswith(".pyc")
+                or "__pycache__" in relative.parts
+            ):
+                raise CanaryError("installed AOI namespace contains bytecode cache")
+            try:
+                # Native Windows DirEntry.stat() may report st_nlink=0 even
+                # when Path.lstat() reports the required single-link identity.
+                metadata = path.lstat()
+            except OSError as exc:
+                raise CanaryError(
+                    "could not inspect installed namespace member"
+                ) from exc
+            if path.is_symlink() or bool(
+                getattr(metadata, "st_file_attributes", 0) & 0x400
+            ):
+                raise CanaryError(
+                    "installed namespace contains a link or reparse point"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                visit(path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise CanaryError(
+                    "installed namespace contains a non-regular or linked member"
+                )
+            actual_files.add(path.resolve())
+            if len(actual_files) > _MAX_INSTALLED_FILES:
+                raise CanaryError("installed namespace exceeds the file-count bound")
+            size, digest = _stable_regular_file_sha256(
+                path,
+                "installed namespace file",
+                max_bytes=_MAX_INSTALLED_BYTES,
+                min_bytes=0,
+            )
+            total_bytes += size
+            if total_bytes > _MAX_INSTALLED_BYTES:
+                raise CanaryError("installed namespace exceeds the byte bound")
+            manifest.append(
+                {
+                    "path": _contract_path(path),
+                    "size_bytes": size,
+                    "sha256": digest,
+                }
+            )
+
+    for root in roots:
+        visit(root)
+    if actual_files != expected_files:
+        unexpected = sorted(
+            _contract_path(path) for path in actual_files - expected_files
+        )
+        missing = sorted(
+            _contract_path(path) for path in expected_files - actual_files
+        )
+        raise CanaryError(
+            "installed AOI namespace differs from exact RECORD closure: "
+            f"unexpected={unexpected[:8]} missing={missing[:8]}"
+        )
+    manifest.sort(key=lambda row: row["path"])
+    directory_names = sorted(_contract_path(path) for path in actual_directories)
+    return {
+        "file_count": len(manifest),
+        "directory_count": len(directory_names),
+        "total_size_bytes": total_bytes,
+        "closure_sha256": _digest(
+            {"directories": directory_names, "files": manifest}
+        ),
+    }
+
+
+def _bridge_install_binding(
+    value: Any,
+    *,
+    bridge_executable: Path,
+) -> dict[str, Any]:
+    item = _object(
+        value,
+        _BRIDGE_INSTALL_BINDING_FIELDS,
+        "bridge_install_binding",
+    )
+    receipt_path = _absolute_file(
+        item["package_receipt_file"],
+        "bridge_install_binding.package_receipt_file",
+    )
+    expected_receipt_sha = _sha256(
+        item["package_receipt_sha256"],
+        "bridge_install_binding.package_receipt_sha256",
+    )
+    receipt_raw = _bounded_regular_bytes(
+        receipt_path,
+        "release package receipt",
+        max_bytes=_MAX_PACKAGE_RECEIPT_BYTES,
+    )
+    if hashlib.sha256(receipt_raw).hexdigest() != expected_receipt_sha:
+        raise CanaryError("release package receipt bytes drifted")
+    receipt = _object(
+        _strict_json_loads(receipt_raw, "release package receipt"),
+        _PACKAGE_RECEIPT_FIELDS,
+        "release package receipt",
+    )
+    if (
+        receipt["schema"] != _PACKAGE_RECEIPT_SCHEMA
+        or receipt["source_clean"] is not True
+        or receipt["verify_dist_exit_code"] != 0
+    ):
+        raise CanaryError("release package receipt is not one passing clean gate")
+    commit_oid = _git_oid(
+        item["expected_source_commit_oid"],
+        "bridge_install_binding.expected_source_commit_oid",
+    )
+    tree_oid = _git_oid(
+        item["expected_source_tree_oid"],
+        "bridge_install_binding.expected_source_tree_oid",
+    )
+    if receipt["head"] != commit_oid or receipt["tree"] != tree_oid:
+        raise CanaryError("release package receipt source binding drifted")
+    version = _text(receipt["version"], "release package version", limit=128)
+    expected_dist_name = f"aoi_orgware-{version}.dist-info"
+    wheel_sha = _sha256(
+        item["expected_wheel_sha256"],
+        "bridge_install_binding.expected_wheel_sha256",
+    )
+    wheel_path = _absolute_file(
+        item["wheel_file"],
+        "bridge_install_binding.wheel_file",
+    )
+    wheel_files, wheel_size = _wheel_payload(
+        wheel_path,
+        expected_dist_info=expected_dist_name,
+        expected_sha256=wheel_sha,
+    )
+    entry_points_name = f"{expected_dist_name}/entry_points.txt"
+    try:
+        console_scripts = _wheel_console_scripts(wheel_files[entry_points_name])
+    except KeyError as exc:
+        raise CanaryError("wheel lacks its console-script metadata") from exc
+    artifacts = receipt["artifacts"]
+    if not isinstance(artifacts, list) or not artifacts or len(artifacts) > 8:
+        raise CanaryError("release package receipt artifacts are invalid")
+    artifact_rows: list[dict[str, Any]] = []
+    for row in artifacts:
+        checked = _object(
+            row,
+            _PACKAGE_ARTIFACT_FIELDS,
+            "release package artifact",
+        )
+        if (
+            not isinstance(checked["size_bytes"], int)
+            or isinstance(checked["size_bytes"], bool)
+            or checked["size_bytes"] < 1
+        ):
+            raise CanaryError("release package artifact size is invalid")
+        _sha256(checked["sha256"], "release package artifact SHA-256")
+        _text(checked["name"], "release package artifact name", limit=512)
+        artifact_rows.append(checked)
+    wheel_rows = [
+        row
+        for row in artifact_rows
+        if row["name"] == wheel_path.name
+        and row["size_bytes"] == wheel_size
+        and row["sha256"] == wheel_sha
+    ]
+    if len(wheel_rows) != 1:
+        raise CanaryError("release package receipt does not bind the exact wheel")
+
+    site_root = _absolute_directory(
+        item["site_packages_root"],
+        "bridge_install_binding.site_packages_root",
+    )
+    dist_info = _absolute_directory(
+        item["distribution_info_root"],
+        "bridge_install_binding.distribution_info_root",
+    )
+    if dist_info.parent != site_root:
+        raise CanaryError("distribution info root is outside exact site-packages")
+    prefix = bridge_executable.parent.parent
+    prefix = _absolute_directory(prefix, "bridge virtual environment")
+    if not _under(site_root, prefix) or not _under(bridge_executable, prefix):
+        raise CanaryError("bridge installation is not contained by one venv")
+    expected_scripts_directory = "scripts" if os.name == "nt" else "bin"
+    if bridge_executable.parent.name.casefold() != expected_scripts_directory:
+        raise CanaryError("bridge executable is outside the venv scripts directory")
+    launcher_suffix = ".exe" if os.name == "nt" else ""
+    launcher_paths = {
+        name: _absolute_file(
+            bridge_executable.parent / f"{name}{launcher_suffix}",
+            f"installed {name} launcher",
+        )
+        for name in console_scripts
+    }
+    if not _same_path(launcher_paths["aoi-codex-bridge"], bridge_executable):
+        raise CanaryError("bridge executable differs from its wheel entry point")
+    trusted_python_binding = _trusted_bridge_python_binding()
+    trusted_python = _absolute_file(
+        trusted_python_binding["path"],
+        "trusted Bridge Python executable",
+    )
+    config = _bounded_regular_bytes(
+        _absolute_file(prefix / "pyvenv.cfg", "bridge pyvenv.cfg"),
+        "bridge pyvenv.cfg",
+        max_bytes=64 * 1024,
+    )
+    pyvenv_configuration = _pyvenv_configuration(
+        config,
+        prefix=prefix,
+        trusted_python=trusted_python,
+    )
+
+    if dist_info.name != expected_dist_name:
+        raise CanaryError("distribution info directory identity drifted")
+    package_root = _absolute_directory(
+        site_root / "aoi_orgware",
+        "installed AOI package root",
+    )
+    try:
+        top_level = sorted(
+            site_root.iterdir(),
+            key=lambda path: (path.name.casefold(), path.name),
+        )
+    except OSError as exc:
+        raise CanaryError("could not enumerate site-packages") from exc
+    for entry in top_level:
+        folded = entry.name.casefold()
+        if entry.suffix.casefold() == ".pth":
+            raise CanaryError("bridge venv may not contain a .pth authority path")
+        startup_stem = folded.partition(".")[0]
+        if startup_stem in _STARTUP_INJECTION_STEMS:
+            raise CanaryError("bridge venv contains a Python startup injection")
+        if folded == "aoi_orgware" and entry.name != "aoi_orgware":
+            raise CanaryError("installed AOI package casing drifted")
+        if folded.startswith("aoi_orgware."):
+            raise CanaryError("site-packages contains an AOI import shadow")
+        if (
+            folded.startswith("aoi_orgware-")
+            and folded.endswith(".dist-info")
+            and entry.name != dist_info.name
+        ):
+            raise CanaryError("site-packages contains another AOI distribution")
+
+    record_path = _absolute_file(dist_info / "RECORD", "installed RECORD")
+    wheel_record_name = f"{expected_dist_name}/RECORD"
+    forbidden_wheel_generated = {
+        f"{expected_dist_name}/INSTALLER",
+        f"{expected_dist_name}/REQUESTED",
+        f"{expected_dist_name}/direct_url.json",
+    }
+    if forbidden_wheel_generated & set(wheel_files):
+        raise CanaryError("wheel contains an installer-generated metadata surface")
+    wheel_installed_paths: dict[Path, bytes] = {}
+    for name, payload in wheel_files.items():
+        if name == wheel_record_name:
+            continue
+        target = _absolute_file(
+            site_root.joinpath(*PurePosixPath(name).parts),
+            "installed wheel payload",
+        )
+        wheel_installed_paths[target] = payload
+    direct_path = _absolute_file(
+        dist_info / "direct_url.json",
+        "installed direct_url.json",
+    )
+    installer_path = _absolute_file(dist_info / "INSTALLER", "installed INSTALLER")
+    requested_path = _absolute_file(dist_info / "REQUESTED", "installed REQUESTED")
+    expected_record_paths = set(wheel_installed_paths) | {
+        record_path,
+        direct_path,
+        installer_path,
+        requested_path,
+        *launcher_paths.values(),
+    }
+    installer_surface_count = 4 + len(launcher_paths)
+    if len(expected_record_paths) != (
+        len(wheel_installed_paths) + installer_surface_count
+    ):
+        raise CanaryError("installed wheel and installer surfaces overlap")
+    record_raw = _bounded_regular_bytes(
+        record_path,
+        "installed RECORD",
+        max_bytes=_MAX_RECORD_BYTES,
+    )
+    try:
+        rows = list(
+            csv.reader(record_raw.decode("utf-8", errors="strict").splitlines())
+        )
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise CanaryError("installed RECORD is not strict CSV") from exc
+    if not rows or len(rows) > _MAX_RECORD_ROWS:
+        raise CanaryError("installed RECORD row count is outside the bound")
+    record_entries: dict[Path, tuple[str | None, int | None]] = {}
+    total_recorded_bytes = 0
+    for row in rows:
+        if len(row) != 3 or not row[0]:
+            raise CanaryError("installed RECORD row is invalid")
+        candidate = _record_candidate(site_root, prefix, row[0])
+        if candidate in record_entries:
+            raise CanaryError("installed RECORD repeats a canonical path")
+        digest_field, size_field = row[1], row[2]
+        if candidate == record_path:
+            if digest_field or size_field:
+                raise CanaryError("installed RECORD self-row must be unhashed")
+            record_entries[candidate] = (None, None)
+            continue
+        if not digest_field or not size_field.isdecimal():
+            raise CanaryError(
+                "installed RECORD row lacks verifiable SHA-256 and size"
+            )
+        expected_size = int(size_field)
+        size, digest = _stable_regular_file_sha256(
+            candidate,
+            "installed RECORD member",
+            max_bytes=_MAX_INSTALLED_BYTES,
+            min_bytes=0,
+        )
+        if size != expected_size or digest != _record_digest(
+            digest_field,
+            label="installed RECORD row",
+        ):
+            raise CanaryError("installed RECORD member bytes drifted")
+        total_recorded_bytes += size
+        if total_recorded_bytes > _MAX_INSTALLED_BYTES:
+            raise CanaryError("installed RECORD payload exceeds the byte bound")
+        record_entries[candidate] = (digest, size)
+
+    if set(record_entries) != expected_record_paths:
+        raise CanaryError("installed RECORD differs from the wheel and installer closure")
+    for installed_path, expected_payload in wheel_installed_paths.items():
+        observed_payload = _bounded_regular_bytes(
+            installed_path,
+            "installed wheel payload",
+            max_bytes=_MAX_WHEEL_UNCOMPRESSED_BYTES,
+            min_bytes=0,
+        )
+        if observed_payload != expected_payload:
+            raise CanaryError("installed payload differs from exact wheel bytes")
+    if _bounded_regular_bytes(
+        installer_path,
+        "installed INSTALLER",
+        max_bytes=1024,
+    ) not in {b"pip\n", b"pip\r\n"}:
+        raise CanaryError("installed INSTALLER is not the expected pip surface")
+    if (
+        _bounded_regular_bytes(
+            requested_path,
+            "installed REQUESTED",
+            max_bytes=1024,
+            min_bytes=0,
+        )
+        != b""
+    ):
+        raise CanaryError("installed REQUESTED is not the expected empty surface")
+
+    expected_namespace_files = {
+        path
+        for path in record_entries
+        if _under(path, package_root) or _under(path, dist_info)
+    }
+    namespace = _installed_namespace_closure(
+        (package_root, dist_info),
+        prefix=prefix,
+        expected_files=expected_namespace_files,
+    )
+    launcher_manifest: list[dict[str, Any]] = []
+    for name, entry_target in sorted(console_scripts.items()):
+        launcher_path = launcher_paths[name]
+        launcher_entry = record_entries.get(launcher_path)
+        if launcher_entry is None or launcher_entry[0] is None:
+            raise CanaryError("console launcher is absent from installed RECORD")
+        launcher_manifest.append(
+            {
+                "name": name,
+                "target": entry_target,
+                "path": _contract_path(launcher_path),
+                "sha256": launcher_entry[0],
+                "size_bytes": launcher_entry[1],
+            }
+        )
+    bridge_entry = record_entries.get(bridge_executable)
+    if bridge_entry is None or bridge_entry[0] is None:
+        raise CanaryError("bridge executable is absent from installed RECORD")
+    bridge_size, bridge_sha = _stable_regular_file_sha256(
+        bridge_executable,
+        "installed bridge executable",
+        max_bytes=_MAX_EXECUTABLE_BYTES,
+    )
+    if bridge_entry != (bridge_sha, bridge_size):
+        raise CanaryError("installed RECORD does not bind the bridge executable")
+
+    direct_path = _absolute_file(
+        dist_info / "direct_url.json",
+        "installed direct_url.json",
+    )
+    direct_entry = record_entries.get(direct_path)
+    if direct_entry is None or direct_entry[0] is None:
+        raise CanaryError("direct_url.json is absent from installed RECORD")
+    direct_raw = _bounded_regular_bytes(
+        direct_path,
+        "installed direct_url.json",
+        max_bytes=64 * 1024,
+    )
+    direct = _object(
+        _strict_json_loads(direct_raw, "installed direct_url.json"),
+        {"url", "archive_info"},
+        "installed direct_url.json",
+    )
+    archive = _object(
+        direct["archive_info"],
+        {"hash", "hashes"},
+        "installed direct_url archive_info",
+    )
+    if archive["hash"] != f"sha256={wheel_sha}" or archive["hashes"] != {
+        "sha256": wheel_sha
+    }:
+        raise CanaryError("installed direct_url does not bind the exact wheel")
+    if not _same_path(_file_url_path(direct["url"]), wheel_path):
+        raise CanaryError("installed direct_url points at another wheel")
+
+    metadata_raw = _bounded_regular_bytes(
+        _absolute_file(dist_info / "METADATA", "installed METADATA"),
+        "installed METADATA",
+        max_bytes=1024 * 1024,
+    )
+    try:
+        metadata_text = metadata_raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise CanaryError("installed METADATA is not UTF-8") from exc
+    metadata_lines = metadata_text.splitlines()
+    names = [line[6:] for line in metadata_lines if line.startswith("Name: ")]
+    versions = [
+        line[9:] for line in metadata_lines if line.startswith("Version: ")
+    ]
+    if names != ["aoi-orgware"] or versions != [version]:
+        raise CanaryError("installed distribution metadata identity drifted")
+    installed_entry_points = _bounded_regular_bytes(
+        _absolute_file(
+            dist_info / "entry_points.txt",
+            "installed entry_points.txt",
+        ),
+        "installed entry_points.txt",
+        max_bytes=64 * 1024,
+    )
+    if _wheel_console_scripts(installed_entry_points) != console_scripts:
+        raise CanaryError("installed console-script metadata drifted")
+
+    closure = {
+        "source_commit_oid": commit_oid,
+        "source_tree_oid": tree_oid,
+        "wheel_sha256": wheel_sha,
+        "package_receipt_sha256": expected_receipt_sha,
+        "pyvenv_config_sha256": hashlib.sha256(config).hexdigest(),
+        "pyvenv_configuration": pyvenv_configuration,
+        "bridge_runtime_python": trusted_python_binding,
+        "record_sha256": hashlib.sha256(record_raw).hexdigest(),
+        "record_rows": len(rows),
+        "namespace": namespace,
+        "console_scripts": launcher_manifest,
+        "bridge_executable_sha256": bridge_sha,
+    }
+    closure["closure_sha256"] = _digest(closure)
+    return {
+        "package_receipt_file": _contract_path(receipt_path),
+        "package_receipt_sha256": expected_receipt_sha,
+        "expected_source_commit_oid": commit_oid,
+        "expected_source_tree_oid": tree_oid,
+        "expected_wheel_sha256": wheel_sha,
+        "wheel_file": _contract_path(wheel_path),
+        "site_packages_root": _contract_path(site_root),
+        "distribution_info_root": _contract_path(dist_info),
+        "closure": closure,
+    }
+
+
 def _bounded_regular_bytes(
     path: Path,
     label: str,
     *,
     max_bytes: int = _LOCAL_FILES_MAX_BYTES,
+    min_bytes: int = 1,
 ) -> bytes:
     try:
         before = path.lstat()
@@ -411,7 +1337,9 @@ def _bounded_regular_bytes(
         ):
             raise CanaryError(f"{label} must be a regular non-linked file")
         size = int(before.st_size)
-        if size < 1 or size > max_bytes:
+        if min_bytes < 0 or min_bytes > max_bytes:
+            raise CanaryError(f"{label} has invalid byte bounds")
+        if size < min_bytes or size > max_bytes:
             raise CanaryError(f"{label} bytes are outside the bounded limit")
         resolved = path.resolve(strict=True)
     except OSError as exc:
@@ -643,6 +1571,7 @@ def load_spec(path: Path) -> dict[str, Any]:
             "bridge_executable",
             "bridge_executable_sha256",
             "bridge_executable_size_bytes",
+            "bridge_install_binding",
             "git_executable",
             "git_executable_sha256",
             "git_executable_size_bytes",
@@ -691,6 +1620,10 @@ def load_spec(path: Path) -> dict[str, Any]:
         expected_size=bridge_size,
         expected_sha256=bridge_sha256,
     )
+    bridge_install = _bridge_install_binding(
+        value["bridge_install_binding"],
+        bridge_executable=bridge_executable,
+    )
     git_executable = _absolute_file(value["git_executable"], "git_executable")
     git_size = _executable_size(
         value["git_executable_size_bytes"], "git_executable"
@@ -738,6 +1671,7 @@ def load_spec(path: Path) -> dict[str, Any]:
         "bridge_executable": bridge_executable,
         "bridge_executable_sha256": bridge_sha256,
         "bridge_executable_size_bytes": bridge_size,
+        "bridge_install_binding": bridge_install,
         "git_executable": git_executable,
         "git_executable_sha256": git_sha256,
         "git_executable_size_bytes": git_size,
@@ -881,27 +1815,104 @@ def _set_closed_git_environment(environment: dict[str, str]) -> None:
     environment["GCM_INTERACTIVE"] = "Never"
 
 
+def _native_windows_directory() -> Path:
+    if os.name != "nt":
+        raise CanaryError("native Windows directory is unavailable")
+    import ctypes
+
+    loader = getattr(ctypes, "WinDLL", None)
+    if loader is None:
+        raise CanaryError("Win32 loader is unavailable")
+    kernel32 = loader("kernel32", use_last_error=True)
+    get_windows_directory = kernel32.GetWindowsDirectoryW
+    get_windows_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+    get_windows_directory.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = int(get_windows_directory(buffer, len(buffer)))
+    if length <= 0 or length >= len(buffer):
+        raise CanaryError("GetWindowsDirectoryW failed")
+    return _absolute_directory(Path(buffer.value), "native Windows directory")
+
+
+def _validated_temp_directory() -> Path:
+    path = Path(tempfile.gettempdir())
+    if not path.is_absolute():
+        path = path.absolute()
+    return _absolute_directory(path, "temporary directory")
+
+
+def _constructed_bridge_path(spec: Mapping[str, Any]) -> str:
+    directories = [
+        _absolute_directory(
+            Path(str(spec["codex_executable"])).parent,
+            "Codex executable directory",
+        ),
+        _absolute_directory(
+            Path(str(spec["git_executable"])).parent,
+            "Git executable directory",
+        ),
+    ]
+    if os.name == "nt":
+        system_root = _native_windows_directory()
+        directories.extend(
+            (
+                _absolute_directory(
+                    system_root / "System32",
+                    "native Windows System32 directory",
+                ),
+                system_root,
+            )
+        )
+    else:
+        directories.extend((Path("/usr/local/bin"), Path("/usr/bin"), Path("/bin")))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for directory in directories:
+        value = str(directory)
+        folded = os.path.normcase(os.path.normpath(value))
+        if folded not in seen:
+            seen.add(folded)
+            unique.append(value)
+    return os.pathsep.join(unique)
+
+
 def _bridge_environment(spec: Mapping[str, Any]) -> dict[str, str]:
     """Return the bounded child environment for bridge-owned subprocesses."""
 
-    environment: dict[str, str] = {}
-    for name, value in os.environ.items():
-        upper = name.upper()
-        if (
-            upper == "CODEX_HOME"
-            or upper in _AOI_SECRET_ENV_NAMES
-            or upper.startswith(_AOI_SECRET_ENV_PREFIXES)
-            or upper == "AOI_BACKUP_ROOT"
-            or upper.startswith("PYTHON")
-            or upper in _PYTHON_RUNTIME_ENV_NAMES
-            or _is_publish_credential_name(name)
-            or _is_git_routing_environment_name(name)
-        ):
-            continue
-        environment[name] = value
-    environment["CODEX_HOME"] = str(spec["codex_home_policy"]["codex_home"])
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PYTHONSAFEPATH"] = "1"
+    codex_home = str(spec["codex_home_policy"]["codex_home"])
+    temporary_directory = str(_validated_temp_directory())
+    environment: dict[str, str] = {
+        "CODEX_HOME": codex_home,
+        "HOME": codex_home,
+        "USERPROFILE": codex_home,
+        "PATH": _constructed_bridge_path(spec),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONSAFEPATH": "1",
+        "PYTHONUTF8": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TEMP": temporary_directory,
+        "TMP": temporary_directory,
+    }
+    if os.name == "nt":
+        home_path = Path(codex_home)
+        system_root = _native_windows_directory()
+        command_processor = _absolute_file(
+            system_root / "System32" / "cmd.exe",
+            "native Windows command processor",
+        )
+        home_suffix = str(home_path)[len(home_path.drive) :] or "\\"
+        environment.update(
+            {
+                "HOMEDRIVE": home_path.drive or "C:",
+                "HOMEPATH": home_suffix,
+                "SYSTEMROOT": str(system_root),
+                "WINDIR": str(system_root),
+                "COMSPEC": str(command_processor),
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            }
+        )
     _set_closed_git_environment(environment)
     return environment
 
@@ -923,6 +1934,15 @@ def _revalidate_bridge_binding(spec: Mapping[str, Any]) -> None:
         expected_size=int(spec["bridge_executable_size_bytes"]),
         expected_sha256=str(spec["bridge_executable_sha256"]),
     )
+    refreshed_install = _bridge_install_binding(
+        {
+            field: spec["bridge_install_binding"][field]
+            for field in _BRIDGE_INSTALL_BINDING_FIELDS
+        },
+        bridge_executable=bridge,
+    )
+    if refreshed_install != spec["bridge_install_binding"]:
+        raise CanaryError("bridge installed-distribution binding drifted")
     refreshed_home = _local_files_codex_home(
         spec["codex_home_policy"]["codex_home"]
     )
@@ -1510,9 +2530,19 @@ def _bridge_json(
     args: Sequence[str],
 ) -> dict[str, Any]:
     _revalidate_bridge_binding(spec)
+    install_binding = spec["bridge_install_binding"]
+    runtime_python = install_binding["closure"]["bridge_runtime_python"]
     completed = _run_process(
         [
-            str(spec["bridge_executable"]),
+            str(runtime_python["path"]),
+            "-I",
+            "-S",
+            "-B",
+            "-X",
+            "utf8",
+            "-c",
+            _BRIDGE_MODULE_BOOTSTRAP,
+            str(install_binding["site_packages_root"]),
             "--root",
             str(spec["aoi_root"]),
             *args,
@@ -1521,6 +2551,7 @@ def _bridge_json(
         timeout_seconds=float(spec["timeout_seconds"]) + 30.0,
         environment=_bridge_environment(spec),
     )
+    _revalidate_bridge_binding(spec)
     try:
         value = _strict_json_loads(completed.stdout, "bridge result")
     except CanaryError as exc:
@@ -1543,21 +2574,35 @@ def _inspect(spec: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-def _validate_policy(
+def _preflight(spec: Mapping[str, Any]) -> dict[str, Any]:
+    return _bridge_json(
+        spec,
+        [
+            "preflight",
+            "--task",
+            str(spec["task_id"]),
+            "--permit-sha256",
+            str(spec["permit_sha256"]),
+            "--prompt-file",
+            str(spec["prompt_file"]),
+        ],
+    )
+
+
+def _validate_intent_policy(
     spec: Mapping[str, Any],
-    inspected: Mapping[str, Any],
+    observed: Mapping[str, Any],
     *,
-    fresh: bool,
-) -> None:
+    label: str,
+) -> Mapping[str, Any]:
     if (
-        inspected.get("task_id") != spec["task_id"]
-        or inspected.get("launch_id") != spec["launch_id"]
-        or inspected.get("contract_version") != "v2"
+        observed.get("task_id") != spec["task_id"]
+        or observed.get("launch_id") != spec["launch_id"]
     ):
-        raise CanaryError("inspect result does not identify the exact V2 launch")
-    intent = inspected.get("intent")
+        raise CanaryError(f"{label} does not identify the exact launch")
+    intent = observed.get("intent")
     if not isinstance(intent, Mapping):
-        raise CanaryError("inspect result has no authenticated intent")
+        raise CanaryError(f"{label} has no authenticated intent")
     expected_runtime = dict(spec["runtime_pin"])
     if (
         intent.get("cwd") != _contract_path(Path(spec["scratch_root"]))
@@ -1566,7 +2611,73 @@ def _validate_policy(
         or intent.get("network_access") is not False
         or intent.get("runtime_pin") != expected_runtime
     ):
-        raise CanaryError("inspect intent differs from the canary policy")
+        raise CanaryError(f"{label} intent differs from the canary policy")
+    return intent
+
+
+def _validate_issued_preflight(
+    spec: Mapping[str, Any],
+    preflight: Mapping[str, Any],
+) -> None:
+    expected_fields = {
+        "task_id",
+        "launch_id",
+        "packet_id",
+        "packet_status",
+        "permit_sha256",
+        "intent",
+        "issuance",
+        "semantic_head_sha256",
+        "status",
+        "evidence_level",
+        "permit_consumed",
+        "runtime_evidence",
+        "confidentiality_warnings",
+        "task_completion",
+    }
+    if set(preflight) != expected_fields:
+        raise CanaryError("issued preflight fields differ from the v4 contract")
+    intent = _validate_intent_policy(
+        spec,
+        preflight,
+        label="issued preflight",
+    )
+    issuance = preflight.get("issuance")
+    if (
+        preflight.get("packet_id") != intent.get("packet_id")
+        or preflight.get("packet_status") != "armed"
+        or preflight.get("permit_sha256") != spec["permit_sha256"]
+        or preflight.get("status") != "issued_unconsumed"
+        or preflight.get("evidence_level") != "transport_issued"
+        or preflight.get("permit_consumed") is not False
+        or preflight.get("runtime_evidence") != "none"
+        or preflight.get("task_completion") != "not_inferred"
+        or not isinstance(preflight.get("confidentiality_warnings"), list)
+        or not isinstance(issuance, Mapping)
+        or issuance.get("task_id") != spec["task_id"]
+        or issuance.get("launch_id") != spec["launch_id"]
+        or issuance.get("permit_sha256") != spec["permit_sha256"]
+        or issuance.get("intent_sha256") != intent.get("intent_sha256")
+    ):
+        raise CanaryError(
+            "issued preflight is not the exact authenticated unconsumed launch"
+        )
+    _sha256(
+        preflight.get("semantic_head_sha256"),
+        "issued preflight semantic head",
+    )
+    _sha256(issuance.get("issuance_sha256"), "issued preflight issuance")
+
+
+def _validate_policy(
+    spec: Mapping[str, Any],
+    inspected: Mapping[str, Any],
+) -> None:
+    if (
+        inspected.get("contract_version") != "v2"
+    ):
+        raise CanaryError("inspect result does not identify the exact V2 launch")
+    _validate_intent_policy(spec, inspected, label="inspect result")
     reservation = inspected.get("reservation")
     if not isinstance(reservation, Mapping) or (
         reservation.get("classification") != "committed"
@@ -1586,15 +2697,6 @@ def _validate_policy(
     lifecycle = inspected.get("lifecycle")
     if not isinstance(lifecycle, list) or not lifecycle:
         raise CanaryError("transport inspect lifecycle is missing")
-    if fresh:
-        if (
-            len(lifecycle) != 1
-            or lifecycle[0].get("event_type") != "reserved"
-            or inspected.get("terminal_receipts") != []
-            or inspected.get("evidence_level") != "transport_reserved"
-        ):
-            raise CanaryError("canary launch is not one fresh reservation")
-        return
     terminal = inspected.get("terminal_receipts")
     if (
         not isinstance(terminal, list)
@@ -1607,11 +2709,35 @@ def _validate_policy(
         raise CanaryError("live canary lacks one committed completed receipt")
 
 
+def _validate_run_result(
+    spec: Mapping[str, Any],
+    run_result: Mapping[str, Any],
+) -> None:
+    if (
+        run_result.get("task_id") != spec["task_id"]
+        or run_result.get("launch_id") != spec["launch_id"]
+        or run_result.get("permit_sha256") != spec["permit_sha256"]
+        or run_result.get("terminal_state") != "completed"
+        or run_result.get("evidence_level") != "codex_runtime_observed"
+        or run_result.get("runtime_completed") is not True
+        or run_result.get("process_start_evidence")
+        != "process_started_observed"
+        or run_result.get("app_server_start_durably_observed") is not True
+        or run_result.get("runtime_process_boundary_reached") is not True
+        or run_result.get("task_completion") != "not_inferred"
+    ):
+        raise CanaryError("bridge run result is not one completed live launch")
+    _sha256(
+        run_result.get("terminal_receipt_sha256"),
+        "bridge run terminal receipt",
+    )
+
+
 def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
     _validate_scratch(spec)
     before = _git_snapshot(spec)
-    reserved = _inspect(spec)
-    _validate_policy(spec, reserved, fresh=True)
+    issued = _preflight(spec)
+    _validate_issued_preflight(spec, issued)
     basis = {
         "schema_version": SCHEMA_VERSION,
         "mode": spec["mode"],
@@ -1625,6 +2751,7 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
             "size_bytes": spec["bridge_executable_size_bytes"],
             "sha256": spec["bridge_executable_sha256"],
         },
+        "bridge_install_binding": spec["bridge_install_binding"],
         "git_executable": {
             "path": _contract_path(Path(spec["git_executable"])),
             "size_bytes": spec["git_executable_size_bytes"],
@@ -1632,7 +2759,7 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
         },
         "scratch_root": _contract_path(Path(spec["scratch_root"])),
         "pre_git_snapshot": before,
-        "reserved_inspect_sha256": _digest(reserved),
+        "issued_preflight_sha256": _digest(issued),
     }
     if not execute:
         return {
@@ -1657,8 +2784,9 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
             str(spec["timeout_seconds"]),
         ],
     )
+    _validate_run_result(spec, run_result)
     completed = _inspect(spec)
-    _validate_policy(spec, completed, fresh=False)
+    _validate_policy(spec, completed)
     after = _git_snapshot(spec)
     if spec["mode"] == "read_only":
         if after != before:

@@ -1548,6 +1548,44 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
             config_worktree.unlink(missing_ok=True)
             self._git("worktree", "remove", "--force", str(linked))
 
+    def test_linked_worktree_authority_binds_optional_worktree_refs_presence(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-optional-linked-refs"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        git_dir_text = (linked / ".git").read_text(encoding="utf-8").strip()
+        self.assertTrue(git_dir_text.startswith("gitdir: "))
+        git_dir = Path(git_dir_text[len("gitdir: ") :])
+        worktree_refs = git_dir / "refs"
+        try:
+            if worktree_refs.exists():
+                self.assertEqual(list(worktree_refs.iterdir()), [])
+                worktree_refs.rmdir()
+            self.assertFalse(worktree_refs.exists())
+            absent = gp.git_observation_authority(linked)
+            self.assertFalse(absent["worktree_refs_present"])
+            self.assertIsNone(absent["worktree_refs_dir"])
+
+            worktree_refs.mkdir()
+            present = gp.git_observation_authority(linked)
+            self.assertTrue(present["worktree_refs_present"])
+            self.assertEqual(
+                present["worktree_refs_dir"],
+                str(worktree_refs.resolve(strict=True)),
+            )
+            self.assertNotEqual(
+                absent["authority_sha256"],
+                present["authority_sha256"],
+            )
+        finally:
+            self._git("worktree", "remove", "--force", str(linked))
+
     def test_linked_worktree_authority_rejects_linked_ref_hardlink(
         self,
     ) -> None:
@@ -1565,6 +1603,7 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
         subject = git_dir / "refs" / "aoi-test-ref"
         hardlink = self.repo.parent / f"{self.repo.name}-linked-ref-hardlink-copy"
         try:
+            subject.parent.mkdir(exist_ok=True)
             subject.write_text(self.baseline + "\n", encoding="ascii")
             try:
                 os.link(subject, hardlink)
@@ -1596,6 +1635,7 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
         outside.mkdir()
         created = False
         try:
+            subject.parent.mkdir(exist_ok=True)
             if os.name == "nt":
                 completed = subprocess.run(
                     [

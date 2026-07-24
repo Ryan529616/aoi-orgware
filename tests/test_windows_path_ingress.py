@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import unittest
 from unittest import mock
 from types import SimpleNamespace
@@ -479,7 +480,7 @@ class WindowsPathIngressTests(HarnessTestCase):
             with self.assertRaisesRegex(inventory.InventoryError, "changed"):
                 inventory.verify(captured, dist)
 
-    def test_inventory_uses_held_root_entries_and_rejects_reverted_mutation(self) -> None:
+    def test_capture_rejects_transient_mutation_only_when_watcher_is_enabled(self) -> None:
         dist = self.root / "stable-root"
         dist.mkdir()
         (dist / "aoi_orgware-0.4.0-py3-none-any.whl").write_bytes(b"wheel")
@@ -504,6 +505,27 @@ class WindowsPathIngressTests(HarnessTestCase):
         (dist / "unexpected-stable-root.txt").unlink()
 
         original_entries = windows_handles.DirectoryHandle.entries
+        original_identity_from_handle = windows_handles._identity_from_handle
+        stable_identities: dict[int, windows_handles.WindowsHandleIdentity] = {}
+        original_open_directory = inventory.open_directory_identity
+
+        def metadata_identity(handle_value: int) -> windows_handles.WindowsHandleIdentity:
+            """Hide directory metadata drift; the watcher must still reject it."""
+
+            identity = original_identity_from_handle(handle_value)
+            return stable_identities.get(handle_value, identity)
+
+        def open_and_track(
+            path: Path, *, watch_changes: bool = False, enable_watch: bool
+        ) -> windows_handles.DirectoryHandle:
+            self.assertTrue(watch_changes)
+            handle = original_open_directory(path, watch_changes=enable_watch)
+            assert handle._handle is not None
+            assert handle.identity is not None
+            # Freeze the baseline before the transient mutation; reading the
+            # identity for the first time afterwards would not hide its drift.
+            stable_identities[handle._handle] = handle.identity
+            return handle
 
         def mutate_after_enumeration(
             handle: windows_handles.DirectoryHandle,
@@ -514,14 +536,364 @@ class WindowsPathIngressTests(HarnessTestCase):
             transient.unlink()
             return entries
 
-        with mock.patch.object(
-            windows_handles.DirectoryHandle,
-            "entries",
-            new=mutate_after_enumeration,
-        ):
-            with self.assertRaisesRegex(inventory.InventoryError, "changed while being captured"):
-                inventory.capture(
+        def capture_with_watch(enable_watch: bool) -> dict[str, object]:
+            stable_identities.clear()
+            with (
+                mock.patch.object(
+                    windows_handles.DirectoryHandle,
+                    "entries",
+                    new=mutate_after_enumeration,
+                ),
+                mock.patch.object(
+                    inventory,
+                    "open_directory_identity",
+                    new=lambda path, *, watch_changes=False: open_and_track(
+                        path, watch_changes=watch_changes, enable_watch=enable_watch
+                    ),
+                ),
+                mock.patch.object(
+                    windows_handles,
+                    "_identity_from_handle",
+                    side_effect=metadata_identity,
+                ),
+            ):
+                return inventory.capture(
                     dist,
                     distribution_name="aoi-orgware",
                     package_version="0.4.0",
                 )
+
+        with self.assertRaisesRegex(inventory.InventoryError, "changed while being captured"):
+            capture_with_watch(True)
+        self.assertEqual(len(capture_with_watch(False)["artifacts"]), 2)
+
+    def test_verify_rejects_transient_mutation_only_when_watcher_is_enabled(self) -> None:
+        dist = self.root / "verify-stable-root"
+        dist.mkdir()
+        (dist / "aoi_orgware-0.4.0-py3-none-any.whl").write_bytes(b"wheel")
+        (dist / "aoi_orgware-0.4.0.tar.gz").write_bytes(b"sdist")
+        captured = inventory.capture(
+            dist, distribution_name="aoi-orgware", package_version="0.4.0"
+        )
+        original_entries = windows_handles.DirectoryHandle.entries
+        original_identity_from_handle = windows_handles._identity_from_handle
+        original_open_directory = inventory.open_directory_identity
+        stable_identities: dict[int, windows_handles.WindowsHandleIdentity] = {}
+
+        def metadata_identity(handle_value: int) -> windows_handles.WindowsHandleIdentity:
+            identity = original_identity_from_handle(handle_value)
+            return stable_identities.get(handle_value, identity)
+
+        def open_and_track(
+            path: Path, *, watch_changes: bool = False, enable_watch: bool
+        ) -> windows_handles.DirectoryHandle:
+            self.assertTrue(watch_changes)
+            handle = original_open_directory(path, watch_changes=enable_watch)
+            assert handle._handle is not None
+            assert handle.identity is not None
+            stable_identities[handle._handle] = handle.identity
+            return handle
+
+        def mutate_after_enumeration(
+            handle: windows_handles.DirectoryHandle,
+        ) -> list[windows_handles.DirectoryEntry]:
+            entries = original_entries(handle)
+            transient = dist / "verify-transient-after-enumeration.txt"
+            transient.write_bytes(b"transient")
+            transient.unlink()
+            return entries
+
+        def verify_with_watch(enable_watch: bool) -> None:
+            stable_identities.clear()
+            with (
+                mock.patch.object(
+                    windows_handles.DirectoryHandle,
+                    "entries",
+                    new=mutate_after_enumeration,
+                ),
+                mock.patch.object(
+                    inventory,
+                    "open_directory_identity",
+                    new=lambda path, *, watch_changes=False: open_and_track(
+                        path, watch_changes=watch_changes, enable_watch=enable_watch
+                    ),
+                ),
+                mock.patch.object(
+                    windows_handles,
+                    "_identity_from_handle",
+                    side_effect=metadata_identity,
+                ),
+            ):
+                inventory.verify(captured, dist)
+
+        with self.assertRaisesRegex(inventory.InventoryError, "changed while being verified"):
+            verify_with_watch(True)
+        verify_with_watch(False)
+
+    def test_change_watch_finalization_drains_before_any_handle_is_closed(self) -> None:
+        identity = windows_handles.WindowsHandleIdentity("C:\\watch", 1, 2, 1, 3)
+        handle = windows_handles.DirectoryHandle(17, identity)
+        handle._change_buffer = ctypes.create_string_buffer(1)
+        handle._change_overlapped = ctypes.c_ulong()
+        handle._change_event = 18
+        handle._change_watch_enabled = True
+        order: list[str] = []
+
+        def cancel(*_args: object) -> bool:
+            order.append("cancel")
+            ctypes.set_last_error(1168)  # ERROR_NOT_FOUND: completion raced.
+            return False
+
+        def get_result(*_args: object) -> bool:
+            order.append("drain")
+            ctypes.set_last_error(995)  # ERROR_OPERATION_ABORTED: clean cancel.
+            return False
+
+        kernel32 = SimpleNamespace(
+            CancelIoEx=mock.Mock(side_effect=cancel),
+            GetOverlappedResult=mock.Mock(side_effect=get_result),
+        )
+
+        def current_identity(_handle: int) -> windows_handles.WindowsHandleIdentity:
+            order.append("identity")
+            return identity
+
+        with (
+            mock.patch.object(windows_handles, "_kernel32", return_value=kernel32),
+            mock.patch.object(
+                windows_handles, "_identity_from_handle", side_effect=current_identity
+            ),
+            mock.patch.object(
+                windows_handles,
+                "_close_handle",
+                side_effect=lambda value: order.append(f"close:{value}"),
+            ),
+        ):
+            handle.require_unchanged()
+            handle.close()
+
+        self.assertEqual(order, ["identity", "cancel", "drain", "close:18", "close:17"])
+
+    def test_change_watch_completion_and_unexpected_cancel_error_drains_before_raise(self) -> None:
+        identity = windows_handles.WindowsHandleIdentity("C:\\watch", 1, 2, 1, 3)
+
+        def armed_handle() -> windows_handles.DirectoryHandle:
+            handle = windows_handles.DirectoryHandle(17, identity)
+            handle._change_buffer = ctypes.create_string_buffer(1)
+            handle._change_overlapped = ctypes.c_ulong()
+            handle._change_event = 18
+            handle._change_watch_enabled = True
+            return handle
+
+        def raced_cancel(*_args: object) -> bool:
+            ctypes.set_last_error(1168)  # ERROR_NOT_FOUND
+            return False
+
+        completed_kernel32 = SimpleNamespace(
+            CancelIoEx=mock.Mock(side_effect=raced_cancel),
+            GetOverlappedResult=mock.Mock(return_value=True),
+        )
+        completed = armed_handle()
+        with (
+            mock.patch.object(
+                windows_handles, "_kernel32", return_value=completed_kernel32
+            ),
+            mock.patch.object(
+                windows_handles, "_identity_from_handle", return_value=identity
+            ),
+            mock.patch.object(windows_handles, "_close_handle"),
+        ):
+            with self.assertRaisesRegex(OSError, "directory changed"):
+                completed.require_unchanged()
+        self.assertIsNone(completed._change_event)
+
+        order: list[str] = []
+
+        def unexpected_cancel(*_args: object) -> bool:
+            order.append("cancel")
+            ctypes.set_last_error(5)  # ERROR_ACCESS_DENIED
+            return False
+
+        failed_cancel_kernel32 = SimpleNamespace(
+            CancelIoEx=mock.Mock(side_effect=unexpected_cancel),
+            GetOverlappedResult=mock.Mock(),
+        )
+        failed_cancel = armed_handle()
+
+        def drained_failure(*_args: object) -> bool:
+            order.append("drain")
+            ctypes.set_last_error(995)  # ERROR_OPERATION_ABORTED
+            return False
+
+        failed_cancel_kernel32.GetOverlappedResult.side_effect = drained_failure
+        with (
+            mock.patch.object(
+                windows_handles, "_kernel32", return_value=failed_cancel_kernel32
+            ),
+            mock.patch.object(
+                windows_handles,
+                "_close_handle",
+                side_effect=lambda value: order.append(f"close:{value}"),
+            ),
+        ):
+            with self.assertRaises(OSError):
+                failed_cancel.close()
+        failed_cancel_kernel32.GetOverlappedResult.assert_called_once()
+        self.assertEqual(order, ["cancel", "drain", "close:18", "close:17"])
+        self.assertIsNone(failed_cancel._change_event)
+        self.assertIsNone(failed_cancel._handle)
+
+    def test_change_watch_boundary_distinguishes_pre_and_post_cancellation_races(self) -> None:
+        identity = windows_handles.WindowsHandleIdentity("C:\\watch", 1, 2, 1, 3)
+
+        def armed_handle() -> windows_handles.DirectoryHandle:
+            handle = windows_handles.DirectoryHandle(17, identity)
+            handle._change_buffer = ctypes.create_string_buffer(1)
+            handle._change_overlapped = ctypes.c_ulong()
+            handle._change_event = 18
+            handle._change_watch_enabled = True
+            return handle
+
+        pre_boundary = armed_handle()
+        pre_order = ["mutation-before-boundary"]
+
+        def completed_cancel(*_args: object) -> bool:
+            pre_order.append("cancel")
+            return True
+
+        def completed_result(*_args: object) -> bool:
+            pre_order.append("drain")
+            return True
+
+        completed_kernel32 = SimpleNamespace(
+            CancelIoEx=mock.Mock(side_effect=completed_cancel),
+            GetOverlappedResult=mock.Mock(side_effect=completed_result),
+        )
+        with (
+            mock.patch.object(windows_handles, "_kernel32", return_value=completed_kernel32),
+            mock.patch.object(windows_handles, "_close_handle"),
+        ):
+            self.assertTrue(pre_boundary._finalize_change_watch())
+        self.assertEqual(pre_order, ["mutation-before-boundary", "cancel", "drain"])
+
+        post_boundary = armed_handle()
+        cancellation_boundary = threading.Event()
+        mutation_finished = threading.Event()
+        order: list[str] = []
+
+        def mutate_after_boundary() -> None:
+            self.assertTrue(cancellation_boundary.wait(timeout=1))
+            order.append("mutation-after-boundary")
+            mutation_finished.set()
+
+        worker = threading.Thread(target=mutate_after_boundary)
+        worker.start()
+
+        def cancel(*_args: object) -> bool:
+            order.append("cancel")
+            cancellation_boundary.set()
+            self.assertTrue(mutation_finished.wait(timeout=1))
+            return True
+
+        def cancelled_result(*_args: object) -> bool:
+            order.append("drain")
+            ctypes.set_last_error(995)  # ERROR_OPERATION_ABORTED
+            return False
+
+        cancelled_kernel32 = SimpleNamespace(
+            CancelIoEx=mock.Mock(side_effect=cancel),
+            GetOverlappedResult=mock.Mock(side_effect=cancelled_result),
+        )
+        with (
+            mock.patch.object(windows_handles, "_kernel32", return_value=cancelled_kernel32),
+            mock.patch.object(windows_handles, "_close_handle"),
+        ):
+            self.assertFalse(post_boundary._finalize_change_watch())
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(order, ["cancel", "mutation-after-boundary", "drain"])
+
+    def test_directory_exit_preserves_body_exception_when_cleanup_detects_change(self) -> None:
+        identity = windows_handles.WindowsHandleIdentity("C:\\watch", 1, 2, 1, 3)
+        handle = windows_handles.DirectoryHandle(17, identity)
+        handle._change_buffer = ctypes.create_string_buffer(1)
+        handle._change_overlapped = ctypes.c_ulong()
+        handle._change_event = 18
+        handle._change_watch_enabled = True
+        kernel32 = SimpleNamespace(
+            CancelIoEx=mock.Mock(return_value=True),
+            GetOverlappedResult=mock.Mock(return_value=True),
+        )
+        with (
+            mock.patch.object(windows_handles, "_kernel32", return_value=kernel32),
+            mock.patch.object(windows_handles, "_close_handle"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "body failure") as raised:
+                with handle:
+                    raise RuntimeError("body failure")
+        self.assertTrue(
+            any(
+                "Directory cleanup also detected" in note
+                for note in raised.exception.__notes__
+            )
+        )
+
+    def test_directory_close_retains_handle_ownership_until_close_succeeds(self) -> None:
+        identity = windows_handles.WindowsHandleIdentity("C:\\watch", 1, 2, 1, 3)
+        handle = windows_handles.DirectoryHandle(17, identity)
+        attempts: list[int] = []
+
+        def close_once_then_succeed(value: int) -> None:
+            attempts.append(value)
+            if len(attempts) == 1:
+                raise OSError("injected CloseHandle failure")
+
+        with mock.patch.object(
+            windows_handles,
+            "_close_handle",
+            side_effect=close_once_then_succeed,
+        ):
+            with self.assertRaisesRegex(OSError, "injected CloseHandle failure"):
+                handle.close()
+            self.assertEqual(handle._handle, 17)
+            handle.close()
+
+        self.assertEqual(attempts, [17, 17])
+        self.assertIsNone(handle._handle)
+
+    def test_open_directory_watch_arms_before_baseline_and_uses_overlapped_flag_only_when_needed(
+        self,
+    ) -> None:
+        identity = windows_handles.WindowsHandleIdentity("C:\\watch", 1, 2, 1, 3)
+        create_file = mock.Mock(return_value=17)
+        kernel32 = SimpleNamespace(CreateFileW=create_file)
+        order: list[str] = []
+
+        def arm(_handle: windows_handles.DirectoryHandle) -> None:
+            order.append("arm")
+
+        def baseline(_value: int) -> windows_handles.WindowsHandleIdentity:
+            order.append("identity")
+            return identity
+
+        with (
+            mock.patch.object(windows_handles, "_kernel32", return_value=kernel32),
+            mock.patch.object(windows_handles, "_identity_from_handle", side_effect=baseline),
+            mock.patch.object(windows_handles.DirectoryHandle, "begin_change_watch", new=arm),
+            mock.patch.object(windows_handles, "_close_handle"),
+        ):
+            plain = windows_handles.open_directory_identity(Path("C:/plain"))
+            watched = windows_handles.open_directory_identity(
+                Path("C:/watched"), watch_changes=True
+            )
+            plain.close()
+            watched.close()
+
+        self.assertEqual(create_file.call_args_list[0].args[5], 0x02000000)
+        self.assertEqual(create_file.call_args_list[1].args[5], 0x42000000)
+        self.assertEqual(order, ["identity", "arm", "identity"])
+
+        already_watched = windows_handles.DirectoryHandle(17, identity)
+        already_watched._change_event = 18
+        with self.assertRaisesRegex(OSError, "already armed"):
+            already_watched.begin_change_watch()

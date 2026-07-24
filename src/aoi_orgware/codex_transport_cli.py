@@ -31,6 +31,7 @@ from . import evidence_artifacts
 from . import git_plumbing as git
 from . import harnesslib as h
 from . import semantic_events as semantic
+from . import semantic_objects as objects
 from . import semantic_store as store
 from .codex_app_server_stdio import (
     AppServerError,
@@ -451,6 +452,139 @@ def _exact_prompt(prompt: str, intent: Mapping[str, Any]) -> None:
         )
 
 
+def _fresh_issued_preflight_locked(
+    paths: h.HarnessPaths,
+    *,
+    task_id: str,
+    permit_sha256: str,
+    prompt: str,
+    now: datetime,
+) -> tuple[dict[str, Any], list[str], str]:
+    """Authenticate one unconsumed issuance without reserving or launching it."""
+
+    h._require_chief_lock(paths)
+    events = store.load_semantic_events(paths, task_id)
+    marker = runtime.inspect_codex_launch_issuance(
+        paths,
+        task_id=task_id,
+        permit_sha256=permit_sha256,
+    )
+    launch_id = str(marker["launch_id"])
+    if _launch_is_committed(events, launch_id):
+        raise CodexTransportCLIError(
+            "Codex transport issuance is already reserved or terminal"
+        )
+    report = objects.inspect_semantic_objects(paths, task_id, events)
+    if report["pending_binding_sha256s"]:
+        raise CodexTransportCLIError(
+            "Codex transport issuance has pending semantic publication; "
+            "reconcile before launch"
+        )
+    transaction = runtime.reconstruct_issued_launch_transaction(
+        paths,
+        task_id=task_id,
+        permit_sha256=permit_sha256,
+        event_chain=events,
+        current_time=now,
+    )
+    intent = transaction["intent"]
+    _exact_prompt(prompt, intent)
+    confidentiality_warnings = _confidentiality_preflight(paths, intent)
+    _require_fresh_pre_git_endpoint(
+        paths,
+        task_id=task_id,
+        intent=intent,
+        pre_git_endpoint_cas_sha256=marker["pre_git_endpoint_cas_sha256"],
+    )
+
+    # A dry-run proves the same current packet authority that first consume
+    # will recheck. It is evidence only: reserve_codex_launch remains the sole
+    # transition that consumes the permit and changes armed -> dispatched.
+    from . import cli as core_cli
+
+    canonical_authority = launch_authority.require_canonical_launch_authority(
+        paths,
+        task_id=task_id,
+        intent=intent,
+        event_chain=events,
+        current_time=now,
+        packet_integrity_services=core_cli._packet_integrity_services(),
+    )
+    if transaction["launch_authority"] != canonical_authority:
+        raise CodexTransportCLIError(
+            "issued launch authority drifted before preflight"
+        )
+    state = semantic.replay_events(events)
+    packets = [
+        row
+        for row in state.get("packets", [])
+        if row.get("packet_id") == intent["packet_id"]
+    ]
+    if len(packets) != 1 or packets[0].get("status") != "armed":
+        raise CodexTransportCLIError(
+            "Codex transport preflight requires one still-armed packet"
+        )
+    return transaction, confidentiality_warnings, str(
+        events[-1]["event_sha256"]
+    )
+
+
+def _preflight(args: argparse.Namespace) -> dict[str, Any]:
+    _scrub_nonissuance_process_environment()
+    paths = _paths(args.root)
+    permit_sha256 = _sha(args.permit_sha256, "permit SHA-256")
+    prompt = _read_prompt(args.prompt_file)
+    try:
+        with h.state_lock(paths, create_layout=False):
+            transaction, confidentiality_warnings, semantic_head = (
+                _fresh_issued_preflight_locked(
+                    paths,
+                    task_id=args.task,
+                    permit_sha256=permit_sha256,
+                    prompt=prompt,
+                    now=_now(),
+                )
+            )
+            marker = runtime.inspect_codex_launch_issuance(
+                paths,
+                task_id=args.task,
+                permit_sha256=permit_sha256,
+            )
+    except (
+        h.HarnessError,
+        store.SemanticStoreError,
+        objects.SemanticObjectError,
+        runtime.CodexTransportRuntimeError,
+        mutation.CodexTransportMutationError,
+        confidentiality.ConfidentialityError,
+        CodexTransportCLIError,
+        contracts.CodexTransportContractError,
+        projection.CodexTransportProjectionError,
+        OSError,
+        ValueError,
+    ) as exc:
+        if isinstance(exc, CodexTransportCLIError):
+            raise
+        raise CodexTransportCLIError(str(exc)) from exc
+    intent = transaction["intent"]
+    return {
+        "task_id": args.task,
+        "launch_id": transaction["launch_id"],
+        "packet_id": intent["packet_id"],
+        "packet_status": "armed",
+        "permit_sha256": permit_sha256,
+        "intent": intent,
+        "issuance": marker,
+        "semantic_head_sha256": semantic_head,
+        "status": "issued_unconsumed",
+        "evidence_level": "transport_issued",
+        "permit_consumed": False,
+        "runtime_evidence": "none",
+        "confidentiality_warnings": confidentiality_warnings,
+        "task_completion": "not_inferred",
+    }
+
+
 def _process_start_evidence(
     journal: Sequence[Mapping[str, Any]],
 ) -> str:
@@ -633,6 +767,15 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             paths, task_id=args.task, launch_id=launch_id
         ):
             with h.state_lock(paths, create_layout=False):
+                events = store.load_semantic_events(paths, args.task)
+                if not _launch_is_committed(events, launch_id):
+                    _fresh_issued_preflight_locked(
+                        paths,
+                        task_id=args.task,
+                        permit_sha256=permit_sha256,
+                        prompt=prompt,
+                        now=_now(),
+                    )
                 launch = _load_or_reserve(
                     paths,
                     task_id=args.task,
@@ -885,6 +1028,16 @@ def _parser() -> argparse.ArgumentParser:
     issue.add_argument("--chief-credential-file", required=True)
     issue.add_argument("--json", action="store_true")
     issue.set_defaults(handler=_issue)
+
+    preflight = subparsers.add_parser(
+        "preflight",
+        help="authenticate one issued launch without consuming its permit",
+    )
+    preflight.add_argument("--task", required=True)
+    preflight.add_argument("--permit-sha256", required=True)
+    preflight.add_argument("--prompt-file", required=True)
+    preflight.add_argument("--json", action="store_true")
+    preflight.set_defaults(handler=_preflight)
 
     run = subparsers.add_parser("run", help="consume and supervise one launch")
     run.add_argument("--task", required=True)

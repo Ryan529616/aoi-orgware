@@ -364,7 +364,7 @@ def capture(dist_dir: Path, *, distribution_name: str, package_version: str) -> 
     if not lexical_root.is_absolute():
         lexical_root = Path.cwd() / lexical_root
     root = _secure_directory(lexical_root, label="dist directory")
-    with open_directory_identity(lexical_root) as root_handle:
+    with open_directory_identity(lexical_root, watch_changes=True) as root_handle:
         if not handle_matches_path(root_handle.identity, root):
             raise InventoryError("dist directory changed while being opened")
         if _secure_directory(lexical_root, label="dist directory") != root:
@@ -407,7 +407,7 @@ def verify(inventory: dict[str, Any], root: Path) -> None:
         lexical_root = Path.cwd() / lexical_root
     artifact_root = _secure_directory(lexical_root, label="artifact root")
     expected = {artifact["name"]: artifact for artifact in inventory["artifacts"]}
-    with open_directory_identity(lexical_root) as root_handle:
+    with open_directory_identity(lexical_root, watch_changes=True) as root_handle:
         if not handle_matches_path(root_handle.identity, artifact_root):
             raise InventoryError("artifact root changed while being opened")
         if _secure_directory(lexical_root, label="artifact root") != artifact_root:

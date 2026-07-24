@@ -435,7 +435,10 @@ def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], rece
     try:
         snapshot = scratch / "snapshot"; manifest, count = _snapshot(repo, snapshot)
         env, env_names, env_sha = _child_env(snapshot, inherited_env)
-        command = [os.fspath(Path(sys.executable).resolve()), "-m", "pytest", *pytest_argv]
+        # Preserve the venv launcher spelling.  Resolving a POSIX venv's
+        # ``bin/python`` symlink to the base interpreter discards the venv
+        # package context and can run a different pytest environment.
+        command = [sys.executable, "-m", "pytest", *pytest_argv]
         try:
             completed = subprocess.run(command, cwd=snapshot, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_seconds, check=False)
             result_code = completed.returncode; log = completed.stdout; terminal = "completed" if result_code == 0 else "rejected"

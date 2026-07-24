@@ -507,9 +507,15 @@ semantic evidence.
 
 `aoi-codex-bridge` is an optional stdlib-only adapter, not a second AOI state
 model and not a resident scheduler. `issue` is Chief-fenced and writes an
-immutable issuance marker. `run` receives only its exact permit SHA, starts at
-most one local pinned App Server process over stdio, and persists a milestone
-before each uncertain process/request boundary. `inspect` is read-only.
+immutable issuance marker. `preflight` receives only the exact permit SHA and
+prompt bytes; under the state lock it authenticates the still-armed canonical
+packet, issuance, expiry, confidentiality policy, and pre-Git endpoint, then
+returns `issued_unconsumed` without reserving, consuming, publishing semantic
+state, or starting a process. `run` repeats those checks under the per-launch
+process lock before the one reservation transition, starts at most one local
+pinned App Server process over stdio, and persists a milestone before each
+uncertain process/request boundary. `inspect` is read-only for already
+reserved/runtime state.
 `verify-mutation` is a separate Git/CAS/claim evidence transition. A new
 elevation requires its Git executable path/size/SHA fields as one all-or-none
 tuple; committed v2 replay recovers that tuple from CAS before any endpoint
@@ -531,6 +537,32 @@ record reports no Git executable identity. The provenance scope is the Bridge
 verification/recapture observation; it neither retroactively identifies the
 binary used for an older pre-endpoint nor proves an atomic OS-loaded image,
 dependencies, or code-signing chain.
+
+The external disposable-canary v4 driver is not part of Bridge authority. It
+independently binds the local package-gate receipt, source commit/tree, wheel,
+PEP 610 `direct_url`, installed `RECORD`, and complete AOI package/dist-info
+namespace without importing the package under test. The bounded wheel read
+itself must match the expected SHA-256; its ZIP members and wheel `RECORD` are
+closed and every installed wheel-owned byte is compared with that exact
+payload. The wheel's exact four-entry console-script declaration determines
+the complete pip-generated launcher set, including the separately spec-pinned
+Bridge launcher. Installer metadata and launchers remain distinct from
+wheel-owned bytes but must be the exact additional installed `RECORD` surface.
+No installer-generated launcher is trusted for execution. The driver instead
+binds and revalidates the base Python already running the canary, then starts
+it with isolated/no-site/no-bytecode flags and fixed code that imports only
+the exact installed `aoi_orgware.codex_transport_cli` module. The exact
+site-packages root is appended after the isolated standard-library paths, so
+an installed top-level file cannot shadow a standard-library import.
+`pyvenv.cfg` must be an unambiguous unique-key mapping whose home, base
+executable, Python version, disabled system-site setting, and exact terminal
+creation prefix match that trusted runtime and venv. The closure is revalidated
+before and after every Bridge
+subprocess. Child processes receive a constructed allowlist environment,
+including a native Windows system-root lookup rather than ambient
+`SystemRoot`. This closes the declared cooperative installed-package
+attribution for that canary; it still does not attest the OS loader, DLL
+chain, code signature, same-user races, or model-provider control channel.
 
 The reservation transition atomically consumes the exact canonical packet arm
 without inventing a hook observation. The attempt becomes

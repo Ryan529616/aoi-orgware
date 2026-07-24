@@ -691,6 +691,28 @@ def _run_args(
     ]
 
 
+def _preflight_args(
+    value: BridgeFixture,
+    prompt: Path,
+    *,
+    release_chief: bool = True,
+) -> list[str]:
+    if release_chief:
+        _release_issuing_chief(value)
+    return [
+        "--root",
+        str(value.root),
+        "preflight",
+        "--task",
+        "task-1",
+        "--permit-sha256",
+        value.permit_sha256,
+        "--prompt-file",
+        str(prompt),
+        "--json",
+    ]
+
+
 def test_cli_issue_run_inspect_and_no_resend(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
@@ -713,6 +735,34 @@ def test_cli_issue_run_inspect_and_no_resend(
     monkeypatch.setattr(bridge, "CodexAppServerStdio", factory)
     wrong = tmp_path / "wrong-prompt.txt"
     wrong.write_text("different", encoding="utf-8")
+    issued_head = store.load_semantic_events(value.paths, "task-1")[-1][
+        "event_sha256"
+    ]
+    assert bridge.main(_preflight_args(value, value.prompt_path)) == 0
+    preflight = json.loads(capsys.readouterr().out)
+    assert preflight["status"] == "issued_unconsumed"
+    assert preflight["evidence_level"] == "transport_issued"
+    assert preflight["packet_status"] == "armed"
+    assert preflight["permit_consumed"] is False
+    assert preflight["runtime_evidence"] == "none"
+    assert preflight["task_completion"] == "not_inferred"
+    assert (
+        store.load_semantic_events(value.paths, "task-1")[-1]["event_sha256"]
+        == issued_head
+    )
+    assert bridge.main(
+        _preflight_args(value, value.prompt_path, release_chief=False)
+    ) == 0
+    replayed_preflight = json.loads(capsys.readouterr().out)
+    assert replayed_preflight == preflight
+    assert bridge.main(
+        _preflight_args(value, wrong, release_chief=False)
+    ) == 2
+    assert "do not match" in capsys.readouterr().err
+    assert (
+        store.load_semantic_events(value.paths, "task-1")[-1]["event_sha256"]
+        == issued_head
+    )
     assert bridge.main(_run_args(value, wrong)) == 2
     assert "do not match" in capsys.readouterr().err
     assert created == []
@@ -727,10 +777,12 @@ def test_cli_issue_run_inspect_and_no_resend(
             "launch-1",
             "--json",
         ]
-    ) == 0
-    reserved_view = json.loads(capsys.readouterr().out)
-    assert reserved_view["evidence_level"] == "transport_reserved"
-    assert [row["event_type"] for row in reserved_view["lifecycle"]] == ["reserved"]
+    ) == 2
+    assert "not reserved" in capsys.readouterr().err
+    assert (
+        store.load_semantic_events(value.paths, "task-1")[-1]["event_sha256"]
+        == issued_head
+    )
 
     assert bridge.main(_run_args(value, value.prompt_path)) == 0
     completed = json.loads(capsys.readouterr().out)
@@ -782,6 +834,79 @@ def test_cli_issue_run_inspect_and_no_resend(
     ) == 0
     aggregate = json.loads(capsys.readouterr().out)
     assert aggregate["launches"] == [inspected]
+
+
+def _assert_issued_launch_remains_armed(
+    value: BridgeFixture,
+    *,
+    expected_head: str,
+) -> None:
+    events = store.load_semantic_events(value.paths, "task-1")
+    assert events[-1]["event_sha256"] == expected_head
+    assert not bridge._launch_is_committed(events, "launch-1")
+    state = semantic.replay_events(events)
+    packet = next(row for row in state["packets"] if row["packet_id"] == "packet-1")
+    assert packet["status"] == "armed"
+    assert packet["dispatch_attempts"][0]["status"] == "armed"
+    marker = runtime.inspect_codex_launch_issuance(
+        value.paths,
+        task_id="task-1",
+        permit_sha256=value.permit_sha256,
+    )
+    assert marker["launch_id"] == "launch-1"
+
+
+def test_cli_preflight_expired_issuance_stays_unconsumed_and_armed(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    _release_issuing_chief(value)
+    issued_head = store.load_semantic_events(value.paths, "task-1")[-1]["event_sha256"]
+    monkeypatch.setattr(
+        bridge,
+        "_now",
+        lambda: datetime(2100, 1, 1, tzinfo=UTC),
+    )
+
+    assert bridge.main(
+        _preflight_args(value, value.prompt_path, release_chief=False)
+    ) == 2
+    assert "expired" in capsys.readouterr().err
+    _assert_issued_launch_remains_armed(value, expected_head=issued_head)
+
+
+def test_cli_preflight_semantic_head_drift_stays_unconsumed_and_armed(
+    tmp_path: Path, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    _release_issuing_chief(value)
+    with h.state_lock(value.paths, create_layout=False):
+        events = store.load_semantic_events(value.paths, "task-1")
+        drifted_state = semantic.replay_events(events)
+        drifted_state["updated_at"] = "2026-07-21T00:00:00Z"
+        drift = store.append_semantic_transition(
+            value.paths,
+            "task-1",
+            drifted_state,
+            event_type="test_semantic_head_drift",
+            command_id="test-head-drift",
+            recorded_at="2026-07-21T00:00:00Z",
+            authority_ref="test",
+            expected_head_sha256=events[-1]["event_sha256"],
+        )
+
+    assert bridge.main(
+        _preflight_args(value, value.prompt_path, release_chief=False)
+    ) == 2
+    assert "reservation is no longer the terminal semantic transition" in capsys.readouterr().err
+    _assert_issued_launch_remains_armed(
+        value,
+        expected_head=drift.event["event_sha256"],
+    )
 
 
 def test_cli_thread_start_loss_is_launch_unknown_and_never_resent(
@@ -1248,6 +1373,7 @@ def test_cli_expiry_crossing_before_pending_prevents_process_start(
     capsys.readouterr()
     moments = iter(
         [
+            datetime(2026, 7, 20, 0, 1, tzinfo=UTC),
             datetime(2026, 7, 20, 0, 1, tzinfo=UTC),
             datetime(2100, 7, 20, 0, 1, tzinfo=UTC),
         ]

@@ -424,6 +424,10 @@ aoi-codex-bridge --root <project> issue `
   --chief-session-id <chief-session> --chief-epoch <epoch> `
   --chief-credential-file <absolute-external-credential-file> --json
 
+aoi-codex-bridge --root <project> preflight `
+  --task <task-id> --permit-sha256 <permit-sha256> `
+  --prompt-file <exact-utf8-prompt-file> --json
+
 aoi-codex-bridge --root <project> run `
   --task <task-id> --permit-sha256 <permit-sha256> `
   --prompt-file <exact-utf8-prompt-file> --json
@@ -439,7 +443,12 @@ aoi-codex-bridge --root <project> verify-mutation `
   --git-executable-sha256 $gitSha256 --sealed-claim-scope --json
 ```
 
-`run` deliberately has no Chief credential option. Every `readOnly` and
+`preflight` and `run` deliberately have no Chief credential option.
+`preflight` is repeatable only while the exact packet remains armed and the
+permit is unconsumed; it returns `issued_unconsumed` and no runtime evidence.
+It does not create a reservation. `run` repeats the same current checks under
+the process-owner lock before it performs the unique consuming reservation.
+Every `readOnly` and
 `workspaceWrite` issuance requires `--pre-git-endpoint-file`; AOI re-captures
 that exact Git/tree/status/claim endpoint under the issue lock, again before
 reservation, and again at process-pending. The endpoint separately binds the
@@ -457,6 +466,28 @@ which Git binary created the historical pre-endpoint, and its pre-spawn check
 is not an atomic hostile-writer or dynamic-loader attestation. A completed turn
 is not task completion. If `inspect` reports `launch_unknown`, do not rerun the
 launch; reconcile the task evidence instead.
+
+Release qualification uses disposable-canary spec
+`aoi.codex-transport-canary.v4`. Besides the runtime/Bridge/Git executable
+tuple, the spec must name the exact local package receipt, source commit/tree,
+wheel, installed site-packages root, and dist-info root. The standalone driver
+checks the SHA-256 of the exact wheel bytes it parses, closes the wheel ZIP and
+wheel `RECORD`, and byte-compares every installed wheel-owned AOI
+package/dist-info member. It separately rechecks PEP 610, installer metadata,
+the installed `RECORD`, and all four console launchers declared by the exact
+wheel entry-point metadata before and after each Bridge subprocess. The
+declared `aoi-codex-bridge` launcher must also be the separately pinned Bridge
+executable. A launcher hash or a self-consistent rewritten installed `RECORD`
+alone is not accepted as installed-package provenance, and the installer
+launcher is not executed. The driver instead revalidates its trusted base
+Python and invokes it with `-I -S -B -X utf8` plus a fixed bootstrap for the
+exact installed `aoi_orgware.codex_transport_cli` module. The exact site root
+is appended after isolated standard-library paths so an installed top-level
+module cannot shadow the standard library. `pyvenv.cfg` must have unique known
+keys and bind disabled system site packages, exact base home/executable/version,
+and the exact terminal venv prefix (not a prefix-superstring). The Bridge child gets an
+explicit allowlist environment; ambient loader, proxy, Node, Python, Git, SSH,
+publication, OIDC, OpenAI, and unknown variables are not forwarded.
 
 New Bridge endpoint capture writes mutation snapshot v3 and binds one closed
 repository-observation authority across the pre/post pair. Generic AOI
