@@ -172,8 +172,8 @@ class PermitCliTests(HarnessTestCase):
                 "session_id": "harness-test-chief",
                 "source": "startup",
                 "observed_at": h.now_iso(),
-                "cwd": str(self.root),
-                "project_root": str(self.root),
+                "cwd": str(h.get_paths(self.root).root),
+                "project_root": str(h.get_paths(self.root).root),
                 "aoi_config_sha256": self.paths.project.sha256,
             },
         )

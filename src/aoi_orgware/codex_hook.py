@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .agent_identity import validate_agent_id
-from .harnesslib import get_paths, is_semantic_v2_task
+from .harnesslib import canonicalize_no_link_traversal, get_paths, is_semantic_v2_task
+from .windows_handle_identity import handle_matches_path, open_directory_identity
 
 
 SUPPORTED_HOOK_VERSION = "6"
@@ -660,6 +661,25 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
             raw_cwd = payload.get("cwd")
             if type(raw_session_id) is not str or type(raw_cwd) is not str:
                 raise ValueError("startup receipt input is incomplete")
+            # Codex supplies the raw working-directory spelling.  Inspect every
+            # component before normalizing it so a benign native-Windows 8.3
+            # alias is persisted as the canonical receipt identity without
+            # accepting symlink or junction traversal.
+            lexical_cwd = Path(raw_cwd).expanduser()
+            if not lexical_cwd.is_absolute():
+                lexical_cwd = Path.cwd() / lexical_cwd
+            cwd = canonicalize_no_link_traversal(
+                lexical_cwd, "startup receipt cwd"
+            )
+            with open_directory_identity(lexical_cwd) as cwd_handle:
+                if not handle_matches_path(cwd_handle.identity, cwd):
+                    raise ValueError("startup receipt cwd changed while being opened")
+                rebound_cwd = canonicalize_no_link_traversal(
+                    lexical_cwd, "startup receipt cwd"
+                )
+                if rebound_cwd != cwd:
+                    raise ValueError("startup receipt cwd changed while being opened")
+                cwd_handle.require_unchanged()
             # Keep the receipt store optional and startup-only.  A failure here
             # must not change the established fail-open SessionStart context.
             from .harnesslib import now_iso
@@ -673,7 +693,7 @@ def session_start(root: Path, payload: dict[str, Any]) -> None:
                     "session_id": raw_session_id,
                     "source": raw_source,
                     "observed_at": now_iso(),
-                    "cwd": raw_cwd,
+                    "cwd": str(cwd),
                     "project_root": str(paths.root),
                     "aoi_config_sha256": paths.project.sha256,
                 },

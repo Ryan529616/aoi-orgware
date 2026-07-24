@@ -17,6 +17,11 @@ from .. import harnesslib as h
 from .. import permit_runtime as permit_runtime
 from .. import semantic_events as semantic
 from .. import semantic_store as store
+from ..windows_handle_identity import (
+    handle_matches_path,
+    opened_file_identity,
+    same_handle_identity,
+)
 
 
 COHORT_ROUND_REQUEST_SCHEMA_VERSION = 1
@@ -52,12 +57,11 @@ def _load_canonical_json_artifact(
 
     if not isinstance(raw_path, str) or not raw_path:
         raise h.HarnessError(f"{label} is required")
-    requested = Path(raw_path)
-    path = requested if requested.is_absolute() else Path.cwd() / requested
+    lexical_path = Path(raw_path).expanduser()
+    if not lexical_path.is_absolute():
+        lexical_path = Path.cwd() / lexical_path
     try:
-        canonical = h.canonicalize_no_link_traversal(path, label)
-        if canonical != path:
-            raise h.HarnessError(f"{label} path is non-canonical")
+        path = h.canonicalize_no_link_traversal(lexical_path, label)
         h.validate_existing_regular_file(path, label)
         before = path.lstat()
         if (
@@ -66,13 +70,23 @@ def _load_canonical_json_artifact(
             or before.st_nlink != 1
         ):
             raise h.HarnessError(f"{label} must be one regular non-linked file")
-        with path.open("rb") as handle:
+        # Open the original ingress spelling so the opened handle can prove
+        # that a resolve-time namespace swap did not redirect accepted bytes.
+        with lexical_path.open("rb") as handle:
             opened = os.fstat(handle.fileno())
+            opened_handle = opened_file_identity(handle.fileno())
             if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise h.HarnessError(f"{label} changed while being opened")
+            if (
+                not handle_matches_path(opened_handle, path)
+                or (opened_handle is not None and opened_handle.link_count != 1)
+            ):
                 raise h.HarnessError(f"{label} changed while being opened")
             raw = handle.read(maximum + 1)
             finished = os.fstat(handle.fileno())
-        after = path.lstat()
+            finished_handle = opened_file_identity(handle.fileno())
+            rebound_path = h.canonicalize_no_link_traversal(lexical_path, label)
+        after = None if opened_handle is not None else path.lstat()
     except FileNotFoundError as exc:
         raise h.HarnessError(f"{label} is missing") from exc
     except OSError as exc:
@@ -84,12 +98,18 @@ def _load_canonical_json_artifact(
         identity != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
         or identity
         != (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns)
-        or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (
+            after is not None
+            and identity
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        )
         or opened.st_nlink != 1
         or finished.st_nlink != 1
-        or after.st_nlink != 1
+        or (after is not None and after.st_nlink != 1)
         or len(raw) != finished.st_size
-        or h.canonicalize_no_link_traversal(path, label) != path
+        or not same_handle_identity(opened_handle, finished_handle)
+        or rebound_path != path
+        or not handle_matches_path(finished_handle, rebound_path)
     ):
         raise h.HarnessError(f"{label} changed while being read")
 
@@ -182,12 +202,13 @@ def _load_permit_transaction(raw_path: str) -> dict[str, Any]:
 
     if not isinstance(raw_path, str) or not raw_path:
         raise h.HarnessError("permit transaction file is required")
-    requested = Path(raw_path)
-    path = requested if requested.is_absolute() else Path.cwd() / requested
+    lexical_path = Path(raw_path).expanduser()
+    if not lexical_path.is_absolute():
+        lexical_path = Path.cwd() / lexical_path
     try:
-        canonical = h.canonicalize_no_link_traversal(path, "permit transaction file")
-        if canonical != path:
-            raise h.HarnessError("permit transaction file path is non-canonical")
+        path = h.canonicalize_no_link_traversal(
+            lexical_path, "permit transaction file"
+        )
         h.validate_existing_regular_file(path, "permit transaction file")
         before = path.lstat()
         if (
@@ -198,15 +219,27 @@ def _load_permit_transaction(raw_path: str) -> dict[str, Any]:
             raise h.HarnessError(
                 "permit transaction file must be one regular non-linked file"
             )
-        with path.open("rb") as handle:
+        with lexical_path.open("rb") as handle:
             opened = os.fstat(handle.fileno())
+            opened_handle = opened_file_identity(handle.fileno())
             if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise h.HarnessError(
+                    "permit transaction file changed while being opened"
+                )
+            if (
+                not handle_matches_path(opened_handle, path)
+                or (opened_handle is not None and opened_handle.link_count != 1)
+            ):
                 raise h.HarnessError(
                     "permit transaction file changed while being opened"
                 )
             raw = handle.read(maximum + 1)
             finished = os.fstat(handle.fileno())
-        after = path.lstat()
+            finished_handle = opened_file_identity(handle.fileno())
+            rebound_path = h.canonicalize_no_link_traversal(
+                lexical_path, "permit transaction file"
+            )
+        after = None if opened_handle is not None else path.lstat()
     except FileNotFoundError as exc:
         raise h.HarnessError("permit transaction file is missing") from exc
     except OSError as exc:
@@ -218,12 +251,18 @@ def _load_permit_transaction(raw_path: str) -> dict[str, Any]:
         identity != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
         or identity
         != (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns)
-        or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (
+            after is not None
+            and identity
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        )
         or opened.st_nlink != 1
         or finished.st_nlink != 1
-        or after.st_nlink != 1
+        or (after is not None and after.st_nlink != 1)
         or len(raw) != finished.st_size
-        or h.canonicalize_no_link_traversal(path, "permit transaction file") != path
+        or not same_handle_identity(opened_handle, finished_handle)
+        or rebound_path != path
+        or not handle_matches_path(finished_handle, rebound_path)
     ):
         raise h.HarnessError("permit transaction file changed while being read")
 

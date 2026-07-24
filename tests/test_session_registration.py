@@ -137,8 +137,8 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
                     "session_id": "harness-test-chief",
                     "source": "startup",
                     "observed_at": now_iso(),
-                    "cwd": str(self.root),
-                    "project_root": str(self.root),
+                    "cwd": str(get_paths(self.root).root),
+                    "project_root": str(get_paths(self.root).root),
                     "aoi_config_sha256": paths.project.sha256,
                 },
             )
@@ -254,8 +254,8 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
                 "session_id": "harness-test-chief",
                 "source": "startup",
                 "observed_at": now_iso(),
-                "cwd": str(self.root),
-                "project_root": str(self.root),
+                "cwd": str(get_paths(self.root).root),
+                "project_root": str(get_paths(self.root).root),
                 "aoi_config_sha256": get_paths(self.root).project.sha256,
             },
         )
@@ -773,8 +773,8 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
                 "observed_at": (
                     applied_at - dt.timedelta(seconds=1, microseconds=445679)
                 ).isoformat(timespec="microseconds"),
-                "cwd": str(self.root),
-                "project_root": str(self.root),
+                "cwd": str(get_paths(self.root).root),
+                "project_root": str(get_paths(self.root).root),
                 "aoi_config_sha256": paths.project.sha256,
             },
         )
@@ -868,8 +868,8 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
                 "session_id": "harness-test-chief",
                 "source": "startup",
                 "observed_at": now_iso(),
-                "cwd": str(self.root),
-                "project_root": str(self.root),
+                "cwd": str(get_paths(self.root).root),
+                "project_root": str(get_paths(self.root).root),
                 "aoi_config_sha256": paths.project.sha256,
             },
         )
@@ -969,8 +969,8 @@ class ChiefSessionRegistrationTests(HarnessTestCase):
                 "session_id": "harness-test-chief",
                 "source": "startup",
                 "observed_at": now_iso(),
-                "cwd": str(self.root),
-                "project_root": str(self.root),
+                "cwd": str(get_paths(self.root).root),
+                "project_root": str(get_paths(self.root).root),
                 "aoi_config_sha256": paths.project.sha256,
             },
         )

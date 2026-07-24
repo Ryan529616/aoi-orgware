@@ -26,17 +26,21 @@ from .. import publication_policy
 from .. import semantic_events as semantic
 from .. import semantic_store as store
 from ..state_lookup import require_open_task
+from ..windows_handle_identity import (
+    handle_matches_path,
+    opened_file_identity,
+    same_handle_identity,
+)
 
 
 def _read_canonical_json(path_value: str, *, label: str, maximum: int) -> Any:
     if not isinstance(path_value, str) or not path_value:
         raise h.HarnessError(f"{label} is required")
-    requested = Path(path_value)
-    path = requested if requested.is_absolute() else Path.cwd() / requested
+    lexical_path = Path(path_value).expanduser()
+    if not lexical_path.is_absolute():
+        lexical_path = Path.cwd() / lexical_path
     try:
-        canonical = h.canonicalize_no_link_traversal(path, label)
-        if canonical != path:
-            raise h.HarnessError(f"{label} path is non-canonical")
+        path = h.canonicalize_no_link_traversal(lexical_path, label)
         h.validate_existing_regular_file(path, label)
         before = path.lstat()
         if (
@@ -46,13 +50,19 @@ def _read_canonical_json(path_value: str, *, label: str, maximum: int) -> Any:
         ):
             raise h.HarnessError(f"{label} must be one regular non-linked file")
         descriptor = os.open(
-            path,
+            lexical_path,
             os.O_RDONLY
             | getattr(os, "O_BINARY", 0)
             | getattr(os, "O_NOFOLLOW", 0),
         )
         try:
             opened = os.fstat(descriptor)
+            opened_handle = opened_file_identity(descriptor)
+            if (
+                not handle_matches_path(opened_handle, path)
+                or (opened_handle is not None and opened_handle.link_count != 1)
+            ):
+                raise h.HarnessError(f"{label} changed while being opened")
             chunks: list[bytes] = []
             total = 0
             while total <= maximum:
@@ -62,9 +72,11 @@ def _read_canonical_json(path_value: str, *, label: str, maximum: int) -> Any:
                 chunks.append(chunk)
                 total += len(chunk)
             finished = os.fstat(descriptor)
+            finished_handle = opened_file_identity(descriptor)
+            rebound_path = h.canonicalize_no_link_traversal(lexical_path, label)
         finally:
             os.close(descriptor)
-        after = path.lstat()
+        after = None if opened_handle is not None else path.lstat()
     except FileNotFoundError as exc:
         raise h.HarnessError(f"{label} is missing") from exc
     except OSError as exc:
@@ -78,12 +90,18 @@ def _read_canonical_json(path_value: str, *, label: str, maximum: int) -> Any:
         != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
         or identity
         != (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns)
-        or identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (
+            after is not None
+            and identity
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        )
         or opened.st_nlink != 1
         or finished.st_nlink != 1
-        or after.st_nlink != 1
+        or (after is not None and after.st_nlink != 1)
         or len(raw) != finished.st_size
-        or h.canonicalize_no_link_traversal(path, label) != path
+        or not same_handle_identity(opened_handle, finished_handle)
+        or rebound_path != path
+        or not handle_matches_path(finished_handle, rebound_path)
     ):
         raise h.HarnessError(f"{label} changed while being read")
 

@@ -31,7 +31,12 @@ from .git_plumbing import (
     _git_transport_config_audit_bytes,
     _run_git_bytes_bounded,
 )
-from .harnesslib import HarnessError
+from .harnesslib import HarnessError, canonicalize_no_link_traversal
+from .windows_handle_identity import (
+    handle_matches_path,
+    opened_file_identity,
+    same_handle_identity,
+)
 
 
 CONFIDENTIALITY_REPORT_SCHEMA_VERSION = 2
@@ -2056,13 +2061,17 @@ def validate_git_push_preflight_receipt_structure(
 def load_git_push_preflight_receipt(path: Path) -> dict[str, Any]:
     """Read one bounded single-link JSON receipt without accepting duplicate keys."""
 
-    path = path.expanduser().absolute()
+    # Preflight artifacts are ingress, not persisted lock identities.  Inspect
+    # the caller spelling component-by-component, then retain the canonical
+    # path for the stable descriptor read below.  This accepts benign Windows
+    # short names without allowing a link or reparse traversal.
+    lexical_path = path.expanduser()
+    if not lexical_path.is_absolute():
+        lexical_path = Path.cwd() / lexical_path
     try:
-        resolved = path.resolve(strict=True)
-        if resolved != path:
-            raise ConfidentialityError(
-                "Git push preflight receipt path traverses a link/reparse point"
-            )
+        path = canonicalize_no_link_traversal(
+            lexical_path, "Git push preflight receipt"
+        )
         before = path.lstat()
         if _path_is_link_or_reparse(path) or not path.is_file() or before.st_nlink != 1:
             raise ConfidentialityError(
@@ -2072,20 +2081,76 @@ def load_git_push_preflight_receipt(path: Path) -> dict[str, Any]:
             raise ConfidentialityError(
                 "Git push preflight receipt exceeds its byte bound"
             )
-        raw = path.read_bytes()
-        after = path.lstat()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(lexical_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            opened_handle = opened_file_identity(descriptor)
+            if (
+                opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_size != before.st_size
+                or opened.st_mtime_ns != before.st_mtime_ns
+                or opened.st_nlink != 1
+            ):
+                raise ConfidentialityError(
+                    "Git push preflight receipt changed while being opened"
+                )
+            if (
+                not handle_matches_path(opened_handle, path)
+                or (opened_handle is not None and opened_handle.link_count != 1)
+            ):
+                raise ConfidentialityError(
+                    "Git push preflight receipt changed while being opened"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while total <= MAX_GIT_PREFLIGHT_RECEIPT_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, MAX_GIT_PREFLIGHT_RECEIPT_BYTES + 1 - total),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            finished = os.fstat(descriptor)
+            finished_handle = opened_file_identity(descriptor)
+            rebound_path = canonicalize_no_link_traversal(
+                lexical_path, "Git push preflight receipt"
+            )
+        finally:
+            os.close(descriptor)
+        after = None if opened_handle is not None else path.lstat()
     except ConfidentialityError:
         raise
+    except HarnessError as exc:
+        raise ConfidentialityError(str(exc)) from exc
     except OSError as exc:
         raise ConfidentialityError(
             f"Git push preflight receipt could not be read: {exc}"
         ) from exc
+    raw = b"".join(chunks)
     if (
         len(raw) != before.st_size
-        or before.st_size != after.st_size
-        or before.st_mtime_ns != after.st_mtime_ns
-        or before.st_ino != after.st_ino
-        or after.st_nlink != 1
+        or (after is not None and before.st_size != after.st_size)
+        or (after is not None and before.st_mtime_ns != after.st_mtime_ns)
+        or (after is not None and before.st_ino != after.st_ino)
+        or (after is not None and before.st_dev != after.st_dev)
+        or (after is not None and _path_is_link_or_reparse(path))
+        or (after is not None and after.st_nlink != 1)
+        or finished.st_dev != before.st_dev
+        or finished.st_ino != before.st_ino
+        or finished.st_size != before.st_size
+        or finished.st_mtime_ns != before.st_mtime_ns
+        or finished.st_nlink != 1
+        or not same_handle_identity(opened_handle, finished_handle)
+        or rebound_path != path
+        or not handle_matches_path(finished_handle, rebound_path)
     ):
         raise ConfidentialityError(
             "Git push preflight receipt changed while being read"

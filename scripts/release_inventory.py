@@ -18,6 +18,20 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+# This standalone script is also invoked directly from a source checkout.
+_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from aoi_orgware.windows_handle_identity import (
+    DirectoryHandle,
+    handle_is_child_of,
+    handle_matches_path,
+    open_directory_identity,
+    opened_file_identity,
+    same_handle_identity,
+)
+
 
 SCHEMA_VERSION = 1
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -69,19 +83,39 @@ def _is_reparse_point(info: os.stat_result) -> bool:
 
 
 def _secure_directory(path: Path, *, label: str) -> Path:
-    absolute = Path(os.path.abspath(path))
+    """Return a canonical directory after rejecting every linked component.
+
+    ``Path.resolve`` expands native Windows 8.3 names as well as links.  Walk
+    the lexical components first so short-name ingress is accepted only when
+    no symlink, junction, or other reparse point was crossed.
+    """
+
+    lexical = path.expanduser()
+    if not lexical.is_absolute():
+        lexical = Path.cwd() / lexical
+    current = Path(lexical.anchor)
     try:
-        info = absolute.lstat()
-        resolved = absolute.resolve(strict=True)
+        for part in lexical.parts[1:]:
+            if part == "..":
+                raise InventoryError(f"{label} may not contain parent traversal")
+            current /= part
+            try:
+                component = current.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(component.st_mode) or _is_reparse_point(component):
+                raise InventoryError(
+                    f"{label} must not traverse a link or reparse point: {path}"
+                )
+        info = current.lstat()
+        resolved = current.resolve(strict=True)
     except FileNotFoundError as exc:
         raise InventoryError(f"{label} does not exist: {path}") from exc
     except OSError as exc:
         raise InventoryError(f"cannot resolve {label}: {path}") from exc
     if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info) or not stat.S_ISDIR(info.st_mode):
         raise InventoryError(f"{label} must be a real directory, not a link: {path}")
-    if os.path.normcase(str(absolute)) != os.path.normcase(str(resolved)):
-        raise InventoryError(f"{label} must not traverse a link or alias: {path}")
-    return absolute
+    return resolved
 
 
 def _validate_name(name: object) -> str:
@@ -143,7 +177,12 @@ def _identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
-def _file_digest(path: Path, *, expected_size: int | None = None) -> tuple[int, str]:
+def _file_digest(
+    path: Path,
+    *,
+    expected_size: int | None = None,
+    root_handle: DirectoryHandle | None = None,
+) -> tuple[int, str]:
     try:
         before = path.lstat()
     except FileNotFoundError as exc:
@@ -167,14 +206,30 @@ def _file_digest(path: Path, *, expected_size: int | None = None) -> tuple[int, 
         descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "rb", closefd=True) as handle:
             opened = os.fstat(handle.fileno())
+            opened_handle = opened_file_identity(handle.fileno())
             if _is_reparse_point(opened) or _identity(opened) != _identity(before):
+                raise InventoryError(f"artifact changed while opening: {path.name}")
+            if (
+                root_handle is not None
+                and not handle_is_child_of(
+                    opened_handle, root_handle.identity, path.name
+                )
+            ):
+                raise InventoryError(
+                    f"artifact opened outside the stable artifact root: {path.name}"
+                )
+            if opened_handle is not None and opened_handle.link_count != 1:
                 raise InventoryError(f"artifact changed while opening: {path.name}")
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
+            finished_handle = opened_file_identity(handle.fileno())
     except OSError as exc:
         raise InventoryError(f"cannot read artifact: {path.name}") from exc
-    after = path.lstat()
-    if _identity(after) != _identity(before):
+    after = None if opened_handle is not None else path.lstat()
+    if (
+        (after is not None and _identity(after) != _identity(before))
+        or not same_handle_identity(opened_handle, finished_handle)
+    ):
         raise InventoryError(f"artifact changed while hashing: {path.name}")
     return before.st_size, digest.hexdigest()
 
@@ -290,9 +345,11 @@ def load_inventory(path: Path) -> dict[str, Any]:
     return inventory
 
 
-def _clean_entries(root: Path) -> list[Path]:
-    _secure_directory(root, label="artifact root")
-    entries = sorted(root.iterdir(), key=lambda item: item.name)
+def _clean_entries(root: Path, root_handle: DirectoryHandle) -> list[Path]:
+    entries = sorted(
+        (root / entry.name for entry in root_handle.entries()),
+        key=lambda item: item.name,
+    )
     if not entries:
         raise InventoryError("artifact root is empty")
     for entry in entries:
@@ -303,18 +360,32 @@ def _clean_entries(root: Path) -> list[Path]:
 def capture(dist_dir: Path, *, distribution_name: str, package_version: str) -> dict[str, Any]:
     distribution_name = _validate_distribution(distribution_name)
     package_version = _validate_version(package_version)
-    root = _secure_directory(dist_dir, label="dist directory")
-    entries = _clean_entries(root)
-    artifacts: list[dict[str, Any]] = []
-    aggregate = 0
-    for entry in entries:
-        name = _validate_name(entry.name)
-        _validate_artifact_filename(name, distribution_name, package_version)
-        size, digest = _file_digest(entry)
-        aggregate += size
-        if aggregate > MAX_ARTIFACT_AGGREGATE_BYTES:
-            raise InventoryError("artifacts exceed their aggregate byte bound")
-        artifacts.append({"name": name, "size_bytes": size, "sha256": digest})
+    lexical_root = dist_dir.expanduser()
+    if not lexical_root.is_absolute():
+        lexical_root = Path.cwd() / lexical_root
+    root = _secure_directory(lexical_root, label="dist directory")
+    with open_directory_identity(lexical_root) as root_handle:
+        if not handle_matches_path(root_handle.identity, root):
+            raise InventoryError("dist directory changed while being opened")
+        if _secure_directory(lexical_root, label="dist directory") != root:
+            raise InventoryError("dist directory changed while being opened")
+        entries = _clean_entries(root, root_handle)
+        artifacts: list[dict[str, Any]] = []
+        aggregate = 0
+        for entry in entries:
+            name = _validate_name(entry.name)
+            _validate_artifact_filename(name, distribution_name, package_version)
+            size, digest = _file_digest(entry, root_handle=root_handle)
+            aggregate += size
+            if aggregate > MAX_ARTIFACT_AGGREGATE_BYTES:
+                raise InventoryError("artifacts exceed their aggregate byte bound")
+            artifacts.append({"name": name, "size_bytes": size, "sha256": digest})
+        try:
+            if _secure_directory(lexical_root, label="dist directory") != root:
+                raise InventoryError("dist directory changed while being captured")
+            root_handle.require_unchanged()
+        except OSError as exc:
+            raise InventoryError("dist directory changed while being captured") from exc
     artifacts.sort(key=lambda item: item["name"])
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -331,21 +402,39 @@ def capture(dist_dir: Path, *, distribution_name: str, package_version: str) -> 
 
 def verify(inventory: dict[str, Any], root: Path) -> None:
     inventory = _validate_inventory(inventory)
-    artifact_root = _secure_directory(root, label="artifact root")
+    lexical_root = root.expanduser()
+    if not lexical_root.is_absolute():
+        lexical_root = Path.cwd() / lexical_root
+    artifact_root = _secure_directory(lexical_root, label="artifact root")
     expected = {artifact["name"]: artifact for artifact in inventory["artifacts"]}
-    entries = _clean_entries(artifact_root)
-    actual = {entry.name: entry for entry in entries}
-    if set(actual) != set(expected):
-        missing = sorted(set(expected) - set(actual))
-        extra = sorted(set(actual) - set(expected))
-        detail = ([f"missing={','.join(missing)}"] if missing else []) + ([f"extra={','.join(extra)}"] if extra else [])
-        raise InventoryError("artifact root does not exactly match inventory: " + "; ".join(detail))
-    if len({name.casefold() for name in actual}) != len(actual):
-        raise InventoryError("artifact root has casefold-colliding names")
-    for name, artifact in expected.items():
-        size, digest = _file_digest(actual[name], expected_size=artifact["size_bytes"])
-        if size != artifact["size_bytes"] or digest != artifact["sha256"]:
-            raise InventoryError(f"artifact hash does not match inventory: {name}")
+    with open_directory_identity(lexical_root) as root_handle:
+        if not handle_matches_path(root_handle.identity, artifact_root):
+            raise InventoryError("artifact root changed while being opened")
+        if _secure_directory(lexical_root, label="artifact root") != artifact_root:
+            raise InventoryError("artifact root changed while being opened")
+        entries = _clean_entries(artifact_root, root_handle)
+        actual = {entry.name: entry for entry in entries}
+        if set(actual) != set(expected):
+            missing = sorted(set(expected) - set(actual))
+            extra = sorted(set(actual) - set(expected))
+            detail = ([f"missing={','.join(missing)}"] if missing else []) + ([f"extra={','.join(extra)}"] if extra else [])
+            raise InventoryError("artifact root does not exactly match inventory: " + "; ".join(detail))
+        if len({name.casefold() for name in actual}) != len(actual):
+            raise InventoryError("artifact root has casefold-colliding names")
+        for name, artifact in expected.items():
+            size, digest = _file_digest(
+                actual[name],
+                expected_size=artifact["size_bytes"],
+                root_handle=root_handle,
+            )
+            if size != artifact["size_bytes"] or digest != artifact["sha256"]:
+                raise InventoryError(f"artifact hash does not match inventory: {name}")
+        try:
+            if _secure_directory(lexical_root, label="artifact root") != artifact_root:
+                raise InventoryError("artifact root changed while being verified")
+            root_handle.require_unchanged()
+        except OSError as exc:
+            raise InventoryError("artifact root changed while being verified") from exc
 
 
 def _copy_exact(source: Path, destination: Path, size: int, sha256: str) -> None:
