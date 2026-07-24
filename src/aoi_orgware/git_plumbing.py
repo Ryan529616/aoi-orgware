@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -42,13 +44,19 @@ MAX_GIT_STATUS_RECORDS = 10_000
 MAX_GIT_STATUS_PATH_BYTES = 16 * 1024
 MAX_GIT_COMMAND_BYTES = 4 * 1024 * 1024
 MAX_GIT_COMMAND_STDERR_BYTES = 64 * 1024
+MAX_GIT_EXECUTABLE_BYTES = 1024 * 1024 * 1024
+GIT_READER_JOIN_TIMEOUT_SECONDS = 5.0
+GIT_EXECUTABLE_BINDING_SCHEMA = "aoi.git-executable-binding.v1"
+GIT_EXECUTABLE_PROVENANCE_SCOPE = "bridge_verify_mutation_git_observation"
+_GIT_EXECUTABLE_HASH_CHUNK_BYTES = 1024 * 1024
 _GIT_MODE_RE = re.compile(rb"^[0-7]{6}$")
 _GIT_OID_RE = re.compile(rb"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _GIT_SCORE_RE = re.compile(rb"^[RC](?:[0-9]{1,2}|100)$")
 _GIT_XY_CHARS = frozenset(b".MTADRCU")
 _GIT_SUBMODULE_RE = re.compile(rb"^(?:N\.\.\.|S[.C][.M][.U])$")
 GIT_STATUS_SNAPSHOT_SCHEMA = "aoi.git-status-porcelain-v2.snapshot.v1"
-GIT_MUTATION_SNAPSHOT_SCHEMA = "aoi.git-mutation-snapshot.v2"
+LEGACY_GIT_MUTATION_SNAPSHOT_SCHEMA = "aoi.git-mutation-snapshot.v2"
+GIT_MUTATION_SNAPSHOT_SCHEMA = "aoi.git-mutation-snapshot.v3"
 GIT_TASK_CLAIM_SCOPE_SCHEMA = "aoi.git-task-live-claim-scope.v1"
 GIT_TASK_CLAIM_AUTHORITY_SCHEMA = "aoi.git-task-live-claim-authority.v1"
 GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA = (
@@ -68,6 +76,252 @@ _REMOTE_RELEASE_ADVERTISEMENT_KEYS = {
     "tag_peeled_commit_oid",
     "observation_sha256",
 }
+_LOWER_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_GIT_OBSERVATION_FILE_MAX_BYTES = 1024 * 1024
+_GIT_OBSERVATION_CONFIG_KEYS = frozenset(
+    {
+        "core.autocrlf",
+        "core.bare",
+        "core.eol",
+        "core.filemode",
+        "core.ignorecase",
+        "core.logallrefupdates",
+        "core.longpaths",
+        "core.precomposeunicode",
+        "core.protecthfs",
+        "core.protectntfs",
+        "core.quotepath",
+        "core.repositoryformatversion",
+        "core.safecrlf",
+        "core.symlinks",
+        "extensions.compatobjectformat",
+        "extensions.objectformat",
+        "user.email",
+        "user.name",
+        "user.signingkey",
+    }
+)
+_GIT_OBSERVATION_CONFIG_PATTERNS = (
+    re.compile(r"remote\..+\.(?:fetch|mirror|prune|prunetags|pushurl|tagopt|url)\Z"),
+    re.compile(r"branch\..+\.(?:description|merge|pushremote|rebase|remote)\Z"),
+)
+_GIT_OBSERVATION_FORBIDDEN_PATHS = (
+    "commondir",
+    "gitdir",
+    "config.worktree",
+    "worktrees",
+    "shallow",
+    "shallow.lock",
+    "info/grafts",
+    "objects/info/alternates",
+    "objects/info/http-alternates",
+    "objects/info/alternates.lock",
+    "refs/replace",
+)
+
+
+def _file_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(getattr(value, "st_file_attributes", 0)),
+    )
+
+
+def _file_handle_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        stat.S_IFMT(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
+def _stable_executable_sha256(path: Path) -> tuple[int, str]:
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect bound Git executable: {exc}") from exc
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+        or os.path.normcase(os.path.abspath(path))
+        != os.path.normcase(str(resolved))
+    ):
+        raise HarnessError(
+            "bound Git executable must be one absolute regular non-linked file"
+        )
+    size = int(before.st_size)
+    if size < 1 or size > MAX_GIT_EXECUTABLE_BYTES:
+        raise HarnessError("bound Git executable size is outside the configured limit")
+    descriptor: int | None = None
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+        digest = hashlib.sha256()
+        total = 0
+        with os.fdopen(descriptor, "rb", buffering=0) as handle:
+            descriptor = None
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or _file_handle_identity(before) != _file_handle_identity(opened)
+            ):
+                raise HarnessError("bound Git executable changed before hashing")
+            while True:
+                chunk = handle.read(_GIT_EXECUTABLE_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_GIT_EXECUTABLE_BYTES:
+                    raise HarnessError(
+                        "bound Git executable exceeds the configured limit"
+                    )
+                digest.update(chunk)
+            handle_after = os.fstat(handle.fileno())
+        after = path.lstat()
+        resolved_after = path.resolve(strict=True)
+    except HarnessError:
+        raise
+    except OSError as exc:
+        raise HarnessError(f"cannot hash bound Git executable: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        total != size
+        or _file_stat_fingerprint(before) != _file_stat_fingerprint(after)
+        or _file_stat_fingerprint(opened) != _file_stat_fingerprint(handle_after)
+        or _file_handle_identity(after) != _file_handle_identity(handle_after)
+        or os.path.normcase(os.path.abspath(path))
+        != os.path.normcase(str(resolved_after))
+    ):
+        raise HarnessError("bound Git executable changed while hashing")
+    return size, digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class GitExecutableBinding:
+    """Exact cooperative pre-spawn binding for Git evidence collection."""
+
+    path: Path
+    size_bytes: int
+    sha256: str
+
+    @classmethod
+    def create(
+        cls,
+        path: str | os.PathLike[str],
+        size_bytes: int,
+        sha256: str,
+    ) -> GitExecutableBinding:
+        candidate = Path(path)
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 1
+            or size_bytes > MAX_GIT_EXECUTABLE_BYTES
+        ):
+            raise HarnessError("Git executable binding size is invalid")
+        if not isinstance(sha256, str) or _LOWER_SHA256_RE.fullmatch(sha256) is None:
+            raise HarnessError("Git executable binding SHA-256 is invalid")
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise HarnessError(f"cannot resolve bound Git executable: {exc}") from exc
+        binding = cls(path=resolved, size_bytes=size_bytes, sha256=sha256)
+        binding.revalidate()
+        return binding
+
+    @classmethod
+    def from_contract(cls, value: Mapping[str, Any]) -> GitExecutableBinding:
+        expected = {
+            "schema",
+            "path",
+            "size_bytes",
+            "sha256",
+            "provenance_scope",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise HarnessError("Git executable provenance schema is invalid")
+        if (
+            value["schema"] != GIT_EXECUTABLE_BINDING_SCHEMA
+            or value["provenance_scope"] != GIT_EXECUTABLE_PROVENANCE_SCOPE
+            or not isinstance(value["path"], str)
+            or "\\" in value["path"]
+        ):
+            raise HarnessError("Git executable provenance contract is invalid")
+        binding = cls.create(
+            value["path"],
+            value["size_bytes"],
+            value["sha256"],
+        )
+        if binding.contract() != dict(value):
+            raise HarnessError("Git executable provenance path is not canonical")
+        return binding
+
+    def revalidate(self) -> None:
+        size, sha256 = _stable_executable_sha256(self.path)
+        if size != self.size_bytes or sha256 != self.sha256:
+            raise HarnessError("bound Git executable bytes drifted")
+
+    def contract(self) -> dict[str, Any]:
+        path = self.path.resolve(strict=True).as_posix()
+        if "\\" in path:
+            raise HarnessError("bound Git executable path is not canonical")
+        return {
+            "schema": GIT_EXECUTABLE_BINDING_SCHEMA,
+            "path": path,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+            "provenance_scope": GIT_EXECUTABLE_PROVENANCE_SCOPE,
+        }
+
+
+_ACTIVE_GIT_EXECUTABLE: ContextVar[GitExecutableBinding | None] = ContextVar(
+    "aoi_active_git_executable",
+    default=None,
+)
+
+
+@contextmanager
+def use_git_executable_binding(
+    binding: GitExecutableBinding | None,
+) -> Iterator[GitExecutableBinding | None]:
+    """Scope one exact executable across all nested Git subprocesses."""
+
+    if binding is None:
+        yield None
+        return
+    binding.revalidate()
+    current = _ACTIVE_GIT_EXECUTABLE.get()
+    if current is not None and current.contract() != binding.contract():
+        raise HarnessError("nested Git executable bindings disagree")
+    token = _ACTIVE_GIT_EXECUTABLE.set(binding)
+    try:
+        yield binding
+    finally:
+        _ACTIVE_GIT_EXECUTABLE.reset(token)
+
+
+def active_git_executable_binding() -> GitExecutableBinding | None:
+    return _ACTIVE_GIT_EXECUTABLE.get()
 
 
 def _b64(raw: bytes) -> str:
@@ -86,7 +340,7 @@ def _require_task_id(value: object) -> str:
     return value
 
 
-def _git_environment() -> dict[str, str]:
+def _git_environment(*, closed_observation: bool = False) -> dict[str, str]:
     """Make read-only Git inspection independent of ambient pathspec modes."""
 
     environment = dict(os.environ)
@@ -97,6 +351,22 @@ def _git_environment() -> dict[str, str]:
         "GIT_ICASE_PATHSPECS",
     ):
         environment.pop(name, None)
+    if active_git_executable_binding() is not None or closed_observation:
+        for name in tuple(environment):
+            upper = name.upper()
+            if upper.startswith("GIT_") or upper in {
+                "SSH_AUTH_SOCK",
+                "SSH_AGENT_PID",
+                "SSH_ASKPASS",
+                "SSH_ASKPASS_REQUIRE",
+            }:
+                environment.pop(name, None)
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        environment["GIT_ATTR_NOSYSTEM"] = "1"
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GCM_INTERACTIVE"] = "Never"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
@@ -117,13 +387,21 @@ def _run_git_command_bytes_bounded(
     as either stream crosses its cap.  This also avoids a stderr-pipe deadlock.
     """
 
+    actual_command = list(command)
+    binding = active_git_executable_binding()
+    if binding is not None:
+        if not actual_command or actual_command[0] != "git":
+            raise HarnessError(f"{label} is not routed through the Git binding")
+        binding.revalidate()
+        actual_command[0] = str(binding.path)
     try:
         process = subprocess.Popen(
-            command,
+            actual_command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=dict(environment),
+            bufsize=0,
         )
     except OSError as exc:
         raise HarnessError(f"{label} command failed: {exc}") from exc
@@ -134,45 +412,72 @@ def _run_git_command_bytes_bounded(
         raise HarnessError(f"{label} output limit may not be negative")
     outputs: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
     exceeded = threading.Event()
+    reader_errors: list[BaseException] = []
 
     def drain(stream: Any, name: str, limit: int) -> None:
-        while True:
-            chunk = stream.read(min(64 * 1024, limit + 1))
-            if not chunk:
-                return
-            destination = outputs[name]
-            remaining = limit - len(destination)
-            if remaining > 0:
-                destination.extend(chunk[:remaining])
-            if len(chunk) > remaining:
+        try:
+            while True:
+                chunk = stream.read(min(64 * 1024, limit + 1))
+                if not chunk:
+                    return
+                destination = outputs[name]
+                remaining = limit - len(destination)
+                if remaining > 0:
+                    destination.extend(chunk[:remaining])
+                if len(chunk) <= remaining:
+                    continue
                 exceeded.set()
                 try:
                     process.kill()
                 except OSError:
                     pass
-                # Continue draining until EOF so the child cannot block on its
-                # other pipe while it exits.
+                return
+        except (OSError, ValueError) as exc:
+            reader_errors.append(exc)
+            try:
+                process.kill()
+            except OSError:
+                pass
 
     readers = [
-        threading.Thread(target=drain, args=(process.stdout, "stdout", output_limit)),
-        threading.Thread(target=drain, args=(process.stderr, "stderr", MAX_GIT_COMMAND_STDERR_BYTES)),
+        threading.Thread(
+            target=drain,
+            args=(process.stdout, "stdout", output_limit),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=(process.stderr, "stderr", MAX_GIT_COMMAND_STDERR_BYTES),
+            daemon=True,
+        ),
     ]
     for reader in readers:
         reader.start()
+    timed_out = False
     try:
         returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        process.kill()
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            process.kill()
+        except OSError:
+            pass
         returncode = process.wait()
-        for reader in readers:
-            reader.join()
+    for reader in readers:
+        reader.join(timeout=GIT_READER_JOIN_TIMEOUT_SECONDS)
+    readers_alive = any(reader.is_alive() for reader in readers)
+    if readers_alive:
         process.stdout.close()
         process.stderr.close()
-        raise HarnessError(f"{label} command timed out") from exc
-    for reader in readers:
-        reader.join()
-    process.stdout.close()
-    process.stderr.close()
+        for reader in readers:
+            reader.join(timeout=1.0)
+    else:
+        process.stdout.close()
+        process.stderr.close()
+    if timed_out:
+        raise HarnessError(f"{label} command timed out")
+    if reader_errors or readers_alive:
+        raise HarnessError(f"{label} command output reader failed")
     if exceeded.is_set():
         raise HarnessError(f"{label} command output exceeds the configured byte bound")
     if returncode != 0:
@@ -393,14 +698,37 @@ def _run_git_bytes_bounded(
     timeout: float = 10,
     stdout_limit: int | None = None,
     transport_identity: str | None = None,
+    closed_observation: bool = False,
 ) -> bytes:
     """Run Git with bounded output and optional exact transport isolation."""
 
     argument_list = list(arguments)
+    if closed_observation:
+        command_prefix = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.ignoreStat=false",
+            "-c",
+            "core.checkStat=default",
+            "-c",
+            "core.trustctime=true",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            f"core.excludesFile={os.devnull}",
+            "-c",
+            f"core.attributesFile={os.devnull}",
+        ]
+    else:
+        command_prefix = ["git"]
     if transport_identity is None:
         return _run_git_command_bytes_bounded(
-            ["git", "-C", str(worktree), *argument_list],
-            environment=_git_environment(),
+            [*command_prefix, "-C", str(worktree), *argument_list],
+            environment=_git_environment(closed_observation=closed_observation),
             label=label,
             timeout=timeout,
             stdout_limit=stdout_limit,
@@ -417,12 +745,311 @@ def _run_git_bytes_bounded(
             alias if argument == identity else argument for argument in argument_list
         ]
         return _run_git_command_bytes_bounded(
-            ["git", "-C", str(worktree), *isolated_arguments],
+            [*command_prefix, "-C", str(worktree), *isolated_arguments],
             environment=environment,
             label=label,
             timeout=timeout,
             stdout_limit=stdout_limit,
         )
+
+
+def _require_observation_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect {label}: {exc}") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+        or os.path.normcase(os.path.abspath(path))
+        != os.path.normcase(str(resolved))
+    ):
+        raise HarnessError(f"{label} must be a local non-reparse directory")
+
+
+def _observation_file_bytes(
+    path: Path,
+    label: str,
+    *,
+    required: bool,
+) -> bytes | None:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise HarnessError(f"{label} is missing")
+        return None
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect {label}: {exc}") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+        or before.st_size > _GIT_OBSERVATION_FILE_MAX_BYTES
+    ):
+        raise HarnessError(f"{label} must be one bounded regular non-linked file")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        chunks: list[bytes] = []
+        total = 0
+        with os.fdopen(descriptor, "rb", buffering=0) as handle:
+            opened = os.fstat(handle.fileno())
+            if _file_handle_identity(opened) != _file_handle_identity(before):
+                raise HarnessError(f"{label} changed before opening")
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _GIT_OBSERVATION_FILE_MAX_BYTES:
+                    raise HarnessError(f"{label} exceeds its byte bound")
+                chunks.append(chunk)
+            handle_after = os.fstat(handle.fileno())
+        after = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot read {label}: {exc}") from exc
+    if (
+        total != before.st_size
+        or _file_stat_fingerprint(before) != _file_stat_fingerprint(after)
+        or _file_handle_identity(opened) != _file_handle_identity(handle_after)
+        or _file_handle_identity(after) != _file_handle_identity(handle_after)
+    ):
+        raise HarnessError(f"{label} changed while observed")
+    return b"".join(chunks)
+
+
+def _observation_file_identity(path: Path, label: str) -> dict[str, str]:
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect {label}: {exc}") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+        or os.path.normcase(os.path.abspath(path))
+        != os.path.normcase(str(resolved))
+    ):
+        raise HarnessError(f"{label} must be a local regular non-linked file")
+    return {"path": str(resolved), "kind": "regular_non_linked_file"}
+
+
+def _validate_observation_tree_links(root: Path, label: str) -> None:
+    pending = [root]
+    entries_seen = 0
+    while pending:
+        directory = pending.pop()
+        _require_observation_directory(directory, label)
+        try:
+            children = list(os.scandir(directory))
+        except OSError as exc:
+            raise HarnessError(f"cannot enumerate {label}: {exc}") from exc
+        entries_seen += len(children)
+        if entries_seen > 100_000:
+            raise HarnessError(f"{label} exceeds its entry bound")
+        for child in children:
+            path = Path(child.path)
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise HarnessError(f"cannot inspect {label}: {exc}") from exc
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            ):
+                raise HarnessError(f"{label} contains a link or reparse point")
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise HarnessError(
+                    f"{label} contains a special or hard-linked file"
+                )
+
+
+def _observation_config_key_allowed(key: str) -> bool:
+    return key in _GIT_OBSERVATION_CONFIG_KEYS or any(
+        pattern.fullmatch(key) is not None
+        for pattern in _GIT_OBSERVATION_CONFIG_PATTERNS
+    )
+
+
+def git_observation_authority(worktree: Path) -> dict[str, Any]:
+    """Bind the standalone repository authority used for mutation evidence.
+
+    Transport mutation evidence deliberately supports only an ordinary
+    standalone ``root/.git`` repository.  Linked/common worktrees, alternate
+    object/history authority, executable local config, and replacement history
+    fail closed before status, diff, or tree evidence is accepted.
+    """
+
+    root = worktree.resolve(strict=True)
+    _require_observation_directory(root, "Git observation worktree")
+    git_dir = root / ".git"
+    _require_observation_directory(git_dir, "Git observation .git")
+    objects_dir = git_dir / "objects"
+    refs_dir = git_dir / "refs"
+    _require_observation_directory(objects_dir, "Git observation objects")
+    _require_observation_directory(refs_dir, "Git observation refs")
+    _validate_observation_tree_links(
+        objects_dir,
+        "Git observation objects",
+    )
+    _validate_observation_tree_links(
+        refs_dir,
+        "Git observation refs",
+    )
+    head_identity = _observation_file_identity(
+        git_dir / "HEAD",
+        "Git observation HEAD",
+    )
+    index_identity = _observation_file_identity(
+        git_dir / "index",
+        "Git observation index",
+    )
+    head_bytes = _observation_file_bytes(
+        git_dir / "HEAD",
+        "Git observation HEAD",
+        required=True,
+    )
+    assert head_bytes is not None
+    try:
+        head_text = head_bytes.decode("ascii", "strict").strip()
+    except UnicodeDecodeError as exc:
+        raise HarnessError("Git observation HEAD is not ASCII") from exc
+    if head_text.startswith("ref: "):
+        head_ref = head_text[5:]
+        if (
+            not head_ref.startswith("refs/heads/")
+            or any(part in {"", ".", ".."} for part in head_ref.split("/"))
+        ):
+            raise HarnessError("Git observation HEAD ref is not canonical")
+    elif FULL_COMMIT_RE.fullmatch(head_text) is None:
+        raise HarnessError("Git observation detached HEAD is invalid")
+    for relative in _GIT_OBSERVATION_FORBIDDEN_PATHS:
+        candidate = git_dir / Path(relative)
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot inspect Git observation authority {relative}: {exc}"
+            ) from exc
+        raise HarnessError(
+            f"Git observation authority contains forbidden {relative}"
+        )
+
+    config_path = git_dir / "config"
+    config_before = _observation_file_bytes(
+        config_path,
+        "Git observation local config",
+        required=True,
+    )
+    assert config_before is not None
+    raw_config = _run_git_bytes_bounded(
+        root,
+        (
+            "config",
+            "--file",
+            str(config_path),
+            "--no-includes",
+            "--null",
+            "--list",
+        ),
+        label="Git observation local config",
+        stdout_limit=_GIT_OBSERVATION_FILE_MAX_BYTES,
+        closed_observation=True,
+    )
+    config_after = _observation_file_bytes(
+        config_path,
+        "Git observation local config",
+        required=True,
+    )
+    if config_after != config_before:
+        raise HarnessError("Git observation local config changed while parsed")
+    records = raw_config.split(b"\0")
+    if not records or records[-1] != b"":
+        raise HarnessError("Git observation local config output is malformed")
+    config_rows: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    for record in records[:-1]:
+        key_bytes, separator, value_bytes = record.partition(b"\n")
+        try:
+            key = key_bytes.decode("utf-8", "strict").casefold()
+            value = value_bytes.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise HarnessError(
+                "Git observation local config is not strict UTF-8"
+            ) from exc
+        if (
+            not separator
+            or key in seen_keys
+            or not _observation_config_key_allowed(key)
+        ):
+            raise HarnessError(
+                f"Git observation local config contains unapproved key: {key!r}"
+            )
+        seen_keys.add(key)
+        config_rows.append({"key": key, "value": value})
+
+    packed_refs = _observation_file_bytes(
+        git_dir / "packed-refs",
+        "Git observation packed-refs",
+        required=False,
+    )
+    if packed_refs is not None and any(
+        line
+        and not line.startswith((b"#", b"^"))
+        and b" refs/replace/" in line
+        for line in packed_refs.splitlines()
+    ):
+        raise HarnessError("Git observation authority contains packed replace refs")
+    auxiliary: list[dict[str, Any]] = []
+    for relative in ("info/exclude", "info/attributes"):
+        data = _observation_file_bytes(
+            git_dir / Path(relative),
+            f"Git observation {relative}",
+            required=False,
+        )
+        auxiliary.append(
+            {
+                "path": relative,
+                "present": data is not None,
+                "sha256": (
+                    None if data is None else hashlib.sha256(data).hexdigest()
+                ),
+            }
+        )
+    base = {
+        "schema": "aoi.git-observation-authority.v1",
+        "worktree": str(root),
+        "git_dir": str(git_dir.resolve(strict=True)),
+        "objects_dir": str(objects_dir.resolve(strict=True)),
+        "refs_dir": str(refs_dir.resolve(strict=True)),
+        "head": head_identity,
+        "index": index_identity,
+        "config_sha256": hashlib.sha256(config_before).hexdigest(),
+        "config": sorted(config_rows, key=lambda row: (row["key"], row["value"])),
+        "auxiliary": auxiliary,
+    }
+    return {
+        **base,
+        "authority_sha256": hashlib.sha256(
+            _canonical_json_bytes(base)
+        ).hexdigest(),
+    }
 
 
 def _unb64(value: object, label: str) -> bytes:
@@ -715,14 +1342,32 @@ def task_mutation_snapshot(
 
     task_id = _require_task_id(task_id)
     baseline_head = require_full_commit(baseline_head, "baseline_head")
-    metadata = git_metadata(worktree)
+    authority_before = git_observation_authority(worktree)
+    metadata = git_metadata(worktree, closed_observation=True)
     resolved = Path(metadata["worktree"])
     current_head = metadata["head_sha"]
+    staged = _run_git_bytes_bounded(
+        resolved,
+        ["ls-files", "--stage", "-z"],
+        label="Git task mutation index",
+        stdout_limit=MAX_GIT_STATUS_BYTES,
+        closed_observation=True,
+    )
+    if any(record.startswith(b"160000 ") for record in staged.split(b"\0") if record):
+        raise HarnessError("Git task mutation snapshot refuses gitlink index entries")
     diff_records = _parse_git_name_status(
         _run_git_bytes_bounded(
             resolved,
-            ["diff", "--name-status", "-z", f"{baseline_head}..{current_head}"],
+            [
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--name-status",
+                "-z",
+                f"{baseline_head}..{current_head}",
+            ],
             label="Git task mutation diff",
+            closed_observation=True,
         )
     )
     status_records = _parse_git_status_porcelain_v2(
@@ -731,8 +1376,14 @@ def task_mutation_snapshot(
             ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
             label="Git task mutation status",
             stdout_limit=MAX_GIT_STATUS_BYTES,
+            closed_observation=True,
         )
     )
+    authority_after = git_observation_authority(resolved)
+    if authority_after != authority_before:
+        raise HarnessError(
+            "Git observation authority changed during mutation snapshot"
+        )
     if any(
         record.get("record") in {"1", "2", "u"} and record.get("submodule") != "N..."
         for record in status_records
@@ -746,6 +1397,9 @@ def task_mutation_snapshot(
         "schema": GIT_MUTATION_SNAPSHOT_SCHEMA,
         "task_id": task_id,
         "worktree": str(resolved),
+        "observation_authority_sha256": authority_before[
+            "authority_sha256"
+        ],
         "baseline_head": baseline_head,
         "current_head": current_head,
         "baseline_to_current_name_status": diff_records,
@@ -761,11 +1415,28 @@ def validate_task_mutation_snapshot(snapshot: Mapping[str, Any]) -> tuple[str, l
 
     if not isinstance(snapshot, Mapping):
         raise HarnessError("Git task mutation snapshot must be an object")
-    if snapshot.get("schema") != GIT_MUTATION_SNAPSHOT_SCHEMA:
+    schema = snapshot.get("schema")
+    if schema not in {
+        LEGACY_GIT_MUTATION_SNAPSHOT_SCHEMA,
+        GIT_MUTATION_SNAPSHOT_SCHEMA,
+    }:
         raise HarnessError("unsupported Git task mutation snapshot schema")
     task_id = _require_task_id(snapshot.get("task_id"))
     if not isinstance(snapshot.get("worktree"), str) or not snapshot["worktree"]:
         raise HarnessError("Git task mutation snapshot worktree must be non-empty text")
+    authority_sha256 = snapshot.get("observation_authority_sha256")
+    if schema == GIT_MUTATION_SNAPSHOT_SCHEMA:
+        if (
+            not isinstance(authority_sha256, str)
+            or _LOWER_SHA256_RE.fullmatch(authority_sha256) is None
+        ):
+            raise HarnessError(
+                "Git task mutation snapshot observation authority is invalid"
+            )
+    elif authority_sha256 is not None:
+        raise HarnessError(
+            "legacy Git task mutation snapshot has unexpected authority"
+        )
     for key in ("baseline_head", "current_head"):
         value = snapshot.get(key)
         if not isinstance(value, str):
@@ -828,6 +1499,7 @@ def git_status_snapshot(worktree: Path) -> dict[str, Any]:
             ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
             label="Git status snapshot",
             stdout_limit=MAX_GIT_STATUS_BYTES,
+            closed_observation=True,
         )
     )
     records.sort(
@@ -1525,14 +2197,21 @@ def require_full_commit(value: str, label: str) -> str:
     return commit
 
 
-def git_metadata(worktree: Path) -> dict[str, str]:
+def git_metadata(
+    worktree: Path,
+    *,
+    closed_observation: bool = False,
+) -> dict[str, str]:
     resolved = worktree.resolve()
     if not resolved.is_dir():
         raise HarnessError(f"worktree does not exist: {resolved}")
 
     def run(*arguments: str) -> str:
         return _run_git_bytes_bounded(
-            resolved, arguments, label=f"Git metadata ({' '.join(arguments)})"
+            resolved,
+            arguments,
+            label=f"Git metadata ({' '.join(arguments)})",
+            closed_observation=closed_observation,
         ).decode("utf-8", "strict").strip()
 
     top = run("rev-parse", "--show-toplevel")
@@ -2065,6 +2744,9 @@ __all__ = [
     "COMMIT_RE",
     "FULL_COMMIT_RE",
     "GIT_MUTATION_SNAPSHOT_SCHEMA",
+    "LEGACY_GIT_MUTATION_SNAPSHOT_SCHEMA",
+    "GIT_EXECUTABLE_BINDING_SCHEMA",
+    "GIT_EXECUTABLE_PROVENANCE_SCOPE",
     "GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA",
     "GIT_REMOTE_RELEASE_MAIN_REF",
     "GIT_STATUS_SNAPSHOT_SCHEMA",
@@ -2072,11 +2754,16 @@ __all__ = [
     "GIT_TASK_CLAIM_SCOPE_SCHEMA",
     "MAX_GIT_COMMAND_BYTES",
     "MAX_GIT_COMMAND_STDERR_BYTES",
+    "MAX_GIT_EXECUTABLE_BYTES",
+    "GIT_READER_JOIN_TIMEOUT_SECONDS",
     "MAX_GIT_STATUS_BYTES",
     "MAX_GIT_STATUS_PATH_BYTES",
     "MAX_GIT_STATUS_RECORDS",
     "git_is_ancestor",
+    "GitExecutableBinding",
+    "active_git_executable_binding",
     "git_metadata",
+    "git_observation_authority",
     "capture_task_live_claim_authority",
     "task_mutation_snapshot",
     "task_mutation_snapshot_claim_coverage",
@@ -2096,6 +2783,7 @@ __all__ = [
     "remote_ref_tip",
     "resolve_task_commit",
     "state_worktree",
+    "use_git_executable_binding",
     "worktree_integrity_errors",
     "validate_remote_release_advertisement_snapshot",
 ]

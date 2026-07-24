@@ -95,7 +95,14 @@ initialize_result = {
     "platformOs": platform.system().lower(),
     "userAgent": "fake-codex-app-server/0.145.0",
     "secret_present": "AOI_CHIEF_CREDENTIAL_FILE" in os.environ,
-    "publication_secret_present": "GITHUB_TOKEN" in os.environ,
+    "publication_secret_present": any(
+        name in os.environ
+        for name in (
+            "GITHUB_TOKEN",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "ACTIONS_RUNTIME_TOKEN",
+        )
+    ),
 }
 if scenario == "invalid_initialize_response":
     initialize_result.pop("userAgent")
@@ -307,6 +314,8 @@ def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwarg
             {
                 "AOI_CHIEF_CREDENTIAL_FILE": "must-not-leak",
                 "GITHUB_TOKEN": "must-not-leak",
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "must-not-leak",
+                "ACTIONS_RUNTIME_TOKEN": "must-not-leak",
                 "SAFE_VALUE": "yes",
             },
         )
@@ -446,7 +455,7 @@ def test_default_launch_is_exact_standalone_stdio_and_scrubs_secret_env(tmp_path
         "--listen",
         "stdio://",
     )
-    scrubbed = scrub_aoi_secret_env({"AOI_CHIEF_EPOCH": "secret", "aoi_chief_credential_file": "secret", "GITHUB_TOKEN": "secret", "GITHUB_PAT": "secret", "AZURE_DEVOPS_EXT_PAT": "secret", "DOCKER_AUTH_CONFIG": "secret", "TWINE_PASSWORD": "secret", "OPENAI_API_KEY": "model-control", "SAFE": "1"})
+    scrubbed = scrub_aoi_secret_env({"AOI_CHIEF_EPOCH": "secret", "aoi_chief_credential_file": "secret", "GITHUB_TOKEN": "secret", "GITHUB_PAT": "secret", "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "secret", "ACTIONS_ID_TOKEN_REQUEST_URL": "secret", "ACTIONS_RUNTIME_TOKEN": "secret", "ACTIONS_RUNTIME_URL": "secret", "ACTIONS_RESULTS_URL": "secret", "ACTIONS_CACHE_URL": "secret", "AZURE_DEVOPS_EXT_PAT": "secret", "DOCKER_AUTH_CONFIG": "secret", "TWINE_PASSWORD": "secret", "OPENAI_API_KEY": "model-control", "SAFE": "1"})
     assert scrubbed == {"OPENAI_API_KEY": "model-control", "SAFE": "1"}
 
 

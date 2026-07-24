@@ -510,7 +510,21 @@ model and not a resident scheduler. `issue` is Chief-fenced and writes an
 immutable issuance marker. `run` receives only its exact permit SHA, starts at
 most one local pinned App Server process over stdio, and persists a milestone
 before each uncertain process/request boundary. `inspect` is read-only.
-`verify-mutation` is a separate Git/CAS/claim evidence transition.
+`verify-mutation` is a separate Git/CAS/claim evidence transition. A new
+elevation requires its Git executable path/size/SHA fields as one all-or-none
+tuple; committed v2 replay recovers that tuple from CAS before any endpoint
+recapture or Git subprocess. A new elevation with no tuple fails before Git
+can start. Every nested Bridge Git process revalidates and launches that exact path, and new
+`codex_mutation_verification_v2` evidence references a task-local CAS record of
+the binding. New endpoint capture writes authority-bound mutation snapshot v3;
+the reader retains mutation snapshot v2 for existing records. A legacy
+`codex_mutation_verification_v1` record remains readable only when its caller
+first supplies an active exact Git executable binding. That validation does
+not manufacture historical executable provenance, so the projected legacy
+record reports no Git executable identity. The provenance scope is the Bridge
+verification/recapture observation; it neither retroactively identifies the
+binary used for an older pre-endpoint nor proves an atomic OS-loaded image,
+dependencies, or code-signing chain.
 
 The reservation transition atomically consumes the exact canonical packet arm
 without inventing a hook observation. The attempt becomes
@@ -570,6 +584,22 @@ state. A start request with an uncertain response becomes `launch_unknown` and
 cannot be resent. A known active turn lost mid-stream becomes
 `runtime_unknown`. `turn/interrupt` acknowledgement remains nonterminal until
 the correlated `turn/completed` notification arrives.
+
+Direct verified-mutation capture is deliberately narrower than ordinary Git
+use. It accepts only an ordinary standalone `root/.git` directory and rejects
+linked/common worktrees, gitlinks, non-allowlisted local config, alternates,
+grafts, replacement refs, shallow state, and redirected object/ref authority.
+Both endpoints use the same closed Git observation semantics and must bind the
+same repository-observation-authority digest. Only the post-Bridge observation
+can additionally claim exact executable provenance. Writable canary acceptance
+requires a nonempty direct workload delta and a non-no-op elevation whose
+committed post path set covers every direct delta path. Core elevation also
+requires at least one post mutation path and an observable file/tree/status
+projection change after excluding commit identity, so an empty commit or other
+same-tree HEAD-only change cannot become `verified_mutation`. Ignored-only and
+tracked-plus-ignored mixed changes fail closed. Canary JSON rejects duplicate
+keys and non-finite values, while child stdout and stderr are bounded during
+streaming execution.
 
 ## Known v0.3 alpha boundaries
 

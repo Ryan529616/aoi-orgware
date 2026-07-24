@@ -8,18 +8,22 @@ The default is preflight-only; ``--execute`` is required to start App Server.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
+import threading
 import tomllib
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = "aoi.codex-transport-canary.v2"
+SCHEMA_VERSION = "aoi.codex-transport-canary.v3"
 ROOT_MARKER = ".aoi-codex-transport-canary.json"
 ROOT_MARKER_SCHEMA = "aoi.codex-transport-canary-root.v1"
 _MODES = {
@@ -30,9 +34,13 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_FILES = 4096
+_MAX_ENTRIES = 8192
 _MAX_FILE_BYTES = 16 * 1024 * 1024
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_EXECUTABLE_BYTES = 1024 * 1024 * 1024
+_HASH_CHUNK_BYTES = 1024 * 1024
 _LOCAL_FILES_MAX_BYTES = 1_048_576
+_ROOT_MARKER_MAX_BYTES = 4096
 _LOCAL_FILES_HOME_NAMES = frozenset(
     {"auth.json", "config.toml", "managed_config.toml"}
 )
@@ -76,6 +84,12 @@ _PUBLISH_CREDENTIAL_NAMES = frozenset(
         "GH_ENTERPRISE_TOKEN",
         "GITHUB_PAT",
         "GITHUB_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_RUNTIME_TOKEN",
+        "ACTIONS_RUNTIME_URL",
+        "ACTIONS_RESULTS_URL",
+        "ACTIONS_CACHE_URL",
         "CI_JOB_TOKEN",
         "GITLAB_PRIVATE_TOKEN",
         "GITLAB_TOKEN",
@@ -104,6 +118,30 @@ _PUBLISH_CREDENTIAL_NAMES = frozenset(
     }
 )
 _PUBLISH_CREDENTIAL_PREFIXES = ("TWINE_", "PYPI_", "ARTIFACTORY_", "JFROG_")
+_SSH_CONTROL_ENV_NAMES = frozenset(
+    {
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+    }
+)
+_LOCAL_GIT_CONFIG_KEYS = frozenset(
+    {
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.symlinks",
+        "core.ignorecase",
+        "core.autocrlf",
+        "user.name",
+        "user.email",
+    }
+)
+_GIT_EXECUTABLE_BINDING_SCHEMA = "aoi.git-executable-binding.v1"
+_GIT_EXECUTABLE_PROVENANCE_SCOPE = "bridge_verify_mutation_git_observation"
+_GIT_MUTATION_PATHS_SCHEMA = "aoi.codex-transport.git-mutation-paths.v1"
 
 
 class CanaryError(ValueError):
@@ -121,6 +159,28 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _strict_json_loads(raw: bytes, label: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CanaryError(f"{label} contains duplicate object keys")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise CanaryError(f"{label} contains non-finite JSON number {value}")
+
+    try:
+        return json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CanaryError(f"{label} must be strict UTF-8 JSON") from exc
 
 
 def _object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -198,27 +258,203 @@ def _same_physical_path(path: Path, resolved: Path) -> bool:
     return os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(resolved))
 
 
-def _bounded_regular_bytes(path: Path, label: str) -> bytes:
-    if (
-        path.is_symlink()
-        or not path.is_file()
-        or _is_reparse(path, label=label)
-    ):
-        raise CanaryError(f"{label} must be a regular non-linked file")
+def _path_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(getattr(value, "st_file_attributes", 0)),
+    )
+
+
+def _handle_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(getattr(value, "st_file_attributes", 0)),
+    )
+
+
+def _path_handle_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        stat.S_IFMT(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+    )
+
+
+def _stable_regular_file_sha256(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+    min_bytes: int = 1,
+) -> tuple[int, str]:
+    """Stream one regular file while proving its path and open handle stayed stable."""
+
     try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+        ):
+            raise CanaryError(f"{label} must be a regular non-linked file")
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise CanaryError(f"could not resolve {label}") from exc
     if not _same_physical_path(path, resolved):
         raise CanaryError(f"{label} resolves through a link or reparse boundary")
     try:
-        size = path.stat().st_size
-        data = path.read_bytes()
+        size = int(before.st_size)
+        if size < min_bytes or size > max_bytes:
+            raise CanaryError(f"{label} size is outside the bounded limit")
+        digest = hashlib.sha256()
+        total = 0
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", buffering=0) as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or _path_handle_identity(before) != _path_handle_identity(opened)
+            ):
+                raise CanaryError(f"{label} changed before hashing")
+            while True:
+                chunk = handle.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise CanaryError(f"{label} exceeds the bounded limit")
+                digest.update(chunk)
+            handle_after = os.fstat(handle.fileno())
+        after = path.lstat()
+        resolved_after = path.resolve(strict=True)
+    except CanaryError:
+        raise
+    except OSError as exc:
+        raise CanaryError(f"could not hash {label}") from exc
+    if (
+        total != size
+        or _path_stat_fingerprint(before) != _path_stat_fingerprint(after)
+        or _handle_stat_fingerprint(opened)
+        != _handle_stat_fingerprint(handle_after)
+        or _path_handle_identity(after) != _path_handle_identity(handle_after)
+        or not _same_physical_path(path, resolved_after)
+    ):
+        raise CanaryError(f"{label} changed while hashing")
+    return size, digest.hexdigest()
+
+
+def _executable_size(value: Any, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > _MAX_EXECUTABLE_BYTES
+    ):
+        raise CanaryError(f"{label}_size_bytes is invalid")
+    return value
+
+
+def _verify_executable_binding(
+    path: Path,
+    label: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    try:
+        actual_size, actual_sha256 = _stable_regular_file_sha256(
+            path,
+            label,
+            max_bytes=_MAX_EXECUTABLE_BYTES,
+        )
+    except CanaryError as exc:
+        raise CanaryError(f"{label} bytes drifted") from exc
+    if actual_size != expected_size or actual_sha256 != expected_sha256:
+        raise CanaryError(f"{label} bytes drifted")
+
+
+def _bounded_regular_bytes(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int = _LOCAL_FILES_MAX_BYTES,
+) -> bytes:
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+        ):
+            raise CanaryError(f"{label} must be a regular non-linked file")
+        size = int(before.st_size)
+        if size < 1 or size > max_bytes:
+            raise CanaryError(f"{label} bytes are outside the bounded limit")
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError(f"could not resolve {label}") from exc
+    if not _same_physical_path(path, resolved):
+        raise CanaryError(f"{label} resolves through a link or reparse boundary")
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+        chunks: list[bytes] = []
+        total = 0
+        with os.fdopen(descriptor, "rb", buffering=0) as handle:
+            opened = os.fstat(handle.fileno())
+            if _path_handle_identity(before) != _path_handle_identity(opened):
+                raise CanaryError(f"{label} changed before reading")
+            while True:
+                chunk = handle.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise CanaryError(f"{label} exceeds the bounded limit")
+                chunks.append(chunk)
+            handle_after = os.fstat(handle.fileno())
+        after = path.lstat()
+        resolved_after = path.resolve(strict=True)
     except OSError as exc:
         raise CanaryError(f"could not read {label}") from exc
-    if not data or len(data) != size or size > _LOCAL_FILES_MAX_BYTES:
+    if (
+        total != size
+        or _path_stat_fingerprint(before) != _path_stat_fingerprint(after)
+        or _handle_stat_fingerprint(opened)
+        != _handle_stat_fingerprint(handle_after)
+        or _path_handle_identity(after) != _path_handle_identity(handle_after)
+        or not _same_physical_path(path, resolved_after)
+    ):
         raise CanaryError(f"{label} bytes are invalid or changed while bound")
-    return data
+    return b"".join(chunks)
 
 
 def _local_files_codex_home(value: Any) -> dict[str, Any]:
@@ -344,14 +580,13 @@ def _runtime_pin(value: Any) -> dict[str, Any]:
     executable = _absolute_file(
         result["executable_path"], "runtime_pin.executable_path"
     )
-    size = result["executable_size_bytes"]
-    if (
-        isinstance(size, bool)
-        or not isinstance(size, int)
-        or size < 1
-        or size > 2**63 - 1
-    ):
-        raise CanaryError("runtime_pin.executable_size_bytes is invalid")
+    size = _executable_size(
+        result["executable_size_bytes"], "runtime_pin.executable"
+    )
+    executable_sha256 = _sha256(
+        result["app_server_executable_sha256"],
+        "runtime_pin.app_server_executable_sha256",
+    )
     normalized = {
         "codex_cli_version": _text(
             result["codex_cli_version"],
@@ -363,10 +598,7 @@ def _runtime_pin(value: Any) -> dict[str, Any]:
             "runtime_pin.codex_app_server_version",
             limit=128,
         ),
-        "app_server_executable_sha256": _sha256(
-            result["app_server_executable_sha256"],
-            "runtime_pin.app_server_executable_sha256",
-        ),
+        "app_server_executable_sha256": executable_sha256,
         "schema_manifest_sha256": _sha256(
             result["schema_manifest_sha256"],
             "runtime_pin.schema_manifest_sha256",
@@ -378,12 +610,12 @@ def _runtime_pin(value: Any) -> dict[str, Any]:
         "executable_path": _contract_path(executable),
         "executable_size_bytes": size,
     }
-    actual_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
-    if (
-        actual_sha256 != normalized["app_server_executable_sha256"]
-        or executable.stat().st_size != normalized["executable_size_bytes"]
-    ):
-        raise CanaryError("runtime_pin executable bytes drifted")
+    _verify_executable_binding(
+        executable,
+        "runtime_pin executable",
+        expected_size=size,
+        expected_sha256=executable_sha256,
+    )
     return normalized
 
 
@@ -395,13 +627,8 @@ def load_spec(path: Path) -> dict[str, Any]:
         or _is_reparse(path, label="spec")
     ):
         raise CanaryError("spec must be an existing absolute regular file")
-    raw = path.read_bytes()
-    if not raw or len(raw) > _MAX_JSON_BYTES:
-        raise CanaryError("spec size is invalid")
-    try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CanaryError("spec must be strict UTF-8 JSON") from exc
+    raw = _bounded_regular_bytes(path, "spec", max_bytes=_MAX_JSON_BYTES)
+    parsed = _strict_json_loads(raw, "spec")
     value = _object(
         parsed,
         {
@@ -417,6 +644,8 @@ def load_spec(path: Path) -> dict[str, Any]:
             "bridge_executable_sha256",
             "bridge_executable_size_bytes",
             "git_executable",
+            "git_executable_sha256",
+            "git_executable_size_bytes",
             "scratch_root",
             "codex_home",
             "runtime_pin",
@@ -450,29 +679,37 @@ def load_spec(path: Path) -> dict[str, Any]:
     bridge_executable = _absolute_file(
         value["bridge_executable"], "bridge_executable"
     )
-    bridge_size = value["bridge_executable_size_bytes"]
-    if (
-        isinstance(bridge_size, bool)
-        or not isinstance(bridge_size, int)
-        or bridge_size < 1
-        or bridge_size > 2**63 - 1
-    ):
-        raise CanaryError("bridge_executable_size_bytes is invalid")
+    bridge_size = _executable_size(
+        value["bridge_executable_size_bytes"], "bridge_executable"
+    )
     bridge_sha256 = _sha256(
         value["bridge_executable_sha256"], "bridge_executable_sha256"
     )
-    if (
-        bridge_executable.stat().st_size != bridge_size
-        or hashlib.sha256(bridge_executable.read_bytes()).hexdigest()
-        != bridge_sha256
-    ):
-        raise CanaryError("bridge_executable bytes drifted")
+    _verify_executable_binding(
+        bridge_executable,
+        "bridge_executable",
+        expected_size=bridge_size,
+        expected_sha256=bridge_sha256,
+    )
     git_executable = _absolute_file(value["git_executable"], "git_executable")
+    git_size = _executable_size(
+        value["git_executable_size_bytes"], "git_executable"
+    )
+    git_sha256 = _sha256(
+        value["git_executable_sha256"], "git_executable_sha256"
+    )
+    _verify_executable_binding(
+        git_executable,
+        "git_executable",
+        expected_size=git_size,
+        expected_sha256=git_sha256,
+    )
     codex_home_policy = _local_files_codex_home(value["codex_home"])
     timeout_seconds = value["timeout_seconds"]
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
         or timeout_seconds < 1
         or timeout_seconds > 900
     ):
@@ -502,6 +739,8 @@ def load_spec(path: Path) -> dict[str, Any]:
         "bridge_executable_sha256": bridge_sha256,
         "bridge_executable_size_bytes": bridge_size,
         "git_executable": git_executable,
+        "git_executable_sha256": git_sha256,
+        "git_executable_size_bytes": git_size,
         "scratch_root": scratch_root,
         "codex_home_policy": codex_home_policy,
         "runtime_pin": runtime_pin,
@@ -518,20 +757,100 @@ def _run_process(
     environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     allowed = {0} if allow_codes is None else allow_codes
+    command = list(argv)
     try:
-        completed = subprocess.run(
-            list(argv),
+        process = subprocess.Popen(
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
             env=None if environment is None else dict(environment),
+            bufsize=0,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise CanaryError(f"command execution failed: {argv[0]}") from exc
-    if len(completed.stdout) > _MAX_JSON_BYTES or len(completed.stderr) > _MAX_JSON_BYTES:
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    outputs = [bytearray(), bytearray()]
+    overflow = threading.Event()
+    reader_errors: list[BaseException] = []
+
+    def drain(stream: Any, output: bytearray) -> None:
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                remaining = _MAX_JSON_BYTES - len(output)
+                if len(chunk) > remaining:
+                    if remaining > 0:
+                        output.extend(chunk[:remaining])
+                    overflow.set()
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    return
+                output.extend(chunk)
+        except (OSError, ValueError) as exc:
+            reader_errors.append(exc)
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(
+            target=drain,
+            args=(process.stdout, outputs[0]),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=(process.stderr, outputs[1]),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+    for reader in readers:
+        reader.join(timeout=5.0)
+    readers_alive = any(reader.is_alive() for reader in readers)
+    if readers_alive:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.stdout.close()
+        process.stderr.close()
+        for reader in readers:
+            reader.join(timeout=1.0)
+    else:
+        process.stdout.close()
+        process.stderr.close()
+
+    if timed_out or reader_errors or readers_alive:
+        raise CanaryError(f"command execution failed: {argv[0]}")
+    if overflow.is_set():
         raise CanaryError("command output exceeds the bounded canary limit")
+    completed = subprocess.CompletedProcess(
+        args=command,
+        returncode=process.returncode,
+        stdout=bytes(outputs[0]),
+        stderr=bytes(outputs[1]),
+    )
     if completed.returncode not in allowed:
         stderr = completed.stderr.decode("utf-8", errors="replace")[:1024]
         raise CanaryError(
@@ -545,6 +864,21 @@ def _is_publish_credential_name(name: str) -> bool:
     return upper in _PUBLISH_CREDENTIAL_NAMES or upper.startswith(
         _PUBLISH_CREDENTIAL_PREFIXES
     )
+
+
+def _is_git_routing_environment_name(name: str) -> bool:
+    upper = name.upper()
+    return upper.startswith("GIT_") or upper in _SSH_CONTROL_ENV_NAMES
+
+
+def _set_closed_git_environment(environment: dict[str, str]) -> None:
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_ATTR_NOSYSTEM"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GCM_INTERACTIVE"] = "Never"
 
 
 def _bridge_environment(spec: Mapping[str, Any]) -> dict[str, str]:
@@ -561,28 +895,344 @@ def _bridge_environment(spec: Mapping[str, Any]) -> dict[str, str]:
             or upper.startswith("PYTHON")
             or upper in _PYTHON_RUNTIME_ENV_NAMES
             or _is_publish_credential_name(name)
+            or _is_git_routing_environment_name(name)
         ):
             continue
         environment[name] = value
     environment["CODEX_HOME"] = str(spec["codex_home_policy"]["codex_home"])
     environment["PYTHONNOUSERSITE"] = "1"
     environment["PYTHONSAFEPATH"] = "1"
+    _set_closed_git_environment(environment)
     return environment
 
 
 def _revalidate_bridge_binding(spec: Mapping[str, Any]) -> None:
+    _revalidate_scratch_boundaries(spec)
+    runtime = spec["runtime_pin"]
+    codex = _absolute_file(spec["codex_executable"], "codex_executable")
+    _verify_executable_binding(
+        codex,
+        "runtime_pin executable",
+        expected_size=int(runtime["executable_size_bytes"]),
+        expected_sha256=str(runtime["app_server_executable_sha256"]),
+    )
     bridge = _absolute_file(spec["bridge_executable"], "bridge_executable")
-    if (
-        bridge.stat().st_size != spec["bridge_executable_size_bytes"]
-        or hashlib.sha256(bridge.read_bytes()).hexdigest()
-        != spec["bridge_executable_sha256"]
-    ):
-        raise CanaryError("bridge_executable bytes drifted")
+    _verify_executable_binding(
+        bridge,
+        "bridge_executable",
+        expected_size=int(spec["bridge_executable_size_bytes"]),
+        expected_sha256=str(spec["bridge_executable_sha256"]),
+    )
     refreshed_home = _local_files_codex_home(
         spec["codex_home_policy"]["codex_home"]
     )
     if refreshed_home != spec["codex_home_policy"]:
         raise CanaryError("codex_home policy binding drifted")
+
+
+def _git_environment(spec: Mapping[str, Any]) -> dict[str, str]:
+    environment = _bridge_environment(spec)
+    environment.pop("CODEX_HOME", None)
+    return environment
+
+
+def _revalidate_git_binding(spec: Mapping[str, Any]) -> None:
+    executable = _absolute_file(spec["git_executable"], "git_executable")
+    _verify_executable_binding(
+        executable,
+        "git_executable",
+        expected_size=int(spec["git_executable_size_bytes"]),
+        expected_sha256=str(spec["git_executable_sha256"]),
+    )
+
+
+def _git_process(
+    spec: Mapping[str, Any],
+    args: Sequence[str],
+    *,
+    allow_codes: set[int] | None = None,
+) -> bytes:
+    _revalidate_scratch_boundaries(spec)
+    _revalidate_git_binding(spec)
+    completed = _run_process(
+        [
+            str(spec["git_executable"]),
+            "-C",
+            str(spec["scratch_root"]),
+            "--git-dir",
+            str(Path(spec["scratch_root"]) / ".git"),
+            "--work-tree",
+            str(spec["scratch_root"]),
+            *args,
+        ],
+        timeout_seconds=min(float(spec["timeout_seconds"]), 30.0),
+        allow_codes=allow_codes,
+        environment=_git_environment(spec),
+    )
+    return completed.stdout
+
+
+def _optional_lstat(path: Path, label: str) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CanaryError(f"could not inspect {label}") from exc
+
+
+def _reject_git_authority_path(path: Path, label: str) -> None:
+    if _optional_lstat(path, label) is not None:
+        raise CanaryError(f"scratch Git repository contains forbidden {label}")
+
+
+def _git_metadata_binding(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind all local Git metadata while rejecting alternate authority."""
+
+    root = Path(spec["scratch_root"])
+    git_dir = root / ".git"
+    _require_local_directory(git_dir, "scratch .git")
+    for relative, label in (
+        ("commondir", "commondir"),
+        ("gitdir", "linked-worktree gitdir marker"),
+        ("config.worktree", "worktree config"),
+        ("worktrees", "linked-worktree metadata"),
+        ("shallow", "shallow repository state"),
+        ("shallow.lock", "shallow repository lock"),
+        ("info/grafts", "grafts"),
+        ("objects/info/alternates", "object alternates"),
+        ("objects/info/http-alternates", "HTTP object alternates"),
+        ("objects/info/alternates.lock", "object alternates lock"),
+        ("refs/replace", "replace refs"),
+    ):
+        _reject_git_authority_path(git_dir / Path(relative), label)
+
+    rows: list[dict[str, Any]] = []
+    total_bytes = 0
+    total_entries = 0
+    pending = [git_dir]
+    while pending:
+        directory = pending.pop()
+        _require_local_directory(
+            directory,
+            f"scratch Git metadata directory {directory.relative_to(git_dir).as_posix()}",
+        )
+        try:
+            directory_before = directory.lstat()
+            with os.scandir(directory) as entries:
+                children = sorted(
+                    (Path(entry.path) for entry in entries),
+                    key=lambda item: item.name,
+                )
+            directory_after = directory.lstat()
+        except OSError as exc:
+            raise CanaryError("could not enumerate scratch Git metadata") from exc
+        if _path_stat_fingerprint(directory_before) != _path_stat_fingerprint(
+            directory_after
+        ):
+            raise CanaryError("scratch Git metadata changed while enumerated")
+        total_entries += len(children)
+        if total_entries > _MAX_ENTRIES:
+            raise CanaryError("scratch Git metadata exceeds bounded limits")
+        for path in children:
+            relative_path = path.relative_to(git_dir)
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise CanaryError("could not inspect scratch Git metadata") from exc
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            ):
+                raise CanaryError("scratch Git metadata cannot contain links or reparses")
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CanaryError("scratch Git metadata cannot contain special files")
+            size, sha256 = _stable_regular_file_sha256(
+                path,
+                f"scratch Git metadata/{relative_path.as_posix()}",
+                max_bytes=_MAX_FILE_BYTES,
+                min_bytes=0,
+            )
+            total_bytes += size
+            if total_bytes > _MAX_TOTAL_BYTES or len(rows) >= _MAX_FILES:
+                raise CanaryError("scratch Git metadata exceeds bounded limits")
+            rows.append(
+                {
+                    "path": relative_path.as_posix(),
+                    "size_bytes": size,
+                    "sha256": sha256,
+                }
+            )
+
+    packed_refs = git_dir / "packed-refs"
+    if _optional_lstat(packed_refs, "scratch packed-refs") is not None:
+        packed = _bounded_regular_bytes(
+            packed_refs,
+            "scratch packed-refs",
+            max_bytes=_LOCAL_FILES_MAX_BYTES,
+        )
+        if any(
+            line and not line.startswith((b"#", b"^")) and b" refs/replace/" in line
+            for line in packed.splitlines()
+        ):
+            raise CanaryError("scratch Git repository contains packed replace refs")
+    ordered = sorted(rows, key=lambda row: str(row["path"]))
+    return {
+        "files_sha256": _digest(ordered),
+        "file_count": len(ordered),
+        "total_bytes": total_bytes,
+    }
+
+
+def _git_raw(
+    spec: Mapping[str, Any],
+    args: Sequence[str],
+    *,
+    allow_codes: set[int] | None = None,
+) -> bytes:
+    before = _git_metadata_binding(spec)
+    output = _git_process(spec, args, allow_codes=allow_codes)
+    after = _git_metadata_binding(spec)
+    if after != before:
+        raise CanaryError("scratch Git metadata changed across Git command")
+    return output
+
+
+def _local_git_config_binding(spec: Mapping[str, Any]) -> dict[str, Any]:
+    root = Path(spec["scratch_root"])
+    config_path = root / ".git" / "config"
+    before = _bounded_regular_bytes(
+        config_path,
+        "scratch .git/config",
+        max_bytes=_LOCAL_FILES_MAX_BYTES,
+    )
+    output = _git_raw(
+        spec,
+        [
+            "config",
+            "--file",
+            str(config_path),
+            "--no-includes",
+            "--null",
+            "--show-origin",
+            "--list",
+        ],
+    )
+    after = _bounded_regular_bytes(
+        config_path,
+        "scratch .git/config",
+        max_bytes=_LOCAL_FILES_MAX_BYTES,
+    )
+    if before != after:
+        raise CanaryError("scratch .git/config changed while inspected")
+    parts = output.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    if not parts or len(parts) % 2:
+        raise CanaryError("scratch .git/config inventory is malformed")
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    try:
+        for index in range(0, len(parts), 2):
+            origin = parts[index].decode("utf-8", errors="strict")
+            key_value = parts[index + 1].decode("utf-8", errors="strict")
+            key, separator, value = key_value.partition("\n")
+            normalized_key = key.casefold()
+            if normalized_key.startswith("remote."):
+                raise CanaryError(
+                    "scratch .git/config contains a Git remote"
+                )
+            if (
+                not separator
+                or not origin.startswith("file:")
+                or not _same_path(Path(origin[5:]), config_path)
+                or normalized_key in seen
+                or normalized_key not in _LOCAL_GIT_CONFIG_KEYS
+            ):
+                raise CanaryError(
+                    "scratch .git/config contains unapproved local authority"
+                )
+            seen.add(normalized_key)
+            rows.append({"key": normalized_key, "value": value})
+    except UnicodeDecodeError as exc:
+        raise CanaryError("scratch .git/config is not strict UTF-8") from exc
+    values = {row["key"]: row["value"].casefold() for row in rows}
+    if (
+        values.get("core.repositoryformatversion") != "0"
+        or values.get("core.bare") != "false"
+        or values.get("core.autocrlf") != "false"
+    ):
+        raise CanaryError(
+            "scratch .git/config lacks the exact non-bare/autocrlf contract"
+        )
+    return {
+        "path": _contract_path(config_path),
+        "sha256": hashlib.sha256(before).hexdigest(),
+        "keys": sorted(seen),
+    }
+
+
+def _git_repository_path_binding(spec: Mapping[str, Any]) -> dict[str, str]:
+    root = Path(spec["scratch_root"])
+    git_dir = root / ".git"
+    output = _git_raw(
+        spec,
+        [
+            "rev-parse",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--git-path",
+            "objects",
+            "--git-path",
+            "refs",
+            "--show-toplevel",
+        ],
+    )
+    try:
+        rows = output.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise CanaryError("scratch Git path inventory is not strict UTF-8") from exc
+    if len(rows) != 5 or any(not row for row in rows):
+        raise CanaryError("scratch Git path inventory is malformed")
+    expected = [
+        git_dir,
+        git_dir,
+        git_dir / "objects",
+        git_dir / "refs",
+        root,
+    ]
+    labels = ["git_dir", "git_common_dir", "objects", "refs", "work_tree"]
+    for row, target, label in zip(rows, expected, labels, strict=True):
+        candidate = Path(row)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if not _same_path(candidate, target):
+            raise CanaryError(
+                f"scratch Git {label} escapes the exact disposable repository"
+            )
+    _require_local_directory(git_dir / "objects", "scratch Git objects")
+    _require_local_directory(git_dir / "refs", "scratch Git refs")
+    return {
+        label: _contract_path(target)
+        for label, target in zip(labels, expected, strict=True)
+    }
+
+
+def _git_authority_binding(spec: Mapping[str, Any]) -> dict[str, Any]:
+    before = _git_metadata_binding(spec)
+    local_config = _local_git_config_binding(spec)
+    paths = _git_repository_path_binding(spec)
+    after = _git_metadata_binding(spec)
+    if after != before:
+        raise CanaryError("scratch Git repository authority changed while inspected")
+    return {
+        "metadata": before,
+        "local_config": local_config,
+        "paths": paths,
+    }
 
 
 def _git(
@@ -591,25 +1241,47 @@ def _git(
     *,
     allow_codes: set[int] | None = None,
 ) -> bytes:
-    completed = _run_process(
-        [
-            str(spec["git_executable"]),
-            "-C",
-            str(spec["scratch_root"]),
-            *args,
-        ],
-        timeout_seconds=min(float(spec["timeout_seconds"]), 30.0),
-        allow_codes=allow_codes,
-    )
-    return completed.stdout
+    before = _git_authority_binding(spec)
+    output = _git_raw(spec, args, allow_codes=allow_codes)
+    after = _git_authority_binding(spec)
+    if after != before:
+        raise CanaryError("scratch Git repository authority changed across Git command")
+    return output
+
+
+def _require_local_directory(path: Path, label: str) -> None:
+    try:
+        value = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError(f"could not inspect {label}") from exc
+    if (
+        stat.S_ISLNK(value.st_mode)
+        or not stat.S_ISDIR(value.st_mode)
+        or bool(getattr(value, "st_file_attributes", 0) & 0x400)
+        or not _same_physical_path(path, resolved)
+    ):
+        raise CanaryError(f"{label} must be a local non-reparse directory")
+
+
+def _revalidate_scratch_boundaries(spec: Mapping[str, Any]) -> None:
+    root = Path(spec["scratch_root"])
+    _require_local_directory(root, "scratch_root")
+    _require_local_directory(root / ".git", "scratch .git")
+    _require_local_directory(root / ".aoi", "scratch .aoi")
 
 
 def _validate_scratch(spec: Mapping[str, Any]) -> None:
     root = Path(spec["scratch_root"])
     marker = _absolute_file(root / ROOT_MARKER, "scratch marker")
+    marker_bytes = _bounded_regular_bytes(
+        marker,
+        "scratch marker",
+        max_bytes=_ROOT_MARKER_MAX_BYTES,
+    )
     try:
-        marker_value = json.loads(marker.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        marker_value = _strict_json_loads(marker_bytes, "scratch marker")
+    except CanaryError as exc:
         raise CanaryError("scratch marker must be strict UTF-8 JSON") from exc
     expected_marker = {
         "schema_version": ROOT_MARKER_SCHEMA,
@@ -618,6 +1290,8 @@ def _validate_scratch(spec: Mapping[str, Any]) -> None:
     }
     if marker_value != expected_marker:
         raise CanaryError("scratch marker does not exactly authorize this mode")
+    _revalidate_scratch_boundaries(spec)
+    authority = _git_authority_binding(spec)
     top = _git(spec, ["rev-parse", "--show-toplevel"]).decode(
         "utf-8", errors="strict"
     ).strip()
@@ -625,6 +1299,15 @@ def _validate_scratch(spec: Mapping[str, Any]) -> None:
         raise CanaryError("scratch_root is not the exact Git top level")
     if _git(spec, ["remote"]).strip():
         raise CanaryError("transport canary repository must have no Git remotes")
+    autocrlf = _git(
+        spec,
+        ["config", "--local", "--get", "core.autocrlf"],
+        allow_codes={0, 1},
+    ).strip().lower()
+    if autocrlf != b"false":
+        raise CanaryError(
+            "transport canary repository must pin local core.autocrlf=false"
+        )
     rewrites = _git(
         spec,
         [
@@ -642,37 +1325,91 @@ def _validate_scratch(spec: Mapping[str, Any]) -> None:
     )
     if status.strip():
         raise CanaryError("transport canary repository must begin Git-clean")
+    if _git_authority_binding(spec) != authority:
+        raise CanaryError("scratch Git repository authority changed during validation")
 
 
 def _workspace_files(root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     total_bytes = 0
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] in {".git", ".aoi"}:
-            continue
-        if path.is_symlink():
-            raise CanaryError("transport canary workload cannot contain links")
-        if not path.is_file():
-            continue
-        size = path.stat().st_size
-        if size > _MAX_FILE_BYTES:
-            raise CanaryError("transport canary workload file is too large")
-        total_bytes += size
-        if total_bytes > _MAX_TOTAL_BYTES or len(rows) >= _MAX_FILES:
-            raise CanaryError("transport canary workload exceeds bounded limits")
-        rows.append(
-            {
-                "path": relative.as_posix(),
-                "size_bytes": size,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
+    total_entries = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        _require_local_directory(
+            directory,
+            f"transport canary workload directory {directory}",
         )
-    return rows
+        try:
+            directory_before = directory.lstat()
+            with os.scandir(directory) as entries:
+                children = sorted(
+                    (Path(entry.path) for entry in entries),
+                    key=lambda item: item.name,
+                )
+            directory_after = directory.lstat()
+        except OSError as exc:
+            raise CanaryError("could not enumerate transport canary workload") from exc
+        if _path_stat_fingerprint(directory_before) != _path_stat_fingerprint(
+            directory_after
+        ):
+            raise CanaryError(
+                "transport canary workload directory changed while enumerated"
+            )
+        total_entries += len(children)
+        if total_entries > _MAX_ENTRIES:
+            raise CanaryError("transport canary workload exceeds bounded limits")
+        for path in children:
+            relative = path.relative_to(root)
+            if relative.parts and relative.parts[0] in {".git", ".aoi"}:
+                _require_local_directory(
+                    path,
+                    f"scratch {relative.parts[0]}",
+                )
+                continue
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise CanaryError("could not inspect transport canary workload") from exc
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            ):
+                raise CanaryError(
+                    "transport canary workload cannot contain links or reparses"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CanaryError(
+                    "transport canary workload cannot contain special files"
+                )
+            size, sha256 = _stable_regular_file_sha256(
+                path,
+                f"transport canary workload/{relative.as_posix()}",
+                max_bytes=_MAX_FILE_BYTES,
+                min_bytes=0,
+            )
+            total_bytes += size
+            if total_bytes > _MAX_TOTAL_BYTES or len(rows) >= _MAX_FILES:
+                raise CanaryError(
+                    "transport canary workload exceeds bounded limits"
+                )
+            rows.append(
+                {
+                    "path": relative.as_posix(),
+                    "mode": format(stat.S_IMODE(metadata.st_mode), "04o"),
+                    "size_bytes": size,
+                    "sha256": sha256,
+                }
+            )
+    return sorted(rows, key=lambda row: str(row["path"]))
 
 
-def _git_snapshot(spec: Mapping[str, Any]) -> dict[str, str]:
+def _git_snapshot(spec: Mapping[str, Any]) -> dict[str, Any]:
     root = Path(spec["scratch_root"])
+    authority = _git_authority_binding(spec)
     head = _git(spec, ["rev-parse", "HEAD"]).decode(
         "ascii", errors="strict"
     ).strip()
@@ -681,6 +1418,8 @@ def _git_snapshot(spec: Mapping[str, Any]) -> dict[str, str]:
         spec, ["status", "--porcelain=v2", "--untracked-files=all", "-z"]
     )
     files = _workspace_files(root)
+    if _git_authority_binding(spec) != authority:
+        raise CanaryError("scratch Git repository authority changed during Git snapshot")
     if _GIT_OID.fullmatch(head) is None:
         raise CanaryError("transport canary requires one committed Git HEAD")
     return {
@@ -688,7 +1427,82 @@ def _git_snapshot(spec: Mapping[str, Any]) -> dict[str, str]:
         "index_sha256": hashlib.sha256(index).hexdigest(),
         "status_sha256": hashlib.sha256(status).hexdigest(),
         "workload_files_sha256": _digest(files),
+        "workload_files": files,
+        "local_config_sha256": str(authority["local_config"]["sha256"]),
+        "repository_authority_sha256": _digest(authority),
     }
+
+
+def _workload_delta_paths(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> list[str]:
+    before_rows = before.get("workload_files")
+    after_rows = after.get("workload_files")
+    if not isinstance(before_rows, list) or not isinstance(after_rows, list):
+        raise CanaryError("workload snapshot manifest is missing")
+    before_by_path = {
+        str(row["path"]): row
+        for row in before_rows
+        if isinstance(row, Mapping) and isinstance(row.get("path"), str)
+    }
+    after_by_path = {
+        str(row["path"]): row
+        for row in after_rows
+        if isinstance(row, Mapping) and isinstance(row.get("path"), str)
+    }
+    if len(before_by_path) != len(before_rows) or len(after_by_path) != len(
+        after_rows
+    ):
+        raise CanaryError("workload snapshot manifest is malformed")
+    return sorted(
+        path
+        for path in set(before_by_path) | set(after_by_path)
+        if before_by_path.get(path) != after_by_path.get(path)
+    )
+
+
+def _committed_mutation_paths(mutation: Mapping[str, Any]) -> set[str]:
+    encoded = mutation.get("post_mutation_paths_b64")
+    digest = mutation.get("post_mutation_paths_sha256")
+    if (
+        not isinstance(encoded, list)
+        or len(encoded) != len(set(encoded))
+        or any(not isinstance(value, str) for value in encoded)
+        or digest
+        != _digest(
+            {
+                "schema": _GIT_MUTATION_PATHS_SCHEMA,
+                "paths_b64": encoded,
+            }
+        )
+    ):
+        raise CanaryError(
+            "verified mutation does not bind canonical post mutation paths"
+        )
+    paths: set[str] = set()
+    raw_paths: list[bytes] = []
+    for value in encoded:
+        try:
+            raw = base64.b64decode(value.encode("ascii"), validate=True)
+            path = raw.decode("utf-8", errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError, ValueError) as exc:
+            raise CanaryError(
+                "verified mutation path is not canonical UTF-8 base64"
+            ) from exc
+        if (
+            base64.b64encode(raw).decode("ascii") != value
+            or not path
+            or "\\" in path
+            or path.startswith("/")
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise CanaryError("verified mutation path is not canonical")
+        raw_paths.append(raw)
+        paths.add(path)
+    if raw_paths != sorted(raw_paths):
+        raise CanaryError("verified mutation paths are not canonically ordered")
+    return paths
 
 
 def _bridge_json(
@@ -708,9 +1522,9 @@ def _bridge_json(
         environment=_bridge_environment(spec),
     )
     try:
-        value = json.loads(completed.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CanaryError("bridge did not return one UTF-8 JSON value") from exc
+        value = _strict_json_loads(completed.stdout, "bridge result")
+    except CanaryError as exc:
+        raise CanaryError("bridge did not return one strict UTF-8 JSON value") from exc
     if not isinstance(value, Mapping):
         raise CanaryError("bridge JSON result is not an object")
     return dict(value)
@@ -755,9 +1569,18 @@ def _validate_policy(
         raise CanaryError("inspect intent differs from the canary policy")
     reservation = inspected.get("reservation")
     if not isinstance(reservation, Mapping) or (
-        reservation.get("evidence_level") != "transport_reserved"
+        reservation.get("classification") != "committed"
+        or reservation.get("evidence_level") != "transport_reserved"
     ):
         raise CanaryError("inspect reservation is not transport_reserved")
+    issuance = inspected.get("issuance")
+    if (
+        reservation.get("permit_sha256") != spec["permit_sha256"]
+        or not isinstance(issuance, Mapping)
+        or issuance.get("classification") != "committed"
+        or issuance.get("permit_sha256") != spec["permit_sha256"]
+    ):
+        raise CanaryError("inspect result is not bound to the exact permit")
     if inspected.get("task_completion") != "not_inferred":
         raise CanaryError("transport inspect inferred task completion")
     lifecycle = inspected.get("lifecycle")
@@ -802,7 +1625,12 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
             "size_bytes": spec["bridge_executable_size_bytes"],
             "sha256": spec["bridge_executable_sha256"],
         },
-        "scratch_root": str(spec["scratch_root"]),
+        "git_executable": {
+            "path": _contract_path(Path(spec["git_executable"])),
+            "size_bytes": spec["git_executable_size_bytes"],
+            "sha256": spec["git_executable_sha256"],
+        },
+        "scratch_root": _contract_path(Path(spec["scratch_root"])),
         "pre_git_snapshot": before,
         "reserved_inspect_sha256": _digest(reserved),
     }
@@ -838,8 +1666,17 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
         mutation: dict[str, Any] | None = None
         evidence_level = "codex_runtime_observed"
     else:
-        if after == before:
+        direct_delta_paths = _workload_delta_paths(before, after)
+        if not direct_delta_paths:
             raise CanaryError("workspace_write canary made no workload mutation")
+        if (
+            after["local_config_sha256"] != before["local_config_sha256"]
+            or after["repository_authority_sha256"]
+            != before["repository_authority_sha256"]
+        ):
+            raise CanaryError(
+                "workspace_write canary changed Git repository authority"
+            )
         verify_args = [
             "verify-mutation",
             "--task",
@@ -847,16 +1684,37 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
             "--launch-id",
             str(spec["launch_id"]),
             "--sealed-claim-scope",
+            "--git-executable",
+            str(spec["git_executable"]),
+            "--git-executable-size-bytes",
+            str(spec["git_executable_size_bytes"]),
+            "--git-executable-sha256",
+            str(spec["git_executable_sha256"]),
         ]
         endpoint = spec["post_git_endpoint_file"]
         if endpoint is not None:
             verify_args.extend(["--post-git-endpoint-file", str(endpoint)])
         mutation = _bridge_json(spec, verify_args)
+        expected_git_provenance = {
+            "schema": _GIT_EXECUTABLE_BINDING_SCHEMA,
+            "path": _contract_path(Path(spec["git_executable"])),
+            "size_bytes": spec["git_executable_size_bytes"],
+            "sha256": spec["git_executable_sha256"],
+            "provenance_scope": _GIT_EXECUTABLE_PROVENANCE_SCOPE,
+        }
         if (
             mutation.get("evidence_level") != "verified_mutation"
             or mutation.get("task_completion") != "not_inferred"
+            or mutation.get("git_executable") != expected_git_provenance
         ):
             raise CanaryError("writable canary was not elevated to verified_mutation")
+        committed_paths = _committed_mutation_paths(mutation)
+        missing_paths = sorted(set(direct_delta_paths) - committed_paths)
+        if missing_paths:
+            raise CanaryError(
+                "verified mutation omits direct workload delta paths: "
+                + ", ".join(missing_paths)
+            )
         evidence_level = "verified_mutation"
     return {
         **basis,

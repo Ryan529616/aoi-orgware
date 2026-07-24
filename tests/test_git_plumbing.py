@@ -6,12 +6,14 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -50,6 +52,408 @@ class GitMetadataTests(unittest.TestCase):
         with self.assertRaises((HarnessError, OSError)):
             gp.git_is_ancestor(
                 Path("this-path-should-not-exist-anywhere-12345"), "HEAD", "HEAD"
+            )
+
+
+class GitExecutableBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        executable = shutil.which("git")
+        if executable is None:
+            self.skipTest("git is required")
+        self.git = Path(executable).resolve()
+
+    def _binding(self, path: Path | None = None) -> gp.GitExecutableBinding:
+        subject = self.git if path is None else path
+        return gp.GitExecutableBinding.create(
+            subject,
+            subject.stat().st_size,
+            hashlib.sha256(subject.read_bytes()).hexdigest(),
+        )
+
+    def test_binding_uses_exact_git_and_never_hostile_path_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(
+                [str(self.git), "-C", str(repo), "init", "-q"],
+                check=True,
+                capture_output=True,
+            )
+            hostile = root / "hostile"
+            hostile.mkdir()
+            marker = root / "hostile-started"
+            if os.name == "nt":
+                shim = hostile / "git.cmd"
+                shim.write_text(
+                    f"@echo hostile>{marker}\r\n@exit /b 91\r\n",
+                    encoding="utf-8",
+                )
+            else:
+                shim = hostile / "git"
+                shim.write_text(
+                    f"#!/bin/sh\nprintf hostile > {marker!s}\nexit 91\n",
+                    encoding="utf-8",
+                )
+                shim.chmod(0o700)
+            commands: list[list[str]] = []
+            environments: list[dict[str, str]] = []
+            original_popen = subprocess.Popen
+
+            def observed(command: list[str], *args: object, **kwargs: object) -> object:
+                commands.append(list(command))
+                environments.append(dict(kwargs["env"]))  # type: ignore[arg-type]
+                return original_popen(command, *args, **kwargs)
+
+            environment = {
+                **os.environ,
+                "PATH": str(hostile) + os.pathsep + os.environ.get("PATH", ""),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(gp.subprocess, "Popen", side_effect=observed),
+                gp.use_git_executable_binding(self._binding()),
+            ):
+                gp._run_git_bytes_bounded(
+                    repo,
+                    ("status", "--porcelain"),
+                    label="bound Git test",
+                )
+
+            self.assertFalse(marker.exists())
+            self.assertTrue(commands)
+            self.assertTrue(environments)
+            self.assertTrue(
+                all(
+                    os.path.normcase(command[0])
+                    == os.path.normcase(str(self.git))
+                    for command in commands
+                )
+            )
+            for child_environment in environments:
+                self.assertNotIn("GIT_DIR", child_environment)
+                self.assertNotIn("GIT_WORK_TREE", child_environment)
+                self.assertNotIn("GIT_OBJECT_DIRECTORY", child_environment)
+                self.assertNotIn("SSH_AUTH_SOCK", child_environment)
+                self.assertEqual(child_environment["GIT_CONFIG_NOSYSTEM"], "1")
+                self.assertEqual(child_environment["GIT_CONFIG_GLOBAL"], os.devnull)
+                self.assertEqual(child_environment["GIT_ATTR_NOSYSTEM"], "1")
+                self.assertEqual(child_environment["GIT_NO_REPLACE_OBJECTS"], "1")
+
+    def test_binding_ignores_ambient_repository_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repositories = [root / "victim", root / "other"]
+            heads: list[str] = []
+            for index, repository in enumerate(repositories):
+                repository.mkdir()
+                for command in (
+                    ("init", "-q"),
+                    ("config", "user.email", "test@example.invalid"),
+                    ("config", "user.name", "AOI test"),
+                ):
+                    subprocess.run(
+                        [str(self.git), "-C", str(repository), *command],
+                        check=True,
+                        capture_output=True,
+                    )
+                (repository / "subject.txt").write_text(
+                    f"repository-{index}\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(
+                    [str(self.git), "-C", str(repository), "add", "subject.txt"],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    [
+                        str(self.git),
+                        "-C",
+                        str(repository),
+                        "commit",
+                        "-qm",
+                        f"repository {index}",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                heads.append(
+                    subprocess.run(
+                        [str(self.git), "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                )
+
+            ambient = {
+                **os.environ,
+                "GIT_DIR": str(repositories[1] / ".git"),
+                "GIT_WORK_TREE": str(repositories[0]),
+                "GIT_OBJECT_DIRECTORY": str(repositories[1] / ".git" / "objects"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.bare",
+                "GIT_CONFIG_VALUE_0": "true",
+            }
+            with (
+                mock.patch.dict(os.environ, ambient, clear=True),
+                gp.use_git_executable_binding(self._binding()),
+            ):
+                observed = gp.git_metadata(repositories[0])
+
+            self.assertEqual(observed["head_sha"], heads[0])
+            self.assertNotEqual(observed["head_sha"], heads[1])
+
+    def test_binding_revalidates_drift_before_every_popen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary) / f"git-copy{self.git.suffix}"
+            shutil.copy2(self.git, copied)
+            binding = self._binding(copied)
+            with gp.use_git_executable_binding(binding):
+                with copied.open("r+b") as handle:
+                    first = handle.read(1)
+                    handle.seek(0)
+                    handle.write(bytes([first[0] ^ 0xFF]))
+                with mock.patch.object(
+                    gp.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("drifted Git must not start"),
+                ):
+                    with self.assertRaisesRegex(
+                        HarnessError,
+                        "bytes drifted",
+                    ):
+                        gp._run_git_bytes_bounded(
+                            Path(temporary),
+                            ("status",),
+                            label="drifted Git test",
+                        )
+
+    def test_mutation_observation_rejects_local_fsmonitor_before_execution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repo"
+            repository.mkdir()
+            for command in (
+                ("init", "-q"),
+                ("config", "user.email", "test@example.invalid"),
+                ("config", "user.name", "AOI test"),
+                ("config", "core.autocrlf", "false"),
+            ):
+                subprocess.run(
+                    [str(self.git), "-C", str(repository), *command],
+                    check=True,
+                    capture_output=True,
+                )
+            subject = repository / "subject.txt"
+            subject.write_text("before\n", encoding="utf-8")
+            subprocess.run(
+                [str(self.git), "-C", str(repository), "add", "subject.txt"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [str(self.git), "-C", str(repository), "commit", "-qm", "baseline"],
+                check=True,
+                capture_output=True,
+            )
+            baseline = subprocess.run(
+                [str(self.git), "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            marker = root / "fsmonitor-started"
+            if os.name == "nt":
+                monitor = root / "fsmonitor.cmd"
+                monitor.write_text(
+                    f"@echo started>{marker}\r\n@echo token\r\n",
+                    encoding="utf-8",
+                )
+            else:
+                monitor = root / "fsmonitor"
+                monitor.write_text(
+                    f"#!/bin/sh\nprintf started > {marker!s}\nprintf 'token\\n'\n",
+                    encoding="utf-8",
+                )
+                monitor.chmod(0o700)
+            subprocess.run(
+                [
+                    str(self.git),
+                    "-C",
+                    str(repository),
+                    "config",
+                    "core.fsmonitor",
+                    str(monitor),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subject.write_text("after\n", encoding="utf-8")
+
+            with (
+                gp.use_git_executable_binding(self._binding()),
+                self.assertRaisesRegex(HarnessError, "unapproved key"),
+            ):
+                gp.task_mutation_snapshot("task-1", repository, baseline)
+            self.assertFalse(marker.exists())
+
+    def test_mutation_observation_rejects_executable_local_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(
+                [str(self.git), "-C", str(repository), "init", "-q"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    str(self.git),
+                    "-C",
+                    str(repository),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    str(self.git),
+                    "-C",
+                    str(repository),
+                    "config",
+                    "user.name",
+                    "AOI test",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subject = repository / "subject.txt"
+            subject.write_text("baseline\n", encoding="utf-8")
+            subprocess.run(
+                [str(self.git), "-C", str(repository), "add", "subject.txt"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [str(self.git), "-C", str(repository), "commit", "-qm", "baseline"],
+                check=True,
+                capture_output=True,
+            )
+            for key, value in (
+                ("include.path", "../outside.gitconfig"),
+                ("filter.evil.process", "must-not-run"),
+                ("core.attributesFile", "../outside.attributes"),
+                ("core.excludesFile", "../outside.excludes"),
+            ):
+                with self.subTest(key=key):
+                    subprocess.run(
+                        [
+                            str(self.git),
+                            "-C",
+                            str(repository),
+                            "config",
+                            key,
+                            value,
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    with self.assertRaisesRegex(HarnessError, "unapproved key"):
+                        gp.git_observation_authority(repository)
+                    subprocess.run(
+                        [
+                            str(self.git),
+                            "-C",
+                            str(repository),
+                            "config",
+                            "--unset-all",
+                            key,
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+
+    def test_binding_contract_rejects_noncanonical_or_hardlinked_file(self) -> None:
+        contract = self._binding().contract()
+        self.assertEqual(
+            gp.GitExecutableBinding.from_contract(contract).contract(),
+            contract,
+        )
+        with self.assertRaisesRegex(HarnessError, "provenance contract"):
+            gp.GitExecutableBinding.from_contract(
+                {**contract, "path": contract["path"].replace("/", "\\")}
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary) / f"git-copy{self.git.suffix}"
+            linked = Path(temporary) / f"git-hardlink{self.git.suffix}"
+            shutil.copy2(self.git, copied)
+            os.link(copied, linked)
+            with self.assertRaisesRegex(HarnessError, "non-linked"):
+                self._binding(copied)
+
+
+class _BrokenReadPipe:
+    def read(self, _size: int = -1) -> bytes:
+        raise OSError("injected pipe read failure")
+
+    def close(self) -> None:
+        return None
+
+
+class _LingeringReadPipe:
+    def __init__(self) -> None:
+        self.closed = threading.Event()
+
+    def read(self, _size: int = -1) -> bytes:
+        self.closed.wait()
+        return b""
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class _PipeProcess:
+    def __init__(self, stdout: object, stderr: object) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def kill(self) -> None:
+        return None
+
+
+class GitBoundedRunnerTests(unittest.TestCase):
+    def test_pipe_read_error_fails_closed(self) -> None:
+        process = _PipeProcess(_BrokenReadPipe(), io.BytesIO())
+        with (
+            mock.patch.object(gp.subprocess, "Popen", return_value=process),
+            self.assertRaisesRegex(HarnessError, "output reader failed"),
+        ):
+            gp._run_git_command_bytes_bounded(
+                ["git", "version"],
+                environment={},
+                label="reader failure",
+            )
+
+    def test_lingering_inherited_pipe_cannot_defeat_timeout(self) -> None:
+        process = _PipeProcess(_LingeringReadPipe(), io.BytesIO())
+        with (
+            mock.patch.object(gp.subprocess, "Popen", return_value=process),
+            mock.patch.object(gp, "GIT_READER_JOIN_TIMEOUT_SECONDS", 0.01),
+            self.assertRaisesRegex(HarnessError, "output reader failed"),
+        ):
+            gp._run_git_command_bytes_bounded(
+                ["git", "version"],
+                environment={},
+                label="lingering pipe",
             )
 
 
@@ -784,6 +1188,182 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
         self.assertEqual(
             {item["status"] for item in snapshot["baseline_to_current_name_status"]}, {"A"}
         )
+
+    def test_legacy_v2_snapshot_remains_readable(self) -> None:
+        (self.repo / "base.txt").write_bytes(b"legacy snapshot\n")
+        current = gp.task_mutation_snapshot(
+            self.TASK_ID,
+            self.repo,
+            self.baseline,
+        )
+        legacy = dict(current)
+        legacy["schema"] = gp.LEGACY_GIT_MUTATION_SNAPSHOT_SCHEMA
+        legacy.pop("observation_authority_sha256")
+        legacy.pop("snapshot_sha256")
+        legacy["snapshot_sha256"] = hashlib.sha256(
+            gp._canonical_json_bytes(legacy)
+        ).hexdigest()
+
+        task_id, paths = gp.validate_task_mutation_snapshot(legacy)
+
+        self.assertEqual(task_id, self.TASK_ID)
+        self.assertEqual(paths, [b"base.txt"])
+
+    def test_snapshot_rejects_gitlink_index_entry(self) -> None:
+        self._git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.baseline},nested-repository",
+        )
+
+        with self.assertRaisesRegex(HarnessError, "gitlink"):
+            gp.task_mutation_snapshot(
+                self.TASK_ID,
+                self.repo,
+                self.baseline,
+            )
+
+    def test_closed_observation_ignores_ambient_git_config(self) -> None:
+        (self.repo / "base.txt").write_bytes(b"ambient-independent\n")
+        marker = (
+            self.repo.parent
+            / f"{self.repo.name}-ambient-fsmonitor-started"
+        )
+        hostile = {
+            **os.environ,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.autocrlf",
+            "GIT_CONFIG_VALUE_0": "true",
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_1": str(marker),
+        }
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            first = gp.task_mutation_snapshot(
+                self.TASK_ID,
+                self.repo,
+                self.baseline,
+            )
+        clean = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
+        with mock.patch.dict(os.environ, clean, clear=True):
+            second = gp.task_mutation_snapshot(
+                self.TASK_ID,
+                self.repo,
+                self.baseline,
+            )
+
+        self.assertEqual(first, second)
+        self.assertFalse(marker.exists())
+
+    def test_observation_authority_rejects_alternate_history_paths(self) -> None:
+        for relative, as_directory in (
+            ("info/grafts", False),
+            ("objects/info/alternates", False),
+            ("objects/info/http-alternates", False),
+            ("shallow", False),
+            ("refs/replace", True),
+        ):
+            with self.subTest(relative=relative):
+                candidate = self.repo / ".git" / Path(relative)
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                if as_directory:
+                    candidate.mkdir()
+                else:
+                    candidate.write_text("../outside\n", encoding="utf-8")
+                try:
+                    with self.assertRaisesRegex(HarnessError, "forbidden"):
+                        gp.git_observation_authority(self.repo)
+                finally:
+                    if as_directory:
+                        candidate.rmdir()
+                    else:
+                        candidate.unlink()
+
+    def test_observation_authority_rejects_linked_worktree(self) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-linked"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        try:
+            with self.assertRaisesRegex(HarnessError, r"\.git"):
+                gp.git_observation_authority(linked)
+        finally:
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_observation_authority_rejects_redirected_objects_and_refs(
+        self,
+    ) -> None:
+        for name in ("objects", "refs"):
+            with self.subTest(name=name):
+                subject = self.repo / ".git" / name
+                outside = (
+                    self.repo.parent / f"{self.repo.name}-outside-{name}"
+                )
+                shutil.move(str(subject), str(outside))
+                linked = False
+                try:
+                    if os.name == "nt":
+                        completed = subprocess.run(
+                            [
+                                "cmd",
+                                "/c",
+                                "mklink",
+                                "/J",
+                                str(subject),
+                                str(outside),
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False,
+                        )
+                        if completed.returncode != 0:
+                            self.skipTest(
+                                "Windows junction creation is unavailable"
+                            )
+                    else:
+                        os.symlink(outside, subject, target_is_directory=True)
+                    linked = True
+                    with self.assertRaisesRegex(
+                        HarnessError,
+                        "non-reparse directory",
+                    ):
+                        gp.git_observation_authority(self.repo)
+                finally:
+                    if linked:
+                        if os.name == "nt":
+                            subject.rmdir()
+                        else:
+                            subject.unlink()
+                    shutil.move(str(outside), str(subject))
+
+    def test_observation_authority_rejects_linked_head_and_index(self) -> None:
+        for name in ("HEAD", "index"):
+            with self.subTest(name=name):
+                subject = self.repo / ".git" / name
+                linked = (
+                    self.repo.parent / f"{self.repo.name}-hardlinked-{name}"
+                )
+                try:
+                    os.link(subject, linked)
+                except OSError as exc:
+                    self.skipTest(f"hardlink creation unavailable: {exc}")
+                try:
+                    with self.assertRaisesRegex(
+                        HarnessError,
+                        "regular non-linked file",
+                    ):
+                        gp.git_observation_authority(self.repo)
+                finally:
+                    linked.unlink()
 
     def test_byte_drift_changes_canonical_digest(self) -> None:
         (self.repo / "base.txt").write_bytes(b"first\n")

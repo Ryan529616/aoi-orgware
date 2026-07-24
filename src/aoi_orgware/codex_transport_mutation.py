@@ -29,6 +29,7 @@ from .harnesslib import HarnessError, HarnessPaths
 LEGACY_GIT_ENDPOINT_SCHEMA = "aoi.codex-transport.git-endpoint.v1"
 GIT_ENDPOINT_SCHEMA = "aoi.codex-transport.git-endpoint.v2"
 GIT_TREE_SCHEMA = "aoi.codex-transport.git-tree.v1"
+GIT_MUTATION_PATHS_SCHEMA = "aoi.codex-transport.git-mutation-paths.v1"
 CLAIM_ENDPOINT_SCHEMA = "aoi.codex-transport.claim-endpoints.v2"
 MAX_MUTATION_RECORD_BYTES = 8 * 1024 * 1024
 # ``rev-parse <commit>^{tree}`` is tiny by contract.  Keep a separate narrow
@@ -64,6 +65,18 @@ def _sha_text(value: str, label: str) -> str:
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise CodexTransportMutationError(f"{label} is not lowercase SHA-256")
     return value
+
+
+def _mutation_paths_digest(paths_b64: Sequence[str]) -> str:
+    return _sha(
+        _canonical(
+            {
+                "schema": GIT_MUTATION_PATHS_SCHEMA,
+                "paths_b64": list(paths_b64),
+            },
+            "post mutation paths",
+        )
+    )
 
 
 def _mutation_namespace(value: Any) -> dict[str, Any]:
@@ -124,16 +137,45 @@ def _worktree_for_intent(snapshot: Mapping[str, Any], intent: Mapping[str, Any])
         raise CodexTransportMutationError("Git endpoint worktree does not match launch intent cwd")
 
 
+def _observable_file_mutation(endpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """Project endpoint facts that can prove a path/tree mutation.
+
+    ``current_head`` is deliberately excluded: an empty commit changes the
+    commit identity without changing any file or path evidence.
+    """
+
+    try:
+        snapshot = endpoint["snapshot"]
+        tree = endpoint["tree"]
+        return {
+            "tree": tree["tree"],
+            "baseline_to_current_name_status": snapshot[
+                "baseline_to_current_name_status"
+            ],
+            "porcelain_v2": snapshot["porcelain_v2"],
+            "mutation_paths_b64": snapshot["mutation_paths_b64"],
+            "paths": snapshot["paths"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise _fail("Git endpoint lacks observable file mutation facts", exc) from exc
+
+
 def _git_tree(worktree: Path, head: str) -> dict[str, str]:
     """Resolve one exact commit's tree object through Git's bounded runner."""
 
     try:
+        authority_before = git.git_observation_authority(worktree)
         raw = git._run_git_bytes_bounded(
             worktree,
             ("rev-parse", f"{head}^{{tree}}"),
             label="Git tree lookup",
             stdout_limit=MAX_GIT_TREE_OUTPUT_BYTES,
+            closed_observation=True,
         )
+        if git.git_observation_authority(worktree) != authority_before:
+            raise HarnessError(
+                "Git observation authority changed during tree lookup"
+            )
     except HarnessError as exc:
         raise _fail("Git tree lookup failed", exc) from exc
     try:
@@ -428,6 +470,48 @@ def materialize_verified_mutation(
         _worktree_for_intent(post["snapshot"], checked_intent)
         if endpoint_pre_git_binding(pre) != checked_intent["pre_git_binding"]:
             raise CodexTransportMutationError("pre Git endpoint does not match launch intent source/tree binding")
+        if (
+            post["snapshot"]["baseline_head"]
+            != pre["snapshot"]["baseline_head"]
+        ):
+            raise CodexTransportMutationError(
+                "post Git endpoint changed the sealed mutation baseline"
+            )
+        if (
+            pre["snapshot"]["schema"] != git.GIT_MUTATION_SNAPSHOT_SCHEMA
+            or post["snapshot"]["schema"] != git.GIT_MUTATION_SNAPSHOT_SCHEMA
+        ):
+            raise CodexTransportMutationError(
+                "new verified mutation requires authority-bound Git snapshots"
+            )
+        if (
+            post["snapshot"]["observation_authority_sha256"]
+            != pre["snapshot"]["observation_authority_sha256"]
+        ):
+            raise CodexTransportMutationError(
+                "pre/post Git observation authority differs"
+            )
+        if (
+            post["snapshot"]["snapshot_sha256"]
+            == pre["snapshot"]["snapshot_sha256"]
+        ):
+            raise CodexTransportMutationError(
+                "verified mutation requires distinct pre/post Git snapshots"
+            )
+        if not post["snapshot"]["mutation_paths_b64"]:
+            raise CodexTransportMutationError(
+                "verified mutation requires at least one post Git mutation path"
+            )
+        if _canonical(
+            _observable_file_mutation(post),
+            "post observable file mutation",
+        ) == _canonical(
+            _observable_file_mutation(pre),
+            "pre observable file mutation",
+        ):
+            raise CodexTransportMutationError(
+                "verified mutation requires an observable file or path delta"
+            )
         # The supplied post endpoint may have been valid at capture time but
         # become stale before its bytes reach CAS.  Re-capture exactly once at
         # publication time, using the sealed baseline and task-local claims;
@@ -460,8 +544,22 @@ def materialize_verified_mutation(
         coverage_ref = _persist_json(paths, task_id, claim_endpoints, "claim endpoint coverage")
         pre_tree_ref = _persist_json(paths, task_id, pre["tree"], "pre Git tree")
         post_tree_ref = _persist_json(paths, task_id, post["tree"], "post Git tree")
-        payload = contracts.validate_mutation_verification_payload({
-            "contract_type": "codex_mutation_verification_v1",
+        active_git = git.active_git_executable_binding()
+        git_executable_ref = None
+        if active_git is not None:
+            active_git.revalidate()
+            git_executable_ref = _persist_json(
+                paths,
+                task_id,
+                active_git.contract(),
+                "Git executable binding",
+            )
+        payload_input: dict[str, Any] = {
+            "contract_type": (
+                "codex_mutation_verification_v2"
+                if git_executable_ref is not None
+                else "codex_mutation_verification_v1"
+            ),
             "launch_intent_sha256": checked_intent["intent_sha256"],
             "reservation_sha256": checked_reservation["reservation_sha256"],
             "journal_head_sha256": journal_state.head_sha256,
@@ -470,7 +568,13 @@ def materialize_verified_mutation(
             "claim_coverage": {"cas_sha256": coverage_ref["sha256"], "content_type": "claim_coverage"},
             "pre_git_tree": {"cas_sha256": pre_tree_ref["sha256"], "content_type": "git_tree"},
             "post_git_tree": {"cas_sha256": post_tree_ref["sha256"], "content_type": "git_tree"},
-        })
+        }
+        if git_executable_ref is not None:
+            payload_input["git_executable"] = {
+                "cas_sha256": git_executable_ref["sha256"],
+                "content_type": "git_executable_binding",
+            }
+        payload = contracts.validate_mutation_verification_payload(payload_input)
         wrapped = objects.create_semantic_object(
             object_type="codex_mutation_verification", task_id=task_id,
             object_identity=f"{checked_intent['intent_sha256']}:{journal_state.head_sha256}", payload=payload,
@@ -493,11 +597,12 @@ def materialize_verified_mutation(
         raise _fail("cannot materialize verified Codex mutation", exc) from exc
 
 
-def validate_materialized_mutation(
+def _validate_materialized_mutation_evidence(
     paths: HarnessPaths,
     *,
     task_id: str,
-    semantic_object: Mapping[str, Any],
+    wrapped: Mapping[str, Any],
+    payload: Mapping[str, Any],
     verified_terminal_receipt: Mapping[str, Any],
     intent: Mapping[str, Any],
     reservation: Mapping[str, Any],
@@ -505,13 +610,7 @@ def validate_materialized_mutation(
     claims: Sequence[Mapping[str, Any]],
     sealed_claim_scope: bool = False,
 ) -> dict[str, Any]:
-    """Read CAS bytes back and falsify any drift before accepting promotion."""
-
     try:
-        wrapped = objects.validate_semantic_object(semantic_object)
-        if wrapped["object_type"] != "codex_mutation_verification" or wrapped["task_id"] != task_id:
-            raise CodexTransportMutationError("mutation verification object identity is invalid")
-        payload = contracts.validate_mutation_verification_payload(wrapped["payload"])
         checked_intent = contracts.validate_launch_intent(intent)
         checked_reservation = contracts.validate_reservation_against_intent(reservation, checked_intent)
         state = contracts.validate_transport_journal(journal)
@@ -558,6 +657,46 @@ def validate_materialized_mutation(
         }
         if pre["endpoint_sha256"] != coverage["pre_endpoint_sha256"] or post["endpoint_sha256"] != coverage["post_endpoint_sha256"]:
             raise CodexTransportMutationError("claim endpoint coverage hashes do not bind CAS endpoints")
+        if (
+            pre_snapshot["baseline_head"] != post_snapshot["baseline_head"]
+            or pre_snapshot["snapshot_sha256"]
+            == post_snapshot["snapshot_sha256"]
+        ):
+            raise CodexTransportMutationError(
+                "materialized mutation has no valid pre/post Git delta"
+            )
+        pre_schema = pre_snapshot["schema"]
+        post_schema = post_snapshot["schema"]
+        if (pre_schema == git.GIT_MUTATION_SNAPSHOT_SCHEMA) != (
+            post_schema == git.GIT_MUTATION_SNAPSHOT_SCHEMA
+        ):
+            raise CodexTransportMutationError(
+                "materialized mutation mixes Git snapshot authority schemas"
+            )
+        if (
+            pre_schema == git.GIT_MUTATION_SNAPSHOT_SCHEMA
+            and pre_snapshot["observation_authority_sha256"]
+            != post_snapshot["observation_authority_sha256"]
+        ):
+            raise CodexTransportMutationError(
+                "materialized pre/post Git observation authority differs"
+            )
+        post_mutation_paths = list(post_snapshot["mutation_paths_b64"])
+        if pre_schema == git.GIT_MUTATION_SNAPSHOT_SCHEMA:
+            if not post_mutation_paths:
+                raise CodexTransportMutationError(
+                    "materialized mutation has no post Git mutation path"
+                )
+            if _canonical(
+                _observable_file_mutation(post),
+                "materialized post observable file mutation",
+            ) == _canonical(
+                _observable_file_mutation(pre),
+                "materialized pre observable file mutation",
+            ):
+                raise CodexTransportMutationError(
+                    "materialized mutation has no observable file or path delta"
+                )
         validate_git_endpoint(pre, claims, sealed_claim_scope=sealed_claim_scope)
         validate_git_endpoint(post, claims, sealed_claim_scope=sealed_claim_scope)
         _worktree_for_intent(pre_snapshot, checked_intent)
@@ -568,9 +707,93 @@ def validate_materialized_mutation(
             "object_sha256": wrapped["object_sha256"],
             "pre_endpoint_sha256": pre["endpoint_sha256"],
             "post_endpoint_sha256": post["endpoint_sha256"],
+            "post_mutation_paths_b64": post_mutation_paths,
+            "post_mutation_paths_sha256": _mutation_paths_digest(
+                post_mutation_paths
+            ),
             "task_completion": "not_inferred",
         }
     except (HarnessError, contracts.CodexTransportContractError, objects.SemanticObjectError, KeyError, TypeError) as exc:
+        raise _fail("materialized Codex mutation validation failed", exc) from exc
+
+
+def validate_materialized_mutation(
+    paths: HarnessPaths,
+    *,
+    task_id: str,
+    semantic_object: Mapping[str, Any],
+    verified_terminal_receipt: Mapping[str, Any],
+    intent: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+    journal: Sequence[Mapping[str, Any]],
+    claims: Sequence[Mapping[str, Any]],
+    sealed_claim_scope: bool = False,
+) -> dict[str, Any]:
+    """Read CAS bytes back and falsify any drift before accepting promotion."""
+
+    try:
+        wrapped = objects.validate_semantic_object(semantic_object)
+        if (
+            wrapped["object_type"] != "codex_mutation_verification"
+            or wrapped["task_id"] != task_id
+        ):
+            raise CodexTransportMutationError(
+                "mutation verification object identity is invalid"
+            )
+        payload = contracts.validate_mutation_verification_payload(wrapped["payload"])
+        persisted_binding = None
+        observation_binding = git.active_git_executable_binding()
+        if payload["contract_type"] == "codex_mutation_verification_v2":
+            provenance = _read_json(
+                paths,
+                task_id,
+                payload["git_executable"]["cas_sha256"],
+                "Git executable binding",
+            )
+            persisted_binding = git.GitExecutableBinding.from_contract(provenance)
+            active = git.active_git_executable_binding()
+            if (
+                active is not None
+                and active.contract() != persisted_binding.contract()
+            ):
+                raise CodexTransportMutationError(
+                    "active Git executable differs from committed mutation provenance"
+                )
+            observation_binding = persisted_binding
+        elif observation_binding is None:
+            raise CodexTransportMutationError(
+                "legacy mutation validation requires a caller-bound exact Git executable"
+            )
+        with git.use_git_executable_binding(observation_binding):
+            validated = _validate_materialized_mutation_evidence(
+                paths,
+                task_id=task_id,
+                wrapped=wrapped,
+                payload=payload,
+                verified_terminal_receipt=verified_terminal_receipt,
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                claims=claims,
+                sealed_claim_scope=sealed_claim_scope,
+            )
+        return {
+            **validated,
+            "git_executable": (
+                None
+                if persisted_binding is None
+                else persisted_binding.contract()
+            ),
+        }
+    except CodexTransportMutationError:
+        raise
+    except (
+        HarnessError,
+        contracts.CodexTransportContractError,
+        objects.SemanticObjectError,
+        KeyError,
+        TypeError,
+    ) as exc:
         raise _fail("materialized Codex mutation validation failed", exc) from exc
 
 
@@ -684,6 +907,13 @@ def inspect_verified_mutation_commit(
             "object_sha256": validated["object_sha256"],
             "pre_endpoint_sha256": validated["pre_endpoint_sha256"],
             "post_endpoint_sha256": validated["post_endpoint_sha256"],
+            "post_mutation_paths_b64": validated[
+                "post_mutation_paths_b64"
+            ],
+            "post_mutation_paths_sha256": validated[
+                "post_mutation_paths_sha256"
+            ],
+            "git_executable": validated["git_executable"],
             "task_completion": "not_inferred",
         }
     except CodexTransportMutationError:
@@ -709,6 +939,7 @@ def commit_verified_mutation(
     post_endpoint: Mapping[str, Any],
     claims: Sequence[Mapping[str, Any]],
     sealed_claim_scope: bool = False,
+    require_git_executable_binding: bool = False,
 ) -> dict[str, Any]:
     """CAS, bind, and semantically commit one verified-mutation elevation.
 
@@ -732,13 +963,27 @@ def commit_verified_mutation(
             sealed_claim_scope=sealed_claim_scope,
         )
         if existing["status"] == "committed":
-            validate_committed_post_endpoint(
-                existing,
-                post_endpoint=post_endpoint,
-                claims=claims,
-                sealed_claim_scope=sealed_claim_scope,
+            committed_git = existing.get("git_executable")
+            replay_binding = (
+                None
+                if committed_git is None
+                else git.GitExecutableBinding.from_contract(committed_git)
             )
+            with git.use_git_executable_binding(replay_binding):
+                validate_committed_post_endpoint(
+                    existing,
+                    post_endpoint=post_endpoint,
+                    claims=claims,
+                    sealed_claim_scope=sealed_claim_scope,
+                )
             return {**existing, "idempotent_replay": True}
+        if (
+            require_git_executable_binding
+            and git.active_git_executable_binding() is None
+        ):
+            raise CodexTransportMutationError(
+                "new verified mutation requires an exact Git executable binding"
+            )
         launch = runtime.load_codex_transport_launch(
             paths, task_id, launch_id, records
         )

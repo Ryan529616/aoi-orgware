@@ -54,14 +54,43 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   pins are regenerated from that exact unchanged live config. User projects
   may independently select `local_files` and designate protected paths; making
   AOI updateable does not weaken those per-project destination rules.
-- **The disposable transport canary now binds its launcher environment.** Its
-  v2 spec names the exact isolated `CODEX_HOME` policy and exact Bridge
-  executable bytes. Every inspect, run, and mutation-verification subprocess
-  revalidates both bindings, overrides ambient `CODEX_HOME`, and removes known
-  AOI authority, publication credentials, and ambient Python path/home/venv
-  influence while retaining model-service authentication. The child also
-  disables user-site and unsafe-path injection. A v1 canary spec is not
-  accepted under the stronger contract.
+- **The disposable transport canary now binds its declared launcher inputs.**
+  Its wire-breaking v3 spec names the exact isolated `CODEX_HOME` policy and
+  exact Codex, Bridge, and Git executable bytes. Executables use bounded
+  streaming hashes plus stable before/open/after identity and are revalidated
+  at each relevant subprocess boundary. Git runs with ambient `GIT_*` and SSH
+  control removed and a closed noninteractive config; exact repo-local config
+  is allowlisted and digest-checked around every Git command, so includes,
+  fsmonitor/hooks, filters, diff/merge drivers, credentials, and SSH commands
+  are rejected before evidence collection in the cooperative canary model.
+  The bounded full `.git` inventory and exact Git-dir/common-dir/object/ref
+  paths are also bound; linked worktrees, alternates, grafts, replacement refs,
+  shallow state, nested links/reparses, hard links, and special files fail
+  closed. System attributes and replacement objects are disabled explicitly.
+  Writable Bridge elevation receives the same exact Git tuple, revalidates it
+  before every nested Git process, and stores its canonical provenance in
+  task-local CAS referenced by backward-compatible mutation-evidence v2. New
+  endpoint capture writes authority-bound mutation snapshot v3 while existing
+  snapshot v2 remains readable. Legacy mutation-evidence v1 readback now
+  requires a caller-bound exact Git executable and does not invent historical
+  Git provenance. A no-pin committed-v2 replay restores its CAS-bound exact Git
+  before any recapture or Git subprocess; a new elevation with no tuple fails
+  before Git starts. Direct capture supports only an ordinary standalone
+  repository, rejects no-op, empty-commit/HEAD-only, ignored-only, and
+  tracked-plus-ignored workload deltas, and requires every direct workload
+  delta path to be covered by the committed post-mutation path set.
+  This scope proves Bridge verification/recapture observations, not the binary
+  that originally created a historical pre-endpoint.
+  Workload snapshots use bounded
+  non-following traversal that rejects symlinks, hard links, Windows
+  reparses/junctions, special files, and identity drift. The shared
+  publication scrub now includes GitHub Actions OIDC/runtime/results/cache
+  authority. AOI authority and ambient Python path/home/venv remain removed,
+  user-site and unsafe-path insertion remain disabled, and model-service
+  authentication remains available. These are verify-before-spawn file
+  observations, not an atomic hostile-writer lock or proof of the OS-loaded
+  image, DLLs, dynamic dependencies, or code-signing trust. Older v1/v2 canary
+  specs are unsupported.
 
 ### v0.4.0a3 (unreleased)
 

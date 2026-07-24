@@ -1516,11 +1516,17 @@ def validate_mutation_verification_payload(value: Any) -> dict[str, Any]:
         "pre_git_tree",
         "post_git_tree",
     }
-    item = _object(value, fields, "mutation_verification")
-    if item["contract_type"] != "codex_mutation_verification_v1":
+    if not isinstance(value, Mapping):
+        _fail("mutation_verification must be an object")
+    contract_type = value.get("contract_type")
+    if contract_type == "codex_mutation_verification_v1":
+        item = _object(value, fields, "mutation_verification")
+    elif contract_type == "codex_mutation_verification_v2":
+        item = _object(value, fields | {"git_executable"}, "mutation_verification")
+    else:
         _fail("mutation_verification contract_type is invalid")
-    return {
-        "contract_type": "codex_mutation_verification_v1",
+    result = {
+        "contract_type": contract_type,
         "launch_intent_sha256": _sha256(item["launch_intent_sha256"], "mutation_verification.launch_intent_sha256"),
         "reservation_sha256": _sha256(item["reservation_sha256"], "mutation_verification.reservation_sha256"),
         "journal_head_sha256": _sha256(item["journal_head_sha256"], "mutation_verification.journal_head_sha256"),
@@ -1530,6 +1536,13 @@ def validate_mutation_verification_payload(value: Any) -> dict[str, Any]:
         "pre_git_tree": _cas_reference(item["pre_git_tree"], "mutation_verification.pre_git_tree", "git_tree"),
         "post_git_tree": _cas_reference(item["post_git_tree"], "mutation_verification.post_git_tree", "git_tree"),
     }
+    if contract_type == "codex_mutation_verification_v2":
+        result["git_executable"] = _cas_reference(
+            item["git_executable"],
+            "mutation_verification.git_executable",
+            "git_executable_binding",
+        )
+    return result
 
 
 def _mutation_verification_reference(

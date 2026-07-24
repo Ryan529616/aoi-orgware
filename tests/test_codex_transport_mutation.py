@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, datetime
+import hashlib
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,17 @@ def _run(root: Path, *args: str) -> str:
     result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
+
+
+def _git_binding() -> git.GitExecutableBinding:
+    executable = shutil.which("git")
+    assert executable is not None
+    pinned = Path(executable).resolve()
+    return git.GitExecutableBinding.create(
+        pinned,
+        pinned.stat().st_size,
+        hashlib.sha256(pinned.read_bytes()).hexdigest(),
+    )
 
 
 def _correlation(thread: str | None = None, turn: str | None = None) -> dict[str, str | None]:
@@ -82,6 +95,7 @@ class MutationFixture:
         _run(self.root, "init")
         _run(self.root, "config", "user.email", "test@example.invalid")
         _run(self.root, "config", "user.name", "AOI Test")
+        _run(self.root, "config", "core.autocrlf", "false")
         (self.root / ".gitignore").write_text(".aoi/\n", encoding="utf-8")
         (self.root / "aoi.toml").write_text(default_config_text("Mutation test"), encoding="utf-8")
         (self.root / "src").mkdir()
@@ -163,13 +177,134 @@ def test_materializes_exact_endpoints_and_never_claims_task_completion(fixture: 
             fixture.paths, task_id="task-1", intent=intent, reservation=reservation, journal=journal,
             runtime_terminal_receipt=terminal, pre_endpoint=pre, post_endpoint=post, claims=fixture.claims,
         )
-        checked = mutation.validate_materialized_mutation(
-            fixture.paths, task_id="task-1", semantic_object=result["semantic_object"],
-            verified_terminal_receipt=result["verified_terminal_receipt"], intent=intent, reservation=reservation,
-            journal=journal, claims=fixture.claims,
-        )
+        with git.use_git_executable_binding(_git_binding()):
+            checked = mutation.validate_materialized_mutation(
+                fixture.paths, task_id="task-1", semantic_object=result["semantic_object"],
+                verified_terminal_receipt=result["verified_terminal_receipt"], intent=intent, reservation=reservation,
+                journal=journal, claims=fixture.claims,
+            )
     assert result["verified_terminal_receipt"]["evidence_level"] == "verified_mutation"
     assert result["task_completion"] == checked["task_completion"] == "not_inferred"
+
+
+def test_legacy_validation_requires_caller_bound_exact_git(
+    fixture: MutationFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre = fixture.endpoint()
+    intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+    (fixture.root / "src" / "tracked.txt").write_text(
+        "legacy after image\n",
+        encoding="utf-8",
+    )
+    post = fixture.endpoint()
+    with h.state_lock(fixture.paths, create_layout=False):
+        result = mutation.materialize_verified_mutation(
+            fixture.paths,
+            task_id="task-1",
+            intent=intent,
+            reservation=reservation,
+            journal=journal,
+            runtime_terminal_receipt=terminal,
+            pre_endpoint=pre,
+            post_endpoint=post,
+            claims=fixture.claims,
+        )
+    assert (
+        result["mutation_verification"]["contract_type"]
+        == "codex_mutation_verification_v1"
+    )
+    monkeypatch.setattr(
+        git.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy validation must not resolve ambient PATH Git"
+        ),
+    )
+
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="caller-bound exact Git executable",
+    ):
+        mutation.validate_materialized_mutation(
+            fixture.paths,
+            task_id="task-1",
+            semantic_object=result["semantic_object"],
+            verified_terminal_receipt=result["verified_terminal_receipt"],
+            intent=intent,
+            reservation=reservation,
+            journal=journal,
+            claims=fixture.claims,
+        )
+
+
+def test_v2_mutation_binds_and_reuses_exact_git_executable(
+    fixture: MutationFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _git_binding()
+    pre = fixture.endpoint()
+    intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+    (fixture.root / "src" / "tracked.txt").write_text(
+        "v2 after image\n",
+        encoding="utf-8",
+    )
+    with git.use_git_executable_binding(binding):
+        post = fixture.endpoint()
+        with h.state_lock(fixture.paths, create_layout=False):
+            result = mutation.materialize_verified_mutation(
+                fixture.paths,
+                task_id="task-1",
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                runtime_terminal_receipt=terminal,
+                pre_endpoint=pre,
+                post_endpoint=post,
+                claims=fixture.claims,
+            )
+    payload = result["mutation_verification"]
+    assert payload["contract_type"] == "codex_mutation_verification_v2"
+    provenance = mutation._read_json(
+        fixture.paths,
+        "task-1",
+        payload["git_executable"]["cas_sha256"],
+        "Git executable binding",
+    )
+    assert provenance == binding.contract()
+    with h.state_lock(fixture.paths, create_layout=False):
+        checked = mutation.validate_materialized_mutation(
+            fixture.paths,
+            task_id="task-1",
+            semantic_object=result["semantic_object"],
+            verified_terminal_receipt=result["verified_terminal_receipt"],
+            intent=intent,
+            reservation=reservation,
+            journal=journal,
+            claims=fixture.claims,
+        )
+    assert checked["task_completion"] == "not_inferred"
+
+    monkeypatch.setattr(
+        git,
+        "_stable_executable_sha256",
+        lambda _path: (binding.size_bytes, "0" * 64),
+    )
+    with h.state_lock(fixture.paths, create_layout=False):
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match="bytes drifted",
+        ):
+            mutation.validate_materialized_mutation(
+                fixture.paths,
+                task_id="task-1",
+                semantic_object=result["semantic_object"],
+                verified_terminal_receipt=result["verified_terminal_receipt"],
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                claims=fixture.claims,
+            )
 
 
 def test_rejects_after_image_claim_and_source_binding_mismatches(fixture: MutationFixture) -> None:
@@ -300,6 +435,124 @@ def test_rejects_post_endpoint_drift_before_cas_publication(fixture: MutationFix
             )
 
 
+def test_rejects_unchanged_pre_and_post_endpoints(
+    fixture: MutationFixture,
+) -> None:
+    pre = fixture.endpoint()
+    intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+
+    with h.state_lock(fixture.paths, create_layout=False):
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match="distinct pre/post Git snapshots",
+        ):
+            mutation.materialize_verified_mutation(
+                fixture.paths,
+                task_id="task-1",
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                runtime_terminal_receipt=terminal,
+                pre_endpoint=pre,
+                post_endpoint=pre,
+                claims=fixture.claims,
+            )
+
+
+def test_rejects_empty_commit_with_same_tree_and_no_mutation_paths(
+    fixture: MutationFixture,
+) -> None:
+    pre = fixture.endpoint()
+    intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+    _run(fixture.root, "commit", "--allow-empty", "-m", "empty")
+    post = fixture.endpoint()
+    assert post["snapshot"]["current_head"] != pre["snapshot"]["current_head"]
+    assert post["tree"]["tree"] == pre["tree"]["tree"]
+    assert post["snapshot"]["mutation_paths_b64"] == []
+
+    with h.state_lock(fixture.paths, create_layout=False):
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match="at least one post Git mutation path",
+        ):
+            mutation.materialize_verified_mutation(
+                fixture.paths,
+                task_id="task-1",
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                runtime_terminal_receipt=terminal,
+                pre_endpoint=pre,
+                post_endpoint=post,
+                claims=fixture.claims,
+            )
+
+
+def test_rejects_head_only_change_with_unchanged_dirty_path_evidence(
+    fixture: MutationFixture,
+) -> None:
+    (fixture.root / "src" / "tracked.txt").write_text(
+        "dirty before runtime\n",
+        encoding="utf-8",
+    )
+    pre = fixture.endpoint()
+    intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+    _run(fixture.root, "commit", "--allow-empty", "-m", "empty")
+    post = fixture.endpoint()
+    assert post["snapshot"]["mutation_paths_b64"]
+    assert post["tree"]["tree"] == pre["tree"]["tree"]
+
+    with h.state_lock(fixture.paths, create_layout=False):
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match="observable file or path delta",
+        ):
+            mutation.materialize_verified_mutation(
+                fixture.paths,
+                task_id="task-1",
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                runtime_terminal_receipt=terminal,
+                pre_endpoint=pre,
+                post_endpoint=post,
+                claims=fixture.claims,
+            )
+
+
+def test_rejects_pre_post_git_observation_authority_drift(
+    fixture: MutationFixture,
+) -> None:
+    pre = fixture.endpoint()
+    intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+    (fixture.root / ".git" / "info" / "exclude").write_text(
+        "metadata-only-authority-change\n",
+        encoding="utf-8",
+    )
+    (fixture.root / "src" / "tracked.txt").write_text(
+        "after authority drift\n",
+        encoding="utf-8",
+    )
+    post = fixture.endpoint()
+
+    with h.state_lock(fixture.paths, create_layout=False):
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match="observation authority differs",
+        ):
+            mutation.materialize_verified_mutation(
+                fixture.paths,
+                task_id="task-1",
+                intent=intent,
+                reservation=reservation,
+                journal=journal,
+                runtime_terminal_receipt=terminal,
+                pre_endpoint=pre,
+                post_endpoint=post,
+                claims=fixture.claims,
+            )
+
+
 class _FakePopen:
     def __init__(self, stdout: bytes, stderr: bytes) -> None:
         self.stdout = io.BytesIO(stdout)
@@ -315,6 +568,11 @@ class _FakePopen:
 def test_git_tree_lookup_bounds_stdout_and_stderr(fixture: MutationFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mutation, "MAX_GIT_TREE_OUTPUT_BYTES", 4)
     monkeypatch.setattr(git, "MAX_GIT_COMMAND_STDERR_BYTES", 4)
+    monkeypatch.setattr(
+        git,
+        "git_observation_authority",
+        lambda _worktree: {"authority_sha256": SHA_A},
+    )
     monkeypatch.setattr(git.subprocess, "Popen", lambda *_args, **_kwargs: _FakePopen(b"12345", b""))
     with pytest.raises(mutation.CodexTransportMutationError, match="output exceeds"):
         mutation._git_tree(fixture.root, fixture.baseline)
@@ -326,6 +584,10 @@ def test_git_tree_lookup_bounds_stdout_and_stderr(fixture: MutationFixture, monk
 def test_rejects_wrong_runtime_correlation_and_tampered_cas(fixture: MutationFixture) -> None:
     pre = fixture.endpoint()
     intent, reservation, journal, terminal = fixture.intent_and_runtime(pre)
+    (fixture.root / "src" / "tracked.txt").write_text(
+        "after correlation check\n",
+        encoding="utf-8",
+    )
     post = fixture.endpoint()
     with h.state_lock(fixture.paths, create_layout=False):
         wrong_terminal = contracts.seal_terminal_receipt({
@@ -346,7 +608,13 @@ def test_rejects_wrong_runtime_correlation_and_tampered_cas(fixture: MutationFix
         payload = result["mutation_verification"]
         target = mutation.artifacts.artifact_blob_path(fixture.paths, "task-1", payload["post_git_tree"]["cas_sha256"])
         target.write_bytes(b"tampered")
-        with pytest.raises(mutation.CodexTransportMutationError, match="tampered|cannot materialize"):
+        with (
+            git.use_git_executable_binding(_git_binding()),
+            pytest.raises(
+                mutation.CodexTransportMutationError,
+                match="tampered|cannot materialize",
+            ),
+        ):
             mutation.validate_materialized_mutation(
                 fixture.paths, task_id="task-1", semantic_object=result["semantic_object"],
                 verified_terminal_receipt=result["verified_terminal_receipt"], intent=intent, reservation=reservation,

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -217,6 +218,7 @@ def _fixture(
     _git(worktree, "init")
     _git(worktree, "config", "user.email", "test@example.invalid")
     _git(worktree, "config", "user.name", "AOI Test")
+    _git(worktree, "config", "core.autocrlf", "false")
     (worktree / "src").mkdir()
     (worktree / "src" / "tracked.txt").write_text("before\n", encoding="utf-8")
     _git(worktree, "add", "src/tracked.txt")
@@ -1697,9 +1699,10 @@ def test_cli_workspace_write_elevation_is_separate_committed_evidence(
     runtime_result = json.loads(capsys.readouterr().out)
     assert runtime_result["evidence_level"] == "codex_runtime_observed"
 
-    (value.worktree / "src" / "tracked.txt").write_text(
-        "after\n", encoding="utf-8"
-    )
+    git_executable_value = shutil.which("git")
+    assert git_executable_value is not None
+    git_executable = Path(git_executable_value).resolve()
+    git_sha256 = hashlib.sha256(git_executable.read_bytes()).hexdigest()
     verify_args = [
         "--root",
         str(value.root),
@@ -1710,8 +1713,66 @@ def test_cli_workspace_write_elevation_is_separate_committed_evidence(
         "launch-1",
         "--pre-git-endpoint-file",
         str(value.pre_endpoint_path),
+        "--git-executable",
+        str(git_executable),
+        "--git-executable-size-bytes",
+        str(git_executable.stat().st_size),
+        "--git-executable-sha256",
+        git_sha256,
         "--json",
     ]
+    assert bridge.main(verify_args) == 2
+    assert "distinct pre/post Git snapshots" in capsys.readouterr().err
+
+    (value.worktree / "src" / "tracked.txt").write_text(
+        "after\n", encoding="utf-8"
+    )
+    incomplete = verify_args.copy()
+    size_index = incomplete.index("--git-executable-size-bytes")
+    del incomplete[size_index : size_index + 2]
+    sha_index = incomplete.index("--git-executable-sha256")
+    del incomplete[sha_index : sha_index + 2]
+    assert bridge.main(incomplete) == 2
+    assert "must be supplied together" in capsys.readouterr().err
+    without_git_binding = verify_args.copy()
+    for option in (
+        "--git-executable",
+        "--git-executable-size-bytes",
+        "--git-executable-sha256",
+    ):
+        option_index = without_git_binding.index(option)
+        del without_git_binding[option_index : option_index + 2]
+    with monkeypatch.context() as no_git:
+        no_git.setattr(
+            bridge.git.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: pytest.fail(
+                "new elevation without a Git tuple must fail before Git Popen"
+            ),
+        )
+        assert bridge.main(without_git_binding) == 2
+    assert "requires an exact Git executable binding" in capsys.readouterr().err
+
+    hostile = tmp_path / "hostile-path"
+    hostile.mkdir()
+    hostile_marker = tmp_path / "hostile-git-started"
+    if os.name == "nt":
+        shutil.copy2(sys.executable, hostile / "git.exe")
+        (hostile / "git.cmd").write_text(
+            f"@echo hostile>{hostile_marker}\r\n@exit /b 91\r\n",
+            encoding="utf-8",
+        )
+    else:
+        shim = hostile / "git"
+        shim.write_text(
+            f"#!/bin/sh\nprintf hostile > {hostile_marker!s}\nexit 91\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o700)
+    monkeypatch.setenv(
+        "PATH",
+        str(hostile) + os.pathsep + os.environ.get("PATH", ""),
+    )
     original_append = mutation.store.append_semantic_transition
 
     def crash_before_verification_event(*args: object, **kwargs: object) -> object:
@@ -1737,6 +1798,14 @@ def test_cli_workspace_write_elevation_is_separate_committed_evidence(
     assert verified["evidence_level"] == "verified_mutation"
     assert verified["task_completion"] == "not_inferred"
     assert verified["idempotent_replay"] is False
+    assert verified["git_executable"] == {
+        "schema": "aoi.git-executable-binding.v1",
+        "path": git_executable.as_posix(),
+        "size_bytes": git_executable.stat().st_size,
+        "sha256": git_sha256,
+        "provenance_scope": "bridge_verify_mutation_git_observation",
+    }
+    assert not hostile_marker.exists()
 
     # Idempotent replay is bound to the exact committed Post A endpoint.  A
     # current Post B cannot borrow the older committed elevation.
@@ -1755,6 +1824,32 @@ def test_cli_workspace_write_elevation_is_separate_committed_evidence(
     assert replay["verified_terminal_receipt_sha256"] == verified[
         "verified_terminal_receipt_sha256"
     ]
+    assert replay["git_executable"] == verified["git_executable"]
+    assert not hostile_marker.exists()
+    replay_without_pin = verify_args.copy()
+    for option in (
+        "--git-executable",
+        "--git-executable-size-bytes",
+        "--git-executable-sha256",
+    ):
+        option_index = replay_without_pin.index(option)
+        del replay_without_pin[option_index : option_index + 2]
+
+    original_git_popen = bridge.git.subprocess.Popen
+
+    def require_absolute_git_argv(
+        argv: Any, *args: Any, **kwargs: Any
+    ) -> subprocess.Popen[Any]:
+        if not Path(os.fspath(argv[0])).is_absolute():
+            pytest.fail("v2 replay attempted an ambient PATH Git subprocess")
+        return original_git_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(bridge.git.subprocess, "Popen", require_absolute_git_argv)
+    assert bridge.main(replay_without_pin) == 0
+    persisted_pin_replay = json.loads(capsys.readouterr().out)
+    assert persisted_pin_replay["idempotent_replay"] is True
+    assert persisted_pin_replay["git_executable"] == verified["git_executable"]
+    assert not hostile_marker.exists()
     launch = runtime.load_codex_transport_launch(
         value.paths,
         "task-1",

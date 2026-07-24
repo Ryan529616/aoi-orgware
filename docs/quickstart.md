@@ -427,6 +427,16 @@ aoi-codex-bridge --root <project> issue `
 aoi-codex-bridge --root <project> run `
   --task <task-id> --permit-sha256 <permit-sha256> `
   --prompt-file <exact-utf8-prompt-file> --json
+
+$gitExe = (Get-Command git -CommandType Application).Source
+$gitSize = (Get-Item -LiteralPath $gitExe).Length
+$gitSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitExe).Hash.ToLowerInvariant()
+aoi-codex-bridge --root <project> verify-mutation `
+  --task <task-id> --launch-id <launch-id> `
+  --post-git-endpoint-file <exact-post-git-endpoint.json> `
+  --git-executable $gitExe `
+  --git-executable-size-bytes $gitSize `
+  --git-executable-sha256 $gitSha256 --sealed-claim-scope --json
 ```
 
 `run` deliberately has no Chief credential option. Every `readOnly` and
@@ -436,10 +446,33 @@ reservation, and again at process-pending. The endpoint separately binds the
 complete canonical live task-claim authority, even when Git status has no
 mutation paths. A historical marker with no endpoint CAS, or a legacy endpoint
 without that complete authority, is readable for inspection but cannot start.
-Only `workspaceWrite` may later use
-`verify-mutation` to record the post-image and elevate the evidence. A completed
-turn is not task completion. If `inspect` reports `launch_unknown`, do not rerun
-the launch; reconcile the task evidence instead.
+Only `workspaceWrite` may later use `verify-mutation` to record the post-image
+and elevate the evidence. A new elevation requires the Git path, byte count,
+and SHA-256 as one all-or-none tuple; an exact replay of already committed v2
+evidence recovers its binding from CAS before any endpoint recapture or Git
+subprocess. A new elevation with no tuple fails before Git can start. New
+elevation evidence stores that
+exact Bridge-side Git observation provenance in task-local CAS; it does not retroactively prove
+which Git binary created the historical pre-endpoint, and its pre-spawn check
+is not an atomic hostile-writer or dynamic-loader attestation. A completed turn
+is not task completion. If `inspect` reports `launch_unknown`, do not rerun the
+launch; reconcile the task evidence instead.
+
+New endpoint capture writes mutation snapshot v3 and binds one closed
+repository-observation authority across the pre/post pair. Existing mutation
+snapshot v2 remains readable. Legacy `codex_mutation_verification_v1` evidence
+can be inspected only while the caller has supplied an active exact Git
+executable binding; AOI does not infer historical Git provenance for that old
+record. Direct verified-mutation capture supports only an ordinary standalone
+`root/.git` repository, not a linked worktree, gitlink, alternate object store,
+shallow repository, replacement-ref layout, or local filter/fsmonitor/include
+configuration. Use a disposable ordinary repository for a live canary.
+Writable acceptance also rejects a no-op, an ignored-only change, or a mixed
+tracked-plus-ignored change: every direct workload delta path must appear in
+the committed post-mutation path set. The core elevation requires a nonempty
+post mutation path set and a changed file/tree/status projection after commit
+identity is excluded; an empty commit or same-tree HEAD-only change is not a
+verified file mutation.
 
 The bridge consumes the packet arm atomically and does not fabricate a
 `SubagentStart` identity. It uses one per-launch OS lock, checks the earlier

@@ -271,6 +271,8 @@ def test_empty_rules_allow_external_repo_and_redact_publish_credentials(
         environment={
             "GH_TOKEN": "do-not-echo",
             "GITHUB_PAT": "do-not-echo",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "do-not-echo",
+            "ACTIONS_RUNTIME_TOKEN": "do-not-echo",
             "AZURE_DEVOPS_EXT_PAT": "do-not-echo",
             "DOCKER_AUTH_CONFIG": "do-not-echo",
         },
@@ -279,6 +281,8 @@ def test_empty_rules_allow_external_repo_and_redact_publish_credentials(
     warnings = "\n".join(report["warnings"])
     assert "GH_TOKEN" in warnings
     assert "GITHUB_PAT" in warnings
+    assert "ACTIONS_ID_TOKEN_REQUEST_TOKEN" in warnings
+    assert "ACTIONS_RUNTIME_TOKEN" in warnings
     assert "AZURE_DEVOPS_EXT_PAT" in warnings
     assert "DOCKER_AUTH_CONFIG" in warnings
     assert "do-not-echo" not in json.dumps(report)

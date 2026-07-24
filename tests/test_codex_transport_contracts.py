@@ -941,6 +941,40 @@ def test_terminal_and_mutation_evidence_are_structural_not_promotion() -> None:
         "post_git_tree": {"cas_sha256": SHA_D, "content_type": "git_tree"},
     }
     assert contracts.validate_mutation_verification_payload(payload)["pre_git_tree"] == payload["post_git_tree"]
+    v2_payload = {
+        **payload,
+        "contract_type": "codex_mutation_verification_v2",
+        "git_executable": {
+            "cas_sha256": SHA_A,
+            "content_type": "git_executable_binding",
+        },
+    }
+    assert (
+        contracts.validate_mutation_verification_payload(v2_payload)[
+            "git_executable"
+        ]
+        == v2_payload["git_executable"]
+    )
+    with pytest.raises(
+        contracts.CodexTransportContractError,
+        match="schema is invalid",
+    ):
+        contracts.validate_mutation_verification_payload(
+            {**payload, "contract_type": "codex_mutation_verification_v2"}
+        )
+    with pytest.raises(
+        contracts.CodexTransportContractError,
+        match="schema is invalid",
+    ):
+        contracts.validate_mutation_verification_payload(
+            {
+                **payload,
+                "git_executable": {
+                    "cas_sha256": SHA_A,
+                    "content_type": "git_executable_binding",
+                },
+            }
+        )
     verified = contracts.seal_terminal_receipt(terminal(reservation_sha, journal[-1]["event_sha256"], evidence_level="verified_mutation", mutation_verification={"status": "referenced", "object_sha256": SHA_A}))
     assert verified["evidence_level"] == "verified_mutation"
     with pytest.raises(contracts.CodexTransportContractError, match="cannot assert"):

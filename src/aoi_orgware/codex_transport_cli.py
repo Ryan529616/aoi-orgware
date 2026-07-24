@@ -28,6 +28,7 @@ from . import codex_transport_runtime as runtime
 from . import codex_transport_mutation as mutation
 from . import confidentiality
 from . import evidence_artifacts
+from . import git_plumbing as git
 from . import harnesslib as h
 from . import semantic_events as semantic
 from . import semantic_store as store
@@ -716,7 +717,29 @@ def _verify_mutation(args: argparse.Namespace) -> dict[str, Any]:
         else _read_object(args.post_git_endpoint_file, "post-turn Git endpoint")
     )
     try:
-        with h.state_lock(paths, create_layout=False):
+        git_values = (
+            args.git_executable,
+            args.git_executable_size_bytes,
+            args.git_executable_sha256,
+        )
+        if any(value is not None for value in git_values) and not all(
+            value is not None for value in git_values
+        ):
+            raise CodexTransportCLIError(
+                "Git executable path, size, and SHA-256 must be supplied together"
+            )
+        git_binding = (
+            None
+            if all(value is None for value in git_values)
+            else git.GitExecutableBinding.create(
+                args.git_executable,
+                args.git_executable_size_bytes,
+                args.git_executable_sha256,
+            )
+        )
+        with git.use_git_executable_binding(git_binding), h.state_lock(
+            paths, create_layout=False
+        ):
             claims = h.claims_owned_by_task(paths, args.task)
             if not claims:
                 raise CodexTransportCLIError(
@@ -730,58 +753,82 @@ def _verify_mutation(args: argparse.Namespace) -> dict[str, Any]:
                 raise CodexTransportCLIError(
                     "verified mutation requires a workspaceWrite launch"
                 )
-            marker = runtime.inspect_codex_launch_issuance(
-                paths,
-                task_id=args.task,
-                permit_sha256=launch["reservation"]["permit_sha256"],
-            )
-            pre_cas_sha256 = marker["pre_git_endpoint_cas_sha256"]
-            if pre_cas_sha256 is None:
-                raise CodexTransportCLIError(
-                    "workspaceWrite issuance does not bind a pre Git endpoint CAS object"
-                )
-            pre_endpoint = mutation.load_preserved_git_endpoint(
-                paths,
-                task_id=args.task,
-                cas_sha256=pre_cas_sha256,
-                claims=claims,
-                sealed_claim_scope=args.sealed_claim_scope,
-            )
-            if supplied_pre_endpoint is not None and (
-                semantic.canonical_json_bytes(supplied_pre_endpoint)
-                != semantic.canonical_json_bytes(pre_endpoint)
-            ):
-                raise CodexTransportCLIError(
-                    "supplied pre-turn endpoint differs from issuance-bound CAS bytes"
-                )
-            checked_pre = pre_endpoint
-            if (
-                mutation.endpoint_pre_git_binding(checked_pre)
-                != launch["intent"]["pre_git_binding"]
-            ):
-                raise CodexTransportCLIError(
-                    "pre-turn Git endpoint does not match immutable launch intent"
-                )
-            post_endpoint = (
-                supplied_post_endpoint
-                if supplied_post_endpoint is not None
-                else mutation.capture_git_endpoint(
-                    args.task,
-                    Path(str(checked_pre["snapshot"]["worktree"])),
-                    str(checked_pre["snapshot"]["baseline_head"]),
-                    claims,
-                )
-            )
-            committed = mutation.commit_verified_mutation(
+            existing = mutation.inspect_verified_mutation_commit(
                 paths,
                 task_id=args.task,
                 launch_id=args.launch_id,
                 event_chain=events,
-                pre_endpoint=checked_pre,
-                post_endpoint=post_endpoint,
                 claims=claims,
                 sealed_claim_scope=args.sealed_claim_scope,
             )
+            effective_git_binding = git_binding
+            if effective_git_binding is None:
+                committed_git = (
+                    existing.get("git_executable")
+                    if existing.get("status") == "committed"
+                    else None
+                )
+                if not isinstance(committed_git, Mapping):
+                    raise CodexTransportCLIError(
+                        "new verified mutation requires an exact Git executable binding"
+                    )
+                effective_git_binding = git.GitExecutableBinding.from_contract(
+                    committed_git
+                )
+            with git.use_git_executable_binding(effective_git_binding):
+                marker = runtime.inspect_codex_launch_issuance(
+                    paths,
+                    task_id=args.task,
+                    permit_sha256=launch["reservation"]["permit_sha256"],
+                )
+                pre_cas_sha256 = marker["pre_git_endpoint_cas_sha256"]
+                if pre_cas_sha256 is None:
+                    raise CodexTransportCLIError(
+                        "workspaceWrite issuance does not bind a pre Git endpoint CAS object"
+                    )
+                pre_endpoint = mutation.load_preserved_git_endpoint(
+                    paths,
+                    task_id=args.task,
+                    cas_sha256=pre_cas_sha256,
+                    claims=claims,
+                    sealed_claim_scope=args.sealed_claim_scope,
+                )
+                if supplied_pre_endpoint is not None and (
+                    semantic.canonical_json_bytes(supplied_pre_endpoint)
+                    != semantic.canonical_json_bytes(pre_endpoint)
+                ):
+                    raise CodexTransportCLIError(
+                        "supplied pre-turn endpoint differs from issuance-bound CAS bytes"
+                    )
+                checked_pre = pre_endpoint
+                if (
+                    mutation.endpoint_pre_git_binding(checked_pre)
+                    != launch["intent"]["pre_git_binding"]
+                ):
+                    raise CodexTransportCLIError(
+                        "pre-turn Git endpoint does not match immutable launch intent"
+                    )
+                post_endpoint = (
+                    supplied_post_endpoint
+                    if supplied_post_endpoint is not None
+                    else mutation.capture_git_endpoint(
+                        args.task,
+                        Path(str(checked_pre["snapshot"]["worktree"])),
+                        str(checked_pre["snapshot"]["baseline_head"]),
+                        claims,
+                    )
+                )
+                committed = mutation.commit_verified_mutation(
+                    paths,
+                    task_id=args.task,
+                    launch_id=args.launch_id,
+                    event_chain=events,
+                    pre_endpoint=checked_pre,
+                    post_endpoint=post_endpoint,
+                    claims=claims,
+                    sealed_claim_scope=args.sealed_claim_scope,
+                    require_git_executable_binding=True,
+                )
     except (
         h.HarnessError,
         store.SemanticStoreError,
@@ -802,7 +849,13 @@ def _verify_mutation(args: argparse.Namespace) -> dict[str, Any]:
         "verified_terminal_receipt_sha256": receipt["receipt_sha256"],
         "mutation_object_sha256": committed["object_sha256"],
         "binding_sha256": committed["binding_sha256"],
+        "post_endpoint_sha256": committed["post_endpoint_sha256"],
+        "post_mutation_paths_b64": committed["post_mutation_paths_b64"],
+        "post_mutation_paths_sha256": committed[
+            "post_mutation_paths_sha256"
+        ],
         "idempotent_replay": committed["idempotent_replay"],
+        "git_executable": committed["git_executable"],
         "task_completion": "not_inferred",
     }
 
@@ -857,6 +910,9 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--launch-id", required=True)
     verify.add_argument("--pre-git-endpoint-file")
     verify.add_argument("--post-git-endpoint-file")
+    verify.add_argument("--git-executable")
+    verify.add_argument("--git-executable-size-bytes", type=int)
+    verify.add_argument("--git-executable-sha256")
     verify.add_argument("--sealed-claim-scope", action="store_true")
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(handler=_verify_mutation)
