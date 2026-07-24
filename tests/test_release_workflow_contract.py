@@ -27,6 +27,7 @@ RELEASE_RUNBOOK = Path(__file__).resolve().parents[1] / "docs" / "RELEASE.md"
 CHANGELOG = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
 V04_PLAN = Path(__file__).resolve().parents[1] / "docs" / "v0.4-plan.md"
 RELEASE_TOOLS_LOCK = Path(__file__).resolve().parents[1] / "requirements" / "release-tools.lock"
+COVERAGE_TOOLS_LOCK = Path(__file__).resolve().parents[1] / "requirements" / "coverage-tools.lock"
 
 
 def _workflow() -> str:
@@ -666,6 +667,40 @@ def test_full_ci_timeouts_cover_the_observed_long_matrix_runtime() -> None:
     text = _test_workflow()
     assert "timeout-minutes: 90" in _job(text, "unit")
     assert "timeout-minutes: 120" in _job(text, "coverage")
+
+
+def test_unit_matrix_excludes_the_coverage_only_collection_surface() -> None:
+    unit_job = _job(_test_workflow(), "unit")
+    assert "requirements/release-tools.lock" in unit_job
+    assert "--ignore=tests/test_coverage_combine.py" in unit_job
+    assert "requirements/coverage-tools.lock" not in unit_job
+
+
+def test_coverage_job_uses_a_hashed_dedicated_toolchain_and_provenance_combine() -> None:
+    lock = COVERAGE_TOOLS_LOCK.read_text(encoding="utf-8")
+    assert "coverage==7.15.2" in lock
+    assert "pytest==9.1.1" in lock
+    assert "aoi-orgware" not in lock
+    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 8
+
+    coverage_job = _job(_test_workflow(), "coverage")
+    assert "requirements/coverage-tools.lock" in coverage_job
+    assert "--require-hashes" in coverage_job
+    assert '--no-index --find-links "$RUNNER_TEMP/coverage-wheelhouse"' in coverage_job
+    assert 'python -m venv "$RUNNER_TEMP/coverage-tools"' in coverage_job
+    assert '"$RUNNER_TEMP/coverage-tools/bin/python" -m pip install' in coverage_job
+    assert "--no-compile -r requirements/coverage-tools.lock" in coverage_job
+    assert 'COVERAGE_PYTHON=$RUNNER_TEMP/coverage-tools/bin/python' in coverage_job
+    assert 'PYTHONDONTWRITEBYTECODE: "1"' in coverage_job
+    assert '"$COVERAGE_PYTHON" -m coverage run' in coverage_job
+    assert "scripts/combine_coverage.py" in coverage_job
+    assert "--expected-root-count 3" in coverage_job
+    assert "--output-root \"$RUNNER_TEMP/covdata\"" in coverage_job
+    assert "coverage-provenance.json" in coverage_job
+    assert "${{ runner.temp }}/covdata/.coverage" in coverage_job
+    assert "python -m coverage combine" not in coverage_job
+    assert "combined_output_filename" in coverage_job
+    assert '"$COVERAGE_PYTHON" -m coverage json -o "$RUNNER_TEMP/covdata/coverage.json"' in coverage_job
 
 
 def test_complete_pypi_retry_emits_no_phantom_missing_filename() -> None:
