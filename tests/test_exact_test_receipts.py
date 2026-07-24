@@ -3,6 +3,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -280,7 +281,10 @@ def test_dirty_trees_rejected(tmp_path: Path, change: str) -> None:
 
 def test_nonzero_and_secret_env_excluded(tmp_path: Path) -> None:
     repo = _repo(tmp_path, "def test_no():\n    assert False\n")
-    receipt = run_clean_commit_source_tree(repo=repo, pytest_argv=["-q"], receipt_path=tmp_path / "r.json", logs_dir=tmp_path / "logs", inherited_env={"SECRET_TOKEN": "never", "PATH": "x"})
+    inherited_env = {"SECRET_TOKEN": "never", "PATH": "x"}
+    if platform_domain()["domain"] == "wsl":
+        inherited_env.update({key: os.environ[key] for key in receipts._WSL_ENV})
+    receipt = run_clean_commit_source_tree(repo=repo, pytest_argv=["-q"], receipt_path=tmp_path / "r.json", logs_dir=tmp_path / "logs", inherited_env=inherited_env)
     assert not receipt["accepted"] and receipt["pytest_exit_code"] != 0
     assert "SECRET_TOKEN" not in receipt["invocation"]["environment_names"]
 
@@ -327,6 +331,332 @@ def test_stable_regular_read_rejects_linked_symlinked_and_changed_files(tmp_path
 def test_windows_and_wsl_domains() -> None:
     assert platform_domain(system="Windows", release="x", environ={})["domain"] == "windows"
     assert platform_domain(system="Linux", release="x", environ={"WSL_DISTRO_NAME": "Ubuntu"}, proc_version="Microsoft")["domain"] == "wsl"
+
+
+@pytest.mark.skipif(
+    platform_domain()["domain"] != "wsl",
+    reason="requires a real WSL child process",
+)
+def test_wsl_environment_survives_contained_runner_and_nested_routing(
+    tmp_path: Path,
+) -> None:
+    captured_platform = platform_domain()
+    distro = os.environ["WSL_DISTRO_NAME"]
+    interop = os.environ["WSL_INTEROP"]
+    repo = _repo(tmp_path)
+    shutil.copytree(
+        Path(__file__).parents[1] / "src" / "aoi_orgware",
+        repo / "src" / "aoi_orgware",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (repo / "tests" / "test_wsl_routing.py").write_text(
+        "from aoi_orgware.commands.codex_onboarding import CodexOnboardingError, build_codex_hook_commands\n"
+        "import os\n\n"
+        "import platform\n\n"
+        "def test_wsl_route_keeps_complete_signals():\n"
+        "    assert 'SECRET_TOKEN' not in os.environ\n"
+        "    direct, windows = build_codex_hook_commands(\n"
+        "        '/opt/aoi/bin/aoi-codex-hook', '/work/project', 'a' * 64,\n"
+        "        environment=os.environ, kernel_release=platform.release(),\n"
+        "        host_os_name='posix', wsl_user='runner',\n"
+        "    )\n"
+        "    assert direct.startswith('\\\"/opt/aoi/bin/aoi-codex-hook\\\" ')\n"
+        "    expected = 'wsl.exe --distribution \\\"' + os.environ['WSL_DISTRO_NAME'] + '\\\" '\n"
+        "    assert windows.startswith(expected)\n"
+        "    partial = dict(os.environ)\n"
+        "    del partial['WSL_INTEROP']\n"
+        "    try:\n"
+        "        build_codex_hook_commands(\n"
+        "            '/opt/aoi/bin/aoi-codex-hook', '/work/project', 'a' * 64,\n"
+        "            environment=partial, kernel_release=platform.release(),\n"
+        "            host_os_name='posix', wsl_user='runner',\n"
+        "        )\n"
+        "    except CodexOnboardingError:\n"
+        "        pass\n"
+        "    else:\n"
+        "        raise AssertionError('partial WSL routing signals were accepted')\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "include routing fixture"],
+        check=True,
+    )
+    receipt = run_clean_commit_source_tree(
+        repo=repo,
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "wsl.json",
+        logs_dir=tmp_path / "wsl-logs",
+        inherited_env={
+            "PATH": os.environ.get("PATH", ""),
+            "SECRET_TOKEN": "never",
+            "WSL_DISTRO_NAME": distro,
+            "WSL_INTEROP": interop,
+        },
+    )
+    assert receipt["accepted"] is True
+    assert receipt["platform"] == captured_platform
+    assert receipts._WSL_ENV == set(receipt["invocation"]["environment_names"]) & receipts._WSL_ENV
+    assert "SECRET_TOKEN" not in receipt["invocation"]["environment_names"]
+
+
+def test_explicit_environment_is_not_replaced_by_conflicting_ambient_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    explicit = {"PATH": os.environ.get("PATH", ""), "SECRET_TOKEN": "never"}
+    observed: list[object] = []
+    actual_platform_domain = receipts.platform_domain
+    monkeypatch.setenv("WSL_DISTRO_NAME", "ambient-only")
+    monkeypatch.setenv("WSL_INTEROP", "/run/WSL/ambient")
+
+    def capture_explicit_platform(*, environ: object) -> dict[str, str]:
+        observed.append(environ)
+        return actual_platform_domain(
+            system="Linux", release="unit-release", environ=environ, proc_version=""
+        )
+
+    monkeypatch.setattr(receipts, "platform_domain", capture_explicit_platform)
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "explicit.json",
+        logs_dir=tmp_path / "logs",
+        inherited_env=explicit,
+    )
+    assert observed == [explicit]
+    assert receipt["platform"] == {
+        "domain": "linux",
+        "system": "Linux",
+        "release": "unit-release",
+        "wsl_distro": "",
+        "kernel": "",
+    }
+    assert not (receipts._WSL_ENV & set(receipt["invocation"]["environment_names"]))
+
+
+@pytest.mark.parametrize(
+    "explicit",
+    [
+        {"PATH": "x"},
+        {"PATH": "x", "WSL_DISTRO_NAME": "unit-distro"},
+        {"PATH": "x", "WSL_INTEROP": "/run/WSL/unit"},
+    ],
+)
+def test_explicit_wsl_signals_must_be_complete_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: dict[str, str]
+) -> None:
+    child_launches = 0
+    original_run = receipts.subprocess.run
+
+    def reject_child_launch(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal child_launches
+        command = args[0]
+        if isinstance(command, list) and command[1:3] == ["-m", "pytest"]:
+            child_launches += 1
+            raise AssertionError("WSL correlation must fail before the child launches")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(
+        receipts,
+        "platform_domain",
+        lambda *, environ: {
+            "domain": "wsl",
+            "system": "Linux",
+            "release": "unit-microsoft-release",
+            "wsl_distro": environ.get("WSL_DISTRO_NAME", "unit-distro"),
+            "kernel": "unit-microsoft-release",
+        },
+    )
+    monkeypatch.setattr(receipts.subprocess, "run", reject_child_launch)
+    with pytest.raises(ExactTestReceiptError):
+        run_clean_commit_source_tree(
+            repo=_repo(tmp_path),
+            pytest_argv=["-q"],
+            receipt_path=tmp_path / "partial.json",
+            logs_dir=tmp_path / "logs",
+            inherited_env=explicit,
+        )
+    assert child_launches == 0
+
+
+def test_explicit_wsl_distro_mismatch_is_rejected_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_launches = 0
+    original_run = receipts.subprocess.run
+
+    def reject_child_launch(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal child_launches
+        command = args[0]
+        if isinstance(command, list) and command[1:3] == ["-m", "pytest"]:
+            child_launches += 1
+            raise AssertionError("WSL distro mismatch must fail before the child launches")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(
+        receipts,
+        "platform_domain",
+        lambda *, environ: {
+            "domain": "wsl",
+            "system": "Linux",
+            "release": "unit-microsoft-release",
+            "wsl_distro": "captured-distro",
+            "kernel": "unit-microsoft-release",
+        },
+    )
+    monkeypatch.setattr(receipts.subprocess, "run", reject_child_launch)
+    with pytest.raises(ExactTestReceiptError):
+        run_clean_commit_source_tree(
+            repo=_repo(tmp_path),
+            pytest_argv=["-q"],
+            receipt_path=tmp_path / "mismatch.json",
+            logs_dir=tmp_path / "logs",
+            inherited_env={
+                "PATH": "x",
+                "WSL_DISTRO_NAME": "child-distro",
+                "WSL_INTEROP": "/run/WSL/unit",
+            },
+        )
+    assert child_launches == 0
+
+
+def test_wsl_environment_allowlist_is_bounded_and_hashed() -> None:
+    child_env, names, digest = receipts._child_env(
+        Path("/snapshot"),
+        {
+            "PATH": "safe-path",
+            "SECRET_TOKEN": "never",
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        },
+    )
+    assert set(names) == set(child_env)
+    assert receipts._WSL_ENV.issubset(names)
+    assert "SECRET_TOKEN" not in child_env
+    assert digest == receipts._sha256_bytes(
+        receipts._canonical({"environment": {name: child_env[name] for name in names}})
+    )
+
+
+@pytest.mark.parametrize("distro", ["-unit", "unit/distro", "unit\nname", "unit" + "x" * 128])
+def test_wsl_distribution_allowlist_value_is_fail_closed(distro: str) -> None:
+    with pytest.raises(ExactTestReceiptError):
+        receipts._child_env(
+            Path("/snapshot"),
+            {"WSL_DISTRO_NAME": distro, "WSL_INTEROP": "/run/WSL/123_interop"},
+        )
+
+
+def test_wsl_receipt_cross_field_constraints_reject_tampering(tmp_path: Path) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    missing_interop = copy.deepcopy(receipt)
+    missing_interop["platform"] = {
+        "domain": "wsl",
+        "system": "Linux",
+        "release": "6.6.0-microsoft-standard-WSL2",
+        "wsl_distro": "Ubuntu",
+        "kernel": "6.6.0-microsoft-standard-WSL2",
+    }
+    missing_interop["invocation"]["environment_names"] = sorted(
+        (set(missing_interop["invocation"]["environment_names"]) | {"WSL_DISTRO_NAME"})
+        - {"WSL_INTEROP"}
+    )
+    missing_interop = _reseal_with_structured_invocation(
+        missing_interop,
+        missing_interop["invocation"],
+    )
+    with pytest.raises(ExactTestReceiptError):
+        canonical_exact_test_receipt_bytes(missing_interop)
+
+    for platform in (
+        {
+            "domain": "wsl",
+            "system": "Linux",
+            "release": "6.6.0-microsoft-standard-WSL2",
+            "wsl_distro": "",
+            "kernel": "6.6.0-microsoft-standard-WSL2",
+        },
+        {
+            "domain": "wsl",
+            "system": "Linux",
+            "release": "",
+            "wsl_distro": "unit-distro",
+            "kernel": "",
+        },
+        {
+            "domain": "wsl",
+            "system": "Linux",
+            "release": "6.6.0-microsoft-standard-WSL2",
+            "wsl_distro": "unit-distro",
+            "kernel": "6.6.0-other",
+        },
+        {
+            "domain": "wsl",
+            "system": "Windows",
+            "release": "6.6.0-microsoft-standard-WSL2",
+            "wsl_distro": "unit-distro",
+            "kernel": "6.6.0-microsoft-standard-WSL2",
+        },
+    ):
+        incoherent = copy.deepcopy(receipt)
+        incoherent["platform"] = platform
+        incoherent["invocation"]["environment_names"] = sorted(
+            set(incoherent["invocation"]["environment_names"]) | receipts._WSL_ENV
+        )
+        incoherent = _reseal_with_structured_invocation(incoherent, incoherent["invocation"])
+        with pytest.raises(ExactTestReceiptError):
+            canonical_exact_test_receipt_bytes(incoherent)
+
+    for wsl_name in receipts._WSL_ENV:
+        non_wsl = copy.deepcopy(receipt)
+        non_wsl["platform"] = {
+            "domain": "linux",
+            "system": "Linux",
+            "release": "6.6.0-linux",
+            "wsl_distro": "",
+            "kernel": "",
+        }
+        non_wsl["invocation"]["environment_names"] = sorted(
+            set(non_wsl["invocation"]["environment_names"]) | {wsl_name}
+        )
+        non_wsl = _reseal_with_structured_invocation(non_wsl, non_wsl["invocation"])
+        with pytest.raises(ExactTestReceiptError):
+            canonical_exact_test_receipt_bytes(non_wsl)
+
+    legacy = copy.deepcopy(receipt)
+    legacy["producer"] = {
+        **legacy["producer"],
+        "version": receipts.LEGACY_RUNNER_VERSION,
+        "structured_invocation_sha256": receipts._sha256_bytes(
+            receipts._canonical(
+                {
+                    "pytest_argv": legacy["invocation"]["argv"],
+                    "protocol": "pytest-arg-vector-v1",
+                }
+            )
+        ),
+    }
+    legacy["invocation"] = {
+        "argv": legacy["invocation"]["argv"],
+        "cwd_role": legacy["invocation"]["cwd_role"],
+        "environment_names": ["PYTHONHASHSEED"],
+        "environment_sha256": legacy["invocation"]["environment_sha256"],
+    }
+    legacy["platform"] = missing_interop["platform"]
+    assert canonical_exact_test_receipt_bytes(_reseal(legacy))
+
+
+@pytest.mark.parametrize("interop", ["relative/socket", "/run/WSL/../socket", "/run/WSL/\x00socket"])
+def test_wsl_interop_allowlist_value_is_fail_closed(interop: str) -> None:
+    with pytest.raises(ExactTestReceiptError):
+        receipts._child_env(
+            Path("/snapshot"),
+            {"WSL_DISTRO_NAME": "Ubuntu", "WSL_INTEROP": interop},
+        )
 
 
 @pytest.mark.parametrize("mutation", ["source", "index", "head"])
@@ -401,17 +731,20 @@ def _reseal(receipt: dict[str, object]) -> dict[str, object]:
     return base
 
 
-def _reseal_with_v2_invocation(
+def _reseal_with_structured_invocation(
     receipt: dict[str, object],
     invocation: dict[str, object],
+    *,
+    runner_version: str = receipts.RUNNER_VERSION,
 ) -> dict[str, object]:
     producer = {
         **receipt["producer"],
+        "version": runner_version,
         "structured_invocation_sha256": receipts._sha256_bytes(
             receipts._canonical(
                 receipts._structured_invocation_payload(
                     invocation,
-                    runner_version=receipts.RUNNER_VERSION,
+                    runner_version=runner_version,
                 )
             )
         ),
@@ -431,7 +764,88 @@ def test_strict_object_lengths_timestamp_and_accepted_predicate(tmp_path: Path) 
     with pytest.raises(ExactTestReceiptError): canonical_exact_test_receipt_bytes(wrong_producer)
 
 
-def test_resealed_v2_confinement_tampering_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("identity_path", ["/mnt/d/aoi/exact_test_receipts.py", r"D:\aoi\exact_test_receipts.py"])
+def test_receipt_identity_paths_are_host_independent(
+    tmp_path: Path, identity_path: str
+) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    cross_platform = _reseal(
+        {
+            **receipt,
+            "producer": {
+                **receipt["producer"],
+                "module": {**receipt["producer"]["module"], "path": identity_path},
+            },
+            "interpreter": {**receipt["interpreter"], "path": identity_path},
+        }
+    )
+    assert canonical_exact_test_receipt_bytes(cross_platform)
+
+
+@pytest.mark.parametrize("identity_path", ["relative/module.py", "../module.py", r"D:module.py", r"\module.py"])
+def test_receipt_identity_paths_reject_relative_or_ambiguous_syntax(identity_path: str) -> None:
+    with pytest.raises(ExactTestReceiptError):
+        receipts._absolute_path(identity_path, "receipt identity path")
+
+
+def test_historical_v2_structured_receipts_remain_readable_but_not_current(
+    tmp_path: Path,
+) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    historical_wsl = copy.deepcopy(receipt)
+    historical_wsl["platform"] = {
+        "domain": "wsl",
+        "system": "Linux",
+        "release": "6.6.0-microsoft-standard-WSL2",
+        "wsl_distro": "historical-distro",
+        "kernel": "6.6.0-microsoft-standard-WSL2",
+    }
+    historical_wsl["invocation"]["environment_names"] = sorted(
+        set(historical_wsl["invocation"]["environment_names"]) - receipts._WSL_ENV
+    )
+    historical_wsl = _reseal_with_structured_invocation(
+        historical_wsl,
+        historical_wsl["invocation"],
+        runner_version=receipts.PREVIOUS_RUNNER_VERSION,
+    )
+    historical_wsl_raw = canonical_exact_test_receipt_bytes(historical_wsl)
+    assert parse_exact_test_receipt_bytes(historical_wsl_raw) == historical_wsl
+    with pytest.raises(ExactTestReceiptError):
+        parse_exact_test_receipt_bytes(
+            historical_wsl_raw, require_current_protocol=True
+        )
+
+    historical_non_wsl = copy.deepcopy(receipt)
+    historical_non_wsl["platform"] = {
+        "domain": "linux",
+        "system": "Linux",
+        "release": "historical-release",
+        "wsl_distro": "",
+        "kernel": "",
+    }
+    historical_non_wsl["invocation"]["environment_names"] = sorted(
+        set(historical_non_wsl["invocation"]["environment_names"]) - receipts._WSL_ENV
+    )
+    historical_non_wsl = _reseal_with_structured_invocation(
+        historical_non_wsl,
+        historical_non_wsl["invocation"],
+        runner_version=receipts.PREVIOUS_RUNNER_VERSION,
+    )
+    historical_non_wsl_raw = canonical_exact_test_receipt_bytes(historical_non_wsl)
+    assert parse_exact_test_receipt_bytes(historical_non_wsl_raw) == historical_non_wsl
+
+
+def test_resealed_current_confinement_tampering_is_rejected(tmp_path: Path) -> None:
     receipt = run_clean_commit_source_tree(
         repo=_repo(tmp_path),
         pytest_argv=["-q"],
@@ -465,7 +879,7 @@ def test_resealed_v2_confinement_tampering_is_rejected(tmp_path: Path) -> None:
         confcut_drift,
         missing_fixed_env,
     ):
-        tampered = _reseal_with_v2_invocation(receipt, invocation)
+        tampered = _reseal_with_structured_invocation(receipt, invocation)
         with pytest.raises(ExactTestReceiptError):
             canonical_exact_test_receipt_bytes(tampered)
 

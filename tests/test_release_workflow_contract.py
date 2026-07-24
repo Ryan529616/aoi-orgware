@@ -13,6 +13,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+import pytest
+
 
 WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "publish.yml"
@@ -48,6 +50,66 @@ def _release_runbook() -> str:
 
 def _release_history() -> str:
     return CHANGELOG.read_text(encoding="utf-8") + V04_PLAN.read_text(encoding="utf-8")
+
+
+def _is_inside_git_worktree(root: Path) -> bool:
+    probe = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0 and probe.stdout.strip() == "true"
+
+
+def _nearest_lexical_git_marker(root: Path) -> Path | None:
+    current = root
+    while True:
+        # lexists, unlike exists, preserves dangling symlink/reparse-point
+        # markers as Git metadata.
+        if os.path.lexists(current / ".git"):
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _materialize_standalone_gate_checkout(root: Path, checkout: Path) -> None:
+    marker_root = _nearest_lexical_git_marker(root)
+    # A local lexical marker must take the Git path and fail closed when it is
+    # malformed or dangling; an ancestor marker rejects the gitless fixture.
+    if marker_root == root:
+        archive = subprocess.run(
+            ["git", "-C", str(root), "archive", "--format=tar", "HEAD"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as contents:
+            contents.extractall(checkout, filter="data")
+        return
+
+    assert marker_root is None, (
+        "refusing gitless fallback for a root below ancestor Git metadata at "
+        f"{marker_root}"
+    )
+    # This probe only adds rejection.  A rev-parse error is never evidence that
+    # Git metadata is absent: the lexical root-and-ancestor scan above is that
+    # gate, and catches malformed or dangling markers before this command.
+    assert not _is_inside_git_worktree(root), (
+        "refusing gitless fallback for a root managed by a current or parent "
+        "Git worktree"
+    )
+    # This intentionally metadata-free fixture exercises only the standalone
+    # gate.  Source provenance belongs to the outer exact-test receipt; this
+    # branch makes no cryptographic-attestation claim about these copied bytes.
+    shutil.copytree(root / "src", checkout / "src")
+    (checkout / "release").mkdir()
+    shutil.copy2(
+        root / "release" / "publication-policy.json",
+        checkout / "release" / "publication-policy.json",
+    )
+    assert {entry.name for entry in checkout.iterdir()} == {"release", "src"}
 
 
 def _job(text: str, name: str) -> str:
@@ -896,22 +958,17 @@ def test_docs_pages_artifact_upload_is_snapshot_gated() -> None:
     assert "aoi_orgware" not in deploy
 
 
-def test_standalone_gate_runs_from_a_clean_tracked_checkout_without_aoi_toml(
+def test_standalone_gate_runs_from_a_clean_checkout_or_gitless_snapshot_without_aoi_toml(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    archive = subprocess.run(
-        ["git", "-C", str(root), "archive", "--format=tar", "HEAD"],
-        check=True,
-        capture_output=True,
-    ).stdout
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as contents:
-        contents.extractall(checkout, filter="data")
+    _materialize_standalone_gate_checkout(root, checkout)
     assert not (checkout / "aoi.toml").exists()
     policy = checkout / "release" / "publication-policy.json"
     assert policy.is_file(), "the exact tag must carry its reviewed publication snapshot"
+    assert policy.read_bytes() == (root / "release" / "publication-policy.json").read_bytes()
     snapshot_sha256 = json.loads(policy.read_text(encoding="utf-8"))[
         "snapshot_sha256"
     ]
@@ -942,6 +999,181 @@ def test_standalone_gate_runs_from_a_clean_tracked_checkout_without_aoi_toml(
         text=True,
     )
     assert json.loads(result.stdout)["decision"] == "allowed"
+
+
+def test_standalone_gate_gitless_blob_snapshot_fallback_is_explicit(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    snapshot = tmp_path / "exact-test-blob-snapshot"
+    snapshot.mkdir()
+    shutil.copytree(root / "src", snapshot / "src")
+    (snapshot / "release").mkdir()
+    shutil.copy2(
+        root / "release" / "publication-policy.json",
+        snapshot / "release" / "publication-policy.json",
+    )
+    assert not os.path.lexists(snapshot / ".git")
+    assert not _is_inside_git_worktree(snapshot)
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _materialize_standalone_gate_checkout(snapshot, checkout)
+
+    policy = checkout / "release" / "publication-policy.json"
+    snapshot_sha256 = json.loads(policy.read_text(encoding="utf-8"))["snapshot_sha256"]
+    subject = checkout / "sample.txt"
+    subject.write_text("public sample\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aoi_orgware.publication_gate",
+            "preflight",
+            "--policy-snapshot",
+            "release/publication-policy.json",
+            "--expected-snapshot-sha256",
+            snapshot_sha256,
+            "--action",
+            "artifact_upload",
+            "--destination",
+            "https://example.invalid/artifacts",
+            "--subject",
+            "sample.txt",
+            "--json",
+        ],
+        cwd=checkout,
+        env={**os.environ, "PYTHONPATH": str(checkout / "src")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout)["decision"] == "allowed"
+
+
+def test_standalone_gate_gitless_fallback_rejects_malformed_git_marker(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "malformed-git"
+    root.mkdir()
+    (root / ".git").write_text("gitdir: missing\n", encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _materialize_standalone_gate_checkout(root, checkout)
+    assert not (checkout / "src").exists()
+
+
+def test_standalone_gate_gitless_fallback_rejects_dangling_git_marker_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "dangling-git"
+    root.mkdir()
+    marker = root / ".git"
+    real_lexists = os.path.lexists
+
+    def dangling_marker_lexists(path: os.PathLike[str] | str) -> bool:
+        if Path(path) == marker:
+            return True
+        return real_lexists(path)
+
+    # This simulates the lexical visibility of a dangling symlink/junction
+    # without requiring Windows symlink-creation privileges.
+    monkeypatch.setattr(os.path, "lexists", dangling_marker_lexists)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        _materialize_standalone_gate_checkout(root, checkout)
+    assert raised.value.cmd == ["git", "-C", str(root), "archive", "--format=tar", "HEAD"]
+    assert not (checkout / "src").exists()
+
+
+def test_standalone_gate_gitless_fallback_rejects_nested_git_worktree(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "parent-worktree"
+    subprocess.run(["git", "init", str(parent)], check=True, capture_output=True)
+    root = parent / "nested-snapshot"
+    root.mkdir()
+    assert not os.path.lexists(root / ".git")
+    assert _is_inside_git_worktree(root)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(AssertionError, match="ancestor Git metadata"):
+        _materialize_standalone_gate_checkout(root, checkout)
+    assert not (checkout / "src").exists()
+
+
+def test_standalone_gate_gitless_fallback_rejects_malformed_ancestor_git_marker(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "malformed-parent"
+    parent.mkdir()
+    (parent / ".git").write_text("gitdir: missing\n", encoding="utf-8")
+    root = parent / "gitless-fixture"
+    root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(AssertionError, match="ancestor Git metadata"):
+        _materialize_standalone_gate_checkout(root, checkout)
+    assert not (checkout / "src").exists()
+
+
+def test_standalone_gate_gitless_fallback_rejects_dangling_ancestor_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "dangling-parent"
+    root = parent / "gitless-fixture"
+    root.mkdir(parents=True)
+    marker = parent / ".git"
+    real_lexists = os.path.lexists
+
+    def dangling_ancestor_lexists(path: os.PathLike[str] | str) -> bool:
+        if Path(path) == marker:
+            return True
+        return real_lexists(path)
+
+    # Simulate a dangling symlink/junction without Windows symlink privileges.
+    monkeypatch.setattr(os.path, "lexists", dangling_ancestor_lexists)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(AssertionError, match="ancestor Git metadata"):
+        _materialize_standalone_gate_checkout(root, checkout)
+    assert not (checkout / "src").exists()
+
+
+def test_standalone_gate_gitless_fallback_keeps_rev_parse_success_as_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent-worktree"
+    subprocess.run(["git", "init", str(parent)], check=True, capture_output=True)
+    root = parent / "nested-snapshot"
+    root.mkdir()
+    marker = parent / ".git"
+    real_lexists = os.path.lexists
+
+    def hide_parent_marker(path: os.PathLike[str] | str) -> bool:
+        if Path(path) == marker:
+            return False
+        return real_lexists(path)
+
+    # Even if the lexical check misses a concurrent/opaque parent marker, a
+    # successful Git worktree probe remains a fail-closed backstop.
+    monkeypatch.setattr(os.path, "lexists", hide_parent_marker)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(AssertionError, match="current or parent Git worktree"):
+        _materialize_standalone_gate_checkout(root, checkout)
+    assert not (checkout / "src").exists()
 
 
 def test_oidc_is_exclusive_to_protected_publish_job_and_readback_is_post_publish() -> None:

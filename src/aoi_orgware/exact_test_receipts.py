@@ -28,16 +28,32 @@ from typing import Any, NoReturn
 SCHEMA_VERSION = 1
 RECEIPT_KIND = "aoi.clean_commit_source_tree_exact_test_receipt.v1"
 LEGACY_RUNNER_VERSION = "1"
-RUNNER_VERSION = "2"
+PREVIOUS_RUNNER_VERSION = "2"
+RUNNER_VERSION = "3"
 PYTEST_ARGUMENT_CONTRACT = "pytest-contained-argv-v2"
 MAX_RECEIPT_BYTES = 512 * 1024
 EMPTY_GIT_STATUS_SHA256 = hashlib.sha256(b"").hexdigest()
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\Z")
+_WSL_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,127}\Z")
 _ENV_ALLOWLIST = frozenset(
-    {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "TZ"}
+    {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "WSL_DISTRO_NAME",
+        "WSL_INTEROP",
+    }
 )
+_WSL_ENV = frozenset({"WSL_DISTRO_NAME", "WSL_INTEROP"})
 _WINDOWS_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))})
 _PYTEST_TRACEBACK = re.compile(r"--tb=(?:auto|long|short|line|native|no)\Z")
 _MAX_PYTEST_ARGUMENTS = 256
@@ -143,7 +159,7 @@ def _string(value: object, label: str) -> str:
 
 def _absolute_path(value: object, label: str) -> str:
     text = _string(value, label)
-    if not Path(text).is_absolute() and not PureWindowsPath(text).is_absolute():
+    if not PurePosixPath(text).is_absolute() and not PureWindowsPath(text).is_absolute():
         _fail(f"{label} must be absolute")
     return text
 
@@ -405,7 +421,7 @@ def _structured_invocation_payload(
             "pytest_argv": list(invocation["argv"]),
             "protocol": "pytest-arg-vector-v1",
         }
-    if runner_version != RUNNER_VERSION:
+    if runner_version not in {PREVIOUS_RUNNER_VERSION, RUNNER_VERSION}:
         _fail("producer version is invalid")
     return {
         "argument_contract": invocation["argument_contract"],
@@ -454,7 +470,7 @@ def validate_exact_test_receipt(
     if producer["invoker"] is not None:
         invoker = _exact(producer["invoker"], {"path", "sha256"}, "producer invoker")
         _absolute_path(invoker["path"], "producer invoker path"); _sha256(invoker["sha256"], "producer invoker SHA-256")
-    if producer["version"] not in {LEGACY_RUNNER_VERSION, RUNNER_VERSION}: _fail("producer version is invalid")
+    if producer["version"] not in {LEGACY_RUNNER_VERSION, PREVIOUS_RUNNER_VERSION, RUNNER_VERSION}: _fail("producer version is invalid")
     if require_current_protocol and producer["version"] != RUNNER_VERSION:
         _fail("new exact-test evidence requires the current contained pytest protocol")
     _sha256(producer["structured_invocation_sha256"], "producer structured invocation SHA-256")
@@ -512,7 +528,7 @@ def validate_exact_test_receipt(
     if invocation["cwd_role"] != _PYTEST_SNAPSHOT_ROLE: _fail("pytest cwd role is invalid")
     allowed_environment_names = _ENV_ALLOWLIST | _PYTEST_FIXED_ENV
     if not isinstance(invocation["environment_names"], list) or invocation["environment_names"] != sorted(invocation["environment_names"]) or len(invocation["environment_names"]) != len(set(invocation["environment_names"])) or any(x not in allowed_environment_names for x in invocation["environment_names"]): _fail("environment names are invalid")
-    if producer["version"] == RUNNER_VERSION and not _PYTEST_FIXED_ENV.issubset(invocation["environment_names"]):
+    if producer["version"] in {PREVIOUS_RUNNER_VERSION, RUNNER_VERSION} and not _PYTEST_FIXED_ENV.issubset(invocation["environment_names"]):
         _fail("contained pytest environment is incomplete")
     _sha256(invocation["environment_sha256"], "environment SHA-256")
     if producer["structured_invocation_sha256"] != _sha256_bytes(
@@ -528,6 +544,8 @@ def validate_exact_test_receipt(
     if domain["domain"] not in {"windows", "wsl", "linux"}: _fail("platform domain is invalid")
     for key in ("system", "release", "wsl_distro", "kernel"):
         if not isinstance(domain[key], str): _fail(f"platform {key} is invalid")
+    if producer["version"] == RUNNER_VERSION:
+        _require_current_platform_environment(domain, invocation["environment_names"])
     log = _exact(item["log"], {"sha256", "size", "path_role"}, "log")
     _sha256(log["sha256"], "log SHA-256"); _int(log["size"], "log size")
     if log["path_role"] != "repo_external_combined_log": _fail("log path role is invalid")
@@ -727,8 +745,70 @@ def platform_domain(*, system: str | None = None, release: str | None = None, en
     return {"domain": "windows" if system == "Windows" else "wsl" if is_wsl else "linux", "system": system, "release": release, "wsl_distro": environ.get("WSL_DISTRO_NAME", "") if is_wsl else "", "kernel": release if is_wsl else ""}
 
 
+def _require_safe_wsl_distro(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or _WSL_IDENTITY.fullmatch(value) is None
+        or value.startswith("-")
+    ):
+        _fail("WSL distribution name is invalid")
+    return value
+
+
+def _require_current_platform_environment(
+    domain: Mapping[str, Any],
+    environment_names: Sequence[str],
+    *,
+    child_env: Mapping[str, str] | None = None,
+) -> None:
+    """Require the current runner's platform claim to match its child env."""
+
+    domain_name = domain.get("domain")
+    system = domain.get("system")
+    release = domain.get("release")
+    distro = domain.get("wsl_distro")
+    kernel = domain.get("kernel")
+    if domain_name not in {"windows", "wsl", "linux"}:
+        _fail("platform domain is invalid")
+    if not isinstance(system, str) or not system or not isinstance(release, str) or not release:
+        _fail("platform system or release is invalid")
+    if domain_name == "windows" and system != "Windows":
+        _fail("Windows receipt platform is incoherent")
+    if domain_name == "wsl" and system != "Linux":
+        _fail("WSL receipt platform is incoherent")
+    if domain_name == "linux" and system == "Windows":
+        _fail("non-Windows receipt platform is incoherent")
+    names = set(environment_names)
+    if domain_name == "wsl":
+        _require_safe_wsl_distro(distro)
+        if not isinstance(kernel, str) or not kernel or kernel != release:
+            _fail("WSL receipt kernel is incoherent")
+        if "microsoft" not in release.lower():
+            _fail("WSL receipt kernel lacks the Microsoft identity")
+        if not _WSL_ENV.issubset(names):
+            _fail("WSL receipt omits required WSL environment signals")
+        if child_env is not None and child_env.get("WSL_DISTRO_NAME") != distro:
+            _fail("WSL receipt distribution does not match the child environment")
+    elif distro != "" or kernel != "" or _WSL_ENV & names:
+        _fail("non-WSL receipt carries WSL platform or environment signals")
+
+
 def _child_env(snapshot: Path, inherited: Mapping[str, str]) -> tuple[dict[str, str], list[str], str]:
     env = {key: inherited[key] for key in sorted(_ENV_ALLOWLIST) if key in inherited}
+    if "WSL_DISTRO_NAME" in env:
+        _require_safe_wsl_distro(env["WSL_DISTRO_NAME"])
+    if "WSL_INTEROP" in env:
+        interop = env["WSL_INTEROP"]
+        interop_path = PurePosixPath(interop) if isinstance(interop, str) else None
+        if (
+            not isinstance(interop, str)
+            or not interop
+            or any(ord(char) < 0x20 for char in interop)
+            or interop_path is None
+            or not interop_path.is_absolute()
+            or ".." in interop_path.parts
+        ):
+            _fail("WSL interop endpoint is invalid")
     env.update(
         {
             "PYTHONHASHSEED": "0",
@@ -789,6 +869,7 @@ def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], rece
     repo = repo.resolve(strict=True); receipt_path = _external_absolute(receipt_path, repo, "receipt path"); logs_dir = _external_absolute(logs_dir, repo, "logs directory")
     requested_pytest_argv = _bounded_pytest_argv(pytest_argv)
     inherited_env = os.environ if inherited_env is None else inherited_env
+    captured_platform = platform_domain(environ=inherited_env)
     pre = _status(repo)
     if not pre["clean"]: _fail("repository HEAD/index/tree is not clean")
     scratch = Path(tempfile.mkdtemp(prefix="aoi-exact-test-"))
@@ -803,6 +884,9 @@ def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], rece
             stream.flush()
             os.fsync(stream.fileno())
         env, env_names, env_sha = _child_env(snapshot, inherited_env)
+        _require_current_platform_environment(
+            captured_platform, env_names, child_env=env
+        )
         invocation = {
             "argument_contract": PYTEST_ARGUMENT_CONTRACT,
             "argv": effective_pytest_argv,
@@ -847,7 +931,7 @@ def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], rece
         unchanged = pre["head"] == post["head"] and pre["index_tree"] == post["index_tree"] and manifest == post_manifest and post["clean"]
         if not unchanged and terminal == "completed": terminal = "rejected"; error = "repository identity changed during run"
         log_closed = _sha256_file(log_path) == _sha256_bytes(log) and log_path.stat().st_size == len(log)
-        base: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "kind": RECEIPT_KIND, "accepted": False, "terminal_status": terminal, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "producer": _producer_identity(invocation, invoker_path), "source": {"head": pre["head"], "index_tree": pre["index_tree"], "manifest_sha256": manifest, "file_count": count, "snapshot": True}, "interpreter": _interpreter_identity(), "invocation": invocation, "platform": platform_domain(), "log": {"sha256": _sha256_bytes(log), "size": len(log), "path_role": "repo_external_combined_log"}, "pytest_exit_code": result_code, "identity_unchanged": unchanged, "log_closed": log_closed, "publication_atomic": True, "github_matrix_identity": dict(github_matrix_identity) if github_matrix_identity is not None else None, "observation": {"pre": {**{key: pre[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": manifest}, "post": {**{key: post[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": post_manifest}, "error": error}}
+        base: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "kind": RECEIPT_KIND, "accepted": False, "terminal_status": terminal, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "producer": _producer_identity(invocation, invoker_path), "source": {"head": pre["head"], "index_tree": pre["index_tree"], "manifest_sha256": manifest, "file_count": count, "snapshot": True}, "interpreter": _interpreter_identity(), "invocation": invocation, "platform": captured_platform, "log": {"sha256": _sha256_bytes(log), "size": len(log), "path_role": "repo_external_combined_log"}, "pytest_exit_code": result_code, "identity_unchanged": unchanged, "log_closed": log_closed, "publication_atomic": True, "github_matrix_identity": dict(github_matrix_identity) if github_matrix_identity is not None else None, "observation": {"pre": {**{key: pre[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": manifest}, "post": {**{key: post[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": post_manifest}, "error": error}}
         base["accepted"] = result_code == 0 and unchanged and log_closed and terminal == "completed"
         base["receipt_sha256"] = _sha256_bytes(_canonical(base))
         raw = canonical_exact_test_receipt_bytes(

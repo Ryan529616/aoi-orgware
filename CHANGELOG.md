@@ -70,6 +70,20 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   was incomplete on WSL and is also rejected; all later qualification must use
   a successor containing the complete cross-platform and Python 3.11 marker
   closure.
+- **Fresh-ext4 WSL qualification rejects partial host identity and
+  non-causal fixtures.** Exact `fd5984b` is rejected after its canonical WSL
+  full suite reported 21 failures. The successor keeps both
+  `WSL_DISTRO_NAME` and `WSL_INTEROP` inside the exact runner's closed,
+  digest-bound child environment. Runner v3 captures the platform identity
+  from that same explicit environment and cross-checks its WSL
+  distro/kernel/domain before child launch; historical runner v1/v2 receipts
+  remain read-compatible. It does not relax onboarding's partial-signal rejection.
+  Legacy resource-config orphan fixtures now derive migration time strictly
+  after rollback, and the publication-policy smoke retains `git archive` in a
+  real checkout while using a minimal source/policy fixture in the runner's
+  intentionally gitless blob snapshot. All `fd5984b` package, install, test,
+  and review results are historical; a clean successor must regenerate every
+  release gate.
 - **AOI repository publication authority stays distinct from project file
   protection.** This repository's effective confidentiality mode is
   `standard`, so its reviewed source, Git refs, release artifacts, and PyPI

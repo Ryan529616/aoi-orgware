@@ -21,7 +21,6 @@ from aoi_orgware.harnesslib import (  # noqa: E402
     HarnessError,
     get_paths,
     load_chief_authority,
-    now_iso,
 )
 from aoi_orgware.resource_config import (  # noqa: E402
     make_legacy_resource_config_migration_receipt,
@@ -48,6 +47,14 @@ class LegacyResourceConfigMigrationTests(HarnessTestCase):
             json.dumps(state, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+
+    def _migrated_at_after_rollback(self, event: dict) -> str:
+        rollback_at = dt.datetime.fromisoformat(event["rollback"]["recorded_at"])
+        self.assertIsNotNone(rollback_at.tzinfo)
+        self.assertIsNotNone(rollback_at.utcoffset())
+        migrated_at = rollback_at + dt.timedelta(microseconds=1)
+        self.assertGreater(migrated_at, rollback_at)
+        return migrated_at.isoformat()
 
     def _prepare_legacy(
         self,
@@ -609,8 +616,12 @@ class LegacyResourceConfigMigrationTests(HarnessTestCase):
             chief_authority_record_sha256=cli_impl.canonical_record_sha256(
                 authority
             ),
-            migrated_at=now_iso(),
+            migrated_at=self._migrated_at_after_rollback(event),
             aoi_version=__version__,
+        )
+        self.assertGreater(
+            dt.datetime.fromisoformat(orphan["migrated_at"]),
+            dt.datetime.fromisoformat(event["rollback"]["recorded_at"]),
         )
         migration_path = (
             self.root
@@ -650,9 +661,13 @@ class LegacyResourceConfigMigrationTests(HarnessTestCase):
             "chief_authority_record_sha256": cli_impl.canonical_record_sha256(
                 authority
             ),
-            "migrated_at": now_iso(),
+            "migrated_at": self._migrated_at_after_rollback(event),
             "aoi_version": __version__,
         }
+        self.assertGreater(
+            dt.datetime.fromisoformat(base_kwargs["migrated_at"]),
+            dt.datetime.fromisoformat(event["rollback"]["recorded_at"]),
+        )
         migration_path = (
             self.root
             / ".aoi"
