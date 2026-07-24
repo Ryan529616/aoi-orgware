@@ -113,9 +113,13 @@ aoi_orgware-<version>.tar.gz
 toolchain. Download its wheels first, verify every hash, then install from that
 wheelhouse with networking disabled; the producer receipt records the lock
 SHA-256 and the exact name, version, and complete allowed artifact SHA-256 set
-for all 32 locked distributions (40 wheel hashes total). This includes
+for all 40 locked distributions (56 wheel hashes total). This includes
 `twine==6.2.0` and every selected transitive dependency, with wheel hashes for
-CPython 3.11--3.14 on Linux and Windows. Generate that receipt only through
+CPython 3.11--3.14 on Linux and Windows. The uniform lock includes keyring's
+Linux SecretStorage/jeepney/cryptography/cffi/pycparser chain and the Python
+3.11 backports.tarfile/importlib-metadata/zipp marker closure so the same
+hash-closed install resolves across every supported runner. Generate that
+receipt only through
 the locked interpreter with `scripts/release_rehearsal.py release-toolchain`;
 the command also verifies every recorded distribution version is installed.
 Run `twine check --strict` only through that offline build environment; no
@@ -402,7 +406,7 @@ The release workflow:
 4. builds and strictly checks one wheel and one sdist;
 5. installs the exact inventory-selected wheel before `-I` O7 tests and runs
    `scripts/verify_dist.py` against both artifacts;
-6. records the 32-distribution, 40-wheel-hash toolchain receipt, the exact annotated tag
+6. records the 40-distribution, 56-wheel-hash toolchain receipt, the exact annotated tag
    object-to-commit/tree binding, and the producer evidence;
 7. inventories each exact upload directory/file, including wheel/ZIP and
    gzip-tar members, and requires an allowed destination-bound confidentiality

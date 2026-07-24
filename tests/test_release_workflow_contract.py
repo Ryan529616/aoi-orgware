@@ -180,18 +180,23 @@ def test_producer_installs_the_single_inventory_bound_wheel_before_isolated_test
 def test_release_tools_lock_is_complete_hashed_and_used_offline_everywhere() -> None:
     lock = RELEASE_TOOLS_LOCK.read_text(encoding="utf-8")
     expected = {
+        "backports.tarfile==1.2.0",
         "build==1.5.0",
         "certifi==2026.7.22",
+        "cffi==2.0.0",
         "charset-normalizer==3.4.9",
         "colorama==0.4.6",
+        "cryptography==46.0.5",
         "docutils==0.23",
         "hatchling==1.27.0",
         "id==1.6.1",
         "idna==3.18",
+        "importlib-metadata==9.0.0",
         "iniconfig==2.3.0",
         "jaraco.classes==3.4.0",
         "jaraco.context==6.1.2",
         "jaraco.functools==4.6.0",
+        "jeepney==0.9.0",
         "keyring==25.7.0",
         "markdown-it-py==4.2.0",
         "mdurl==0.1.2",
@@ -200,6 +205,7 @@ def test_release_tools_lock_is_complete_hashed_and_used_offline_everywhere() -> 
         "packaging==26.2",
         "pathspec==1.1.1",
         "pluggy==1.6.0",
+        "pycparser==2.23",
         "pygments==2.20.0",
         "pyproject-hooks==1.2.0",
         "pytest==8.4.2",
@@ -209,15 +215,17 @@ def test_release_tools_lock_is_complete_hashed_and_used_offline_everywhere() -> 
         "requests-toolbelt==1.0.0",
         "rfc3986==2.0.0",
         "rich==15.0.0",
+        "secretstorage==3.5.0",
         "trove-classifiers==2026.6.1.19",
         "twine==6.2.0",
         "urllib3==2.7.0",
+        "zipp==4.1.0",
     }
     assert "--only-binary=:all:" in lock
     assert "aoi-orgware" not in lock
     assert all(item in lock for item in expected)
-    assert len(expected) == 32
-    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 40
+    assert len(expected) == 40
+    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 56
     text = _workflow()
     for job_name in ("producer-linux", "verify-windows", "rebuild-linux"):
         job = _job(text, job_name)

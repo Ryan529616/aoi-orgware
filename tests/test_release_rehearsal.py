@@ -251,20 +251,22 @@ def test_producer_binding_cannot_drop_receipt_platform_or_inventory(
 
 def test_linux_producer_receipt_requires_a_canonical_complete_toolchain() -> None:
     toolchain = _release_toolchain()
-    assert len(toolchain["distributions"]) == 32
+    assert len(toolchain["distributions"]) == 40
     assert {entry["name"] for entry in toolchain["distributions"]} == {
-        "build", "certifi", "charset-normalizer", "colorama", "docutils",
-        "hatchling", "id", "idna", "iniconfig", "jaraco-classes",
-        "jaraco-context", "jaraco-functools", "keyring", "markdown-it-py",
-        "mdurl", "more-itertools", "nh3", "packaging", "pathspec", "pluggy",
-        "pygments", "pyproject-hooks", "pytest", "pywin32-ctypes",
-        "readme-renderer", "requests", "requests-toolbelt", "rfc3986", "rich",
-        "trove-classifiers", "twine", "urllib3",
+        "backports-tarfile", "build", "certifi", "cffi",
+        "charset-normalizer", "colorama", "cryptography", "docutils",
+        "hatchling", "id", "idna", "importlib-metadata", "iniconfig",
+        "jaraco-classes", "jaraco-context", "jaraco-functools", "jeepney",
+        "keyring", "markdown-it-py", "mdurl", "more-itertools", "nh3",
+        "packaging", "pathspec", "pluggy", "pycparser", "pygments",
+        "pyproject-hooks", "pytest", "pywin32-ctypes", "readme-renderer",
+        "requests", "requests-toolbelt", "rfc3986", "rich", "secretstorage",
+        "trove-classifiers", "twine", "urllib3", "zipp",
     }
     assert sum(
         len(entry["allowed_artifact_sha256s"])
         for entry in toolchain["distributions"]
-    ) == 40
+    ) == 56
     assert next(
         entry
         for entry in toolchain["distributions"]
@@ -276,6 +278,16 @@ def test_linux_producer_receipt_requires_a_canonical_complete_toolchain() -> Non
             if entry["name"] == "charset-normalizer"
         )["allowed_artifact_sha256s"]
     )
+    hash_counts = {
+        entry["name"]: len(entry["allowed_artifact_sha256s"])
+        for entry in toolchain["distributions"]
+    }
+    assert hash_counts["backports-tarfile"] == 1
+    assert hash_counts["cffi"] == 8
+    assert hash_counts["cryptography"] == 2
+    assert hash_counts["importlib-metadata"] == 1
+    assert hash_counts["secretstorage"] == 1
+    assert hash_counts["zipp"] == 1
     receipt = rehearsal.create_producer_receipt(
         producer_id="build-linux",
         platform="linux",

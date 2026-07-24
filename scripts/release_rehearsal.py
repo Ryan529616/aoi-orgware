@@ -41,8 +41,8 @@ MAX_REQUEST_BYTES = 512 * 1024
 MAX_RECEIPT_BYTES = 256 * 1024
 _SHA = __import__("re").compile(r"[0-9a-f]{64}")
 _PLATFORMS = {"linux", "windows"}
-_RELEASE_TOOL_DISTRIBUTION_COUNT = 32
-_RELEASE_TOOL_ALLOWED_HASH_COUNT = 40
+_RELEASE_TOOL_DISTRIBUTION_COUNT = 40
+_RELEASE_TOOL_ALLOWED_HASH_COUNT = 56
 
 
 class RehearsalError(ValueError):
@@ -79,11 +79,12 @@ def _identifier(value: Any, label: str) -> str:
 
 
 def _release_toolchain(value: Any) -> dict[str, Any]:
-    """Validate the complete, installed release-tool wheel binding.
+    """Validate installed versions plus the complete allowed-wheel set.
 
     The wheel hashes are the hashes accepted by ``pip --require-hashes``.  The
-    receipt is therefore both a record of the installed distribution versions
-    and the immutable artifact set that was allowed to produce the release.
+    receipt records the installed distribution versions and the immutable
+    artifact set allowed by the preceding fresh offline install.  It does not
+    claim to recover an installed wheel's original container digest.
     """
 
     expected = _canonical_release_toolchain()

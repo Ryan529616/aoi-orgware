@@ -61,11 +61,15 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   snapshot root/confcutdir/cwd roles, and a closed child environment. New
   evidence ingestion rejects historical v1 receipts, while integrity and
   doctor can still replay those immutable historical records. The release lock
-  now covers Twine 6.2.0 and all selected dependencies as 32 distributions and
-  40 allowed wheel hashes; test and publish workflows install the complete
+  now covers Twine 6.2.0 and all selected dependencies as 40 distributions and
+  56 allowed wheel hashes, including the Linux-only and Python 3.11-only
+  dependency chains;
+  test and publish workflows install the complete
   toolchain offline and use one canonical multi-hash parser/installed-version
-  observer for producer evidence. These repairs supersede the rejected
-  `ec6d6ae` candidate and require entirely new exact-candidate qualification.
+  observer for producer evidence. Exact `8de626a` proved the first 32/40 lock
+  was incomplete on WSL and is also rejected; all later qualification must use
+  a successor containing the complete cross-platform and Python 3.11 marker
+  closure.
 - **AOI repository publication authority stays distinct from project file
   protection.** This repository's effective confidentiality mode is
   `standard`, so its reviewed source, Git refs, release artifacts, and PyPI
