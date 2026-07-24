@@ -23,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import tempfile
 import tomllib
 import zlib
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from . import confidentiality as confidentiality_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
 from . import evidence_artifacts as evidence_artifacts_impl
+from . import exact_test_receipts as exact_test_receipts_impl
 from .agent_identity import AgentIdentityError, AGENT_ID_RE, validate_agent_id
 from . import execution_topology as execution_topology_impl
 from . import integrity_records as integrity_records_impl
@@ -351,7 +353,12 @@ from .resource_config import (
     rollback_files_from_receipt,
     validate_resource_receipt,
 )
-from .semantic_events import SemanticEventError, canonical_json_bytes
+from .semantic_events import (
+    SemanticEventError,
+    canonical_json_bytes,
+    projection_domain,
+    replay_events,
+)
 
 from .harnesslib import (
     ACCOUNTED_VERIFICATION_STATUSES,
@@ -1017,6 +1024,13 @@ def _verification_policy() -> verification_integrity_impl.VerificationPolicy:
     )
 
 
+def _supported_verification_integrity_version(value: Any) -> bool:
+    return _is_exact_int(value, 1) or _is_exact_int(
+        value,
+        verification_integrity_impl.EXACT_TEST_VERIFICATION_INTEGRITY_VERSION,
+    )
+
+
 def _job_integrity_policy() -> job_integrity_impl.JobIntegrityPolicy:
     return job_integrity_impl.JobIntegrityPolicy(
         receipt_components=tuple(RECEIPT_COMPONENTS),
@@ -1463,20 +1477,29 @@ def verification_record_integrity_errors(
     paths: HarnessPaths,
     state: dict[str, Any],
     indexed_records: Iterable[tuple[int, dict[str, Any]]] | None = None,
+    *,
+    pending_exact_test_bindings: Mapping[str, bytes] | None = None,
 ) -> list[str]:
     return verification_integrity_impl.verification_record_integrity_errors(
         paths,
         state,
         indexed_records,
         policy=_verification_policy(),
+        pending_exact_test_bindings=pending_exact_test_bindings,
     )
 
 
 def verification_integrity_errors(
-    paths: HarnessPaths, state: dict[str, Any]
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    pending_exact_test_bindings: Mapping[str, bytes] | None = None,
 ) -> list[str]:
     return verification_integrity_impl.verification_integrity_errors(
-        paths, state, policy=_verification_policy()
+        paths,
+        state,
+        policy=_verification_policy(),
+        pending_exact_test_bindings=pending_exact_test_bindings,
     )
 
 
@@ -3092,9 +3115,291 @@ def cmd_reconcile(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
+_EXACT_TEST_SEMANTIC_EVENT_TYPE = "verification_added"
+_VERIFICATION_SUPERSEDED_SEMANTIC_EVENT_TYPE = "verification_superseded"
+_SEMANTIC_RECORDED_AT_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+def _require_semantic_recorded_at(value: str, label: str) -> str:
+    if (
+        _SEMANTIC_RECORDED_AT_RE.fullmatch(value) is None
+        or parse_tz_aware_time(value) is None
+    ):
+        raise HarnessError(
+            f"{label} must be a canonical timezone-aware semantic event timestamp"
+        )
+    return value
+
+
+def _stable_exact_test_source_identity(worktree: Path) -> dict[str, Any]:
+    """Observe one clean Git source identity with the receipt producer's rules."""
+
+    try:
+        before = exact_test_receipts_impl._status(worktree)
+        with tempfile.TemporaryDirectory(
+            prefix="aoi-exact-test-live-source-"
+        ) as temporary:
+            manifest_sha256, file_count = exact_test_receipts_impl._snapshot(
+                worktree,
+                Path(temporary) / "snapshot",
+            )
+        after = exact_test_receipts_impl._status(worktree)
+    except exact_test_receipts_impl.ExactTestReceiptError as exc:
+        raise HarnessError(
+            f"cannot observe exact-test task worktree source: {exc}"
+        ) from exc
+    identity_fields = ("head", "index_tree", "status_sha256", "clean")
+    if any(before[field] != after[field] for field in identity_fields):
+        raise HarnessError(
+            "exact-test task worktree source changed during live observation"
+        )
+    return {
+        "head": before["head"],
+        "index_tree": before["index_tree"],
+        "status_sha256": before["status_sha256"],
+        "manifest_sha256": manifest_sha256,
+        "file_count": file_count,
+        "clean": before["clean"],
+    }
+
+
+def _require_live_exact_test_source_identity(
+    worktree: Path, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Fail closed unless the live clean source is the receipt's exact source."""
+
+    current = _stable_exact_test_source_identity(worktree)
+    source = receipt["source"]
+    observation = receipt["observation"]["pre"]
+    expected = {
+        "head": source["head"],
+        "index_tree": source["index_tree"],
+        "status_sha256": observation["status_sha256"],
+        "manifest_sha256": source["manifest_sha256"],
+        "file_count": source["file_count"],
+    }
+    labels = {
+        "head": "HEAD",
+        "index_tree": "index tree",
+        "status_sha256": "status",
+        "manifest_sha256": "manifest",
+        "file_count": "file count",
+    }
+    for field, label in labels.items():
+        if current[field] != expected[field]:
+            raise HarnessError(
+                f"exact-test receipt source {label} differs from the task "
+                f"worktree {label}"
+            )
+    if current["clean"] is not True:
+        raise HarnessError("exact-test task worktree source is not clean")
+    return current
+
+
+def _semantic_verification_retry_states(
+    paths: HarnessPaths,
+    task_id: str,
+    *,
+    command_id: str,
+    expected_head_sha256: str,
+    recorded_at: str,
+    event_type: str,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return published before/after domains for one exact terminal retry."""
+
+    events = semantic_store_impl.load_semantic_events(paths, task_id)
+    matches = [event for event in events if event.get("command_id") == command_id]
+    if not matches:
+        semantic_store_impl.preflight_semantic_append(
+            paths,
+            task_id,
+            command_id=command_id,
+            expected_head_sha256=expected_head_sha256,
+        )
+        return None
+    if (
+        len(matches) != 1
+        or matches[0] is not events[-1]
+        or matches[0].get("event_type") != event_type
+        or matches[0].get("prev_event_sha256") != expected_head_sha256
+        or matches[0].get("recorded_at") != recorded_at
+        or len(events) < 2
+    ):
+        raise HarnessError(
+            f"semantic {label} command is not the matching terminal transition"
+        )
+    try:
+        before = projection_domain(replay_events(events[:-1]))
+        after = projection_domain(replay_events(events))
+    except SemanticEventError as exc:
+        raise HarnessError(
+            f"semantic {label} retry cannot replay its transition: {exc}"
+        ) from exc
+    return before, after
+
+
+def _semantic_exact_test_retry_states(
+    paths: HarnessPaths,
+    task_id: str,
+    *,
+    command_id: str,
+    expected_head_sha256: str,
+    recorded_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    retry = _semantic_verification_retry_states(
+        paths,
+        task_id,
+        command_id=command_id,
+        expected_head_sha256=expected_head_sha256,
+        recorded_at=recorded_at,
+        event_type=_EXACT_TEST_SEMANTIC_EVENT_TYPE,
+        label="exact-test",
+    )
+    if retry is None:
+        return None
+    before, after = retry
+    before_records = before.get("verification")
+    after_records = after.get("verification")
+    if (
+        not isinstance(before_records, list)
+        or not isinstance(after_records, list)
+        or len(after_records) != len(before_records) + 1
+        or after_records[:-1] != before_records
+        or not isinstance(after_records[-1], dict)
+    ):
+        raise HarnessError(
+            "published semantic exact-test transition does not append exactly "
+            "one verification record"
+        )
+    return before, after
+
+
+def _semantic_verification_supersession_retry_states(
+    paths: HarnessPaths,
+    task_id: str,
+    *,
+    command_id: str,
+    expected_head_sha256: str,
+    recorded_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    retry = _semantic_verification_retry_states(
+        paths,
+        task_id,
+        command_id=command_id,
+        expected_head_sha256=expected_head_sha256,
+        recorded_at=recorded_at,
+        event_type=_VERIFICATION_SUPERSEDED_SEMANTIC_EVENT_TYPE,
+        label="verification supersession",
+    )
+    if retry is None:
+        return None
+    before, after = retry
+    before_records = before.get("verification")
+    after_records = after.get("verification")
+    if (
+        not isinstance(before_records, list)
+        or not isinstance(after_records, list)
+        or len(after_records) != len(before_records)
+        or sum(
+            left != right
+            for left, right in zip(before_records, after_records, strict=True)
+        )
+        != 1
+    ):
+        raise HarnessError(
+            "published semantic verification supersession must change exactly "
+            "one verification record"
+        )
+    return before, after
+
+
 def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
     with state_lock(paths):
         state = load_task(paths, args.task)
+        exact_receipt_values = list(getattr(args, "exact_test_receipt", []) or [])
+        exact_log_values = list(getattr(args, "exact_test_log", []) or [])
+        exact_matrix_required = bool(
+            getattr(args, "exact_test_require_github_matrix", False)
+        )
+        exact_requested = bool(
+            exact_receipt_values or exact_log_values or exact_matrix_required
+        )
+        if exact_requested:
+            if len(exact_receipt_values) != 1 or len(exact_log_values) != 1:
+                raise HarnessError(
+                    "exact-test evidence requires exactly one "
+                    "--exact-test-receipt and exactly one --exact-test-log"
+                )
+            for value, label in (
+                (exact_receipt_values[0], "--exact-test-receipt"),
+                (exact_log_values[0], "--exact-test-log"),
+            ):
+                path_text, separator, _digest = value.rpartition("=")
+                if not separator or not Path(path_text).expanduser().is_absolute():
+                    raise HarnessError(
+                        f"{label} must use absolute-path=sha256"
+                    )
+        semantic_v2 = "_semantic" in state
+        semantic_command_id = str(
+            getattr(args, "semantic_command_id", "") or ""
+        ).strip()
+        semantic_expected_head = str(
+            getattr(args, "semantic_expected_head_sha256", "") or ""
+        ).strip()
+        semantic_recorded_at = str(
+            getattr(args, "semantic_recorded_at", "") or ""
+        ).strip()
+        semantic_retry_after: dict[str, Any] | None = None
+        semantic_result: semantic_store_impl.SemanticAppendResult | None = None
+        if semantic_v2:
+            if not exact_requested:
+                raise HarnessError(
+                    "semantic-v2 add-verification currently requires exact-test "
+                    "evidence"
+                )
+            validate_id(semantic_command_id, "semantic command id")
+            if not re.fullmatch(r"[0-9a-f]{64}", semantic_expected_head):
+                raise HarnessError(
+                    "semantic-v2 exact-test evidence requires "
+                    "--semantic-expected-head-sha256"
+                )
+            if not semantic_recorded_at:
+                raise HarnessError(
+                    "semantic-v2 exact-test evidence requires "
+                    "--semantic-recorded-at"
+                )
+            _require_semantic_recorded_at(
+                semantic_recorded_at, "--semantic-recorded-at"
+            )
+            retry_states = _semantic_exact_test_retry_states(
+                paths,
+                args.task,
+                command_id=semantic_command_id,
+                expected_head_sha256=semantic_expected_head,
+                recorded_at=semantic_recorded_at,
+            )
+            if retry_states is not None:
+                retry_errors = verification_integrity_errors(paths, state)
+                if retry_errors:
+                    raise HarnessError(
+                        "published semantic exact-test verification failed "
+                        "integrity validation: "
+                        + "; ".join(retry_errors)
+                    )
+                state, semantic_retry_after = retry_states
+        elif semantic_command_id or semantic_expected_head or semantic_recorded_at:
+            raise HarnessError(
+                "semantic exact-test options require a semantic-v2 task"
+            )
+        if exact_requested and not semantic_v2:
+            raise HarnessError(
+                "new exact-test evidence requires a semantic-v2 task so its "
+                "record is anchored in the authenticated event chain"
+            )
         require_open_task(state, "add verification to")
         if args.lane_id:
             lane_by_id(state, args.lane_id)
@@ -3126,6 +3431,45 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
         prepared_artifact_refs = prepare_bound_artifacts(
             args.artifact_ref, "verification artifact ref"
         )
+        exact_prepared: list[dict[str, Any]] = []
+        exact_receipt: dict[str, Any] | None = None
+        if exact_requested:
+            # Read the externally retained pair once, before publishing any CAS
+            # object.  All strict receipt, log, status, matrix, and source
+            # checks below consume only these stable bytes.
+            exact_prepared = prepare_bound_artifacts(
+                [exact_receipt_values[0], exact_log_values[0]],
+                "exact-test evidence",
+            )
+            receipt_bytes = bytes(exact_prepared[0]["data"])
+            log_bytes = bytes(exact_prepared[1]["data"])
+            try:
+                exact_receipt = (
+                    exact_test_receipts_impl.parse_exact_test_receipt_bytes(
+                        receipt_bytes,
+                        require_github_matrix=exact_matrix_required,
+                    )
+                )
+            except exact_test_receipts_impl.ExactTestReceiptError as exc:
+                raise HarnessError(f"exact-test receipt is invalid: {exc}") from exc
+            receipt_log = exact_receipt["log"]
+            if (
+                len(log_bytes) != receipt_log["size"]
+                or hashlib.sha256(log_bytes).hexdigest() != receipt_log["sha256"]
+            ):
+                raise HarnessError(
+                    "exact-test combined log bytes differ from the receipt"
+                )
+            expected_status = "pass" if exact_receipt["accepted"] else "fail"
+            if args.status != expected_status:
+                raise HarnessError(
+                    "exact-test receipt maps to verification status "
+                    f"{expected_status!r}, not {args.status!r}"
+                )
+            _require_live_exact_test_source_identity(
+                state_worktree(paths, state),
+                exact_receipt,
+            )
         review_packet = None
         reviewer_agent_id: str | None = None
         if args.category == "independent_review":
@@ -3166,8 +3510,13 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
         artifact_refs = preserve_bound_artifacts(
             paths, args.task, prepared_artifact_refs
         )
+        recorded_at = semantic_recorded_at if exact_receipt is not None else now_iso()
         item = {
-            "integrity_version": 1,
+            "integrity_version": (
+                verification_integrity_impl.EXACT_TEST_VERIFICATION_INTEGRITY_VERSION
+                if exact_receipt is not None
+                else 1
+            ),
             "artifact_snapshot_version": 1,
             "category": category,
             "status": args.status,
@@ -3177,8 +3526,53 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "run_id": args.run_id or "",
             "lane_id": args.lane_id or "",
             "artifact_refs": artifact_refs,
-            "recorded_at": now_iso(),
+            "recorded_at": recorded_at,
         }
+        exact_binding_bytes: bytes | None = None
+        if exact_receipt is not None:
+            receipt_artifact = (
+                evidence_artifacts_impl.preserve_generated_artifact_blob(
+                    paths,
+                    args.task,
+                    bytes(exact_prepared[0]["data"]),
+                    label="exact-test receipt",
+                    max_bytes=exact_test_receipts_impl.MAX_RECEIPT_BYTES,
+                )
+            )
+            log_artifact = evidence_artifacts_impl.preserve_generated_artifact_blob(
+                paths,
+                args.task,
+                bytes(exact_prepared[1]["data"]),
+                label="exact-test combined log",
+                max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
+            )
+            exact_test_evidence = {
+                "schema_version": 1,
+                "receipt_artifact": receipt_artifact,
+                "log_artifact": log_artifact,
+                "receipt_file_sha256": exact_prepared[0]["sha256"],
+                "receipt_sha256": exact_receipt["receipt_sha256"],
+                "log_sha256": exact_receipt["log"]["sha256"],
+                "source": {
+                    key: exact_receipt["source"][key]
+                    for key in ("head", "index_tree", "manifest_sha256")
+                },
+                "platform": copy.deepcopy(exact_receipt["platform"]),
+                "github_matrix_identity": copy.deepcopy(
+                    exact_receipt["github_matrix_identity"]
+                ),
+                "github_matrix_required": exact_matrix_required,
+                "accepted": exact_receipt["accepted"],
+                "terminal_status": exact_receipt["terminal_status"],
+                "pytest_exit_code": exact_receipt["pytest_exit_code"],
+                "semantic_transition": {
+                    "event_type": _EXACT_TEST_SEMANTIC_EVENT_TYPE,
+                    "command_id": semantic_command_id,
+                    "expected_head_sha256": semantic_expected_head,
+                    "recorded_at": semantic_recorded_at,
+                },
+            }
+            item["exact_test_evidence"] = exact_test_evidence
         if asserts_completion_boundary:
             item["asserts_completion_boundary"] = True
             # Bind the assertion to the exact boundary text it covered so a
@@ -3191,11 +3585,112 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
             item["review_packet_id"] = review_packet["packet_id"]
             item["review_result_sha256"] = review_packet["result_sha256"]
             item["reviewer_agent_id"] = reviewer_agent_id
-        state.setdefault("verification", []).append(item)
-        bump_task(state)
-        write_task(paths, state)
+        if exact_receipt is not None:
+            # Recheck after CAS publication and immediately before the
+            # immutable binding/event transition.  The earlier check prevents
+            # known drift from causing any CAS side effect; this second check
+            # fails closed on drift concurrent with CAS publication.
+            _require_live_exact_test_source_identity(
+                state_worktree(paths, state),
+                exact_receipt,
+            )
+            exact_binding_bytes, exact_binding_sha256 = (
+                verification_integrity_impl.exact_test_binding_bytes(
+                    args.task,
+                    len(state.get("verification", [])) + 1,
+                    item,
+                )
+            )
+            item["exact_test_evidence"]["binding_sha256"] = (
+                exact_binding_sha256
+            )
+            candidate = copy.deepcopy(state)
+            candidate["verification_integrity_version"] = 2
+            candidate.setdefault("verification", []).append(copy.deepcopy(item))
+            bump_task(candidate)
+            candidate["updated_at"] = semantic_recorded_at
+            if semantic_retry_after is not None:
+                if candidate != semantic_retry_after:
+                    raise HarnessError(
+                        "semantic exact-test retry differs from the published "
+                        "verification transition"
+                    )
+            candidate_errors = verification_integrity_errors(
+                paths,
+                candidate,
+                pending_exact_test_bindings={
+                    str(item["exact_test_evidence"]["binding_sha256"]): bytes(
+                        exact_binding_bytes or b""
+                    )
+                },
+            )
+            if candidate_errors:
+                raise HarnessError(
+                    "verification candidate failed integrity validation: "
+                    + "; ".join(candidate_errors)
+                )
+            assert exact_binding_bytes is not None
+            exact_binding_sha256 = str(
+                item["exact_test_evidence"]["binding_sha256"]
+            )
+            exact_binding_path = (
+                verification_integrity_impl.exact_test_binding_path(
+                    paths, args.task, exact_binding_sha256
+                )
+            )
+            if exact_binding_path.exists():
+                _path, existing_binding = read_regular_artifact(
+                    exact_binding_path,
+                    "existing exact-test immutable binding",
+                    max_bytes=verification_integrity_impl.EXACT_TEST_BINDING_MAX_BYTES,
+                )
+                if existing_binding != exact_binding_bytes:
+                    raise HarnessError(
+                        "existing exact-test immutable binding differs from "
+                        "the verification candidate"
+                    )
+            else:
+                if semantic_retry_after is not None:
+                    raise HarnessError(
+                        "published semantic exact-test immutable binding is missing"
+                    )
+                atomic_create_bytes(exact_binding_path, exact_binding_bytes)
+            if semantic_retry_after is None:
+                semantic_result = semantic_store_impl.append_semantic_transition(
+                    paths,
+                    args.task,
+                    candidate,
+                    event_type=_EXACT_TEST_SEMANTIC_EVENT_TYPE,
+                    command_id=semantic_command_id,
+                    recorded_at=recorded_at,
+                    authority_ref=str(
+                        getattr(args, "_aoi_authority_ref", "") or ""
+                    ),
+                    expected_head_sha256=semantic_expected_head,
+                )
+            else:
+                semantic_result = (
+                    semantic_store_impl.recover_published_semantic_transition(
+                        paths,
+                        args.task,
+                        candidate,
+                        event_type=_EXACT_TEST_SEMANTIC_EVENT_TYPE,
+                        command_id=semantic_command_id,
+                        expected_head_sha256=semantic_expected_head,
+                    )
+                )
+        else:
+            state.setdefault("verification", []).append(item)
+            bump_task(state)
+            write_task(paths, state)
         write_index(paths)
-    emit(item, args.json)
+    emitted_item = copy.deepcopy(item)
+    if semantic_result is not None:
+        emitted_item["semantic_head_sha256"] = semantic_result.event[
+            "event_sha256"
+        ]
+        emitted_item["idempotent_replay"] = semantic_result.idempotent_replay
+    emit(emitted_item, args.json)
     return 0
 
 
@@ -3862,6 +4357,54 @@ def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) ->
 
     with state_lock(paths):
         state = load_task(paths, args.task)
+        semantic_v2 = "_semantic" in state
+        semantic_command_id = str(
+            getattr(args, "semantic_command_id", "") or ""
+        ).strip()
+        semantic_expected_head = str(
+            getattr(args, "semantic_expected_head_sha256", "") or ""
+        ).strip()
+        semantic_recorded_at = str(
+            getattr(args, "semantic_recorded_at", "") or ""
+        ).strip()
+        semantic_retry_after: dict[str, Any] | None = None
+        semantic_result: semantic_store_impl.SemanticAppendResult | None = None
+        if semantic_v2:
+            validate_id(semantic_command_id, "semantic command id")
+            if not re.fullmatch(r"[0-9a-f]{64}", semantic_expected_head):
+                raise HarnessError(
+                    "semantic-v2 verification supersession requires "
+                    "--semantic-expected-head-sha256"
+                )
+            if not semantic_recorded_at:
+                raise HarnessError(
+                    "semantic-v2 verification supersession requires "
+                    "--semantic-recorded-at"
+                )
+            _require_semantic_recorded_at(
+                semantic_recorded_at, "--semantic-recorded-at"
+            )
+            retry_states = _semantic_verification_supersession_retry_states(
+                paths,
+                args.task,
+                command_id=semantic_command_id,
+                expected_head_sha256=semantic_expected_head,
+                recorded_at=semantic_recorded_at,
+            )
+            if retry_states is not None:
+                retry_errors = verification_integrity_errors(paths, state)
+                if retry_errors:
+                    raise HarnessError(
+                        "published semantic verification supersession failed "
+                        "integrity validation: "
+                        + "; ".join(retry_errors)
+                    )
+                state, semantic_retry_after = retry_states
+        elif semantic_command_id or semantic_expected_head or semantic_recorded_at:
+            raise HarnessError(
+                "semantic verification supersession options require a "
+                "semantic-v2 task"
+            )
         require_open_task(state, "supersede verification for")
         records = state.get("verification", [])
         source_index = int(args.verification_index) - 1
@@ -3922,24 +4465,66 @@ def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) ->
         )
         source["original_status"] = source.get("status")
         source["status"] = "skipped"
-        source["superseded_at"] = now_iso()
+        source["superseded_at"] = (
+            semantic_recorded_at if semantic_v2 else now_iso()
+        )
         source["supersession_reason"] = supersession_reason
         source["supersession_version"] = 2
         source["source_record_sha256"] = expected_source_sha
         source["replacement_index"] = replacement_index + 1
         source["replacement_record_sha256"] = expected_replacement_sha
         bump_task(state)
-        write_task(paths, state)
+        if semantic_v2:
+            state["updated_at"] = semantic_recorded_at
+            if semantic_retry_after is not None and state != semantic_retry_after:
+                raise HarnessError(
+                    "semantic verification supersession retry differs from the "
+                    "published transition"
+                )
+            candidate_errors = verification_integrity_errors(paths, state)
+            if candidate_errors:
+                raise HarnessError(
+                    "verification supersession candidate failed integrity "
+                    "validation: "
+                    + "; ".join(candidate_errors)
+                )
+            if semantic_retry_after is None:
+                semantic_result = semantic_store_impl.append_semantic_transition(
+                    paths,
+                    args.task,
+                    state,
+                    event_type=_VERIFICATION_SUPERSEDED_SEMANTIC_EVENT_TYPE,
+                    command_id=semantic_command_id,
+                    recorded_at=semantic_recorded_at,
+                    authority_ref=str(
+                        getattr(args, "_aoi_authority_ref", "") or ""
+                    ),
+                    expected_head_sha256=semantic_expected_head,
+                )
+            else:
+                semantic_result = (
+                    semantic_store_impl.recover_published_semantic_transition(
+                        paths,
+                        args.task,
+                        state,
+                        event_type=_VERIFICATION_SUPERSEDED_SEMANTIC_EVENT_TYPE,
+                        command_id=semantic_command_id,
+                        expected_head_sha256=semantic_expected_head,
+                    )
+                )
+        else:
+            write_task(paths, state)
         write_index(paths)
-    emit(
-        {
-            "task_id": args.task,
-            "verification_index": source_index + 1,
-            "replacement_index": replacement_index + 1,
-            "status": "skipped",
-        },
-        args.json,
-    )
+    result = {
+        "task_id": args.task,
+        "verification_index": source_index + 1,
+        "replacement_index": replacement_index + 1,
+        "status": "skipped",
+    }
+    if semantic_result is not None:
+        result["semantic_head_sha256"] = semantic_result.event["event_sha256"]
+        result["idempotent_replay"] = semantic_result.idempotent_replay
+    emit(result, args.json)
     return 0
 
 
@@ -6573,7 +7158,9 @@ def close_gate(
         if not verification:
             failures.append("no verification/evidence record")
         if not any(
-            item.get("integrity_version") == 1
+            _supported_verification_integrity_version(
+                item.get("integrity_version")
+            )
             and item.get("status") == "pass"
             and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
             for item in verification
@@ -6585,7 +7172,9 @@ def close_gate(
             str(state.get("completion_boundary", "")).encode("utf-8")
         ).hexdigest()
         if verification and not any(
-            item.get("integrity_version") == 1
+            _supported_verification_integrity_version(
+                item.get("integrity_version")
+            )
             and item.get("status") == "pass"
             and item.get("category") in CLOSE_QUALIFYING_CATEGORIES
             and item.get("asserts_completion_boundary") is True
@@ -7330,7 +7919,11 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 terminal_verification, start=1
             ):
                 destination = (
-                    warnings if item.get("integrity_version") != 1 else errors
+                    errors
+                    if _supported_verification_integrity_version(
+                        item.get("integrity_version")
+                    )
+                    else warnings
                 )
                 prefix = (
                     "legacy terminal task" if destination is warnings else "terminal task"
@@ -7349,7 +7942,12 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             graph_destination = (
                 warnings
                 if supersession_records
-                and all(item.get("integrity_version") != 1 for item in supersession_records)
+                and all(
+                    not _supported_verification_integrity_version(
+                        item.get("integrity_version")
+                    )
+                    for item in supersession_records
+                )
                 else errors
             )
             graph_prefix = (
@@ -7360,6 +7958,12 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             graph_destination.extend(
                 f"{graph_prefix} {task_id}: {message}"
                 for message in verification_supersession_errors(task)
+            )
+            errors.extend(
+                f"terminal task {task_id}: {message}"
+                for message in verification_integrity_impl.exact_test_binding_ledger_integrity_errors(
+                    paths, task
+                )
             )
 
         for packet in task.get("packets", []):
@@ -8485,6 +9089,7 @@ def _reload_locked_paths(paths: HarnessPaths) -> HarnessPaths:
 
 
 _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
+    "add-verification",
     "check-locks",
     "close-task",
     "cohort-round-prepare",
@@ -8517,6 +9122,7 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "semantic-migration-rollback",
     "status",
     "verify-backup",
+    "verification-supersede",
 }
 
 

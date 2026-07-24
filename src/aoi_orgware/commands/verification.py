@@ -70,6 +70,55 @@ def register_verification_commands(
     parser.add_argument("--run-id")
     parser.add_argument("--lane-id")
     parser.add_argument("--artifact-ref", action="append", default=[])
+    parser.add_argument(
+        "--exact-test-receipt",
+        action="append",
+        default=[],
+        metavar="ABSOLUTE-PATH=SHA256",
+        help=(
+            "bind exactly one canonical exact-test receipt; requires one "
+            "--exact-test-log"
+        ),
+    )
+    parser.add_argument(
+        "--exact-test-log",
+        action="append",
+        default=[],
+        metavar="ABSOLUTE-PATH=SHA256",
+        help=(
+            "bind exactly one separately retained exact-test combined log; "
+            "requires one --exact-test-receipt"
+        ),
+    )
+    parser.add_argument(
+        "--exact-test-require-github-matrix",
+        action="store_true",
+        help=(
+            "require the exact-test receipt to contain its complete GitHub "
+            "matrix identity"
+        ),
+    )
+    parser.add_argument(
+        "--semantic-command-id",
+        help=(
+            "stable idempotency key required when recording exact-test "
+            "evidence on a semantic-v2 task"
+        ),
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help=(
+            "exact semantic ledger head required when recording exact-test "
+            "evidence on a semantic-v2 task"
+        ),
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help=(
+            "caller-stable timezone-aware event time required for crash-safe "
+            "semantic exact-test retry"
+        ),
+    )
     parser.add_argument("--review-packet-id")
     parser.add_argument(
         "--asserts-completion-boundary",
@@ -120,6 +169,18 @@ def register_verification_commands(
     parser.add_argument("--replacement-index", type=int, required=True)
     parser.add_argument("--replacement-record-sha256", required=True)
     parser.add_argument("--reason", required=True)
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required for semantic-v2 supersession",
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic ledger head required for semantic-v2 supersession",
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help="caller-stable timezone-aware semantic-v2 supersession time",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["verification_supersede"])
 

@@ -40,8 +40,13 @@ class ModuleSurfaceTests(unittest.TestCase):
         self.assertEqual(
             set(vi.__all__),
             {
+                "EXACT_TEST_BINDING_MAX_BYTES",
+                "EXACT_TEST_VERIFICATION_INTEGRITY_VERSION",
                 "SUPERSESSION_MUTATION_FIELDS",
                 "VerificationPolicy",
+                "exact_test_binding_bytes",
+                "exact_test_binding_ledger_integrity_errors",
+                "exact_test_binding_path",
                 "verification_integrity_errors",
                 "verification_integrity_warnings",
                 "verification_legacy_materialization_preimage",
@@ -312,7 +317,102 @@ class RecordIntegrityErrorsTests(unittest.TestCase):
         errors = vi.verification_record_integrity_errors(
             None, state, policy=self._policy({"unit_test"})
         )
-        self.assertEqual(errors, ["verification #1 lacks integrity_version=1"])
+        self.assertEqual(
+            errors,
+            [
+                "verification #1 lacks integrity_version=1 or exact-test "
+                "integrity_version=2"
+            ],
+        )
+
+    def test_exact_test_evidence_uses_one_closed_schema(self) -> None:
+        record: dict[str, object] = {
+            "integrity_version": 2,
+            "category": "unit_test",
+            "status": "pass",
+            "evidence": "Exact receipt contract was retained in task CAS",
+            "boundary": "Only the receipt-bound exact source snapshot",
+            "command": "python -m pytest -q",
+            "artifact_refs": [],
+        }
+        for malformed in (None, {"schema_version": 1, "extra": True}):
+            with self.subTest(malformed=malformed):
+                record["exact_test_evidence"] = malformed
+                errors = vi.verification_record_integrity_errors(
+                    None,
+                    {"task_id": "task", "verification": [record]},
+                    policy=self._policy({"unit_test"}),
+                )
+                self.assertEqual(
+                    errors,
+                    ["verification #1 exact-test evidence schema is invalid"],
+                )
+
+    def test_exact_test_evidence_requires_cas_paths_but_legacy_does_not(self) -> None:
+        record = {
+            "integrity_version": 2,
+            "category": "unit_test",
+            "status": "pass",
+            "evidence": "Exact receipt contract was retained in task CAS",
+            "boundary": "Only the receipt-bound exact source snapshot",
+            "command": "python -m pytest -q",
+            "artifact_refs": [],
+            "exact_test_evidence": {
+                "schema_version": 1,
+                "receipt_artifact": {},
+                "log_artifact": {},
+                "receipt_file_sha256": "a" * 64,
+                "receipt_sha256": "b" * 64,
+                "log_sha256": "c" * 64,
+                "source": {
+                    "head": "d" * 40,
+                    "index_tree": "e" * 40,
+                    "manifest_sha256": "f" * 64,
+                },
+                "platform": {},
+                "github_matrix_identity": None,
+                "github_matrix_required": False,
+                "accepted": True,
+                "terminal_status": "completed",
+                "pytest_exit_code": 0,
+                "semantic_transition": {
+                    "event_type": "verification_added",
+                    "command_id": "record-exact-v1",
+                    "expected_head_sha256": "1" * 64,
+                    "recorded_at": "2026-07-24T12:00:00+00:00",
+                },
+                "binding_sha256": "0" * 64,
+            },
+            "recorded_at": "2026-07-24T12:00:00+00:00",
+        }
+        state = {"task_id": "task", "verification": [record]}
+        errors = vi.verification_record_integrity_errors(
+            None, state, policy=self._policy({"unit_test"})
+        )
+        self.assertEqual(
+            errors,
+            [
+                "verification #1 exact-test evidence cannot be verified "
+                "without AOI paths"
+            ],
+        )
+        record.pop("exact_test_evidence")
+        self.assertEqual(
+            vi.verification_record_integrity_errors(
+                None, state, policy=self._policy({"unit_test"})
+            ),
+            [
+                "verification #1 exact-test integrity_version=2 requires "
+                "exact_test_evidence"
+            ],
+        )
+        record["integrity_version"] = 1
+        self.assertEqual(
+            vi.verification_record_integrity_errors(
+                None, state, policy=self._policy({"unit_test"})
+            ),
+            [],
+        )
 
     def test_independent_reviewer_identity_preserves_legacy_read_compatibility(self) -> None:
         record = {
