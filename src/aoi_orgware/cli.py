@@ -3451,6 +3451,7 @@ def cmd_add_verification(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     exact_test_receipts_impl.parse_exact_test_receipt_bytes(
                         receipt_bytes,
                         require_github_matrix=exact_matrix_required,
+                        require_current_protocol=True,
                     )
                 )
             except exact_test_receipts_impl.ExactTestReceiptError as exc:

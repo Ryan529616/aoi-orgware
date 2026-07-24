@@ -58,17 +58,51 @@ python -m venv <release-root>/build-env
 <release-root>/build-env/bin/python -I -m pip install --isolated --no-index \
   --find-links <release-root>/release-tool-wheelhouse --require-hashes \
   -r requirements/release-tools.lock
+<release-root>/build-env/bin/python -I scripts/release_rehearsal.py \
+  release-toolchain --output <release-root>/release-toolchain.json
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
 <release-root>/build-env/bin/python -I -m build --no-isolation \
   --sdist --wheel --outdir <release-root>/dist
+<release-root>/build-env/bin/python -I -m twine check --strict <release-root>/dist/*
 <release-root>/build-env/bin/python -I scripts/verify_dist.py \
   --dist-dir <release-root>/dist --expected-version <version> \
   --build-python <release-root>/build-env/bin/python \
   --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
 ```
 
-PowerShell uses `<release-root>\build-env\Scripts\python.exe`. The expected
-artifact set is:
+The equivalent PowerShell sequence is:
+
+```powershell
+$releaseRoot = '<release-root>'
+$wheelhouse = Join-Path $releaseRoot 'release-tool-wheelhouse'
+$buildEnv = Join-Path $releaseRoot 'build-env'
+$buildPython = Join-Path $buildEnv 'Scripts\python.exe'
+$distRoot = Join-Path $releaseRoot 'dist'
+
+python -m pip download --isolated --require-hashes --only-binary=:all: `
+  --dest $wheelhouse -r requirements/release-tools.lock
+python -m venv $buildEnv
+& $buildPython -I -m pip install --isolated --no-index `
+  --find-links $wheelhouse --require-hashes `
+  -r requirements/release-tools.lock
+& $buildPython -I scripts/release_rehearsal.py release-toolchain `
+  --output (Join-Path $releaseRoot 'release-toolchain.json')
+$env:SOURCE_DATE_EPOCH = (& git show -s --format=%ct HEAD).Trim()
+try {
+  & $buildPython -I -m build --no-isolation --sdist --wheel `
+    --outdir $distRoot
+} finally {
+  Remove-Item Env:SOURCE_DATE_EPOCH -ErrorAction SilentlyContinue
+}
+$distArtifacts = Get-ChildItem -LiteralPath $distRoot -File |
+  Select-Object -ExpandProperty FullName
+& $buildPython -I -m twine check --strict @distArtifacts
+& $buildPython -I scripts/verify_dist.py --dist-dir $distRoot `
+  --expected-version '<version>' --build-python $buildPython `
+  --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
+```
+
+The expected artifact set is:
 
 ```text
 aoi_orgware-<version>-py3-none-any.whl
@@ -78,10 +112,16 @@ aoi_orgware-<version>.tar.gz
 `requirements/release-tools.lock` is the canonical hash-pinned release
 toolchain. Download its wheels first, verify every hash, then install from that
 wheelhouse with networking disabled; the producer receipt records the lock
-SHA-256 and the exact name, version, and artifact SHA-256 for all eleven locked
-distributions. Before `-I -m pytest` runs the O7 modules, install the exact
-inventory-selected built wheel; no ambient install or replacement rebuild may
-substitute for it.
+SHA-256 and the exact name, version, and complete allowed artifact SHA-256 set
+for all 32 locked distributions (40 wheel hashes total). This includes
+`twine==6.2.0` and every selected transitive dependency, with wheel hashes for
+CPython 3.11--3.14 on Linux and Windows. Generate that receipt only through
+the locked interpreter with `scripts/release_rehearsal.py release-toolchain`;
+the command also verifies every recorded distribution version is installed.
+Run `twine check --strict` only through that offline build environment; no
+ambient Twine install or module invocation may supply it. Before `-I -m pytest`
+runs the O7 modules, install the exact inventory-selected built wheel; no
+ambient install or replacement rebuild may substitute for it.
 
 `scripts/verify_dist.py` installs the wheel and sdist independently in fresh
 environments, checks packaged resources and exact metadata/runtime versions,
@@ -362,7 +402,7 @@ The release workflow:
 4. builds and strictly checks one wheel and one sdist;
 5. installs the exact inventory-selected wheel before `-I` O7 tests and runs
    `scripts/verify_dist.py` against both artifacts;
-6. records the eleven-distribution toolchain receipt, the exact annotated tag
+6. records the 32-distribution, 40-wheel-hash toolchain receipt, the exact annotated tag
    object-to-commit/tree binding, and the producer evidence;
 7. inventories each exact upload directory/file, including wheel/ZIP and
    gzip-tar members, and requires an allowed destination-bound confidentiality

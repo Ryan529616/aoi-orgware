@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,244 @@ def test_clean_pass_and_canonical_receipt(tmp_path: Path) -> None:
     assert receipt["accepted"] is True
     assert receipt["producer"]["invoker"] is None
     assert parse_exact_test_receipt_bytes((tmp_path / "receipt.json").read_bytes())["receipt_sha256"] == receipt["receipt_sha256"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--pyargs", "demo"],
+        ["-p", "external_plugin"],
+        ["-pno:terminal"],
+        ["--quiet"],
+        ["--color=no"],
+        ["--maxfail=1"],
+        ["-c", "outside.ini"],
+        ["--rootdir=.."],
+        ["--confcutdir=.."],
+        ["--import-mode=append"],
+        ["-o", "pythonpath=.."],
+        ["--override-ini=pythonpath=.."],
+        ["@outside.args"],
+        ["@tests/inside.args"],
+        ["--"],
+        ["../outside.py"],
+        ["tests/../../outside.py"],
+        ["tests/../tests/test_demo.py"],
+        ["--ignore=tests/../tests/test_demo.py"],
+        [r"C:\outside.py"],
+        ["C:/outside.py"],
+        ["C:outside.py"],
+        [r"\\server\share\outside.py"],
+        [r"\\?\C:\outside.py"],
+    ],
+)
+def test_pytest_argv_rejects_external_collection_surfaces(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    repo = _repo(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("def test_unrelated():\n    assert True\n")
+    with pytest.raises(ExactTestReceiptError):
+        run_clean_commit_source_tree(
+            repo=repo,
+            pytest_argv=argv,
+            receipt_path=tmp_path / "unsafe.json",
+            logs_dir=tmp_path / "unsafe-logs",
+        )
+    assert not (tmp_path / "unsafe.json").exists()
+
+
+def test_pytest_argv_accepts_only_candidate_target_and_output_format(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    receipt = run_clean_commit_source_tree(
+        repo=repo,
+        pytest_argv=[
+            "-q",
+            "--tb=short",
+            "tests/test_demo.py::test_ok",
+        ],
+        receipt_path=tmp_path / "targeted.json",
+        logs_dir=tmp_path / "targeted-logs",
+    )
+    assert receipt["accepted"] is True
+    assert receipt["invocation"]["argv"] == [
+        "-q",
+        "--tb=short",
+        "tests/test_demo.py::test_ok",
+    ]
+    assert receipt["invocation"]["requested_argv"] == receipt["invocation"]["argv"]
+    assert receipt["producer"]["version"] == receipts.RUNNER_VERSION
+    assert (
+        receipt["invocation"]["argument_contract"]
+        == receipts.PYTEST_ARGUMENT_CONTRACT
+    )
+    assert receipt["invocation"]["config"]["sha256"] == receipts._PYTEST_CONFIG_SHA256
+    assert receipt["invocation"]["rootdir_role"] == "private_git_blob_snapshot"
+    assert receipt["invocation"]["confcutdir_role"] == "private_git_blob_snapshot"
+
+
+def test_pytest_argv_canonicalizes_directory_and_accepts_contained_ignore(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / "tests" / "test_ignored.py").write_text(
+        "def test_ignored():\n    assert False\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "ignored fixture",
+        ],
+        check=True,
+    )
+    receipt = run_clean_commit_source_tree(
+        repo=repo,
+        pytest_argv=[
+            "-q",
+            "tests/",
+            "--ignore=tests/test_ignored.py",
+        ],
+        receipt_path=tmp_path / "canonical.json",
+        logs_dir=tmp_path / "canonical-logs",
+    )
+    assert receipt["accepted"] is True
+    assert receipt["invocation"]["argv"] == [
+        "-q",
+        "tests",
+        "--ignore=tests/test_ignored.py",
+    ]
+    assert receipt["invocation"]["requested_argv"] == [
+        "-q",
+        "tests/",
+        "--ignore=tests/test_ignored.py",
+    ]
+
+
+def test_pytest_argv_rejects_missing_snapshot_target(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    with pytest.raises(ExactTestReceiptError, match="unavailable"):
+        run_clean_commit_source_tree(
+            repo=repo,
+            pytest_argv=["-q", "tests/missing.py"],
+            receipt_path=tmp_path / "missing.json",
+            logs_dir=tmp_path / "missing-logs",
+        )
+
+
+def test_external_pass_cannot_mask_internal_failure(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "def test_internal_failure():\n    assert False\n")
+    outside = tmp_path / "outside_pass.py"
+    outside.write_text("def test_unrelated_pass():\n    assert True\n")
+    with pytest.raises(ExactTestReceiptError):
+        run_clean_commit_source_tree(
+            repo=repo,
+            pytest_argv=[str(outside.resolve())],
+            receipt_path=tmp_path / "false-pass.json",
+            logs_dir=tmp_path / "false-pass-logs",
+        )
+    assert not (tmp_path / "false-pass.json").exists()
+
+
+def test_fixed_config_root_and_environment_ignore_ambient_pytest_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / "pytest.ini").write_text(
+        "[pytest]\naddopts = --pyargs definitely_missing_external_package\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "pytest.ini"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "hostile candidate config",
+        ],
+        check=True,
+    )
+    original_run = receipts.subprocess.run
+    original_snapshot = receipts._snapshot
+    observed: dict[str, object] = {}
+
+    def snapshot_with_hostile_parent(source: Path, destination: Path) -> tuple[str, int]:
+        result = original_snapshot(source, destination)
+        if destination.name == "snapshot":
+            (destination.parent / "conftest.py").write_text(
+                "raise RuntimeError('snapshot parent conftest must not load')\n"
+            )
+        return result
+
+    def capture_pytest(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        command = args[0]
+        if (
+            isinstance(command, list)
+            and len(command) >= 3
+            and command[1:3] == ["-m", "pytest"]
+        ):
+            observed["command"] = list(command)
+            observed["env"] = dict(kwargs["env"])
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(receipts, "_snapshot", snapshot_with_hostile_parent)
+    monkeypatch.setattr(receipts.subprocess, "run", capture_pytest)
+    inherited = {
+        key: os.environ[key]
+        for key in receipts._ENV_ALLOWLIST
+        if key in os.environ
+    }
+    inherited.update(
+        {
+            "PYTEST_ADDOPTS": "--pyargs external",
+            "PYTEST_PLUGINS": "external_plugin",
+            "PYTHONHOME": str(tmp_path / "external-home"),
+            "PYTHONPATH": str(tmp_path / "external-path"),
+            "PYTHONSTARTUP": str(tmp_path / "startup.py"),
+        }
+    )
+    receipt = run_clean_commit_source_tree(
+        repo=repo,
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "isolated.json",
+        logs_dir=tmp_path / "isolated-logs",
+        inherited_env=inherited,
+    )
+    assert receipt["accepted"] is True
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert command[-2:] == ["-q", "tests"]
+    assert "-c" in command
+    assert any(str(item).startswith("--rootdir=") for item in command)
+    assert any(str(item).startswith("--confcutdir=") for item in command)
+    child_env = observed["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert child_env["PYTHONNOUSERSITE"] == "1"
+    assert child_env["PYTHONDONTWRITEBYTECODE"] == "1"
+    for forbidden in (
+        "PYTEST_ADDOPTS",
+        "PYTEST_PLUGINS",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+    ):
+        assert forbidden not in child_env
 
 
 @pytest.mark.parametrize("change", ["staged", "untracked", "rename", "newline name"])
@@ -162,10 +401,73 @@ def _reseal(receipt: dict[str, object]) -> dict[str, object]:
     return base
 
 
+def _reseal_with_v2_invocation(
+    receipt: dict[str, object],
+    invocation: dict[str, object],
+) -> dict[str, object]:
+    producer = {
+        **receipt["producer"],
+        "structured_invocation_sha256": receipts._sha256_bytes(
+            receipts._canonical(
+                receipts._structured_invocation_payload(
+                    invocation,
+                    runner_version=receipts.RUNNER_VERSION,
+                )
+            )
+        ),
+    }
+    return _reseal(
+        {
+            **receipt,
+            "producer": producer,
+            "invocation": invocation,
+        }
+    )
+
+
 def test_strict_object_lengths_timestamp_and_accepted_predicate(tmp_path: Path) -> None:
     receipt = run_clean_commit_source_tree(repo=_repo(tmp_path), pytest_argv=["-q"], receipt_path=tmp_path / "r.json", logs_dir=tmp_path / "logs")
     wrong_producer = _reseal({**receipt, "producer": {**receipt["producer"], "structured_invocation_sha256": "0" * 64}})
     with pytest.raises(ExactTestReceiptError): canonical_exact_test_receipt_bytes(wrong_producer)
+
+
+def test_resealed_v2_confinement_tampering_is_rejected(tmp_path: Path) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    original = receipt["invocation"]
+
+    requested_mismatch = copy.deepcopy(original)
+    requested_mismatch["requested_argv"] = [
+        "-q",
+        "tests/test_demo.py",
+    ]
+
+    config_drift = copy.deepcopy(original)
+    config_drift["config"]["sha256"] = "0" * 64
+
+    root_drift = copy.deepcopy(original)
+    root_drift["rootdir_role"] = "external"
+
+    confcut_drift = copy.deepcopy(original)
+    confcut_drift["confcutdir_role"] = "external"
+
+    missing_fixed_env = copy.deepcopy(original)
+    missing_fixed_env["environment_names"].remove("PYTHONNOUSERSITE")
+
+    for invocation in (
+        requested_mismatch,
+        config_drift,
+        root_drift,
+        confcut_drift,
+        missing_fixed_env,
+    ):
+        tampered = _reseal_with_v2_invocation(receipt, invocation)
+        with pytest.raises(ExactTestReceiptError):
+            canonical_exact_test_receipt_bytes(tampered)
 
 
 def test_cross_field_identity_is_derived_not_self_asserted(tmp_path: Path) -> None:

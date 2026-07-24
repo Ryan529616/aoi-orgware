@@ -107,6 +107,7 @@ class ExactTestReceiptCliTests(HarnessTestCase):
         matrix: dict[str, object] | None = None,
         log: bytes = b"1 passed in 0.01s\n",
         manifest_sha256: str | None = None,
+        legacy_protocol: bool = False,
     ) -> tuple[Path, Path, str, str]:
         head = self._git("rev-parse", "--verify", "HEAD")
         tree = self._git("write-tree")
@@ -119,9 +120,44 @@ class ExactTestReceiptCliTests(HarnessTestCase):
                 Path(temporary) / "snapshot",
             )
         manifest_sha = manifest_sha256 or observed_manifest_sha
-        argv = ["-q", "tests/test_bounded.py"]
+        argv = (
+            ["--maxfail=1", "tests/test_bounded.py"]
+            if legacy_protocol
+            else ["-q", "tests/test_bounded.py"]
+        )
+        if legacy_protocol:
+            runner_version = receipts.LEGACY_RUNNER_VERSION
+            invocation: dict[str, object] = {
+                "argv": argv,
+                "cwd_role": "private_git_blob_snapshot",
+                "environment_names": [],
+                "environment_sha256": "4" * 64,
+            }
+        else:
+            runner_version = receipts.RUNNER_VERSION
+            invocation = {
+                "argument_contract": receipts.PYTEST_ARGUMENT_CONTRACT,
+                "argv": argv,
+                "config": {
+                    "kind": receipts._PYTEST_CONFIG_KIND,
+                    "path_role": receipts._PYTEST_CONFIG_PATH_ROLE,
+                    "sha256": receipts._PYTEST_CONFIG_SHA256,
+                    "size_bytes": len(receipts._PYTEST_CONFIG_BYTES),
+                },
+                "confcutdir_role": "private_git_blob_snapshot",
+                "cwd_role": "private_git_blob_snapshot",
+                "environment_names": sorted(receipts._PYTEST_FIXED_ENV),
+                "environment_sha256": "4" * 64,
+                "requested_argv": argv,
+                "rootdir_role": "private_git_blob_snapshot",
+            }
         structured_sha = hashlib.sha256(
-            _canonical({"pytest_argv": argv, "protocol": "pytest-arg-vector-v1"})
+            _canonical(
+                receipts._structured_invocation_payload(
+                    invocation,
+                    runner_version=runner_version,
+                )
+            )
         ).hexdigest()
         terminal_status = "completed" if accepted else "rejected"
         exit_code = 0 if accepted else 1
@@ -149,7 +185,7 @@ class ExactTestReceiptCliTests(HarnessTestCase):
             "producer": {
                 "module": {"path": str(producer_path), "sha256": "1" * 64},
                 "invoker": invoker,
-                "version": receipts.RUNNER_VERSION,
+                "version": runner_version,
                 "structured_invocation_sha256": structured_sha,
             },
             "source": {
@@ -165,12 +201,7 @@ class ExactTestReceiptCliTests(HarnessTestCase):
                 "implementation": "CPython",
                 "version": sys.version,
             },
-            "invocation": {
-                "argv": argv,
-                "cwd_role": "private_git_blob_snapshot",
-                "environment_names": [],
-                "environment_sha256": "4" * 64,
-            },
+            "invocation": invocation,
             "platform": {
                 "domain": "windows",
                 "system": "Windows",
@@ -331,6 +362,40 @@ class ExactTestReceiptCliTests(HarnessTestCase):
             ),
             close_errors,
         )
+
+    def test_legacy_receipt_remains_parseable_but_cannot_be_new_evidence(self) -> None:
+        receipt_path, log_path, receipt_sha, log_sha = self._receipt_pair(
+            "legacy-protocol",
+            legacy_protocol=True,
+        )
+        historical = receipts.parse_exact_test_receipt_bytes(
+            receipt_path.read_bytes()
+        )
+        self.assertEqual(
+            historical["producer"]["version"],
+            receipts.LEGACY_RUNNER_VERSION,
+        )
+        self.assertEqual(
+            historical["invocation"]["argv"],
+            ["--maxfail=1", "tests/test_bounded.py"],
+        )
+
+        rejected = self.cli(
+            *self._args(
+                receipt_path,
+                log_path,
+                receipt_sha,
+                log_sha,
+                semantic_command_id="reject-legacy-protocol-v1",
+            ),
+            ok=False,
+        )
+        self.assertIn(
+            "requires the current contained pytest protocol",
+            rejected.stderr,
+        )
+        self.assertFalse(self._blobs())
+        self.assertEqual(self._state()["verification"], [])
 
     def test_failed_test_receipt_maps_only_to_fail(self) -> None:
         receipt_path, log_path, receipt_sha, log_sha = self._receipt_pair(

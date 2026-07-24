@@ -34,7 +34,9 @@ jobs:
       - name: Resolve the hash-locked test-tool wheelhouse
         run: python -m pip download --require-hashes --dest .test-wheelhouse -r requirements/release-tools.lock
       - name: Install the test toolchain offline
-        run: python -m pip install --no-index --find-links .test-wheelhouse --require-hashes -r requirements/release-tools.lock
+        run: python -m pip install --ignore-installed --no-index --find-links .test-wheelhouse --require-hashes -r requirements/release-tools.lock
+      - name: Observe the installed test toolchain
+        run: python -I scripts/release_rehearsal.py release-toolchain --output "${{ runner.temp }}/test-release-toolchain.json"
       - name: Install package
         run: python -m pip install --no-build-isolation --no-deps .
       - name: Smoke installed CLI
@@ -44,6 +46,7 @@ jobs:
       - name: Run unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         # The combiner imports coverage at collection.  It is exercised only
         # in the dedicated exact-toolchain coverage job below, rather than
         # leaking an unpinned dependency into this release-tool matrix.
@@ -74,11 +77,10 @@ jobs:
             --find-links .release-wheelhouse \
             --require-hashes \
             -r requirements/release-tools.lock
-          python -m pip install "twine==6.2.0"
       - name: Build wheel and source distribution
         run: .release-tools/bin/python -m build --no-isolation
       - name: Validate distribution metadata
-        run: python -m twine check --strict dist/*
+        run: .release-tools/bin/python -I -m twine check --strict dist/*
       - name: Verify isolated artifact installs
         env:
           PYTHONDONTWRITEBYTECODE: "1"

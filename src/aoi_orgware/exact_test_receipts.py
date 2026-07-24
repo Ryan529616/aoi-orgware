@@ -27,7 +27,9 @@ from typing import Any, NoReturn
 
 SCHEMA_VERSION = 1
 RECEIPT_KIND = "aoi.clean_commit_source_tree_exact_test_receipt.v1"
-RUNNER_VERSION = "1"
+LEGACY_RUNNER_VERSION = "1"
+RUNNER_VERSION = "2"
+PYTEST_ARGUMENT_CONTRACT = "pytest-contained-argv-v2"
 MAX_RECEIPT_BYTES = 512 * 1024
 EMPTY_GIT_STATUS_SHA256 = hashlib.sha256(b"").hexdigest()
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -37,6 +39,25 @@ _ENV_ALLOWLIST = frozenset(
     {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL", "TZ"}
 )
 _WINDOWS_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))})
+_PYTEST_TRACEBACK = re.compile(r"--tb=(?:auto|long|short|line|native|no)\Z")
+_MAX_PYTEST_ARGUMENTS = 256
+_MAX_PYTEST_ARGUMENT_BYTES = 8 * 1024
+_MAX_PYTEST_ARGUMENT_VECTOR_BYTES = 32 * 1024
+_MAX_PYTEST_NODE_BYTES = 4 * 1024
+_PYTEST_CONFIG_BYTES = b"[pytest]\n"
+_PYTEST_CONFIG_SHA256 = hashlib.sha256(_PYTEST_CONFIG_BYTES).hexdigest()
+_PYTEST_CONFIG_KIND = "runner_generated_empty_pytest_ini_v1"
+_PYTEST_CONFIG_PATH_ROLE = "private_runner_scratch_outside_snapshot"
+_PYTEST_SNAPSHOT_ROLE = "private_git_blob_snapshot"
+_PYTEST_FIXED_ENV = frozenset(
+    {
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+)
 
 
 class ExactTestReceiptError(ValueError):
@@ -145,7 +166,267 @@ def _exact(value: object, keys: set[str], label: str) -> Mapping[str, Any]:
     return value
 
 
-def validate_exact_test_receipt(value: Mapping[str, Any], *, require_github_matrix: bool = False) -> dict[str, Any]:
+def _pytest_path_parts(path_text: str, label: str) -> tuple[str, ...]:
+    """Return a lexically safe tests/ path without normalizing aliases."""
+
+    normalized = path_text[:-1] if path_text.endswith("/") else path_text
+    parts = tuple(normalized.split("/"))
+    if (
+        not normalized
+        or "\\" in normalized
+        or ":" in normalized
+        or normalized.startswith("~")
+        or PureWindowsPath(normalized).is_absolute()
+        or PurePosixPath(normalized).is_absolute()
+        or not parts
+        or parts[0] != "tests"
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        _fail(f"{label} must be one relative path below tests/ without aliases")
+    return parts
+
+
+def _bounded_pytest_argv(value: object) -> list[str]:
+    """Validate the closed caller grammar without touching the filesystem."""
+
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or not value
+        or len(value) > _MAX_PYTEST_ARGUMENTS
+    ):
+        _fail("pytest argv must be a non-empty bounded string vector")
+    requested: list[str] = []
+    seen_quiet = False
+    seen_traceback = False
+    encoded_size = 0
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or any(ord(character) < 32 or ord(character) == 127 for character in item)
+        ):
+            _fail("pytest argv must be a non-empty bounded string vector")
+        try:
+            item_size = len(item.encode("utf-8"))
+        except UnicodeEncodeError:
+            _fail("pytest argv must be valid UTF-8")
+        if item_size > _MAX_PYTEST_ARGUMENT_BYTES:
+            _fail("one pytest argument exceeds its byte bound")
+        encoded_size += item_size
+        if encoded_size > _MAX_PYTEST_ARGUMENT_VECTOR_BYTES:
+            _fail("pytest argv exceeds its byte bound")
+        if item == "-q":
+            if seen_quiet:
+                _fail("pytest argv contains duplicate -q")
+            seen_quiet = True
+            requested.append(item)
+            continue
+        if _PYTEST_TRACEBACK.fullmatch(item):
+            if seen_traceback:
+                _fail("pytest argv contains duplicate --tb")
+            seen_traceback = True
+            requested.append(item)
+            continue
+        if item.startswith("--ignore="):
+            _pytest_path_parts(item.removeprefix("--ignore="), "pytest ignore target")
+            requested.append(item)
+            continue
+        if item.startswith("-") or item.startswith("@"):
+            _fail("pytest argv contains an unsupported option or response file")
+        path_text, separator, node_id = item.partition("::")
+        _pytest_path_parts(path_text, "pytest target")
+        if separator and (
+            not node_id
+            or any(ord(character) < 32 or ord(character) == 127 for character in node_id)
+            or len(node_id.encode("utf-8")) > _MAX_PYTEST_NODE_BYTES
+        ):
+            _fail("pytest node selector is invalid")
+        requested.append(item)
+    return requested
+
+
+def _canonical_snapshot_path(
+    snapshot: Path,
+    path_text: str,
+    *,
+    label: str,
+    require_file: bool = False,
+) -> str:
+    """Resolve one exact-spelling path through the private snapshot."""
+
+    requested_parts = _pytest_path_parts(path_text, label)
+    snapshot_root = snapshot.resolve(strict=True)
+    current = snapshot_root
+    canonical_parts: list[str] = []
+    for index, component in enumerate(requested_parts):
+        try:
+            exact_matches = [entry for entry in current.iterdir() if entry.name == component]
+        except OSError as exc:
+            _fail(f"{label} cannot be enumerated in the private snapshot: {exc}")
+        if len(exact_matches) != 1:
+            _fail(f"{label} is unavailable with exact Git spelling in the private snapshot")
+        current = exact_matches[0]
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            _fail(f"{label} is unavailable in the private snapshot: {exc}")
+        if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+            _fail(f"{label} traverses a link or reparse point")
+        if index < len(requested_parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            _fail(f"{label} has a non-directory intermediate component")
+        canonical_parts.append(current.name)
+    try:
+        current.resolve(strict=True).relative_to(snapshot_root)
+    except (OSError, ValueError):
+        _fail(f"{label} escapes the private snapshot")
+    try:
+        info = current.lstat()
+    except OSError as exc:
+        _fail(f"{label} is unavailable in the private snapshot: {exc}")
+    if require_file:
+        if not stat.S_ISREG(info.st_mode):
+            _fail(f"{label} must be a regular file for a node selector")
+    elif not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
+        _fail(f"{label} is not a regular file or directory")
+    if stat.S_ISDIR(info.st_mode):
+        try:
+            if next(current.iterdir(), None) is None:
+                _fail(f"{label} is an empty directory")
+        except OSError as exc:
+            _fail(f"{label} cannot be enumerated in the private snapshot: {exc}")
+    return "/".join(canonical_parts)
+
+
+def _canonical_pytest_argv(snapshot: Path, value: object) -> list[str]:
+    """Canonicalize the closed grammar against exact snapshot spelling."""
+
+    requested = _bounded_pytest_argv(value)
+    effective: list[str] = []
+    selectors: set[str] = set()
+    ignores: set[str] = set()
+    has_selector = False
+    for item in requested:
+        if item == "-q" or _PYTEST_TRACEBACK.fullmatch(item):
+            effective.append(item)
+            continue
+        if item.startswith("--ignore="):
+            canonical = _canonical_snapshot_path(
+                snapshot,
+                item.removeprefix("--ignore="),
+                label="pytest ignore target",
+            )
+            if canonical in ignores:
+                _fail("pytest argv contains a duplicate ignore target")
+            ignores.add(canonical)
+            effective.append(f"--ignore={canonical}")
+            continue
+        path_text, separator, node_id = item.partition("::")
+        canonical = _canonical_snapshot_path(
+            snapshot,
+            path_text,
+            label="pytest target",
+            require_file=bool(separator),
+        )
+        selector = canonical + (f"::{node_id}" if separator else "")
+        if selector in selectors:
+            _fail("pytest argv contains a duplicate target")
+        selectors.add(selector)
+        effective.append(selector)
+        has_selector = True
+    if not has_selector:
+        effective.append(
+            _canonical_snapshot_path(snapshot, "tests", label="default pytest target")
+        )
+    return effective
+
+
+def _require_canonical_effective_pytest_argv(value: object) -> list[str]:
+    """Validate receipt argv after snapshot canonicalization."""
+
+    argv = _bounded_pytest_argv(value)
+    selectors: set[str] = set()
+    ignores: set[str] = set()
+    has_selector = False
+    for item in argv:
+        if item == "-q" or _PYTEST_TRACEBACK.fullmatch(item):
+            continue
+        if item.startswith("--ignore="):
+            raw = item.removeprefix("--ignore=")
+            if raw.endswith("/") or raw != "/".join(_pytest_path_parts(raw, "pytest ignore target")):
+                _fail("receipt pytest ignore target is not canonical")
+            if raw in ignores:
+                _fail("receipt pytest argv contains a duplicate ignore target")
+            ignores.add(raw)
+            continue
+        path_text, separator, node_id = item.partition("::")
+        if path_text.endswith("/") or path_text != "/".join(_pytest_path_parts(path_text, "pytest target")):
+            _fail("receipt pytest target is not canonical")
+        selector = path_text + (f"::{node_id}" if separator else "")
+        if selector in selectors:
+            _fail("receipt pytest argv contains a duplicate target")
+        selectors.add(selector)
+        has_selector = True
+    if not has_selector:
+        _fail("receipt pytest argv lacks an explicit contained target")
+    return argv
+
+
+def _lexical_effective_pytest_argv(value: object) -> list[str]:
+    """Derive the canonical vector possible without reopening the snapshot."""
+
+    requested = _bounded_pytest_argv(value)
+    effective: list[str] = []
+    has_selector = False
+    for item in requested:
+        if item == "-q" or _PYTEST_TRACEBACK.fullmatch(item):
+            effective.append(item)
+            continue
+        if item.startswith("--ignore="):
+            raw = item.removeprefix("--ignore=")
+            effective.append(f"--ignore={'/'.join(_pytest_path_parts(raw, 'pytest ignore target'))}")
+            continue
+        path_text, separator, node_id = item.partition("::")
+        canonical = "/".join(_pytest_path_parts(path_text, "pytest target"))
+        effective.append(canonical + (f"::{node_id}" if separator else ""))
+        has_selector = True
+    if not has_selector:
+        effective.append("tests")
+    return effective
+
+
+def _structured_invocation_payload(
+    invocation: Mapping[str, Any],
+    *,
+    runner_version: str,
+) -> dict[str, Any]:
+    if runner_version == LEGACY_RUNNER_VERSION:
+        return {
+            "pytest_argv": list(invocation["argv"]),
+            "protocol": "pytest-arg-vector-v1",
+        }
+    if runner_version != RUNNER_VERSION:
+        _fail("producer version is invalid")
+    return {
+        "argument_contract": invocation["argument_contract"],
+        "config": dict(invocation["config"]),
+        "confcutdir_role": invocation["confcutdir_role"],
+        "cwd_role": invocation["cwd_role"],
+        "environment_names": list(invocation["environment_names"]),
+        "environment_sha256": invocation["environment_sha256"],
+        "protocol": PYTEST_ARGUMENT_CONTRACT,
+        "pytest_argv": list(invocation["argv"]),
+        "requested_pytest_argv": list(invocation["requested_argv"]),
+        "rootdir_role": invocation["rootdir_role"],
+    }
+
+
+def validate_exact_test_receipt(
+    value: Mapping[str, Any],
+    *,
+    require_github_matrix: bool = False,
+    require_current_protocol: bool = False,
+) -> dict[str, Any]:
     """Validate the complete typed schema and its self digest."""
     keys = {
         "schema_version", "kind", "accepted", "terminal_status", "created_at", "producer",
@@ -173,7 +454,9 @@ def validate_exact_test_receipt(value: Mapping[str, Any], *, require_github_matr
     if producer["invoker"] is not None:
         invoker = _exact(producer["invoker"], {"path", "sha256"}, "producer invoker")
         _absolute_path(invoker["path"], "producer invoker path"); _sha256(invoker["sha256"], "producer invoker SHA-256")
-    if producer["version"] != RUNNER_VERSION: _fail("producer version is invalid")
+    if producer["version"] not in {LEGACY_RUNNER_VERSION, RUNNER_VERSION}: _fail("producer version is invalid")
+    if require_current_protocol and producer["version"] != RUNNER_VERSION:
+        _fail("new exact-test evidence requires the current contained pytest protocol")
     _sha256(producer["structured_invocation_sha256"], "producer structured invocation SHA-256")
     source = _exact(item["source"], {"head", "index_tree", "manifest_sha256", "file_count", "snapshot"}, "source")
     if not isinstance(source["head"], str) or _GIT_OBJECT.fullmatch(source["head"]) is None: _fail("source HEAD is invalid")
@@ -184,15 +467,63 @@ def validate_exact_test_receipt(value: Mapping[str, Any], *, require_github_matr
     interpreter = _exact(item["interpreter"], {"path", "sha256", "implementation", "version"}, "interpreter")
     _absolute_path(interpreter["path"], "interpreter path"); _sha256(interpreter["sha256"], "interpreter SHA-256")
     _string(interpreter["implementation"], "interpreter implementation"); _string(interpreter["version"], "interpreter version")
-    invocation = _exact(item["invocation"], {"argv", "cwd_role", "environment_names", "environment_sha256"}, "invocation")
+    if producer["version"] == LEGACY_RUNNER_VERSION:
+        invocation = _exact(item["invocation"], {"argv", "cwd_role", "environment_names", "environment_sha256"}, "legacy invocation")
+    else:
+        invocation = _exact(
+            item["invocation"],
+            {
+                "argument_contract",
+                "argv",
+                "config",
+                "confcutdir_role",
+                "cwd_role",
+                "environment_names",
+                "environment_sha256",
+                "requested_argv",
+                "rootdir_role",
+            },
+            "invocation",
+        )
+        if invocation["argument_contract"] != PYTEST_ARGUMENT_CONTRACT:
+            _fail("pytest argument contract is invalid")
+        if not isinstance(invocation["requested_argv"], list):
+            _fail("requested pytest argv is invalid")
+        effective_argv = _require_canonical_effective_pytest_argv(invocation["argv"])
+        if effective_argv != _lexical_effective_pytest_argv(invocation["requested_argv"]):
+            _fail("effective pytest argv does not derive from requested argv")
+        config = _exact(
+            invocation["config"],
+            {"kind", "path_role", "sha256", "size_bytes"},
+            "pytest config",
+        )
+        if (
+            config["kind"] != _PYTEST_CONFIG_KIND
+            or config["path_role"] != _PYTEST_CONFIG_PATH_ROLE
+            or config["sha256"] != _PYTEST_CONFIG_SHA256
+            or config["size_bytes"] != len(_PYTEST_CONFIG_BYTES)
+        ):
+            _fail("pytest config binding is invalid")
+        if invocation["rootdir_role"] != _PYTEST_SNAPSHOT_ROLE:
+            _fail("pytest rootdir role is invalid")
+        if invocation["confcutdir_role"] != _PYTEST_SNAPSHOT_ROLE:
+            _fail("pytest confcutdir role is invalid")
     if not isinstance(invocation["argv"], list) or not all(isinstance(x, str) for x in invocation["argv"]): _fail("pytest argv is invalid")
-    if invocation["cwd_role"] != "private_git_blob_snapshot": _fail("pytest cwd role is invalid")
-    if not isinstance(invocation["environment_names"], list) or invocation["environment_names"] != sorted(invocation["environment_names"]) or len(invocation["environment_names"]) != len(set(invocation["environment_names"])) or any(x not in _ENV_ALLOWLIST | {"PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTHONHASHSEED"} for x in invocation["environment_names"]): _fail("environment names are invalid")
+    if invocation["cwd_role"] != _PYTEST_SNAPSHOT_ROLE: _fail("pytest cwd role is invalid")
+    allowed_environment_names = _ENV_ALLOWLIST | _PYTEST_FIXED_ENV
+    if not isinstance(invocation["environment_names"], list) or invocation["environment_names"] != sorted(invocation["environment_names"]) or len(invocation["environment_names"]) != len(set(invocation["environment_names"])) or any(x not in allowed_environment_names for x in invocation["environment_names"]): _fail("environment names are invalid")
+    if producer["version"] == RUNNER_VERSION and not _PYTEST_FIXED_ENV.issubset(invocation["environment_names"]):
+        _fail("contained pytest environment is incomplete")
     _sha256(invocation["environment_sha256"], "environment SHA-256")
     if producer["structured_invocation_sha256"] != _sha256_bytes(
-        _canonical({"pytest_argv": invocation["argv"], "protocol": "pytest-arg-vector-v1"})
+        _canonical(
+            _structured_invocation_payload(
+                invocation,
+                runner_version=producer["version"],
+            )
+        )
     ):
-        _fail("runner structured invocation does not bind pytest argv")
+        _fail("runner structured invocation does not bind pytest confinement")
     domain = _exact(item["platform"], {"domain", "system", "release", "wsl_distro", "kernel"}, "platform")
     if domain["domain"] not in {"windows", "wsl", "linux"}: _fail("platform domain is invalid")
     for key in ("system", "release", "wsl_distro", "kernel"):
@@ -253,14 +584,28 @@ def validate_exact_test_receipt(value: Mapping[str, Any], *, require_github_matr
     return dict(item)
 
 
-def canonical_exact_test_receipt_bytes(value: Mapping[str, Any], *, require_github_matrix: bool = False) -> bytes:
-    checked = validate_exact_test_receipt(value, require_github_matrix=require_github_matrix)
+def canonical_exact_test_receipt_bytes(
+    value: Mapping[str, Any],
+    *,
+    require_github_matrix: bool = False,
+    require_current_protocol: bool = False,
+) -> bytes:
+    checked = validate_exact_test_receipt(
+        value,
+        require_github_matrix=require_github_matrix,
+        require_current_protocol=require_current_protocol,
+    )
     raw = _canonical(checked) + b"\n"
     if len(raw) > MAX_RECEIPT_BYTES: _fail("receipt exceeds byte bound")
     return raw
 
 
-def parse_exact_test_receipt_bytes(raw: bytes, *, require_github_matrix: bool = False) -> dict[str, Any]:
+def parse_exact_test_receipt_bytes(
+    raw: bytes,
+    *,
+    require_github_matrix: bool = False,
+    require_current_protocol: bool = False,
+) -> dict[str, Any]:
     if not isinstance(raw, bytes) or not raw or len(raw) > MAX_RECEIPT_BYTES: _fail("receipt bytes are empty or exceed their bound")
     def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -272,7 +617,11 @@ def parse_exact_test_receipt_bytes(raw: bytes, *, require_github_matrix: bool = 
         parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=lambda x: (_fail(f"receipt has forbidden JSON constant: {x}")))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         _fail(f"receipt is not strict UTF-8 JSON: {exc}")
-    checked = validate_exact_test_receipt(parsed, require_github_matrix=require_github_matrix)
+    checked = validate_exact_test_receipt(
+        parsed,
+        require_github_matrix=require_github_matrix,
+        require_current_protocol=require_current_protocol,
+    )
     if raw != _canonical(checked) + b"\n": _fail("receipt bytes are not canonical LF JSON")
     return checked
 
@@ -380,12 +729,20 @@ def platform_domain(*, system: str | None = None, release: str | None = None, en
 
 def _child_env(snapshot: Path, inherited: Mapping[str, str]) -> tuple[dict[str, str], list[str], str]:
     env = {key: inherited[key] for key in sorted(_ENV_ALLOWLIST) if key in inherited}
-    env.update({"PYTHONPATH": os.fspath(snapshot / "src"), "PYTHONDONTWRITEBYTECODE": "1", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONHASHSEED": "0"})
+    env.update(
+        {
+            "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": os.fspath(snapshot / "src"),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
     names = sorted(env)
     return env, names, _sha256_bytes(_canonical({"environment": {key: env[key] for key in names}}))
 
 
-def _producer_identity(pytest_argv: Sequence[str], invoker_path: Path | None) -> dict[str, Any]:
+def _producer_identity(invocation: Mapping[str, Any], invoker_path: Path | None) -> dict[str, Any]:
     module = Path(__file__).resolve()
     return {
         "module": {"path": os.fspath(module), "sha256": _sha256_file(module)},
@@ -394,7 +751,12 @@ def _producer_identity(pytest_argv: Sequence[str], invoker_path: Path | None) ->
         "invoker": None if invoker_path is None else {"path": os.fspath(invoker_path.resolve(strict=True)), "sha256": _sha256_file(invoker_path.resolve(strict=True))},
         "version": RUNNER_VERSION,
         "structured_invocation_sha256": _sha256_bytes(
-            _canonical({"pytest_argv": list(pytest_argv), "protocol": "pytest-arg-vector-v1"})
+            _canonical(
+                _structured_invocation_payload(
+                    invocation,
+                    runner_version=RUNNER_VERSION,
+                )
+            )
         ),
     }
 
@@ -425,7 +787,7 @@ def _atomic_create(path: Path, raw: bytes) -> None:
 def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], receipt_path: Path, logs_dir: Path, timeout_seconds: float | None = None, github_matrix_identity: Mapping[str, Any] | None = None, require_github_matrix: bool = False, inherited_env: Mapping[str, str] | None = None, invoker_path: Path | None = None) -> dict[str, Any]:
     """Run structured pytest arguments against a private snapshot and publish one receipt."""
     repo = repo.resolve(strict=True); receipt_path = _external_absolute(receipt_path, repo, "receipt path"); logs_dir = _external_absolute(logs_dir, repo, "logs directory")
-    if not pytest_argv or any(not isinstance(item, str) or "\0" in item for item in pytest_argv): _fail("pytest argv must be a non-empty string vector")
+    requested_pytest_argv = _bounded_pytest_argv(pytest_argv)
     inherited_env = os.environ if inherited_env is None else inherited_env
     pre = _status(repo)
     if not pre["clean"]: _fail("repository HEAD/index/tree is not clean")
@@ -434,11 +796,45 @@ def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], rece
     result_code, terminal, error = -1, "runner_error", None
     try:
         snapshot = scratch / "snapshot"; manifest, count = _snapshot(repo, snapshot)
+        effective_pytest_argv = _canonical_pytest_argv(snapshot, pytest_argv)
+        config_path = scratch / "pytest-empty.ini"
+        with config_path.open("xb") as stream:
+            stream.write(_PYTEST_CONFIG_BYTES)
+            stream.flush()
+            os.fsync(stream.fileno())
         env, env_names, env_sha = _child_env(snapshot, inherited_env)
+        invocation = {
+            "argument_contract": PYTEST_ARGUMENT_CONTRACT,
+            "argv": effective_pytest_argv,
+            "config": {
+                "kind": _PYTEST_CONFIG_KIND,
+                "path_role": _PYTEST_CONFIG_PATH_ROLE,
+                "sha256": _PYTEST_CONFIG_SHA256,
+                "size_bytes": len(_PYTEST_CONFIG_BYTES),
+            },
+            "confcutdir_role": _PYTEST_SNAPSHOT_ROLE,
+            "cwd_role": _PYTEST_SNAPSHOT_ROLE,
+            "environment_names": env_names,
+            "environment_sha256": env_sha,
+            "requested_argv": requested_pytest_argv,
+            "rootdir_role": _PYTEST_SNAPSHOT_ROLE,
+        }
         # Preserve the venv launcher spelling.  Resolving a POSIX venv's
         # ``bin/python`` symlink to the base interpreter discards the venv
         # package context and can run a different pytest environment.
-        command = [sys.executable, "-m", "pytest", *pytest_argv]
+        # A fixed empty config, explicit root/confcutdir, and disabled plugin
+        # autoload prevent ambient config, conftest, response-file, and plugin
+        # surfaces from redirecting collection outside the private snapshot.
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-c",
+            os.fspath(config_path),
+            f"--rootdir={snapshot}",
+            f"--confcutdir={snapshot}",
+            *effective_pytest_argv,
+        ]
         try:
             completed = subprocess.run(command, cwd=snapshot, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_seconds, check=False)
             result_code = completed.returncode; log = completed.stdout; terminal = "completed" if result_code == 0 else "rejected"
@@ -451,10 +847,14 @@ def run_clean_commit_source_tree(*, repo: Path, pytest_argv: Sequence[str], rece
         unchanged = pre["head"] == post["head"] and pre["index_tree"] == post["index_tree"] and manifest == post_manifest and post["clean"]
         if not unchanged and terminal == "completed": terminal = "rejected"; error = "repository identity changed during run"
         log_closed = _sha256_file(log_path) == _sha256_bytes(log) and log_path.stat().st_size == len(log)
-        base: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "kind": RECEIPT_KIND, "accepted": False, "terminal_status": terminal, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "producer": _producer_identity(pytest_argv, invoker_path), "source": {"head": pre["head"], "index_tree": pre["index_tree"], "manifest_sha256": manifest, "file_count": count, "snapshot": True}, "interpreter": _interpreter_identity(), "invocation": {"argv": list(pytest_argv), "cwd_role": "private_git_blob_snapshot", "environment_names": env_names, "environment_sha256": env_sha}, "platform": platform_domain(), "log": {"sha256": _sha256_bytes(log), "size": len(log), "path_role": "repo_external_combined_log"}, "pytest_exit_code": result_code, "identity_unchanged": unchanged, "log_closed": log_closed, "publication_atomic": True, "github_matrix_identity": dict(github_matrix_identity) if github_matrix_identity is not None else None, "observation": {"pre": {**{key: pre[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": manifest}, "post": {**{key: post[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": post_manifest}, "error": error}}
+        base: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "kind": RECEIPT_KIND, "accepted": False, "terminal_status": terminal, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "producer": _producer_identity(invocation, invoker_path), "source": {"head": pre["head"], "index_tree": pre["index_tree"], "manifest_sha256": manifest, "file_count": count, "snapshot": True}, "interpreter": _interpreter_identity(), "invocation": invocation, "platform": platform_domain(), "log": {"sha256": _sha256_bytes(log), "size": len(log), "path_role": "repo_external_combined_log"}, "pytest_exit_code": result_code, "identity_unchanged": unchanged, "log_closed": log_closed, "publication_atomic": True, "github_matrix_identity": dict(github_matrix_identity) if github_matrix_identity is not None else None, "observation": {"pre": {**{key: pre[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": manifest}, "post": {**{key: post[key] for key in ("head", "index_tree", "status_sha256")}, "manifest_sha256": post_manifest}, "error": error}}
         base["accepted"] = result_code == 0 and unchanged and log_closed and terminal == "completed"
         base["receipt_sha256"] = _sha256_bytes(_canonical(base))
-        raw = canonical_exact_test_receipt_bytes(base, require_github_matrix=require_github_matrix)
+        raw = canonical_exact_test_receipt_bytes(
+            base,
+            require_github_matrix=require_github_matrix,
+            require_current_protocol=True,
+        )
         _atomic_create(receipt_path, raw)
         return base
     finally:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -40,6 +41,8 @@ MAX_REQUEST_BYTES = 512 * 1024
 MAX_RECEIPT_BYTES = 256 * 1024
 _SHA = __import__("re").compile(r"[0-9a-f]{64}")
 _PLATFORMS = {"linux", "windows"}
+_RELEASE_TOOL_DISTRIBUTION_COUNT = 32
+_RELEASE_TOOL_ALLOWED_HASH_COUNT = 40
 
 
 class RehearsalError(ValueError):
@@ -89,20 +92,45 @@ def _release_toolchain(value: Any) -> dict[str, Any]:
     distributions = item["distributions"]
     if not isinstance(distributions, list):
         _fail("release_toolchain.distributions is invalid")
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for entry in distributions:
-        record = _object(entry, {"name", "version", "artifact_sha256"}, "release_toolchain distribution")
+        record = _object(
+            entry,
+            {"name", "version", "allowed_artifact_sha256s"},
+            "release_toolchain distribution",
+        )
         raw_name = _identifier(record["name"], "release_toolchain distribution.name")
         name = re.sub(r"[-_.]+", "-", raw_name.lower())
         if raw_name != name:
             _fail("release_toolchain distribution.name is not canonical")
         version = _text(record["version"], "release_toolchain distribution.version", 128)
-        artifact_sha256 = _sha(record["artifact_sha256"], "release_toolchain distribution.artifact_sha256")
+        allowed_hashes = record["allowed_artifact_sha256s"]
+        if (
+            not isinstance(allowed_hashes, list)
+            or not allowed_hashes
+            or len(allowed_hashes) > 16
+        ):
+            _fail("release_toolchain distribution allowed hashes are invalid")
+        normalized_hashes = [
+            _sha(item, "release_toolchain distribution allowed artifact SHA-256")
+            for item in allowed_hashes
+        ]
+        if (
+            normalized_hashes != sorted(normalized_hashes)
+            or len(normalized_hashes) != len(set(normalized_hashes))
+        ):
+            _fail("release_toolchain distribution allowed hashes are not canonical")
         if name in seen:
             _fail("release_toolchain contains duplicate distributions")
         seen.add(name)
-        normalized.append({"name": name, "version": version, "artifact_sha256": artifact_sha256})
+        normalized.append(
+            {
+                "name": name,
+                "version": version,
+                "allowed_artifact_sha256s": normalized_hashes,
+            }
+        )
     if normalized != sorted(normalized, key=lambda entry: entry["name"]):
         _fail("release_toolchain distributions are not canonical")
     observed = {"lock_sha256": lock_sha256, "distributions": normalized}
@@ -162,7 +190,7 @@ def _read_regular(path: Path, *, limit: int = MAX_FILE_BYTES) -> bytes:
     return data
 
 
-_LOCK_REQUIREMENT = re.compile(r"([a-z0-9]+(?:-[a-z0-9]+)*)==([^\\\s]+)\s+\\\Z")
+_LOCK_REQUIREMENT = re.compile(r"([a-z0-9]+(?:[-_.][a-z0-9]+)*)==([^\\\s]+)\s+\\\Z")
 _LOCK_HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})\Z")
 
 
@@ -175,34 +203,106 @@ def _canonical_release_toolchain() -> dict[str, Any]:
         lines = raw.decode("ascii").splitlines()
     except UnicodeDecodeError as exc:
         raise RehearsalError("release-tools lock is not ASCII") from exc
-    records: list[dict[str, str]] = []
+    records: list[dict[str, Any]] = []
     index = 0
+    only_binary_count = 0
     while index < len(lines):
         line = lines[index].strip()
-        if not line or line.startswith("#") or line == "--only-binary=:all:":
+        if not line or line.startswith("#"):
+            index += 1
+            continue
+        if line == "--only-binary=:all:":
+            if records:
+                _fail("canonical release-tools.lock option appears after requirements")
+            only_binary_count += 1
+            if only_binary_count > 1:
+                _fail("canonical release-tools.lock repeats its binary-only option")
             index += 1
             continue
         requirement = _LOCK_REQUIREMENT.fullmatch(line)
-        if requirement is None or index + 1 >= len(lines):
+        if requirement is None:
             _fail("canonical release-tools.lock is malformed")
-        hash_line = _LOCK_HASH.fullmatch(lines[index + 1].strip())
-        if hash_line is None:
-            _fail("canonical release-tools.lock is malformed")
-        name, version = requirement.groups()
-        records.append({
-            "name": name,
-            "version": version,
-            "artifact_sha256": hash_line.group(1),
-        })
-        index += 2
-    if len(records) != 11 or records != sorted(records, key=lambda item: item["name"]):
-        _fail("canonical release-tools.lock does not contain the exact 11 release tools")
+        assert requirement is not None
+        raw_name, version = requirement.groups()
+        name = re.sub(r"[-_.]+", "-", raw_name.lower())
+        hashes: list[str] = []
+        index += 1
+        while index < len(lines):
+            hash_text = lines[index].strip()
+            continued = hash_text.endswith("\\")
+            if continued:
+                hash_text = hash_text[:-1].rstrip()
+            hash_line = _LOCK_HASH.fullmatch(hash_text)
+            if hash_line is None:
+                _fail("canonical release-tools.lock is malformed")
+            assert hash_line is not None
+            hashes.append(hash_line.group(1))
+            index += 1
+            if not continued:
+                break
+        if not hashes or (index == len(lines) and lines[-1].strip().endswith("\\")):
+            _fail("canonical release-tools.lock has an unterminated requirement")
+        if (
+            len(hashes) > 16
+            or hashes != sorted(hashes)
+            or len(hashes) != len(set(hashes))
+        ):
+            _fail("canonical release-tools.lock hashes are not sorted and unique")
+        records.append(
+            {
+                "name": name,
+                "version": version,
+                "allowed_artifact_sha256s": hashes,
+            }
+        )
+    if only_binary_count != 1:
+        _fail("canonical release-tools.lock lacks its exact binary-only option")
+    if (
+        len(records) != _RELEASE_TOOL_DISTRIBUTION_COUNT
+        or records != sorted(records, key=lambda item: item["name"])
+    ):
+        _fail(
+            "canonical release-tools.lock does not contain the exact "
+            f"{_RELEASE_TOOL_DISTRIBUTION_COUNT} release tools"
+        )
     if len({record["name"] for record in records}) != len(records):
         _fail("canonical release-tools.lock has duplicate release tools")
+    all_hashes = [
+        digest
+        for record in records
+        for digest in record["allowed_artifact_sha256s"]
+    ]
+    if len(all_hashes) != _RELEASE_TOOL_ALLOWED_HASH_COUNT:
+        _fail(
+            "canonical release-tools.lock does not contain the exact "
+            f"{_RELEASE_TOOL_ALLOWED_HASH_COUNT} allowed wheel hashes"
+        )
+    if len(set(all_hashes)) != len(all_hashes):
+        _fail("canonical release-tools.lock reuses an allowed wheel hash")
     return {
         "lock_sha256": hashlib.sha256(raw).hexdigest(),
         "distributions": records,
     }
+
+
+def observe_installed_release_toolchain() -> dict[str, Any]:
+    """Bind the current interpreter's installed versions to the exact lock."""
+
+    expected = _canonical_release_toolchain()
+    for record in expected["distributions"]:
+        name = record["name"]
+        try:
+            observed_version = importlib_metadata.version(name)
+        except importlib_metadata.PackageNotFoundError as exc:
+            raise RehearsalError(
+                f"installed release tool is missing: {name}"
+            ) from exc
+        if observed_version != record["version"]:
+            _fail(
+                "installed release tool does not match lock: "
+                f"{name}=={observed_version}"
+            )
+    return expected
 
 
 def _json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -648,6 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     def common(name: str) -> argparse.ArgumentParser:
         sub = commands.add_parser(name); sub.add_argument("--output", required=True, type=Path); return sub
+    common("release-toolchain")
     sub = common("builder-environment"); sub.add_argument("--platform", required=True, choices=sorted(_PLATFORMS)); sub.add_argument("--python-version", required=True); sub.add_argument("--workflow-name", required=True); sub.add_argument("--run-id", required=True); sub.add_argument("--run-attempt", required=True, type=int); sub.add_argument("--runner-os", required=True); sub.add_argument("--runner-arch", required=True); sub.add_argument("--runner-image", required=True); sub.add_argument("--build-frontend", required=True); sub.add_argument("--build-frontend-version", required=True); sub.add_argument("--source-date-epoch", required=True, type=int)
     sub = common("producer"); sub.add_argument("--producer-id", required=True); sub.add_argument("--platform", required=True, choices=sorted(_PLATFORMS)); sub.add_argument("--inventory-sha256", required=True); sub.add_argument("--result-json", required=True)
     sub = common("gate-contract"); sub.add_argument("--gate-id", required=True); sub.add_argument("--contract-json", required=True)
@@ -661,7 +762,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "builder-environment": value = create_builder_environment_receipt(platform=args.platform, python_version=args.python_version, workflow_name=args.workflow_name, run_id=args.run_id, run_attempt=args.run_attempt, runner_os=args.runner_os, runner_arch=args.runner_arch, runner_image=args.runner_image, build_frontend=args.build_frontend, build_frontend_version=args.build_frontend_version, source_date_epoch=args.source_date_epoch); _emit(value, args.output)
+        if args.command == "release-toolchain": _emit(observe_installed_release_toolchain(), args.output)
+        elif args.command == "builder-environment": value = create_builder_environment_receipt(platform=args.platform, python_version=args.python_version, workflow_name=args.workflow_name, run_id=args.run_id, run_attempt=args.run_attempt, runner_os=args.runner_os, runner_arch=args.runner_arch, runner_image=args.runner_image, build_frontend=args.build_frontend, build_frontend_version=args.build_frontend_version, source_date_epoch=args.source_date_epoch); _emit(value, args.output)
         elif args.command == "producer": value = create_producer_receipt(producer_id=args.producer_id, platform=args.platform, inventory_sha256=args.inventory_sha256, result=_load_mapping_argument(args.result_json)); _emit(value, args.output)
         elif args.command == "gate-contract": value = create_gate_contract(gate_id=args.gate_id, contract=_load_mapping_argument(args.contract_json)); _emit(value, args.output)
         elif args.command == "platform-gate": value = create_platform_gate_receipt(platform=args.platform, gate_id=args.gate_id, check_contract_sha256=args.check_contract_sha256, inventory_sha256=args.inventory_sha256, details=_load_mapping_argument(args.details_json)); _emit(value, args.output)

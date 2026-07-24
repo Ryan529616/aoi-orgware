@@ -87,13 +87,11 @@ jobs:
           python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
           python -m venv .release-tools
           .release-tools/bin/python -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$GITHUB_WORKSPACE/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
-          .release-tools/bin/python -I - <<'PY'
-          import importlib.metadata as metadata
-          expected = {"build": "1.5.0", "colorama": "0.4.6", "hatchling": "1.27.0", "iniconfig": "2.3.0", "packaging": "26.2", "pathspec": "1.1.1", "pluggy": "1.6.0", "pygments": "2.20.0", "pyproject-hooks": "1.2.0", "pytest": "8.4.2", "trove-classifiers": "2026.6.1.19"}
-          assert {name: metadata.version(name) for name in expected} == expected
-          PY
+          mkdir -p release/evidence
+          .release-tools/bin/python -I scripts/release_rehearsal.py release-toolchain --output release/evidence/release-toolchain.json
           epoch="$(git show -s --format=%ct HEAD)"
           SOURCE_DATE_EPOCH="$epoch" .release-tools/bin/python -I -m build --sdist --wheel --no-isolation --outdir release/dist
+          .release-tools/bin/python -I -m twine check --strict release/dist/*
           version="$(<.release-version)"
           .release-tools/bin/python -I scripts/release_inventory.py capture --dist-dir release/dist --distribution-name aoi-orgware --package-version "$version" --output release/inventory-linux.json
           .release-tools/bin/python -I scripts/release_inventory.py verify --inventory release/inventory-linux.json --root release/dist
@@ -187,37 +185,11 @@ jobs:
           raw = json.dumps(base, sort_keys=True, separators=(",", ":")).encode("utf-8")
           print(json.dumps({**base, "receipt_sha256": hashlib.sha256(raw).hexdigest()}, sort_keys=True, separators=(",", ":")))
           PY
-          .release-tools/bin/python -I - <<'PY' > release/evidence/release-toolchain.json
-          import hashlib, importlib.metadata as metadata, json, re
-          from pathlib import Path
-          lock = Path("requirements/release-tools.lock").read_bytes()
-          lines = lock.decode("utf-8").splitlines()
-          entries = []
-          for index, line in enumerate(lines[:-1]):
-              if "==" not in line or not line.rstrip().endswith("\\"):
-                  continue
-              name, version = line.strip()[:-1].strip().split("==", 1)
-              match = re.fullmatch(r"--hash=sha256:([0-9a-f]{64})", lines[index + 1].strip())
-              if match:
-                  entries.append((name, version, match.group(1)))
-          if len(entries) != 11:
-              raise SystemExit("release-tool lock is malformed or incomplete")
-          records = []
-          for raw_name, raw_version, raw_hash in entries:
-              name = re.sub(r"[-_.]+", "-", raw_name.lower())
-              version = raw_version
-              if metadata.version(name) != version:
-                  raise SystemExit(f"installed release tool does not match lock: {name}")
-              records.append({"name": name, "version": version, "artifact_sha256": raw_hash})
-          records.sort(key=lambda item: item["name"])
-          print(json.dumps({"lock_sha256": hashlib.sha256(lock).hexdigest(), "distributions": records}, sort_keys=True, separators=(",", ":")))
-          PY
-          toolchain_json="$(<release/evidence/release-toolchain.json)"
           .release-tools/bin/python -I scripts/release_rehearsal.py builder-environment --platform linux --python-version "$(.release-tools/bin/python --version | awk '{print $2}')" --workflow-name "$GITHUB_WORKFLOW" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --runner-os "$RUNNER_OS" --runner-arch "$RUNNER_ARCH" --runner-image "$ImageOS" --build-frontend build --build-frontend-version 1.5.0 --source-date-epoch "$source_epoch" --output release/evidence/builder.json
           producer_result="$(.release-tools/bin/python -I - <<'PY'
           import json
           from pathlib import Path
-          print(json.dumps({"command": "pytest O7 modules + build + verify_dist", "release_toolchain": json.loads(Path("release/evidence/release-toolchain.json").read_text()), "sdist_verification": "derived-wheel-offline-install", "status": "pass"}, sort_keys=True, separators=(",", ":")))
+          print(json.dumps({"command": "build + twine check --strict + pytest O7 modules + verify_dist", "release_toolchain": json.loads(Path("release/evidence/release-toolchain.json").read_text()), "sdist_verification": "derived-wheel-offline-install", "status": "pass"}, sort_keys=True, separators=(",", ":")))
           PY
           )"
           .release-tools/bin/python -I scripts/release_rehearsal.py producer --producer-id build-linux --platform linux --inventory-sha256 "$inventory_sha256" --result-json "$producer_result" --output release/evidence/producer-receipt.json
@@ -334,7 +306,8 @@ jobs:
            python -m venv .release-tools
            $backendPython = (Resolve-Path .release-tools/Scripts/python.exe).Path
            & $backendPython -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$PWD/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
-           & $backendPython -I -c "import importlib.metadata as metadata; expected={'build':'1.5.0','colorama':'0.4.6','hatchling':'1.27.0','iniconfig':'2.3.0','packaging':'26.2','pathspec':'1.1.1','pluggy':'1.6.0','pygments':'2.20.0','pyproject-hooks':'1.2.0','pytest':'8.4.2','trove-classifiers':'2026.6.1.19'}; assert {name: metadata.version(name) for name in expected} == expected"
+           $toolchainReceipt = Join-Path $env:RUNNER_TEMP 'release-toolchain-windows.json'
+           & $backendPython -I scripts/release_rehearsal.py release-toolchain --output $toolchainReceipt
            python scripts/verify_dist.py --dist-dir windows/dist --expected-version $version --build-python $backendPython --expected-build-version 1.5.0 --expected-hatchling-version 1.27.0
           $inventory = Get-Content release/inventory-linux.json | ConvertFrom-Json
            $contract = Get-Content release/evidence/dist-verify-contract-receipt.json | ConvertFrom-Json
@@ -405,13 +378,10 @@ jobs:
           python -m pip download --isolated --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: --dest .release-tool-wheelhouse -r requirements/release-tools.lock
           python -m venv .release-tools
           .release-tools/bin/python -I -m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --find-links "$GITHUB_WORKSPACE/.release-tool-wheelhouse" --require-hashes -r requirements/release-tools.lock
-          .release-tools/bin/python -I - <<'PY'
-          import importlib.metadata as metadata
-          expected = {"build": "1.5.0", "colorama": "0.4.6", "hatchling": "1.27.0", "iniconfig": "2.3.0", "packaging": "26.2", "pathspec": "1.1.1", "pluggy": "1.6.0", "pygments": "2.20.0", "pyproject-hooks": "1.2.0", "pytest": "8.4.2", "trove-classifiers": "2026.6.1.19"}
-          assert {name: metadata.version(name) for name in expected} == expected
-          PY
+          .release-tools/bin/python -I scripts/release_rehearsal.py release-toolchain --output "$RUNNER_TEMP/release-toolchain-rebuild.json"
           epoch="$(git show -s --format=%ct HEAD)"
           SOURCE_DATE_EPOCH="$epoch" .release-tools/bin/python -I -m build --sdist --wheel --no-isolation --outdir "$RUNNER_TEMP/rebuild/dist"
+          .release-tools/bin/python -I -m twine check --strict "$RUNNER_TEMP/rebuild/dist"/*
           version="$(python -c "import json; print(json.load(open('release/inventory-linux.json'))['package_version'])")"
           python scripts/release_inventory.py capture --dist-dir "$RUNNER_TEMP/rebuild/dist" --distribution-name aoi-orgware --package-version "$version" --output "$RUNNER_TEMP/rebuild/inventory-rebuild.json"
           cmp release/inventory-linux.json "$RUNNER_TEMP/rebuild/inventory-rebuild.json"

@@ -55,6 +55,17 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   across bounded host/WSL clock rollback and fails before mutation on larger
   rollback. Focused Windows/WSL tests pass, but all exact-candidate release
   gates must be regenerated.
+- **Exact-test evidence and the release publishing toolchain fail closed.**
+  New exact-test receipts use a versioned contained-pytest contract that binds
+  requested and canonical effective argv, a runner-generated empty config,
+  snapshot root/confcutdir/cwd roles, and a closed child environment. New
+  evidence ingestion rejects historical v1 receipts, while integrity and
+  doctor can still replay those immutable historical records. The release lock
+  now covers Twine 6.2.0 and all selected dependencies as 32 distributions and
+  40 allowed wheel hashes; test and publish workflows install the complete
+  toolchain offline and use one canonical multi-hash parser/installed-version
+  observer for producer evidence. These repairs supersede the rejected
+  `ec6d6ae` candidate and require entirely new exact-candidate qualification.
 - **AOI repository publication authority stays distinct from project file
   protection.** This repository's effective confidentiality mode is
   `standard`, so its reviewed source, Git refs, release artifacts, and PyPI

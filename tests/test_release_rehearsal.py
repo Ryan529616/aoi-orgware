@@ -251,11 +251,31 @@ def test_producer_binding_cannot_drop_receipt_platform_or_inventory(
 
 def test_linux_producer_receipt_requires_a_canonical_complete_toolchain() -> None:
     toolchain = _release_toolchain()
-    assert len(toolchain["distributions"]) == 11
+    assert len(toolchain["distributions"]) == 32
     assert {entry["name"] for entry in toolchain["distributions"]} == {
-        "build", "colorama", "hatchling", "iniconfig", "packaging", "pathspec",
-        "pluggy", "pygments", "pyproject-hooks", "pytest", "trove-classifiers",
+        "build", "certifi", "charset-normalizer", "colorama", "docutils",
+        "hatchling", "id", "idna", "iniconfig", "jaraco-classes",
+        "jaraco-context", "jaraco-functools", "keyring", "markdown-it-py",
+        "mdurl", "more-itertools", "nh3", "packaging", "pathspec", "pluggy",
+        "pygments", "pyproject-hooks", "pytest", "pywin32-ctypes",
+        "readme-renderer", "requests", "requests-toolbelt", "rfc3986", "rich",
+        "trove-classifiers", "twine", "urllib3",
     }
+    assert sum(
+        len(entry["allowed_artifact_sha256s"])
+        for entry in toolchain["distributions"]
+    ) == 40
+    assert next(
+        entry
+        for entry in toolchain["distributions"]
+        if entry["name"] == "charset-normalizer"
+    )["allowed_artifact_sha256s"] == sorted(
+        next(
+            entry
+            for entry in toolchain["distributions"]
+            if entry["name"] == "charset-normalizer"
+        )["allowed_artifact_sha256s"]
+    )
     receipt = rehearsal.create_producer_receipt(
         producer_id="build-linux",
         platform="linux",
@@ -280,7 +300,7 @@ def test_linux_producer_receipt_requires_a_canonical_complete_toolchain() -> Non
             result={"release_toolchain": missing},
         )
     extra = copy.deepcopy(toolchain)
-    extra["distributions"].append({"name": "zzz", "version": "1.0", "artifact_sha256": "0" * 64})  # type: ignore[index]
+    extra["distributions"].append({"name": "zzz", "version": "1.0", "allowed_artifact_sha256s": ["0" * 64]})  # type: ignore[index]
     with pytest.raises(rehearsal.RehearsalError, match="does not match canonical"):
         rehearsal.create_producer_receipt(producer_id="build-linux", platform="linux", inventory_sha256="1" * 64, result={"release_toolchain": extra})
     wrong_version = copy.deepcopy(toolchain)
@@ -291,6 +311,91 @@ def test_linux_producer_receipt_requires_a_canonical_complete_toolchain() -> Non
     arbitrary_lock["lock_sha256"] = "0" * 64
     with pytest.raises(rehearsal.RehearsalError, match="does not match canonical"):
         rehearsal.create_producer_receipt(producer_id="build-linux", platform="linux", inventory_sha256="1" * 64, result={"release_toolchain": arbitrary_lock})
+
+
+def test_release_toolchain_lock_parser_handles_normalized_names_and_fails_closed() -> None:
+    raw = (
+        rehearsal._ROOT / "requirements" / "release-tools.lock"
+    ).read_bytes()
+    underscore_name = raw.replace(
+        b"jaraco.classes==3.4.0",
+        b"jaraco_classes==3.4.0",
+        1,
+    )
+    with mock.patch.object(
+        rehearsal,
+        "_read_regular",
+        return_value=underscore_name,
+    ):
+        parsed = rehearsal._canonical_release_toolchain()
+    jaraco = next(
+        entry
+        for entry in parsed["distributions"]
+        if entry["name"] == "jaraco-classes"
+    )
+    assert jaraco["version"] == "3.4.0"
+    charset = next(
+        entry
+        for entry in parsed["distributions"]
+        if entry["name"] == "charset-normalizer"
+    )
+    assert len(charset["allowed_artifact_sha256s"]) == 8
+
+    missing_binary_only = raw.replace(b"--only-binary=:all:\n", b"", 1)
+    with mock.patch.object(
+        rehearsal,
+        "_read_regular",
+        return_value=missing_binary_only,
+    ), pytest.raises(rehearsal.RehearsalError, match="binary-only"):
+        rehearsal._canonical_release_toolchain()
+
+    repeated_binary_only = raw.replace(
+        b"--only-binary=:all:\n",
+        b"--only-binary=:all:\n--only-binary=:all:\n",
+        1,
+    )
+    with mock.patch.object(
+        rehearsal,
+        "_read_regular",
+        return_value=repeated_binary_only,
+    ), pytest.raises(rehearsal.RehearsalError, match="repeats"):
+        rehearsal._canonical_release_toolchain()
+
+
+def test_installed_release_toolchain_observation_rejects_missing_or_wrong_versions() -> None:
+    expected = _release_toolchain()
+    versions = {
+        entry["name"]: entry["version"]
+        for entry in expected["distributions"]
+    }
+    with mock.patch.object(
+        rehearsal.importlib_metadata,
+        "version",
+        side_effect=lambda name: versions[name],
+    ):
+        assert rehearsal.observe_installed_release_toolchain() == expected
+
+    first_name = expected["distributions"][0]["name"]
+    wrong_versions = dict(versions)
+    wrong_versions[first_name] = "0"
+    with mock.patch.object(
+        rehearsal.importlib_metadata,
+        "version",
+        side_effect=lambda name: wrong_versions[name],
+    ), pytest.raises(rehearsal.RehearsalError, match="does not match lock"):
+        rehearsal.observe_installed_release_toolchain()
+
+    def missing_version(name: str) -> str:
+        if name == first_name:
+            raise rehearsal.importlib_metadata.PackageNotFoundError(name)
+        return versions[name]
+
+    with mock.patch.object(
+        rehearsal.importlib_metadata,
+        "version",
+        side_effect=missing_version,
+    ), pytest.raises(rehearsal.RehearsalError, match="is missing"):
+        rehearsal.observe_installed_release_toolchain()
 
 
 def test_assemble_revalidates_the_complete_toolchain_not_just_its_count(

@@ -35,7 +35,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--logs-dir", required=True, type=Path)
-    parser.add_argument("--pytest-arg", action="append", default=[], help="One literal pytest argument; repeat, never a shell command (use --pytest-arg=-q for option values)")
+    parser.add_argument(
+        "--pytest-arg",
+        action="append",
+        default=[],
+        help=(
+            "One closed-contract pytest argument; repeat. Only -q, "
+            "--tb=<safe mode>, --ignore=<contained path>, and relative "
+            "targets below tests/ are accepted; paths are canonicalized "
+            "against the private Git snapshot."
+        ),
+    )
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--github-matrix-json")
     parser.add_argument("--require-github-matrix", action="store_true")

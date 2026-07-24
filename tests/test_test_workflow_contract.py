@@ -53,12 +53,20 @@ def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
 
     install = _step(unit, "Install the test toolchain offline")
     assert "python -m pip install" in install
+    assert "--ignore-installed" in install
     assert "--no-index" in install
     assert "--find-links .test-wheelhouse" in install
     assert "--require-hashes" in install
     assert "requirements/release-tools.lock" in install
     assert "\\\n" not in install
     assert "`\n" not in install
+
+    observe = _step(unit, "Observe the installed test toolchain")
+    assert (
+        "python -I scripts/release_rehearsal.py release-toolchain --output"
+        in observe
+    )
+    assert "${{ runner.temp }}/test-release-toolchain.json" in observe
 
     package = _step(unit, "Install package")
     assert re.search(
@@ -76,10 +84,13 @@ def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
     assert "requirements/coverage-tools.lock" not in unit
     assert "unittest discover" not in unit
     assert "PYTHONPATH" not in tests
+    assert 'PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"' in tests
 
     assert unit.index("Resolve the hash-locked test-tool wheelhouse") < unit.index(
         "Install the test toolchain offline"
-    ) < unit.index("Install package") < unit.index("Run unit tests")
+    ) < unit.index("Observe the installed test toolchain") < unit.index(
+        "Install package"
+    ) < unit.index("Run unit tests")
 
 
 def test_typecheck_toolchain_is_exactly_pinned_and_hash_verified() -> None:
@@ -118,9 +129,45 @@ def test_test_and_docs_workflows_pin_every_third_party_action_to_a_commit() -> N
 
 def test_package_jobs_use_the_hash_locked_build_backend_for_sdist_readback() -> None:
     lock = RELEASE_TOOLS_LOCK.read_text(encoding="utf-8")
-    assert "build==1.5.0" in lock
-    assert "hatchling==1.27.0" in lock
-    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 11
+    expected = {
+        "build==1.5.0",
+        "certifi==2026.7.22",
+        "charset-normalizer==3.4.9",
+        "colorama==0.4.6",
+        "docutils==0.23",
+        "hatchling==1.27.0",
+        "id==1.6.1",
+        "idna==3.18",
+        "iniconfig==2.3.0",
+        "jaraco.classes==3.4.0",
+        "jaraco.context==6.1.2",
+        "jaraco.functools==4.6.0",
+        "keyring==25.7.0",
+        "markdown-it-py==4.2.0",
+        "mdurl==0.1.2",
+        "more-itertools==11.1.0",
+        "nh3==0.3.6",
+        "packaging==26.2",
+        "pathspec==1.1.1",
+        "pluggy==1.6.0",
+        "pygments==2.20.0",
+        "pyproject-hooks==1.2.0",
+        "pytest==8.4.2",
+        "pywin32-ctypes==0.2.3",
+        "readme_renderer==45.0",
+        "requests==2.34.2",
+        "requests-toolbelt==1.0.0",
+        "rfc3986==2.0.0",
+        "rich==15.0.0",
+        "trove-classifiers==2026.6.1.19",
+        "twine==6.2.0",
+        "urllib3==2.7.0",
+    }
+    assert "--only-binary=:all:" in lock
+    assert all(requirement in lock for requirement in expected)
+    # Eight charset-normalizer and two nh3 hashes cover the CPython 3.11--3.14
+    # Linux/Windows wheels; every other locked distribution has one wheel hash.
+    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 40
 
     workflow = _workflow()
     package = _job(workflow, "package")
@@ -134,4 +181,7 @@ def test_package_jobs_use_the_hash_locked_build_backend_for_sdist_readback() -> 
         assert "--expected-build-version 1.5.0" in section
         assert "--expected-hatchling-version 1.27.0" in section
     assert ".release-tools/bin/python -m build --no-isolation" in package
+    assert ".release-tools/bin/python -I -m twine check --strict dist/*" in package
+    assert 'python -m pip install "twine==6.2.0"' not in package
+    assert not re.search(r"^\s*run:\s*python -m twine check --strict", package, re.MULTILINE)
     assert ".\\.release-tools\\Scripts\\python.exe" in windows

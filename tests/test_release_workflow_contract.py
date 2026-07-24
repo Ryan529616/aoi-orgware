@@ -142,6 +142,14 @@ def test_producer_gate_uses_pinned_pytest_and_honest_sdist_derivation() -> None:
     assert "release-toolchain.json" in producer
     assert '"release_toolchain"' in producer
     assert "--no-isolation --outdir release/dist" in producer
+    assert (
+        ".release-tools/bin/python -I -m twine check --strict release/dist/*"
+        in producer
+    )
+    assert (
+        '"command": "build + twine check --strict + pytest O7 modules + verify_dist"'
+        in producer
+    )
     assert "--build-python \"$GITHUB_WORKSPACE/.release-tools/bin/python\"" in producer
     assert '"sdist_verification":"derived-wheel-offline-install"' in producer
     assert "unittest discover" not in producer
@@ -150,12 +158,15 @@ def test_producer_gate_uses_pinned_pytest_and_honest_sdist_derivation() -> None:
 def test_producer_installs_the_single_inventory_bound_wheel_before_isolated_tests() -> None:
     producer = _job(_workflow(), "producer-linux")
     build_at = producer.index("-m build --sdist --wheel --no-isolation --outdir release/dist")
+    twine_at = producer.index(
+        ".release-tools/bin/python -I -m twine check --strict release/dist/*"
+    )
     capture_at = producer.index("release_inventory.py capture --dist-dir release/dist")
     verify_at = producer.index("release_inventory.py verify --inventory release/inventory-linux.json --root release/dist")
     select_at = producer.index("inventory must identify exactly one wheel and one sdist")
     install_at = producer.index("-m pip install --isolated --disable-pip-version-check --no-cache-dir --no-index --no-deps \"$wheel\"")
     test_at = producer.index(".release-tools/bin/python -I -m pytest -q")
-    assert build_at < capture_at < verify_at < select_at < install_at < test_at
+    assert build_at < twine_at < capture_at < verify_at < select_at < install_at < test_at
     assert "len(artifacts) != 2 or len(wheels) != 1" in producer
     assert "inventory-selected wheel bytes do not match" in producer
     assert "installed distribution version does not match exact inventory wheel" in producer
@@ -170,21 +181,43 @@ def test_release_tools_lock_is_complete_hashed_and_used_offline_everywhere() -> 
     lock = RELEASE_TOOLS_LOCK.read_text(encoding="utf-8")
     expected = {
         "build==1.5.0",
-        "hatchling==1.27.0",
-        "pytest==8.4.2",
+        "certifi==2026.7.22",
+        "charset-normalizer==3.4.9",
         "colorama==0.4.6",
+        "docutils==0.23",
+        "hatchling==1.27.0",
+        "id==1.6.1",
+        "idna==3.18",
         "iniconfig==2.3.0",
+        "jaraco.classes==3.4.0",
+        "jaraco.context==6.1.2",
+        "jaraco.functools==4.6.0",
+        "keyring==25.7.0",
+        "markdown-it-py==4.2.0",
+        "mdurl==0.1.2",
+        "more-itertools==11.1.0",
+        "nh3==0.3.6",
         "packaging==26.2",
         "pathspec==1.1.1",
         "pluggy==1.6.0",
         "pygments==2.20.0",
         "pyproject-hooks==1.2.0",
+        "pytest==8.4.2",
+        "pywin32-ctypes==0.2.3",
+        "readme_renderer==45.0",
+        "requests==2.34.2",
+        "requests-toolbelt==1.0.0",
+        "rfc3986==2.0.0",
+        "rich==15.0.0",
         "trove-classifiers==2026.6.1.19",
+        "twine==6.2.0",
+        "urllib3==2.7.0",
     }
     assert "--only-binary=:all:" in lock
     assert "aoi-orgware" not in lock
     assert all(item in lock for item in expected)
-    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == len(expected)
+    assert len(expected) == 32
+    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 40
     text = _workflow()
     for job_name in ("producer-linux", "verify-windows", "rebuild-linux"):
         job = _job(text, job_name)
@@ -192,11 +225,25 @@ def test_release_tools_lock_is_complete_hashed_and_used_offline_everywhere() -> 
         assert "--require-hashes --only-binary=:all:" in job
         assert "--no-index --find-links" in job
         assert "requirements/release-tools.lock" in job
+        assert (
+            "scripts/release_rehearsal.py release-toolchain --output"
+            in job
+        )
+    assert (
+        ".release-tools/bin/python -I -m twine check --strict "
+        '"$RUNNER_TEMP/rebuild/dist"/*'
+        in _job(text, "rebuild-linux")
+    )
     producer = _job(text, "producer-linux")
     assert '"release_toolchain"' in producer
-    toolchain_start = producer.index("release/evidence/release-toolchain.json")
-    toolchain_end = producer.index("toolchain_json=", toolchain_start)
+    toolchain_start = producer.index(
+        "scripts/release_rehearsal.py release-toolchain --output "
+        "release/evidence/release-toolchain.json"
+    )
+    toolchain_end = producer.index("\n", toolchain_start)
     assert "aoi-orgware" not in producer[toolchain_start:toolchain_end]
+    assert "len(entries) != 11" not in producer
+    assert '"artifact_sha256"' not in producer
 
 
 def test_producer_requires_an_annotated_exact_tag_and_all_checkouts_use_its_commit() -> None:
