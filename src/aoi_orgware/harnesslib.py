@@ -3139,9 +3139,11 @@ def task_state_path(paths: HarnessPaths, task_id: str) -> Path:
 def is_semantic_v2_task(paths: HarnessPaths, task_id: str) -> bool:
     """Return whether the task has crossed the semantic-v2 ledger boundary."""
 
-    from .semantic_store import has_semantic_ledger
+    from .semantic_store import has_semantic_ledger, semantic_ledger_is_empty
 
-    return has_semantic_ledger(paths, task_id)
+    return has_semantic_ledger(paths, task_id) and not semantic_ledger_is_empty(
+        paths, task_id
+    )
 
 
 def semantic_task_projection_status(paths: HarnessPaths, task_id: str) -> str:
@@ -4368,6 +4370,19 @@ def claims_for_task(
     *,
     validate_reserving: bool = True,
 ) -> list[dict[str, Any]]:
+    # Semantic-v2 claim lifecycle authority is deliberately not reconstructed
+    # from the legacy active/archive mirrors.  The side-record reader verifies
+    # the ledger, immutable object, binding, and publication state as one
+    # transaction, and rejects a prepared or divergent publication rather than
+    # returning a partially authoritative scope.  Keep this import lazy: most
+    # AOI users and every legacy task must retain the old claim-only dependency
+    # path and behavior.
+    task_id = str(state.get("task_id", ""))
+    if is_semantic_v2_task(paths, task_id):
+        from . import semantic_claims
+
+        return semantic_claims.authenticated_claims_for_task(paths, state)
+
     result: list[dict[str, Any]] = []
     for token in state.get("claims", []):
         active_path = claim_path(paths, token, active=True)
@@ -4388,6 +4403,13 @@ def claims_for_task(
 
 
 def claims_owned_by_task(paths: HarnessPaths, task_id: str) -> list[dict[str, Any]]:
+    # See ``claims_for_task``: v2 consumers must never gain authority from a
+    # raw side file whose matching ledger transition has not committed.
+    if is_semantic_v2_task(paths, task_id):
+        from . import semantic_claims
+
+        return semantic_claims.authenticated_claims_owned_by_task(paths, task_id)
+
     result: list[dict[str, Any]] = []
     for directory in (paths.claims_active, paths.claims_archive):
         for path in _claim_files(directory):
@@ -4411,11 +4433,19 @@ def validate_task_claim_references(
     errors: list[str] = []
     if len(set(referenced)) != len(referenced):
         errors.append("task claim references contain duplicates")
-    owned_records = [
-        claim
-        for claim in load_all_claims(paths)
-        if not claim.get("legacy") and str(claim.get("task_id", "")) == task_id
-    ]
+    if is_semantic_v2_task(paths, task_id):
+        # The authenticated reader is also the fail-closed boundary for
+        # pending/divergent semantic side records.  Do not substitute
+        # ``load_all_claims`` here: those raw mirrors remain intentionally
+        # visible to lock reservation/conflict checks, but cannot establish
+        # consumer authority for a migrated task.
+        owned_records = claims_owned_by_task(paths, task_id)
+    else:
+        owned_records = [
+            claim
+            for claim in load_all_claims(paths)
+            if not claim.get("legacy") and str(claim.get("task_id", "")) == task_id
+        ]
     owned_counts: dict[str, int] = {}
     for claim in owned_records:
         token = str(claim.get("token", ""))

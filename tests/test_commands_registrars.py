@@ -1361,6 +1361,96 @@ class TaskLifecycleCommandRegistryTests(unittest.TestCase):
         self.assertIs(args.handler, handlers["set_claim_status"])
         self.assertEqual(args.status, "active")
 
+    def test_claim_lifecycle_commands_register_semantic_transition_options(self) -> None:
+        parser, handlers = self.parser()
+        semantic_args = [
+            "--semantic-command-id",
+            "CMD1",
+            "--semantic-expected-head-sha256",
+            "a" * 64,
+            "--semantic-recorded-at",
+            "2026-07-24T00:00:00Z",
+        ]
+        cases = [
+            (
+                [
+                    "claim",
+                    "--task",
+                    "T1",
+                    "--token",
+                    "TOK1",
+                    "--owner",
+                    "alice",
+                    "--kind",
+                    "file",
+                    "--lock",
+                    "repo:src/a.py",
+                    "--intent",
+                    "change parser",
+                    "--validation",
+                    "unit test",
+                    "--expires-at",
+                    "2026-07-25T00:00:00Z",
+                ],
+                "claim",
+                "T1",
+            ),
+            (
+                [
+                    "set-claim-status",
+                    "--task",
+                    "T1",
+                    "--token",
+                    "TOK1",
+                    "--status",
+                    "active",
+                    "--reason",
+                    "resume",
+                ],
+                "set_claim_status",
+                "T1",
+            ),
+            (
+                [
+                    "release-claim",
+                    "--task",
+                    "T1",
+                    "--token",
+                    "TOK1",
+                    "--status",
+                    "released",
+                    "--reason",
+                    "done",
+                ],
+                "release_claim",
+                "T1",
+            ),
+        ]
+        for command_args, handler_name, task_id in cases:
+            with self.subTest(command=command_args[0]):
+                args = parser.parse_args(command_args + semantic_args)
+                self.assertIs(args.handler, handlers[handler_name])
+                self.assertEqual(args.task, task_id)
+                self.assertEqual(args.semantic_command_id, "CMD1")
+                self.assertEqual(args.semantic_expected_head_sha256, "a" * 64)
+                self.assertEqual(args.semantic_recorded_at, "2026-07-24T00:00:00Z")
+
+    def test_claim_status_commands_keep_legacy_taskless_surface(self) -> None:
+        parser, handlers = self.parser()
+        args = parser.parse_args(
+            [
+                "release-claim",
+                "--token",
+                "TOK1",
+                "--status",
+                "released",
+                "--reason",
+                "done",
+            ]
+        )
+        self.assertIs(args.handler, handlers["release_claim"])
+        self.assertIsNone(args.task)
+
     def test_registry_rejects_out_of_vocab_release_claim_status(self) -> None:
         parser, _ = self.parser()
         with self.assertRaises(SystemExit):

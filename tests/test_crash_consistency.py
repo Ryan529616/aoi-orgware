@@ -15,6 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -24,6 +25,7 @@ WORKER = HERE / "atomic_crash_worker.py"
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import harnesslib as h  # noqa: E402
+from aoi_orgware import semantic_claims  # noqa: E402
 from aoi_orgware import semantic_events as semantic  # noqa: E402
 from aoi_orgware import semantic_store as semantic_store  # noqa: E402
 from tests.harness_case import HarnessTestCase  # noqa: E402
@@ -665,12 +667,291 @@ class SemanticGenesisCrashTests(AtomicCrashController, HarnessTestCase):
         recovered = json.loads(self.cli("recover-temporaries", "--json").stdout)
         self.assertGreaterEqual(len(recovered["recovered"]), 1)
         self.assertEqual(atomic_temporaries(event_directory), [])
+        self.assertFalse(h.is_semantic_v2_task(paths, self.TASK_ID))
         initialized = json.loads(self.cli(*self.semantic_command()).stdout)
         self.assertFalse(initialized["idempotent_retry"])
         self.assertTrue(event_path.is_file())
         self.assertEqual(
             semantic_store.semantic_projection_status(paths, self.TASK_ID), "current"
         )
+
+
+class SemanticClaimCrashTests(HarnessTestCase):
+    """Crash prefixes for the semantic claim object/side/event transaction.
+
+    The injector always invokes the real atomic publication helper first, then
+    raises ``BaseException`` to model process death without exercising ordinary
+    exception cleanup.  This keeps the tests on the actual publication path.
+    """
+
+    TASK_ID = "semantic-claim-crash"
+    TOKEN = "semantic-claim-crash-token"
+    ACQUIRE_COMMAND = "semantic-claim-acquire-crash-v1"
+    RELEASE_COMMAND = "semantic-claim-release-crash-v1"
+    RECORDED_AT = "2026-07-24T00:00:00+00:00"
+
+    class InjectedCrash(BaseException):
+        pass
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.init_task(self.TASK_ID)
+        self.paths = h.get_paths(self.root)
+        state_path = h.task_state_path(self.paths, self.TASK_ID)
+        self.cli(
+            "semantic-migrate",
+            "--task",
+            self.TASK_ID,
+            "--command-id",
+            "semantic-claim-crash-migrate-v1",
+            "--expected-legacy-state-sha256",
+            hashlib.sha256(state_path.read_bytes()).hexdigest(),
+        )
+        self.acquire_head = self.head()
+        self.release_head: str | None = None
+        self.active_path = h.claim_path(self.paths, self.TOKEN, active=True)
+        self.archive_path = h.claim_path(self.paths, self.TOKEN, active=False)
+
+    def head(self) -> str:
+        return str(
+            json.loads(
+                self.cli("semantic-head", "--task", self.TASK_ID, "--json").stdout
+            )["event_sha256"]
+        )
+
+    def claim_command(
+        self,
+        *,
+        command_id: str = ACQUIRE_COMMAND,
+        expected_head: str | None = None,
+        intent: str = "exercise semantic claim crashes",
+    ) -> list[str]:
+        return [
+            "claim",
+            "--task",
+            self.TASK_ID,
+            "--token",
+            self.TOKEN,
+            "--owner",
+            "test-root",
+            "--kind",
+            "implementation",
+            "--lock",
+            "repo:file:.harness-test-root",
+            "--intent",
+            intent,
+            "--validation",
+            "crash consistency unit test",
+            "--expires-at",
+            "2026-07-25T00:00:00+00:00",
+            "--semantic-command-id",
+            command_id,
+            "--semantic-expected-head-sha256",
+            expected_head or self.acquire_head,
+            "--semantic-recorded-at",
+            self.RECORDED_AT,
+            "--json",
+        ]
+
+    def release_command(self, *, expected_head: str | None = None) -> list[str]:
+        return [
+            "release-claim",
+            "--task",
+            self.TASK_ID,
+            "--token",
+            self.TOKEN,
+            "--status",
+            "released",
+            "--reason",
+            "crash consistency release",
+            "--semantic-command-id",
+            self.RELEASE_COMMAND,
+            "--semantic-expected-head-sha256",
+            expected_head or self.release_head or self.head(),
+            "--semantic-recorded-at",
+            self.RECORDED_AT,
+            "--json",
+        ]
+
+    def crash_after_atomic_publication(
+        self, helper: str, predicate: Any
+    ) -> tuple[Any, dict[str, bool]]:
+        original = getattr(h, helper)
+        fired = {"value": False}
+
+        def injected(destination: Path, *args: Any, **kwargs: Any) -> None:
+            original(destination, *args, **kwargs)
+            if not fired["value"] and predicate(Path(destination)):
+                fired["value"] = True
+                raise self.InjectedCrash(helper)
+
+        return mock.patch.object(h, helper, injected), fired
+
+    def assert_claim_event_count(self, event_type: str, expected: int) -> None:
+        chain = semantic_store._read_ledger(self.paths, self.TASK_ID)
+        self.assertEqual(
+            sum(item.get("event_type") == event_type for item in chain), expected
+        )
+
+    def assert_pending_cannot_authorize(self) -> None:
+        with self.assertRaises(h.HarnessError):
+            semantic_claims.authenticated_claims_owned_by_task(
+                self.paths, self.TASK_ID
+            )
+
+    def test_object_publish_crash_retries_once_and_rejects_divergent_request(self) -> None:
+        patcher, fired = self.crash_after_atomic_publication(
+            "atomic_create_bytes",
+            lambda path: "semantic-objects" in path.parts,
+        )
+        with patcher, self.assertRaises(self.InjectedCrash):
+            self.cli_in_process(*self.claim_command())
+        self.assertTrue(fired["value"])
+        self.assertFalse(self.active_path.exists())
+        self.assert_claim_event_count("claim_acquired", 0)
+
+        changed_metadata = self.cli(
+            *self.claim_command(intent="changed intent"), ok=False
+        )
+        self.assertIn("different claim acquisition", changed_metadata.stderr)
+        changed_head = self.cli(
+            *self.claim_command(expected_head="f" * 64), ok=False
+        )
+        self.assertIn("different command metadata", changed_head.stderr)
+        self.assert_claim_event_count("claim_acquired", 0)
+
+        result = json.loads(self.cli(*self.claim_command()).stdout)
+        self.assertFalse(result["idempotent_replay"])
+        self.assert_claim_event_count("claim_acquired", 1)
+        self.assertEqual(
+            semantic_claims.authenticated_claims_owned_by_task(
+                self.paths, self.TASK_ID
+            )[0]["token"],
+            self.TOKEN,
+        )
+
+    def test_pending_side_before_binding_cannot_authorize_and_tamper_fails_closed(self) -> None:
+        patcher, fired = self.crash_after_atomic_publication(
+            "atomic_create_bytes", lambda path: path == self.active_path
+        )
+        with patcher, self.assertRaises(self.InjectedCrash):
+            self.cli_in_process(*self.claim_command())
+        self.assertTrue(fired["value"])
+        self.assertTrue(self.active_path.exists())
+        self.assert_pending_cannot_authorize()
+        self.assert_claim_event_count("claim_acquired", 0)
+
+        pending = json.loads(self.active_path.read_text(encoding="utf-8"))
+        pending["semantic_authority"]["command_id"] = "tampered-command"
+        h.atomic_write_json(self.active_path, pending)
+        rejected = self.cli(*self.claim_command(), ok=False)
+        self.assertIn("divergent bytes", rejected.stderr)
+        self.assert_claim_event_count("claim_acquired", 0)
+
+    def test_binding_publish_crash_keeps_pending_reservation_unusable_until_exact_retry(self) -> None:
+        patcher, fired = self.crash_after_atomic_publication(
+            "atomic_create_bytes",
+            lambda path: "semantic-bindings" in path.parts,
+        )
+        with patcher, self.assertRaises(self.InjectedCrash):
+            self.cli_in_process(*self.claim_command())
+        self.assertTrue(fired["value"])
+        self.assertTrue(self.active_path.exists())
+        self.assert_pending_cannot_authorize()
+        self.assert_claim_event_count("claim_acquired", 0)
+
+        replay = json.loads(self.cli(*self.claim_command()).stdout)
+        self.assertFalse(replay["idempotent_replay"])
+        self.assert_claim_event_count("claim_acquired", 1)
+
+    def test_event_publish_crash_repairs_projection_and_commits_side_without_duplicate(self) -> None:
+        event_path = semantic_store.semantic_event_directory(
+            self.paths, self.TASK_ID
+        ) / semantic.event_filename(2)
+        patcher, fired = self.crash_after_atomic_publication(
+            "atomic_create_bytes", lambda path: path == event_path
+        )
+        with patcher, self.assertRaises(self.InjectedCrash):
+            self.cli_in_process(*self.claim_command())
+        self.assertTrue(fired["value"])
+        self.assertTrue(event_path.exists())
+        self.assertTrue(self.active_path.exists())
+        self.assert_pending_cannot_authorize()
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID), "behind"
+        )
+
+        replay = json.loads(self.cli(*self.claim_command()).stdout)
+        self.assertTrue(replay["idempotent_replay"])
+        self.assert_claim_event_count("claim_acquired", 1)
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID), "current"
+        )
+        self.assertEqual(
+            semantic_claims.authenticated_claims_owned_by_task(
+                self.paths, self.TASK_ID
+            )[0]["token"],
+            self.TOKEN,
+        )
+
+    def test_projection_publish_crash_leaves_pending_side_unusable_until_retry(self) -> None:
+        state_path = h.task_state_path(self.paths, self.TASK_ID)
+        patcher, fired = self.crash_after_atomic_publication(
+            "atomic_write_bytes", lambda path: path == state_path
+        )
+        with patcher, self.assertRaises(self.InjectedCrash):
+            self.cli_in_process(*self.claim_command())
+        self.assertTrue(fired["value"])
+        self.assertTrue(self.active_path.exists())
+        self.assert_pending_cannot_authorize()
+        self.assert_claim_event_count("claim_acquired", 1)
+        self.assertEqual(
+            semantic_store.semantic_projection_status(self.paths, self.TASK_ID), "current"
+        )
+
+        replay = json.loads(self.cli(*self.claim_command()).stdout)
+        self.assertTrue(replay["idempotent_replay"])
+        self.assert_claim_event_count("claim_acquired", 1)
+        self.assertEqual(
+            semantic_claims.authenticated_claims_owned_by_task(
+                self.paths, self.TASK_ID
+            )[0]["token"],
+            self.TOKEN,
+        )
+
+    def test_release_archive_publish_precedes_active_unlink_and_exact_retry_unlinks_once(self) -> None:
+        self.cli(*self.claim_command())
+        self.release_head = self.head()
+        patcher, fired = self.crash_after_atomic_publication(
+            "atomic_create_bytes", lambda path: path == self.archive_path
+        )
+        with patcher, self.assertRaises(self.InjectedCrash):
+            self.cli_in_process(*self.release_command())
+        self.assertTrue(fired["value"])
+        self.assertTrue(self.archive_path.exists())
+        self.assertTrue(self.active_path.exists(), "active unlink must follow archive")
+        self.assert_pending_cannot_authorize()
+        self.assert_claim_event_count("claim_released", 1)
+
+        replay = json.loads(self.cli(*self.release_command()).stdout)
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertFalse(self.active_path.exists())
+        self.assertTrue(self.archive_path.exists())
+        self.assert_claim_event_count("claim_released", 1)
+
+    def test_index_failure_after_commit_retries_without_duplicate_event(self) -> None:
+        with mock.patch.object(
+            h,
+            "write_index",
+            side_effect=h.HarnessError("injected index publication failure"),
+        ):
+            failed = self.cli_in_process(*self.claim_command(), ok=False)
+        self.assertIn("injected index publication failure", failed.stderr)
+        self.assertTrue(self.active_path.exists())
+        self.assert_claim_event_count("claim_acquired", 1)
+        replay = json.loads(self.cli(*self.claim_command()).stdout)
+        self.assertTrue(replay["idempotent_replay"])
+        self.assert_claim_event_count("claim_acquired", 1)
 
 
 class SemanticMigrationCrashTests(AtomicCrashController, HarnessTestCase):

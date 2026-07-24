@@ -141,12 +141,17 @@ from ..harnesslib import (
 )
 from ..pilot import initialize_kit, load_record, write_summary
 from ..semantic_store import (
+    append_semantic_transition,
     has_semantic_ledger,
     initialize_semantic_task,
+    load_semantic_events,
+    preflight_semantic_append,
+    recover_published_semantic_transition,
     repair_semantic_projection,
     semantic_ledger_is_empty,
     semantic_projection_status,
 )
+from ..semantic_events import SemanticEventError, projection_domain, replay_events
 from ..state_lookup import require_open_task
 
 
@@ -1317,7 +1322,208 @@ def cmd_start_mini(args: argparse.Namespace, paths: HarnessPaths, *, services: T
     return 0
 
 
+_SEMANTIC_PLAN_APPROVAL_EVENT_TYPE = "plan_approved"
+
+
+def _semantic_plan_options_supplied(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, field, None) is not None
+        for field in (
+            "semantic_command_id",
+            "semantic_expected_head_sha256",
+            "semantic_recorded_at",
+        )
+    )
+
+
+def _semantic_plan_approval_retry_states(
+    paths: HarnessPaths,
+    task_id: str,
+    *,
+    command_id: str,
+    expected_head_sha256: str,
+    recorded_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return authoritative retry domains only for the exact current tail."""
+
+    events = load_semantic_events(paths, task_id)
+    matches = [event for event in events if event.get("command_id") == command_id]
+    if not matches:
+        return None
+    if (
+        len(matches) != 1
+        or matches[0] is not events[-1]
+        or matches[0].get("event_type") != _SEMANTIC_PLAN_APPROVAL_EVENT_TYPE
+        or matches[0].get("prev_event_sha256") != expected_head_sha256
+        or matches[0].get("recorded_at") != recorded_at
+        or len(events) < 2
+    ):
+        raise HarnessError(
+            "semantic approve-plan command is not the matching terminal transition"
+        )
+    try:
+        return (
+            projection_domain(replay_events(events[:-1])),
+            projection_domain(replay_events(events)),
+        )
+    except SemanticEventError as exc:
+        raise HarnessError(
+            f"semantic approve-plan retry cannot replay its transition: {exc}"
+        ) from exc
+
+
+def _semantic_plan_approval_candidate(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    services: TaskLifecycleCmdServices,
+    recorded_at: str,
+) -> tuple[dict[str, Any], str]:
+    """Build one deterministic approval projection from current bounded plan bytes."""
+
+    candidate = json.loads(json.dumps(projection_domain(state)))
+    require_open_task(candidate, "approve plan for")
+    source = services.plan_path(paths, candidate)
+    _identity, payload = _read_regular_file_snapshot(
+        source, "task plan", max_bytes=PLAN_UPDATE_MAX_BYTES
+    )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError("task plan must be valid UTF-8") from exc
+    unresolved = [
+        marker
+        for marker in ("Replace this line", "[TODO", "{{TASK_ID}}", "{{OBJECTIVE}}")
+        if marker in text
+    ]
+    if unresolved:
+        raise HarnessError(
+            "plan still contains unresolved template markers: " + ", ".join(unresolved)
+        )
+    if len(text.strip()) < 400:
+        raise HarnessError("plan is too short; record evidence, work breakdown, and verification")
+    _require_plan_scope_matches_state(text, candidate)
+    if not candidate.get("worktree"):
+        candidate.update(git_metadata(paths.root))
+    digest = hashlib.sha256(payload).hexdigest()
+    previous_digest = str(candidate.get("plan_sha256", ""))
+    has_dispatched_work = bool(candidate.get("packets") or candidate.get("jobs"))
+    coverage_note = ""
+    if previous_digest and previous_digest != digest and has_dispatched_work:
+        coverage_note = require_text(
+            args.coverage_note or "",
+            "plan re-approval coverage note (--coverage-note): state which "
+            "packets/jobs the superseded plan governed",
+        )
+    note = require_text(args.note, "approval note")
+    revision = int(candidate.get("revision", 0)) + 1
+    candidate["plan_ready"] = True
+    candidate["plan_sha256"] = digest
+    candidate["plan_approved_at"] = recorded_at
+    candidate["plan_approval_note"] = note
+    approval = {
+        "plan_sha256": digest,
+        "approved_at": recorded_at,
+        "note": note,
+        "revision": revision,
+    }
+    if coverage_note:
+        approval["coverage_note"] = coverage_note
+    candidate.setdefault("plan_approvals", []).append(approval)
+    candidate["revision"] = revision
+    candidate["updated_at"] = recorded_at
+    candidate["checkpoint_required"] = True
+    return candidate, digest
+
+
+def _cmd_semantic_approve_plan(
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+    *,
+    services: TaskLifecycleCmdServices,
+) -> dict[str, Any]:
+    command_id = str(getattr(args, "semantic_command_id", "") or "").strip()
+    expected_head_sha256 = str(
+        getattr(args, "semantic_expected_head_sha256", "") or ""
+    ).strip()
+    recorded_at = str(getattr(args, "semantic_recorded_at", "") or "").strip()
+    if not command_id or not expected_head_sha256 or not recorded_at:
+        raise HarnessError(
+            "semantic-v2 approve-plan requires --semantic-command-id, "
+            "--semantic-expected-head-sha256, and --semantic-recorded-at"
+        )
+    validate_id(command_id, "semantic command id")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_head_sha256) is None:
+        raise HarnessError(
+            "semantic-v2 approve-plan requires --semantic-expected-head-sha256"
+        )
+    _require_semantic_checkpoint_recorded_at(recorded_at)
+
+    state = load_task(paths, args.task)
+    from .. import semantic_objects
+
+    events = load_semantic_events(paths, args.task)
+    semantic_objects.require_no_pending_bindings(paths, args.task, events)
+    retry_states = _semantic_plan_approval_retry_states(
+        paths,
+        args.task,
+        command_id=command_id,
+        expected_head_sha256=expected_head_sha256,
+        recorded_at=recorded_at,
+    )
+    base = retry_states[0] if retry_states is not None else state
+    candidate, digest = _semantic_plan_approval_candidate(
+        paths, base, args, services=services, recorded_at=recorded_at
+    )
+    if retry_states is not None:
+        if candidate != retry_states[1]:
+            raise HarnessError(
+                "semantic approve-plan retry differs from the published transition"
+            )
+        semantic_result = recover_published_semantic_transition(
+            paths,
+            args.task,
+            candidate,
+            event_type=_SEMANTIC_PLAN_APPROVAL_EVENT_TYPE,
+            command_id=command_id,
+            expected_head_sha256=expected_head_sha256,
+        )
+    else:
+        preflight_semantic_append(
+            paths,
+            args.task,
+            command_id=command_id,
+            expected_head_sha256=expected_head_sha256,
+        )
+        semantic_result = append_semantic_transition(
+            paths,
+            args.task,
+            candidate,
+            event_type=_SEMANTIC_PLAN_APPROVAL_EVENT_TYPE,
+            command_id=command_id,
+            recorded_at=recorded_at,
+            authority_ref=str(getattr(args, "_aoi_authority_ref", "") or ""),
+            expected_head_sha256=expected_head_sha256,
+        )
+    write_index(paths)
+    return {
+        "task_id": args.task,
+        "plan_sha256": digest,
+        "plan_ready": True,
+        "semantic_head_sha256": semantic_result.event["event_sha256"],
+        "idempotent_replay": semantic_result.idempotent_replay,
+    }
+
+
 def cmd_approve_plan(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices) -> int:
+    if is_semantic_v2_task(paths, args.task):
+        with state_lock(paths):
+            result = _cmd_semantic_approve_plan(args, paths, services=services)
+        emit(result, args.json)
+        return 0
+    if _semantic_plan_options_supplied(args):
+        raise HarnessError("semantic approve-plan options require a semantic-v2 task")
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "approve plan for")
@@ -1575,7 +1781,37 @@ def cmd_inspect_legacy(args: argparse.Namespace, paths: HarnessPaths) -> int:
     return 0
 
 
+def _semantic_claim_options_supplied(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, field, None) is not None
+        for field in (
+            "semantic_command_id",
+            "semantic_expected_head_sha256",
+            "semantic_recorded_at",
+        )
+    )
+
+
+def _reject_legacy_semantic_claim_options(args: argparse.Namespace) -> None:
+    if _semantic_claim_options_supplied(args):
+        raise HarnessError(
+            "semantic claim options require a semantic-v2 task"
+        )
+
+
 def cmd_claim(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLifecycleCmdServices) -> int:
+    if is_semantic_v2_task(paths, args.task):
+        from .. import semantic_claims
+
+        with state_lock(paths):
+            result = semantic_claims.acquire_semantic_claim(
+                args,
+                paths,
+                require_plan_ready=services.require_plan_ready,
+            )
+        emit(result, args.json)
+        return 0
+    _reject_legacy_semantic_claim_options(args)
     token = validate_id(args.token, "claim token")
     locks = list(dict.fromkeys(normalize_lock(item) for item in args.lock))
     if not locks:
@@ -1712,11 +1948,30 @@ def cmd_claim(args: argparse.Namespace, paths: HarnessPaths, *, services: TaskLi
 def cmd_set_claim_status(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if args.status not in RESERVING_CLAIM_STATUSES:
         raise HarnessError("set-claim-status accepts active or blocked only")
+    requested_task = str(getattr(args, "task", "") or "").strip()
+    if requested_task and is_semantic_v2_task(paths, requested_task):
+        from .. import semantic_claims
+
+        with state_lock(paths):
+            result = semantic_claims.set_semantic_claim_status(args, paths)
+        emit(result, args.json)
+        return 0
     with state_lock(paths):
         source = claim_path(paths, args.token, active=True)
         claim = load_claim_file(source)
         validate_claim_lock_identities(paths, claim)
         state = load_task(paths, claim["task_id"])
+        if "_semantic" in state:
+            raise HarnessError(
+                "semantic-v2 set-claim-status requires explicit semantic "
+                "transitions: supply --task and semantic "
+                "command/head/timestamp options"
+            )
+        _reject_legacy_semantic_claim_options(args)
+        if requested_task and requested_task != state["task_id"]:
+            raise HarnessError(
+                f"claim belongs to task {state['task_id']}, not {requested_task}"
+            )
         _reject_stage1_semantic_legacy_side_effect(state, "set-claim-status")
         claim["status"] = args.status
         claim["status_reason"] = require_text(args.reason, "reason")
@@ -1738,10 +1993,36 @@ def cmd_release_claim(
 ) -> int:
     if args.status not in TERMINAL_CLAIM_STATUSES:
         raise HarnessError("release status must be done, released, or stale")
+    requested_task = str(getattr(args, "task", "") or "").strip()
+    if requested_task and is_semantic_v2_task(paths, requested_task):
+        from .. import semantic_claims
+
+        with state_lock(paths):
+            result = semantic_claims.release_semantic_claim(
+                args,
+                paths,
+                uncovered_dependencies_after_release=(
+                    uncovered_dependencies_after_release
+                ),
+            )
+        if emit_result:
+            emit(result, args.json)
+        return 0
     with state_lock(paths):
         source = claim_path(paths, args.token, active=True)
         claim = load_claim_file(source)
         state = load_task(paths, claim["task_id"])
+        if "_semantic" in state:
+            raise HarnessError(
+                "semantic-v2 release-claim requires explicit semantic "
+                "transitions: supply --task and semantic "
+                "command/head/timestamp options"
+            )
+        _reject_legacy_semantic_claim_options(args)
+        if requested_task and requested_task != state["task_id"]:
+            raise HarnessError(
+                f"claim belongs to task {state['task_id']}, not {requested_task}"
+            )
         _reject_stage1_semantic_legacy_side_effect(state, "release-claim")
         uncovered = uncovered_dependencies_after_release(
             paths, state, str(claim.get("token"))
@@ -1933,7 +2214,9 @@ def _next_risk_id(state: dict[str, Any]) -> str:
     return f"r{highest + 1}"
 
 
-def _append_risks(state: dict[str, Any], values: Iterable[str]) -> None:
+def _append_risks(
+    state: dict[str, Any], values: Iterable[str], *, recorded_at: str | None = None
+) -> None:
     """Append typed open risks, skipping texts that are already open.
 
     Retired/materialized texts do not suppress a re-raise: a risk that came
@@ -1954,7 +2237,7 @@ def _append_risks(state: dict[str, Any], values: Iterable[str]) -> None:
                 "id": _next_risk_id(state),
                 "text": value,
                 "status": "open",
-                "recorded_at": now_iso(),
+                "recorded_at": recorded_at or now_iso(),
             }
         )
 
@@ -1991,6 +2274,188 @@ def _require_changed_files_in_worktree(
             ) from exc
 
 
+_SEMANTIC_CHECKPOINT_EVENT_TYPE = "task_checkpointed"
+_SEMANTIC_RECORDED_AT_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+def _semantic_checkpoint_options_supplied(args: argparse.Namespace) -> bool:
+    return any(
+        getattr(args, field, None) is not None
+        for field in (
+            "semantic_command_id",
+            "semantic_expected_head_sha256",
+            "semantic_recorded_at",
+        )
+    )
+
+
+def _require_semantic_checkpoint_recorded_at(value: str) -> str:
+    from ..harnesslib import parse_tz_aware_time
+
+    if (
+        _SEMANTIC_RECORDED_AT_RE.fullmatch(value) is None
+        or parse_tz_aware_time(value) is None
+    ):
+        raise HarnessError(
+            "--semantic-recorded-at must be a canonical timezone-aware "
+            "semantic event timestamp"
+        )
+    return value
+
+
+def _semantic_checkpoint_retry_states(
+    paths: HarnessPaths,
+    task_id: str,
+    *,
+    command_id: str,
+    expected_head_sha256: str,
+    recorded_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return the authoritative before/after domains for an exact retry."""
+
+    events = load_semantic_events(paths, task_id)
+    matches = [event for event in events if event.get("command_id") == command_id]
+    if not matches:
+        return None
+    if (
+        len(matches) != 1
+        or matches[0] is not events[-1]
+        or matches[0].get("event_type") != _SEMANTIC_CHECKPOINT_EVENT_TYPE
+        or matches[0].get("prev_event_sha256") != expected_head_sha256
+        or matches[0].get("recorded_at") != recorded_at
+        or len(events) < 2
+    ):
+        raise HarnessError(
+            "semantic checkpoint command is not the matching terminal transition"
+        )
+    try:
+        return (
+            projection_domain(replay_events(events[:-1])),
+            projection_domain(replay_events(events)),
+        )
+    except SemanticEventError as exc:
+        raise HarnessError(
+            f"semantic checkpoint retry cannot replay its transition: {exc}"
+        ) from exc
+
+
+def _semantic_checkpoint_candidate(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    recorded_at: str,
+) -> tuple[dict[str, Any], Path, str]:
+    """Apply the legacy checkpoint domain mutation with deterministic time."""
+
+    candidate = json.loads(json.dumps(projection_domain(state)))
+    require_open_task(candidate, "checkpoint")
+    _require_changed_files_in_worktree(
+        candidate,
+        args.changed_file,
+        allow_outside=bool(getattr(args, "allow_outside_worktree", False)),
+    )
+    _extend_unique(candidate, "facts", args.fact)
+    _extend_unique(candidate, "decisions", args.decision)
+    _extend_unique(candidate, "rejected_paths", args.rejected)
+    _extend_unique(candidate, "changed_files", args.changed_file)
+    _extend_unique(candidate, "blockers", args.blocker)
+    _append_risks(candidate, args.risk, recorded_at=recorded_at)
+    if args.next_action:
+        candidate["next_action"] = args.next_action
+    if candidate["status"] in {"active", "blocked"} and not candidate.get(
+        "next_action"
+    ):
+        raise HarnessError("active checkpoint requires an exact next action")
+    bump_task(candidate, checkpoint_required=False)
+    candidate["updated_at"] = recorded_at
+    candidate["checkpoint_revision"] = candidate["revision"]
+    candidate["checkpoint_required"] = False
+    checkpoint, checkpoint_text, checkpoint_sha256 = prepare_checkpoint(paths, candidate)
+    candidate["checkpoint_sha256"] = checkpoint_sha256
+    return candidate, checkpoint, checkpoint_text
+
+
+def _cmd_semantic_checkpoint(
+    args: argparse.Namespace,
+    paths: HarnessPaths,
+) -> dict[str, Any]:
+    command_id = str(getattr(args, "semantic_command_id", "") or "").strip()
+    expected_head_sha256 = str(
+        getattr(args, "semantic_expected_head_sha256", "") or ""
+    ).strip()
+    recorded_at = str(getattr(args, "semantic_recorded_at", "") or "").strip()
+    if not command_id or not expected_head_sha256 or not recorded_at:
+        raise HarnessError(
+            "semantic-v2 checkpoint requires --semantic-command-id, "
+            "--semantic-expected-head-sha256, and --semantic-recorded-at"
+        )
+    validate_id(command_id, "semantic command id")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_head_sha256) is None:
+        raise HarnessError(
+            "semantic-v2 checkpoint requires --semantic-expected-head-sha256"
+        )
+    _require_semantic_checkpoint_recorded_at(recorded_at)
+
+    state = load_task(paths, args.task)
+    retry_states = _semantic_checkpoint_retry_states(
+        paths,
+        args.task,
+        command_id=command_id,
+        expected_head_sha256=expected_head_sha256,
+        recorded_at=recorded_at,
+    )
+    base = retry_states[0] if retry_states is not None else state
+    candidate, checkpoint, checkpoint_text = _semantic_checkpoint_candidate(
+        paths, base, args, recorded_at=recorded_at
+    )
+    if retry_states is not None:
+        if candidate != retry_states[1]:
+            raise HarnessError(
+                "semantic checkpoint retry differs from the published transition"
+            )
+        semantic_result = recover_published_semantic_transition(
+            paths,
+            args.task,
+            candidate,
+            event_type=_SEMANTIC_CHECKPOINT_EVENT_TYPE,
+            command_id=command_id,
+            expected_head_sha256=expected_head_sha256,
+        )
+    else:
+        preflight_semantic_append(
+            paths,
+            args.task,
+            command_id=command_id,
+            expected_head_sha256=expected_head_sha256,
+        )
+        semantic_result = append_semantic_transition(
+            paths,
+            args.task,
+            candidate,
+            event_type=_SEMANTIC_CHECKPOINT_EVENT_TYPE,
+            command_id=command_id,
+            recorded_at=recorded_at,
+            authority_ref=str(getattr(args, "_aoi_authority_ref", "") or ""),
+            expected_head_sha256=expected_head_sha256,
+        )
+    # The event/projection are authoritative.  Replacing this derived file is
+    # deliberately after event publication so an interruption is repairable.
+    atomic_write_text(checkpoint, checkpoint_text)
+    write_index(paths)
+    return {
+        "task_id": args.task,
+        "revision": candidate["revision"],
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": candidate["checkpoint_sha256"],
+        "semantic_head_sha256": semantic_result.event["event_sha256"],
+        "idempotent_replay": semantic_result.idempotent_replay,
+    }
+
+
 def cmd_checkpoint(
     args: argparse.Namespace,
     paths: HarnessPaths,
@@ -1998,6 +2463,14 @@ def cmd_checkpoint(
     services: TaskLifecycleCmdServices,
     emit_result: bool = True,
 ) -> int:
+    if is_semantic_v2_task(paths, args.task):
+        with state_lock(paths):
+            result = _cmd_semantic_checkpoint(args, paths)
+        if emit_result:
+            emit(result, args.json)
+        return 0
+    if _semantic_checkpoint_options_supplied(args):
+        raise HarnessError("semantic checkpoint options require a semantic-v2 task")
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "checkpoint")
@@ -2419,6 +2892,18 @@ def register_task_lifecycle_commands(
             "already ran: state which work the superseded plan governed"
         ),
     )
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required for a semantic-v2 plan approval",
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required for a semantic-v2 plan approval",
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help="recorded-at timestamp required for a semantic-v2 plan approval",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["approve_plan"])
 
@@ -2501,24 +2986,62 @@ def register_task_lifecycle_commands(
     parser.add_argument("--adoption-evidence")
     parser.add_argument("--ack-legacy-ambiguity", action="store_true")
     parser.add_argument("--allow-nonexistent", action="store_true")
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required when claiming in a semantic-v2 task",
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required when claiming in a semantic-v2 task",
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help="recorded-at timestamp required when claiming in a semantic-v2 task",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["claim"])
 
     parser = subparsers.add_parser("set-claim-status")
+    parser.add_argument("--task")
     parser.add_argument("--token", required=True)
     parser.add_argument(
         "--status", choices=sorted(RESERVING_CLAIM_STATUSES), required=True
     )
     parser.add_argument("--reason", required=True)
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required for a semantic-v2 claim transition",
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required for a semantic-v2 claim transition",
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help="recorded-at timestamp required for a semantic-v2 claim transition",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["set_claim_status"])
 
     parser = subparsers.add_parser("release-claim")
+    parser.add_argument("--task")
     parser.add_argument("--token", required=True)
     parser.add_argument(
         "--status", choices=sorted(TERMINAL_CLAIM_STATUSES), required=True
     )
     parser.add_argument("--reason", required=True)
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required for a semantic-v2 claim transition",
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required for a semantic-v2 claim transition",
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help="recorded-at timestamp required for a semantic-v2 claim transition",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["release_claim"])
 
@@ -2561,6 +3084,18 @@ def register_task_lifecycle_commands(
         help="acknowledge recording a changed file outside the bound worktree",
     )
     parser.add_argument("--next-action")
+    parser.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required for a semantic-v2 checkpoint",
+    )
+    parser.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required for a semantic-v2 checkpoint",
+    )
+    parser.add_argument(
+        "--semantic-recorded-at",
+        help="recorded-at timestamp required for a semantic-v2 checkpoint",
+    )
     add_json_argument(parser)
     parser.set_defaults(handler=handlers["checkpoint"])
 

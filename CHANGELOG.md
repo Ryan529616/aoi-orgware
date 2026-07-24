@@ -9,6 +9,20 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ### v0.4.0a4 (unreleased; not release-ready)
 
+- **Semantic-v2 typed claim lifecycle is a P0 release gate.** The v0.4
+  contract requires typed `claim_acquired`, `claim_status_changed`, and
+  `claim_released` authority; immutable claim-object/task-head bindings;
+  expected-head exact retry; and release event plus terminal archive before an
+  active entry is unlinked. Pending reservations cannot authorize the Bridge.
+  A deterministic `task_checkpointed` transition is part of the same P0 so
+  claim revision changes can reach the existing close gate without falling
+  back to the disabled legacy state writer.
+  Structured legacy active or archive claims require explicit typed import
+  before migration. Doctor, close, and Bridge authority boundaries must use the
+  authenticated semantic loader rather than a projection or legacy record.
+  This documents a release requirement only: claim contract tests, a live App
+  Server canary, Git mutation verification, and final-SHA remote CI remain
+  distinct, unclaimed evidence gates.
 - **Explicit legacy resource-config migration.** A new read-only
   `codex-config-migrate-legacy-plan` command exposes the exact event and
   immutable receipt digests for one pre-applicability resource event.

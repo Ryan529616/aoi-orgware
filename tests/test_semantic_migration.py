@@ -49,6 +49,103 @@ class SemanticMigrationTests(HarnessTestCase):
                 authority_ref=AUTHORITY,
             )
 
+    def write_structured_claim(
+        self,
+        token: str,
+        *,
+        task_id: str | None = None,
+        active: bool = True,
+    ) -> Path:
+        path = h.claim_path(self.paths, token, active=active)
+        h.atomic_write_json(
+            path,
+            {
+                "schema_version": h.SCHEMA_VERSION,
+                "legacy": False,
+                "source": "structured",
+                "token": token,
+                "task_id": task_id or self.TASK,
+                "owner": "test-root",
+                "kind": "implementation",
+                "locks": [],
+                "status": "active" if active else "released",
+                "worktree": str(self.root),
+            },
+        )
+        return path
+
+    def assert_claim_blocks_without_semantic_writes(self, message: str) -> None:
+        legacy = self.legacy_bytes()
+        with self.assertRaisesRegex(store.SemanticStoreError, message):
+            self.migrate()
+        self.assertEqual(self.legacy_bytes(), legacy)
+        self.assertFalse(store.semantic_event_directory(self.paths, self.TASK).exists())
+
+    def test_structured_claims_block_before_any_semantic_write(self) -> None:
+        for source in ("state-reference", "active-record", "archive-record"):
+            with self.subTest(source=source):
+                token = f"migration-claim-{source}"
+                if source == "state-reference":
+                    state = json.loads(self.legacy_bytes().decode("utf-8"))
+                    state["claims"] = [token]
+                    h.atomic_write_json(h.task_state_path(self.paths, self.TASK), state)
+                    self.write_structured_claim(token)
+                else:
+                    self.write_structured_claim(token, active=source == "active-record")
+                self.assert_claim_blocks_without_semantic_writes("structured claim")
+                if source == "state-reference":
+                    state["claims"] = []
+                    h.atomic_write_json(h.task_state_path(self.paths, self.TASK), state)
+                h.claim_path(
+                    self.paths, token, active=source != "archive-record"
+                ).unlink()
+
+    def test_relevant_malformed_claim_records_fail_closed_without_semantic_writes(self) -> None:
+        token = "migration-malformed-reference"
+        state = json.loads(self.legacy_bytes().decode("utf-8"))
+        state["claims"] = [token]
+        h.atomic_write_json(h.task_state_path(self.paths, self.TASK), state)
+        h.claim_path(self.paths, token, active=True).write_text("{", encoding="utf-8")
+        self.assert_claim_blocks_without_semantic_writes("referenced claim record is malformed")
+
+        h.claim_path(self.paths, token, active=True).unlink()
+        state["claims"] = []
+        h.atomic_write_json(h.task_state_path(self.paths, self.TASK), state)
+        malformed = self.write_structured_claim("migration-malformed-owned")
+        claim = json.loads(malformed.read_text(encoding="utf-8"))
+        claim["locks"] = "not-a-list"
+        h.atomic_write_json(malformed, claim)
+        self.assert_claim_blocks_without_semantic_writes("associated claim record is malformed")
+
+    def test_legacy_shaped_active_record_cannot_cross_migration_boundary(self) -> None:
+        path = h.claim_path(self.paths, "legacy-shaped-active", active=True)
+        h.atomic_write_json(
+            path,
+            {
+                "schema_version": h.SCHEMA_VERSION,
+                "legacy": True,
+                "source": "legacy",
+                "token": "legacy-shaped-active",
+                "task_id": self.TASK,
+                "locks": [],
+                "status": "active",
+            },
+        )
+        self.assert_claim_blocks_without_semantic_writes(
+            "associated active/archive claim is not structured"
+        )
+
+    def test_unrelated_claim_records_do_not_block_claim_free_migration(self) -> None:
+        other = "unrelated-claim-owner"
+        self.init_task(other)
+        self.write_structured_claim("unrelated-structured-claim", task_id=other)
+        (self.paths.claims_archive / "unrelated-malformed.json").write_text(
+            "{", encoding="utf-8"
+        )
+        migrated = self.migrate()
+        self.assertFalse(migrated.idempotent_replay)
+        self.assertEqual(migrated.event["event_type"], "legacy_genesis")
+
     def test_migration_preserves_exact_bytes_and_retry_is_idempotent(self) -> None:
         raw = self.legacy_bytes()
         legacy = json.loads(raw.decode("utf-8"))

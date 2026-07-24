@@ -647,6 +647,90 @@ def _migration_quiescence_errors(state: dict[str, Any]) -> list[str]:
     return sorted(set(errors))
 
 
+def _migration_claim_quiescence_errors(
+    paths: h.HarnessPaths, state: dict[str, Any]
+) -> list[str]:
+    """Reject legacy tasks that still have structured claim authority.
+
+    Migration deliberately has no typed import for v0.4 claims.  A claim named
+    by the legacy state, or a structured active/archive record owned by this
+    task, must therefore be released or removed before the semantic genesis is
+    published.  Only relevant malformed side records block this gate: an
+    unrelated task's corrupt claim must not strand an otherwise claim-free
+    legacy task.
+    """
+
+    task_id = str(state.get("task_id", ""))
+    errors: list[str] = []
+    referenced = state.get("claims", [])
+    reference_tokens: set[str] = set()
+    if not isinstance(referenced, list):
+        errors.append("claim reference collection is malformed")
+    else:
+        for index, token in enumerate(referenced):
+            if not isinstance(token, str):
+                errors.append(f"claim reference {index} is malformed")
+                continue
+            try:
+                reference_tokens.add(h.validate_id(token, "claim token"))
+            except h.HarnessError:
+                errors.append(f"claim reference {index} is malformed")
+
+    seen_references: set[str] = set()
+    for directory in (paths.claims_active, paths.claims_archive):
+        try:
+            records = sorted(directory.glob("*.json"))
+        except OSError as exc:
+            errors.append(f"could not scan structured claim records: {exc}")
+            continue
+        if len(records) > h.TREE_IDENTITY_SCAN_MAX_ENTRIES:
+            errors.append("structured claim record scan exceeds the configured entry bound")
+            continue
+        for path in records:
+            referenced_by_name = path.stem in reference_tokens
+            if referenced_by_name:
+                seen_references.add(path.stem)
+            try:
+                raw_claim = h.load_json(path)
+            except h.HarnessError as exc:
+                if referenced_by_name:
+                    errors.append(f"referenced claim record is malformed: {path.name}: {exc}")
+                continue
+            associated = referenced_by_name or raw_claim.get("task_id") == task_id
+            if not associated:
+                continue
+            try:
+                claim = h.load_claim_file(path)
+            except h.HarnessError as exc:
+                errors.append(f"associated claim record is malformed: {path.name}: {exc}")
+                continue
+            if claim.get("legacy") is not False:
+                # Legacy-pending rows have their own directory and import
+                # workflow.  A legacy-shaped row in active/archive is not a
+                # typed claim that semantic migration can authenticate, even
+                # when the task state happens to reference it.
+                errors.append(
+                    f"associated active/archive claim is not structured: {path.name}"
+                )
+                continue
+            if claim.get("malformed_locks"):
+                errors.append(f"associated claim record has malformed locks: {path.name}")
+                continue
+            try:
+                h.validate_claim_lock_identities(paths, claim)
+            except h.HarnessError as exc:
+                errors.append(f"associated claim record is malformed: {path.name}: {exc}")
+                continue
+            token = str(claim.get("token", path.stem))
+            errors.append(
+                f"structured claim {token} must be released or removed before semantic migration"
+            )
+
+    for token in sorted(reference_tokens - seen_references):
+        errors.append(f"referenced claim record is missing: {token}")
+    return sorted(set(errors))
+
+
 def migrate_legacy_task(
     paths: h.HarnessPaths,
     task_id: str,
@@ -780,6 +864,7 @@ def migrate_legacy_task(
     ):
         raise SemanticStoreError("legacy task configuration binding is not current")
     quiescence_errors = _migration_quiescence_errors(legacy_state)
+    quiescence_errors.extend(_migration_claim_quiescence_errors(paths, legacy_state))
     if quiescence_errors:
         raise SemanticStoreError(
             "legacy task is not quiescent: " + "; ".join(quiescence_errors)

@@ -47,6 +47,7 @@ from . import portfolio_integrity as portfolio_integrity_impl
 from . import resource_governance as resource_governance_impl
 from . import routing_authority as routing_authority_impl
 from . import release_runtime as release_runtime_impl
+from . import semantic_objects as semantic_objects_impl
 from . import semantic_store as semantic_store_impl
 from . import skill_lifecycle as skill_lifecycle_impl
 from . import verification_integrity as verification_integrity_impl
@@ -3117,6 +3118,7 @@ def cmd_reconcile(args: argparse.Namespace, paths: HarnessPaths) -> int:
 
 _EXACT_TEST_SEMANTIC_EVENT_TYPE = "verification_added"
 _VERIFICATION_SUPERSEDED_SEMANTIC_EVENT_TYPE = "verification_superseded"
+_DELIVERY_SET_SEMANTIC_EVENT_TYPE = "delivery_set"
 _SEMANTIC_RECORDED_AT_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
@@ -6465,6 +6467,8 @@ def prepare_delivery(
     paths: HarnessPaths,
     state: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    recorded_at: str | None = None,
 ) -> dict[str, Any]:
     """Validate one delivery record without mutating AOI state."""
 
@@ -6568,7 +6572,10 @@ def prepare_delivery(
         "remote": args.remote or "",
         "remote_ref": args.remote_ref or "",
         "remote_sha": commit if args.mode == "pushed" else "",
-        "verified_at": now_iso() if args.mode == "pushed" else "",
+        "verified_at": (
+            recorded_at if args.mode == "pushed" and recorded_at is not None else
+            now_iso() if args.mode == "pushed" else ""
+        ),
         "confidentiality_policy_binding": confidentiality_binding,
         "confidentiality_preflight_sha256": preflight_sha256,
         "confidentiality_preflight_artifact": None,
@@ -6639,14 +6646,109 @@ def cmd_set_delivery(
     with state_lock(paths):
         state = load_task(paths, args.task)
         require_open_task(state, "set delivery for")
-        delivery = prepare_delivery(paths, state, args)
+        semantic_v2 = "_semantic" in state
+        semantic_values = {
+            "command_id": getattr(args, "semantic_command_id", None),
+            "expected_head": getattr(args, "semantic_expected_head_sha256", None),
+            "recorded_at": getattr(args, "semantic_recorded_at", None),
+        }
+        semantic_options_supplied = any(value is not None for value in semantic_values.values())
+        semantic_command_id = str(semantic_values["command_id"] or "").strip()
+        semantic_expected_head = str(semantic_values["expected_head"] or "").strip()
+        semantic_recorded_at = str(semantic_values["recorded_at"] or "").strip()
+        semantic_retry_after: dict[str, Any] | None = None
+        semantic_result: semantic_store_impl.SemanticAppendResult | None = None
+        if semantic_v2:
+            validate_id(semantic_command_id, "semantic command id")
+            if not re.fullmatch(r"[0-9a-f]{64}", semantic_expected_head):
+                raise HarnessError(
+                    "semantic-v2 set-delivery requires "
+                    "--semantic-expected-head-sha256"
+                )
+            if not semantic_recorded_at:
+                raise HarnessError(
+                    "semantic-v2 set-delivery requires --semantic-recorded-at"
+                )
+            _require_semantic_recorded_at(
+                semantic_recorded_at, "--semantic-recorded-at"
+            )
+            retry_states = _semantic_verification_retry_states(
+                paths,
+                args.task,
+                command_id=semantic_command_id,
+                expected_head_sha256=semantic_expected_head,
+                recorded_at=semantic_recorded_at,
+                event_type=_DELIVERY_SET_SEMANTIC_EVENT_TYPE,
+                label="set-delivery",
+            )
+            if retry_states is not None:
+                state, semantic_retry_after = retry_states
+            semantic_events = semantic_store_impl.load_semantic_events(paths, args.task)
+            try:
+                semantic_objects_impl.require_no_pending_bindings(
+                    paths, args.task, semantic_events
+                )
+            except semantic_objects_impl.SemanticObjectError as exc:
+                raise HarnessError(str(exc)) from exc
+        elif semantic_options_supplied:
+            raise HarnessError(
+                "semantic set-delivery options require a semantic-v2 task"
+            )
+
+        delivery = prepare_delivery(
+            paths,
+            state,
+            args,
+            recorded_at=semantic_recorded_at if semantic_v2 else None,
+        )
         _persist_delivery_confidentiality_preflight(paths, state, args, delivery)
-        state["delivery"] = delivery
-        bump_task(state)
-        write_task(paths, state)
+        candidate = copy.deepcopy(state)
+        candidate["delivery"] = delivery
+        bump_task(candidate)
+        if semantic_v2:
+            candidate["updated_at"] = semantic_recorded_at
+            if semantic_retry_after is not None:
+                if candidate != semantic_retry_after:
+                    raise HarnessError(
+                        "semantic set-delivery retry differs from the "
+                        "published delivery transition"
+                    )
+                semantic_result = (
+                    semantic_store_impl.recover_published_semantic_transition(
+                        paths,
+                        args.task,
+                        candidate,
+                        event_type=_DELIVERY_SET_SEMANTIC_EVENT_TYPE,
+                        command_id=semantic_command_id,
+                        expected_head_sha256=semantic_expected_head,
+                    )
+                )
+            else:
+                semantic_result = semantic_store_impl.append_semantic_transition(
+                    paths,
+                    args.task,
+                    candidate,
+                    event_type=_DELIVERY_SET_SEMANTIC_EVENT_TYPE,
+                    command_id=semantic_command_id,
+                    recorded_at=semantic_recorded_at,
+                    authority_ref=str(
+                        getattr(args, "_aoi_authority_ref", "") or ""
+                    ),
+                    expected_head_sha256=semantic_expected_head,
+                )
+        else:
+            write_task(paths, candidate)
         write_index(paths)
     if emit_result:
-        emit(state["delivery"], args.json)
+        emitted_delivery = copy.deepcopy(delivery)
+        if semantic_result is not None:
+            emitted_delivery["semantic_head_sha256"] = semantic_result.event[
+                "event_sha256"
+            ]
+            emitted_delivery["idempotent_replay"] = (
+                semantic_result.idempotent_replay
+            )
+        emit(emitted_delivery, args.json)
     return 0
 
 
@@ -7662,6 +7764,15 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
             f"task {task_id}: semantic authority: {error}"
             for error in semantic_errors
         )
+        if "_semantic" in task:
+            from . import semantic_claims as semantic_claims_impl
+
+            errors.extend(
+                f"task {task_id}: semantic claim authority: {error}"
+                for error in semantic_claims_impl.semantic_claim_integrity_errors(
+                    paths, task_id
+                )
+            )
         try:
             migration_rolled_back = (
                 semantic_store_impl.semantic_migration_rolled_back(paths, task_id)
@@ -8892,6 +9003,18 @@ def build_parser(
             "confidentiality-git-push-preflight"
         ),
     )
+    p.add_argument(
+        "--semantic-command-id",
+        help="stable idempotency key required when setting semantic-v2 delivery",
+    )
+    p.add_argument(
+        "--semantic-expected-head-sha256",
+        help="exact semantic head required when setting semantic-v2 delivery",
+    )
+    p.add_argument(
+        "--semantic-recorded-at",
+        help="canonical event timestamp required when setting semantic-v2 delivery",
+    )
     add_json_argument(p)
     p.set_defaults(handler=cmd_set_delivery)
 
@@ -9090,7 +9213,10 @@ def _reload_locked_paths(paths: HarnessPaths) -> HarnessPaths:
 
 _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "add-verification",
+    "approve-plan",
     "check-locks",
+    "checkpoint",
+    "claim",
     "close-task",
     "cohort-round-prepare",
     "cohort-round-preview",
@@ -9111,6 +9237,7 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "permit-issue",
     "packet-arm-prepare",
     "release-manifest-observe",
+    "release-claim",
     "release-abandon-pending",
     "release-promote",
     "release-show",
@@ -9120,6 +9247,8 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "semantic-head",
     "semantic-migrate",
     "semantic-migration-rollback",
+    "set-claim-status",
+    "set-delivery",
     "status",
     "verify-backup",
     "verification-supersede",
@@ -9132,9 +9261,11 @@ def _semantic_v2_stage1_target(
     """Resolve direct and legacy-indirect task references without mutation."""
 
     command = str(args._aoi_command)
-    direct = getattr(args, "task", None) or getattr(args, "task_id", None)
-    if isinstance(direct, str) and direct:
-        return validate_id(direct, "task id")
+    direct = getattr(args, "task", None)
+    if direct is None:
+        direct = getattr(args, "task_id", None)
+    if direct is not None:
+        return validate_id(str(direct), "task id")
     if command == "unbind-session":
         session_id = str(getattr(args, "session_id", "") or "")
         mapping = load_json(session_path(paths, session_id))

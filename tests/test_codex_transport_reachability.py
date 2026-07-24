@@ -18,6 +18,7 @@ SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
 from aoi_orgware import codex_transport_contracts as contracts  # noqa: E402
+from aoi_orgware import codex_transport_cli as transport_cli  # noqa: E402
 from aoi_orgware import codex_transport_mutation as mutation  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import permit_runtime  # noqa: E402
@@ -32,6 +33,7 @@ from tests.harness_case import HarnessTestCase  # noqa: E402
 TASK = "task-1"
 PACKET = "bridge-packet"
 PARENT_SESSION = "harness-test-chief"
+SEMANTIC_CLAIM = "bridge-semantic-resource-files"
 PERMIT_CLOCK_DRIVER = HERE / "permit_cli_clock_driver.py"
 PERMIT_CLOCK_ENV = "AOI_TEST_PERMIT_CURRENT_TIME"
 CODEX_CLOCK_DRIVER = HERE / "codex_transport_cli_clock_driver.py"
@@ -204,6 +206,33 @@ class CodexTransportReachabilityTests(HarnessTestCase):
         )
 
     def _migrate(self) -> None:
+        # The migration gate deliberately refuses legacy structured claims.
+        # Resource configuration was established under the legacy claim, then
+        # that claim is terminalized and removed from this disposable fixture
+        # before the task crosses to semantic-v2.  Semantic migration has no
+        # typed import for the old active/archive claim history.
+        self.cli(
+            "release-claim",
+            "--task",
+            TASK,
+            "--token",
+            "bridge-resource-files",
+            "--status",
+            "released",
+            "--reason",
+            "Replace the legacy resource claim with authenticated semantic authority",
+        )
+        h.claim_path(
+            self.paths, "bridge-resource-files", active=False
+        ).unlink()
+        state_path = h.task_state_path(self.paths, TASK)
+        legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy_state["claims"] = [
+            token
+            for token in legacy_state["claims"]
+            if token != "bridge-resource-files"
+        ]
+        h.atomic_write_json(state_path, legacy_state)
         raw = h.task_state_path(self.paths, TASK).read_bytes()
         self.cli(
             "semantic-migrate",
@@ -215,6 +244,85 @@ class CodexTransportReachabilityTests(HarnessTestCase):
             hashlib.sha256(raw).hexdigest(),
             "--json",
         )
+        events = store.load_semantic_events(self.paths, TASK)
+        recorded_at = _parse_iso(str(events[-1]["recorded_at"])) + timedelta(
+            microseconds=1
+        )
+        self.cli(
+            "claim",
+            "--task",
+            TASK,
+            "--token",
+            SEMANTIC_CLAIM,
+            "--owner",
+            PARENT_SESSION,
+            "--kind",
+            "implementation",
+            "--lock",
+            "repo:tree:.codex",
+            "--intent",
+            "Retain authenticated AOI authority for the Codex resource scope",
+            "--validation",
+            "Ledger, object, binding, and committed side record agree",
+            "--expires-at",
+            _iso(recorded_at + timedelta(hours=1)),
+            "--semantic-command-id",
+            "bridge-semantic-claim",
+            "--semantic-expected-head-sha256",
+            str(events[-1]["event_sha256"]),
+            "--semantic-recorded-at",
+            _iso(recorded_at),
+            "--json",
+        )
+
+    def _assert_bridge_claim_consumer_fail_closed(
+        self,
+        *,
+        intent: dict[str, object],
+        pre_git_endpoint_cas_sha256: str,
+    ) -> None:
+        """Exercise the actual Bridge preflight against unauthenticated side data."""
+
+        side_path = h.claim_path(self.paths, SEMANTIC_CLAIM, active=True)
+        original = side_path.read_bytes()
+        try:
+            for mutation_name, mutate in (
+                (
+                    "pending",
+                    lambda side: side["semantic_authority"].update(
+                        {"phase": "pending"}
+                    ),
+                ),
+                (
+                    "tampered",
+                    lambda side: side["semantic_authority"].update(
+                        {"recorded_at": "tampered-authority"}
+                    ),
+                ),
+            ):
+                with self.subTest(side_claim=mutation_name):
+                    side = json.loads(original.decode("utf-8"))
+                    mutate(side)
+                    h.atomic_write_json(side_path, side)
+                    with self.assertRaisesRegex(h.HarnessError, "semantic claim"):
+                        transport_cli._require_fresh_pre_git_endpoint(
+                            self.paths,
+                            task_id=TASK,
+                            intent=intent,
+                            pre_git_endpoint_cas_sha256=pre_git_endpoint_cas_sha256,
+                        )
+                    side_path.write_bytes(original)
+
+            # Once the exact committed side record is restored, the same
+            # Bridge consumer accepts the authenticated semantic claim scope.
+            transport_cli._require_fresh_pre_git_endpoint(
+                self.paths,
+                task_id=TASK,
+                intent=intent,
+                pre_git_endpoint_cas_sha256=pre_git_endpoint_cas_sha256,
+            )
+        finally:
+            side_path.write_bytes(original)
 
     def _arm(self, now: datetime) -> dict[str, object]:
         state = semantic.projection_domain(h.load_task(self.paths, TASK))
@@ -484,6 +592,16 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                 },
                 "pre_git_binding": mutation.endpoint_pre_git_binding(endpoint),
             }
+        )
+        preserved_endpoint = mutation.preserve_git_endpoint(
+            self.paths,
+            task_id=TASK,
+            endpoint=endpoint,
+            claims=claims,
+        )
+        self._assert_bridge_claim_consumer_fail_closed(
+            intent=launch_intent,
+            pre_git_endpoint_cas_sha256=str(preserved_endpoint["sha256"]),
         )
         launch_parameters = {
             "launch_id": "launch-1",

@@ -20,6 +20,7 @@ sys.path.insert(0, str(SRC))
 
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import codex_hook  # noqa: E402
+from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware import semantic_events as semantic  # noqa: E402
 from aoi_orgware import semantic_store as store  # noqa: E402
 from aoi_orgware.config import default_config_text  # noqa: E402
@@ -650,6 +651,281 @@ class SemanticLifecycleIntegrationTests(HarnessTestCase):
         self.assertIn("does not support --session-id", with_session.stderr)
         paths = h.get_paths(self.root)
         self.assertFalse(store.has_semantic_ledger(paths, "semantic-invalid-init"))
+
+
+class SemanticPlanAndDeliveryPortTests(HarnessTestCase):
+    """Permanent black-box contracts for the semantic-v2 plan/delivery ports."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.paths = h.get_paths(self.root)
+        self._number = 0
+
+    def semantic_task(self, label: str) -> tuple[str, str]:
+        self._number += 1
+        task = f"semantic-port-{label}-{self._number}"
+        self.cli(
+            "init-task",
+            "--task-id",
+            task,
+            "--title",
+            f"Semantic port {label}",
+            "--objective",
+            "Exercise deterministic plan approval and delivery transitions",
+            "--owner",
+            "test-root",
+            "--completion-boundary",
+            "The semantic plan and delivery ports remain replayable",
+            "--semantic-v2",
+            "--semantic-command-id",
+            f"init-{label}-{self._number}",
+        )
+        return task, self.semantic_head(task)
+
+    def semantic_head(self, task: str) -> str:
+        return json.loads(
+            self.cli("semantic-head", "--task", task, "--json").stdout
+        )["event_sha256"]
+
+    @staticmethod
+    def approval_args(
+        task: str, head: str, command: str, recorded_at: str, *, note: str = "Approve the bounded semantic test plan."
+    ) -> list[str]:
+        return [
+            "approve-plan", "--task", task, "--note", note,
+            "--semantic-command-id", command,
+            "--semantic-expected-head-sha256", head,
+            "--semantic-recorded-at", recorded_at,
+            "--json",
+        ]
+
+    @staticmethod
+    def delivery_args(
+        task: str,
+        head: str,
+        command: str,
+        recorded_at: str,
+        *,
+        mode: str = "local-only",
+        detail: str = "The semantic delivery test remains in the local fixture.",
+    ) -> list[str]:
+        return [
+            "set-delivery", "--task", task, "--mode", mode, "--detail", detail,
+            "--semantic-command-id", command,
+            "--semantic-expected-head-sha256", head,
+            "--semantic-recorded-at", recorded_at,
+            "--json",
+        ]
+
+    def approve(self, task: str, head: str, command: str, recorded_at: str) -> dict[str, object]:
+        return json.loads(self.cli(*self.approval_args(task, head, command, recorded_at)).stdout)
+
+    def claim_args(self, task: str, head: str, token: str) -> list[str]:
+        claimed = self.root / f"{token}.txt"
+        claimed.write_text("semantic port claim fixture\n", encoding="utf-8")
+        return [
+            "claim", "--task", task, "--token", token,
+            "--owner", "semantic-port-test", "--kind", "implementation",
+            "--lock", f"repo:file:{claimed.name}",
+            "--intent", "exercise the semantic port reachability contract",
+            "--validation", "targeted unittest",
+            "--expires-at", "2026-07-25T00:00:00+00:00",
+            "--semantic-command-id", f"acquire-{token}",
+            "--semantic-expected-head-sha256", head,
+            "--semantic-recorded-at", "2026-07-24T00:03:00+00:00",
+            "--json",
+        ]
+
+    def checkpoint_args(self, task: str, head: str, command: str, recorded_at: str) -> list[str]:
+        return [
+            "checkpoint", "--task", task,
+            "--fact", "Semantic port checkpoint fact.",
+            "--risk", "Semantic port checkpoint risk.",
+            "--next-action", "Complete the semantic port reachability test.",
+            "--semantic-command-id", command,
+            "--semantic-expected-head-sha256", head,
+            "--semantic-recorded-at", recorded_at,
+            "--json",
+        ]
+
+    def test_stage1_allows_only_ported_commands_and_rejects_partial_or_legacy_flags(self) -> None:
+        self.assertTrue({"approve-plan", "set-delivery"}.issubset(
+            cli_impl._SEMANTIC_V2_STAGE1_TARGET_COMMANDS
+        ))
+        self.assertTrue({"set-phase", "plan-update", "retarget-task"}.isdisjoint(
+            cli_impl._SEMANTIC_V2_STAGE1_TARGET_COMMANDS
+        ))
+        task, head = self.semantic_task("parser")
+        event_count = len(store.load_semantic_events(self.paths, task))
+
+        partial_approval = self.cli(
+            "approve-plan", "--task", task, "--note", "partial semantic request",
+            "--semantic-command-id", "partial-approval", ok=False,
+        )
+        self.assertIn("requires --semantic-command-id", partial_approval.stderr)
+        partial_delivery = self.cli(
+            "set-delivery", "--task", task, "--mode", "none", "--detail", "partial request",
+            "--semantic-command-id", "partial-delivery", ok=False,
+        )
+        self.assertIn("requires --semantic-expected-head-sha256", partial_delivery.stderr)
+        self.assertEqual(len(store.load_semantic_events(self.paths, task)), event_count)
+
+        blocked = self.cli("set-phase", "--task", task, "--phase", "implementing", ok=False)
+        self.assertIn("requires explicit semantic transitions", blocked.stderr)
+        self.assertEqual(self.semantic_head(task), head)
+
+        legacy = "legacy-empty-semantic-options"
+        self.init_task(legacy)
+        legacy_approval = self.cli(
+            "approve-plan", "--task", legacy, "--note", "empty semantic option",
+            "--semantic-command-id", "", ok=False,
+        )
+        self.assertIn("semantic approve-plan options require a semantic-v2 task", legacy_approval.stderr)
+        legacy_delivery = self.cli(
+            "set-delivery", "--task", legacy, "--mode", "none", "--detail", "empty semantic option",
+            "--semantic-command-id", "", ok=False,
+        )
+        self.assertIn("semantic set-delivery options require a semantic-v2 task", legacy_delivery.stderr)
+
+    def test_approve_plan_is_deterministic_exact_retryable_and_repairs_projection(self) -> None:
+        task, head = self.semantic_task("approval")
+        before = h.load_task(self.paths, task)
+        args = self.approval_args(task, head, "approve-deterministic", "2026-07-24T00:01:00+00:00")
+        first = json.loads(self.cli(*args).stdout)
+        state = h.load_task(self.paths, task)
+        self.assertEqual(state["revision"], before["revision"] + 1)
+        self.assertEqual(state["updated_at"], "2026-07-24T00:01:00+00:00")
+        self.assertTrue(state["plan_ready"])
+        self.assertTrue(state["checkpoint_required"])
+        self.assertEqual(state["plan_sha256"], first["plan_sha256"])
+        event_count = len(store.load_semantic_events(self.paths, task))
+        projection_path = h.task_state_path(self.paths, task)
+        projection_path.unlink()
+        retry = json.loads(self.cli(*args).stdout)
+        self.assertTrue(retry["idempotent_replay"])
+        self.assertEqual(retry["semantic_head_sha256"], first["semantic_head_sha256"])
+        self.assertEqual(len(store.load_semantic_events(self.paths, task)), event_count)
+        self.assertTrue(projection_path.is_file())
+
+        cases = (
+            ("request", self.approval_args(task, head, "approve-deterministic", "2026-07-24T00:01:00+00:00", note="Changed retry request.")),
+            ("head", self.approval_args(task, "0" * 64, "approve-deterministic", "2026-07-24T00:01:00+00:00")),
+            ("timestamp", self.approval_args(task, head, "approve-deterministic", "2026-07-24T00:01:01+00:00")),
+        )
+        for label, drifted in cases:
+            with self.subTest(drift=label):
+                rejected = self.cli(*drifted, ok=False)
+                self.assertIn("semantic approve-plan", rejected.stderr)
+                self.assertEqual(len(store.load_semantic_events(self.paths, task)), event_count)
+
+        drift_task, drift_head = self.semantic_task("plan-digest")
+        drift_args = self.approval_args(drift_task, drift_head, "approve-plan-digest", "2026-07-24T00:01:02+00:00")
+        self.cli(*drift_args)
+        plan = h.task_dir(self.paths, drift_task) / "plan.md"
+        plan.write_text(plan.read_text(encoding="utf-8") + "\nDigest drift.\n", encoding="utf-8")
+        rejected = self.cli(*drift_args, ok=False)
+        self.assertIn("retry differs", rejected.stderr)
+
+    def test_pending_binding_blocks_new_plan_and_delivery_transitions(self) -> None:
+        task, head = self.semantic_task("pending")
+        approved = self.approve(task, head, "approve-pending", "2026-07-24T00:02:00+00:00")
+        token = "pending-port-claim"
+        with mock.patch.object(
+            store,
+            "append_semantic_transition",
+            side_effect=h.HarnessError("injected claim event interruption"),
+        ):
+            interrupted = self.cli_in_process(*self.claim_args(task, approved["semantic_head_sha256"], token), ok=False)
+        self.assertIn("injected claim event interruption", interrupted.stderr)
+        event_count = len(store.load_semantic_events(self.paths, task))
+
+        approval = self.cli(
+            *self.approval_args(task, self.semantic_head(task), "approve-pending-blocked", "2026-07-24T00:02:01+00:00"),
+            ok=False,
+        )
+        self.assertIn("pending binding", approval.stderr)
+        delivery = self.cli(
+            *self.delivery_args(task, self.semantic_head(task), "delivery-pending-blocked", "2026-07-24T00:02:02+00:00"),
+            ok=False,
+        )
+        self.assertIn("pending binding", delivery.stderr)
+        self.assertEqual(len(store.load_semantic_events(self.paths, task)), event_count)
+
+    def test_set_delivery_is_deterministic_for_local_and_pushed_exact_retries(self) -> None:
+        task, head = self.semantic_task("local-delivery")
+        approved = self.approve(task, head, "approve-local-delivery", "2026-07-24T00:04:00+00:00")
+        before = h.load_task(self.paths, task)
+        args = self.delivery_args(task, approved["semantic_head_sha256"], "delivery-local", "2026-07-24T00:04:01+00:00")
+        first = json.loads(self.cli(*args).stdout)
+        state = h.load_task(self.paths, task)
+        self.assertEqual(state["revision"], before["revision"] + 1)
+        self.assertEqual(state["updated_at"], "2026-07-24T00:04:01+00:00")
+        self.assertTrue(state["checkpoint_required"])
+        self.assertEqual(state["delivery"]["verified_at"], "")
+        count = len(store.load_semantic_events(self.paths, task))
+        replay = json.loads(self.cli(*args).stdout)
+        self.assertEqual(replay["semantic_head_sha256"], first["semantic_head_sha256"])
+        self.assertEqual(len(store.load_semantic_events(self.paths, task)), count)
+        for label, drifted in (
+            ("request", self.delivery_args(task, approved["semantic_head_sha256"], "delivery-local", "2026-07-24T00:04:01+00:00", detail="Changed delivery.")),
+            ("head", self.delivery_args(task, "0" * 64, "delivery-local", "2026-07-24T00:04:01+00:00")),
+            ("timestamp", self.delivery_args(task, approved["semantic_head_sha256"], "delivery-local", "2026-07-24T00:04:02+00:00")),
+        ):
+            with self.subTest(drift=label):
+                rejected = self.cli(*drifted, ok=False)
+                self.assertIn("semantic set-delivery", rejected.stderr)
+                self.assertEqual(len(store.load_semantic_events(self.paths, task)), count)
+
+        pushed_task, pushed_head = self.semantic_task("pushed-delivery")
+        pushed_approval = self.approve(pushed_task, pushed_head, "approve-pushed-delivery", "2026-07-24T00:04:03+00:00")
+        remote = self.root / "semantic-port-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, text=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.root), "remote", "add", "semantic-port", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "push", "semantic-port", "HEAD:refs/heads/main"], check=True, text=True, capture_output=True)
+        commit = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], check=True, text=True, capture_output=True).stdout.strip()
+        pushed_args = self.delivery_args(
+            pushed_task, pushed_approval["semantic_head_sha256"], "delivery-pushed", "2026-07-24T00:04:04+00:00",
+            mode="pushed", detail="The exact fixture commit is present on the fixture remote.",
+        ) + ["--commit", commit, "--remote", "semantic-port", "--remote-ref", "refs/heads/main"]
+        pushed = json.loads(self.cli(*pushed_args).stdout)
+        self.assertEqual(pushed["commit"], commit)
+        self.assertEqual(pushed["verified_at"], "2026-07-24T00:04:04+00:00")
+        self.assertEqual(json.loads(self.cli(*pushed_args).stdout)["semantic_head_sha256"], pushed["semantic_head_sha256"])
+
+    def test_fresh_ported_lifecycle_reaches_non_achieved_close(self) -> None:
+        task, head = self.semantic_task("reachability")
+        approved = self.approve(task, head, "approve-reachability", "2026-07-24T00:05:00+00:00")
+        token = "reachability-port-claim"
+        acquired = json.loads(self.cli(*self.claim_args(task, approved["semantic_head_sha256"], token)).stdout)
+        released = json.loads(self.cli(
+            "release-claim", "--task", task, "--token", token, "--status", "released",
+            "--reason", "The port reachability claim is complete.",
+            "--semantic-command-id", "release-reachability",
+            "--semantic-expected-head-sha256", acquired["event_sha256"],
+            "--semantic-recorded-at", "2026-07-24T00:05:01+00:00", "--json",
+        ).stdout)
+        first_checkpoint = json.loads(self.cli(*self.checkpoint_args(task, released["event_sha256"], "checkpoint-before-delivery", "2026-07-24T00:05:02+00:00")).stdout)
+        delivered = json.loads(self.cli(*self.delivery_args(
+            task, first_checkpoint["semantic_head_sha256"], "delivery-reachability", "2026-07-24T00:05:03+00:00",
+            mode="none", detail="No source delivery is produced by this lifecycle reachability test.",
+        )).stdout)
+        # Delivery is a state mutation, so refresh the checkpoint before the
+        # close gate.  The preceding checkpoint proves the requested port order.
+        final_checkpoint = json.loads(self.cli(*self.checkpoint_args(
+            task, delivered["semantic_head_sha256"], "checkpoint-after-delivery", "2026-07-24T00:05:04+00:00"
+        )).stdout)
+        closed = json.loads(self.cli(
+            "close-task", "--task", task,
+            "--summary", "Fresh semantic plan and delivery ports reached close.",
+            "--outcome", "partial",
+            "--boundary-disposition", "This test proves lifecycle reachability, not the registered engineering boundary.",
+            "--semantic-command-id", "close-reachability",
+            "--semantic-expected-head-sha256", final_checkpoint["semantic_head_sha256"],
+            "--json",
+        ).stdout)
+        self.assertEqual(closed["status"], "done")
+        self.assertEqual(h.load_task(self.paths, task)["delivery"]["mode"], "none")
+        self.assertTrue(h.claim_path(self.paths, token, active=False).exists())
 
 
 if __name__ == "__main__":

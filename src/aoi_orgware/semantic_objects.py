@@ -68,10 +68,11 @@ OBJECT_TYPES = frozenset(
         "codex_launch_authority",
         "codex_transport_receipt",
         "codex_mutation_verification",
+        "semantic_claim",
     }
 )
 SMALL_OBJECT_TYPES = frozenset(
-    {"routing_terminal", "transition_decision", "transition_permit"}
+    {"routing_terminal", "transition_decision", "transition_permit", "semantic_claim"}
 )
 BINDING_KINDS = frozenset(
     {
@@ -84,6 +85,7 @@ BINDING_KINDS = frozenset(
         "codex_launch_reservation",
         "codex_transport_milestone",
         "codex_mutation_verification",
+        "semantic_claim_lifecycle",
     }
 )
 
@@ -293,7 +295,7 @@ def _object_base(
     task_id = h.validate_id(task_id, "task id")
     identity = _validate_text(object_identity, "object identity", MAX_OBJECT_IDENTITY_CHARS)
     payload_copy = _clone(payload, max_bytes=MAX_OBJECT_BYTES)
-    payload_copy = _validate_transport_payload(object_type, task_id, payload_copy)
+    payload_copy = _validate_contract_payload(object_type, task_id, payload_copy)
     return {
         "schema_version": OBJECT_SCHEMA_VERSION,
         "object_type": object_type,
@@ -304,8 +306,8 @@ def _object_base(
     }
 
 
-def _validate_transport_payload(object_type: str, task_id: str, payload: Any) -> Any:
-    """Return a closed transport payload, or the generic payload for v0.3 types.
+def _validate_contract_payload(object_type: str, task_id: str, payload: Any) -> Any:
+    """Return a closed contract payload, or the generic payload for legacy types.
 
     Semantic objects are intentionally generic for the pre-v0.4 object types.
     These new transport registrations are different: they carry execution
@@ -314,6 +316,21 @@ def _validate_transport_payload(object_type: str, task_id: str, payload: Any) ->
     arbitrary App Server JSON cannot enter AOI merely through a registered
     object type.
     """
+
+    if object_type == "semantic_claim":
+        # Keep the claim contract out of the generic object store.  The import
+        # stays lazy so semantic-object users that do not use claims do not
+        # acquire the claim implementation or its dependencies.
+        from . import semantic_claims
+
+        try:
+            return semantic_claims.validate_semantic_claim_object_payload(
+                payload, task_id=task_id
+            )
+        except SemanticObjectError:
+            raise
+        except Exception as exc:
+            raise SemanticObjectError(f"semantic claim payload is invalid: {exc}") from exc
 
     if object_type not in {
         "codex_launch_intent",

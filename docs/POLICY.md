@@ -264,6 +264,42 @@ of a silent `exists: false`.
 Locks coordinate cooperative agents. They cannot stop an unrelated process
 from changing a file.
 
+For semantic-v2 tasks, a claim lifecycle is event-authoritative. Acquisition,
+status transition, and release are respectively the typed
+`claim_acquired`, `claim_status_changed`, and `claim_released` events; a
+projection, legacy claim record, or free-form checkpoint is not substitute
+authority. `claim_acquired` publishes one immutable claim object and its
+immutable task/head binding. Each later status or release transition publishes
+a new immutable revision object and binding whose `prior_object_sha256` points
+to the previously authenticated revision; no transition rewrites an earlier
+object or treats mutable projection data as authority. A `pending` reservation
+reserves scope but is not an active claim and cannot authorize the Codex
+Transport Bridge or a source mutation.
+
+Every typed claim writer uses the exact semantic expected-head CAS. An exact
+retry may return only the already-committed result for the same command,
+expected head, immutable object, and binding; a different head, object,
+binding, or result fails closed. Release first appends `claim_released` and
+publishes the immutable terminal archive; only then may it unlink the active
+claim entry. Interrupted release therefore leaves an active entry or a
+replayable terminal event/archive, never an unaccounted disappearance.
+
+Because each claim transition advances the task revision, semantic-v2 also
+requires a typed `task_checkpointed` transition before close. Its result binds
+the deterministic checkpoint revision and SHA-256 to the supplied semantic
+timestamp; `checkpoint.md` remains a derived file published only after that
+event. A later-head retry cannot rewrite the current checkpoint.
+
+Migration rejects any legacy task containing a structured active or archive
+claim until an explicit typed import creates the corresponding immutable
+semantic objects, bindings, and events. `doctor`, task close, and every Bridge
+authority boundary use the authenticated semantic loader: it replays and
+validates the ledger, object/binding identities, and current typed status
+before acting. They fail closed on missing, tampered, legacy-unimported, or
+projection-only claim authority. These are v0.4 P0 release requirements, not
+proof that a local contract test, a live App Server canary, Git mutation
+verification, or remote CI has passed; each remains a separate evidence gate.
+
 Each state tree is tagged with one runtime lock domain. POSIX/WSL and native
 Windows locks are intentionally incompatible, so a domain mismatch fails
 closed before mutation. Native Windows support excludes UNC/network shares and

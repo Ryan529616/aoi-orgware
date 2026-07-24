@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import ModuleType
 from typing import cast
 from unittest import mock
 
@@ -17,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO / "src"))
 
+import aoi_orgware  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware import semantic_events as semantic  # noqa: E402
 from aoi_orgware import semantic_objects as objects  # noqa: E402
@@ -140,6 +142,41 @@ class SemanticObjectTests(unittest.TestCase):
         with mock.patch.object(objects, "MAX_SMALL_OBJECT_BYTES", 100):
             with self.assertRaises(objects.SemanticObjectError):
                 self.object("b" * 64, "x" * 200, "transition_permit")
+
+    def test_semantic_claim_uses_its_lazy_closed_contract_validator(self) -> None:
+        self.assertIn("semantic_claim", objects.OBJECT_TYPES)
+        self.assertIn("semantic_claim", objects.SMALL_OBJECT_TYPES)
+        self.assertIn("semantic_claim_lifecycle", objects.BINDING_KINDS)
+
+        calls: list[tuple[object, str]] = []
+        claims = ModuleType("aoi_orgware.semantic_claims")
+
+        def validate(payload: object, *, task_id: str) -> dict[str, object]:
+            calls.append((payload, task_id))
+            if payload != {"claim_id": "claim-1", "task_id": TASK}:
+                raise ValueError("claim payload is not closed")
+            if task_id != TASK:
+                raise ValueError("claim task identity does not match object")
+            return {"claim_id": "claim-1", "task_id": task_id}
+
+        claims.validate_semantic_claim_object_payload = validate  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"aoi_orgware.semantic_claims": claims}):
+            with mock.patch.object(aoi_orgware, "semantic_claims", claims, create=True):
+                candidate = self.object(
+                    "claim-1", {"claim_id": "claim-1", "task_id": TASK}, "semantic_claim"
+                )
+                self.assertEqual(candidate["payload"], {"claim_id": "claim-1", "task_id": TASK})
+                self.assertEqual(calls, [({"claim_id": "claim-1", "task_id": TASK}, TASK)])
+
+                with self.assertRaisesRegex(objects.SemanticObjectError, "closed"):
+                    self.object("claim-1", {"unclosed": True}, "semantic_claim")
+                with self.assertRaisesRegex(objects.SemanticObjectError, "task identity"):
+                    objects.create_semantic_object(
+                        object_type="semantic_claim",
+                        task_id="other-task",
+                        object_identity="claim-1",
+                        payload={"claim_id": "claim-1", "task_id": TASK},
+                    )
 
     def test_cohort_plan_wrapper_has_a_distinct_payload_safe_bound(self) -> None:
         self.assertIn("cohort_plan", objects.OBJECT_TYPES)
