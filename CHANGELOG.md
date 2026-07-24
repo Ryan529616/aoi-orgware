@@ -37,14 +37,31 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   remove only the bytes whose publication state is known.
 - **Integrated release successor.** The compatibility, Codex Transport V2, and
   semantic lifecycle commits are integrated with the Windows path-identity and
-  coverage source-provenance repairs. Focused Windows contract/static tests,
-  native and emulated-Windows typing, compile checks, and isolated wheel/sdist
-  installation pass. The ordinary unit workflow keeps the coverage combiner
-  out of its dependency-free collection while the dedicated coverage job owns
-  the hash-locked coverage toolchain; the static workflow contract now checks
-  that exact split. Full final-byte Windows/WSL and coverage runs, both live
+  coverage source-provenance repairs. The clean integration baseline passed
+  focused Windows contract/static tests, native and emulated-Windows typing,
+  compile checks, and isolated wheel/sdist installation; those results remain
+  baseline-scoped after later release-policy and canary-driver corrections.
+  The ordinary unit workflow keeps the coverage combiner out of its
+  dependency-free collection while the dedicated coverage job owns the
+  hash-locked coverage toolchain; the static workflow contract checks that
+  exact split. Full final-byte Windows/WSL and coverage runs, both live
   canaries, fresh review, integrity-v2 sealing, exact-SHA remote CI,
   publication/readback, promotion, and ARISE installation remain required.
+- **AOI repository publication authority stays distinct from project file
+  protection.** This repository's effective confidentiality mode is
+  `standard`, so its reviewed source, Git refs, release artifacts, and PyPI
+  package can be published. The tracked publication snapshot and all workflow
+  pins are regenerated from that exact unchanged live config. User projects
+  may independently select `local_files` and designate protected paths; making
+  AOI updateable does not weaken those per-project destination rules.
+- **The disposable transport canary now binds its launcher environment.** Its
+  v2 spec names the exact isolated `CODEX_HOME` policy and exact Bridge
+  executable bytes. Every inspect, run, and mutation-verification subprocess
+  revalidates both bindings, overrides ambient `CODEX_HOME`, and removes known
+  AOI authority, publication credentials, and ambient Python path/home/venv
+  influence while retaining model-service authentication. The child also
+  disables user-site and unsafe-path injection. A v1 canary spec is not
+  accepted under the stronger contract.
 
 ### v0.4.0a3 (unreleased)
 

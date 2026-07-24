@@ -10,6 +10,9 @@ from typing import Any
 
 import pytest
 
+from aoi_orgware import codex_app_server_stdio as app_server
+from aoi_orgware import confidentiality
+
 
 _SCRIPT = (
     Path(__file__).resolve().parents[1] / "scripts" / "codex_transport_canary.py"
@@ -21,6 +24,33 @@ _SPEC.loader.exec_module(canary)
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
+BRIDGE_BYTES = b"fake bridge entry point"
+BRIDGE_SAME_SIZE_DRIFT = b"drifted bridge payload!"
+assert len(BRIDGE_SAME_SIZE_DRIFT) == len(BRIDGE_BYTES)
+
+
+def test_canary_policy_constants_match_runtime_enforcement() -> None:
+    assert canary._LOCAL_FILES_MAX_BYTES == app_server.DEFAULT_MAX_LINE_BYTES
+    assert canary._LOCAL_FILES_HOME_NAMES == app_server._LOCAL_FILES_HOME_NAMES
+    assert canary._LOCAL_FILES_CONFIG == app_server._LOCAL_FILES_CONFIG
+    assert (
+        canary._LOCAL_FILES_MANAGED_CONFIG
+        == app_server._LOCAL_FILES_MANAGED_CONFIG
+    )
+    assert (
+        canary._LOCAL_FILES_THREAD_CONFIG
+        == app_server._LOCAL_FILES_THREAD_CONFIG
+    )
+    assert canary._AOI_SECRET_ENV_PREFIXES == app_server._AOI_SECRET_ENV_PREFIXES
+    assert canary._AOI_SECRET_ENV_NAMES == app_server._AOI_SECRET_ENV_NAMES
+    assert (
+        canary._PUBLISH_CREDENTIAL_NAMES
+        == confidentiality._STRONG_PUBLISH_CREDENTIAL_NAMES
+    )
+    assert (
+        canary._PUBLISH_CREDENTIAL_PREFIXES
+        == confidentiality._STRONG_PUBLISH_CREDENTIAL_PREFIXES
+    )
 
 
 def _git() -> Path:
@@ -66,7 +96,23 @@ def _spec(tmp_path: Path, mode: str) -> tuple[Path, dict[str, Any]]:
     codex = tmp_path / "codex.exe"
     codex.write_bytes(b"exact pinned fake Codex executable")
     bridge = tmp_path / "aoi-codex-bridge.exe"
-    bridge.write_bytes(b"fake bridge entry point")
+    bridge.write_bytes(BRIDGE_BYTES)
+    codex_home = tmp_path / "isolated-codex-home"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(
+        '{"tokens":{"openai":"secret-not-for-receipts"}}', encoding="utf-8"
+    )
+    (codex_home / "config.toml").write_text(
+        'web_search = "disabled"\n\n'
+        "[features]\napps = false\nremote_plugin = false\nmulti_agent = false\n\n"
+        "[apps._default]\nenabled = false\n",
+        encoding="utf-8",
+    )
+    (codex_home / "managed_config.toml").write_text(
+        "allow_remote_control = false\nallowed_web_search_modes = []\n\n"
+        "[features]\napps = false\nremote_plugin = false\nmulti_agent = false\n",
+        encoding="utf-8",
+    )
     runtime_pin = {
         "codex_cli_version": "0.145.0",
         "codex_app_server_version": "0.145.0",
@@ -88,8 +134,11 @@ def _spec(tmp_path: Path, mode: str) -> tuple[Path, dict[str, Any]]:
         "prompt_file": str((root / "prompt.txt").resolve()),
         "codex_executable": str(codex.resolve()),
         "bridge_executable": str(bridge.resolve()),
+        "bridge_executable_sha256": hashlib.sha256(bridge.read_bytes()).hexdigest(),
+        "bridge_executable_size_bytes": bridge.stat().st_size,
         "git_executable": str(_git()),
         "scratch_root": str(root.resolve()),
+        "codex_home": str(codex_home.resolve()),
         "runtime_pin": runtime_pin,
         "timeout_seconds": 30,
         "post_git_endpoint_file": None,
@@ -155,6 +204,147 @@ def test_policy_accepts_authenticated_contract_paths_on_native_windows(
         == Path(spec["codex_executable"]).as_posix()
     )
     canary._validate_policy(spec, inspected, fresh=True)
+
+
+def test_v1_spec_is_rejected_after_runtime_authority_fields_changed(
+    tmp_path: Path,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    raw["schema_version"] = "aoi.codex-transport-canary.v1"
+    spec_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(canary.CanaryError, match="schema_version is unsupported"):
+        canary.load_spec(spec_path)
+
+
+def test_codex_home_binding_is_exact_and_auth_safe(tmp_path: Path) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+
+    binding = spec["codex_home_policy"]
+    inventory = binding["initial_inventory"]
+    auth = next(row for row in inventory if row["name"] == "auth.json")
+    assert binding["codex_home"] == Path(raw["codex_home"]).as_posix()
+    assert set(binding) >= {
+        "config_path",
+        "config_sha256",
+        "managed_config_path",
+        "managed_config_sha256",
+        "thread_config_sha256",
+    }
+    assert set(auth) == {"name", "path", "size_bytes", "type"}
+    assert "secret-not-for-receipts" not in json.dumps(binding)
+
+
+@pytest.mark.parametrize("change", ["missing", "extra", "policy_drift"])
+def test_codex_home_rejects_inventory_and_policy_drift(
+    tmp_path: Path, change: str
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    home = Path(raw["codex_home"])
+    if change == "missing":
+        (home / "auth.json").unlink()
+    elif change == "extra":
+        (home / "unexpected.txt").write_text("no", encoding="utf-8")
+    else:
+        (home / "config.toml").write_text('web_search = "live"\n', encoding="utf-8")
+
+    with pytest.raises(canary.CanaryError, match="codex_home"):
+        canary.load_spec(spec_path)
+
+
+def test_codex_home_rejects_missing_directory_as_canary_error(
+    tmp_path: Path,
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    raw["codex_home"] = str((tmp_path / "missing-codex-home").resolve())
+    spec_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(canary.CanaryError, match="codex_home"):
+        canary.load_spec(spec_path)
+
+
+def test_bridge_executable_bytes_are_bound(tmp_path: Path) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    Path(raw["bridge_executable"]).write_bytes(BRIDGE_SAME_SIZE_DRIFT)
+
+    with pytest.raises(canary.CanaryError, match="bridge_executable bytes drifted"):
+        canary.load_spec(spec_path)
+
+
+def test_bridge_revalidates_binary_and_codex_home_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    monkeypatch.setattr(
+        canary,
+        "_run_process",
+        lambda *_args, **_kwargs: pytest.fail("bridge must not start after drift"),
+    )
+    Path(raw["bridge_executable"]).write_bytes(BRIDGE_SAME_SIZE_DRIFT)
+    with pytest.raises(canary.CanaryError, match="bridge_executable bytes drifted"):
+        canary._bridge_json(spec, ["inspect"])
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    fresh_spec_path, fresh_raw = _spec(fresh, "read_only")
+    fresh_spec = canary.load_spec(fresh_spec_path)
+    (Path(fresh_raw["codex_home"]) / "config.toml").write_text(
+        'web_search = "live"\n', encoding="utf-8"
+    )
+    with pytest.raises(canary.CanaryError, match="codex_home"):
+        canary._bridge_json(fresh_spec, ["inspect"])
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["inspect", "--task", "canary-task", "--launch-id", "canary-launch"],
+        ["run", "--task", "canary-task", "--permit-sha256", SHA_B],
+        ["verify-mutation", "--task", "canary-task", "--launch-id", "canary-launch"],
+    ],
+)
+def test_all_bridge_subprocesses_use_isolated_redacted_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    spec_path, raw = _spec(tmp_path, "read_only")
+    spec = canary.load_spec(spec_path)
+    ambient_home = tmp_path / "ambient-codex-home"
+    seen: dict[str, str] = {}
+
+    def fake_run(*_args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess([], 0, b"{}", b"")
+
+    monkeypatch.setattr(canary.subprocess, "run", fake_run)
+    monkeypatch.setenv("CODEX_HOME", str(ambient_home))
+    monkeypatch.setenv("AOI_CHIEF_CREDENTIAL_FILE", "must-not-pass")
+    monkeypatch.setenv("AOI_CREDENTIAL_FILE", "must-not-pass")
+    monkeypatch.setenv("AOI_ROOT_TOKEN", "must-not-pass")
+    monkeypatch.setenv("AOI_BACKUP_ROOT", "must-not-pass")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-pass")
+    monkeypatch.setenv("TWINE_PASSWORD", "must-not-pass")
+    monkeypatch.setenv("PYTHONPATH", "must-not-influence-bridge")
+    monkeypatch.setenv("PYTHONHOME", "must-not-influence-bridge")
+    monkeypatch.setenv("VIRTUAL_ENV", "must-not-influence-bridge")
+    monkeypatch.setenv("OPENAI_API_KEY", "model-auth-must-pass")
+
+    canary._bridge_json(spec, args)
+
+    assert seen["CODEX_HOME"] == Path(raw["codex_home"]).as_posix()
+    assert seen["OPENAI_API_KEY"] == "model-auth-must-pass"
+    assert seen["PYTHONNOUSERSITE"] == "1"
+    assert seen["PYTHONSAFEPATH"] == "1"
+    assert "PYTHONPATH" not in seen
+    assert "PYTHONHOME" not in seen
+    assert "VIRTUAL_ENV" not in seen
+    assert not any(
+        name.startswith(canary._AOI_SECRET_ENV_PREFIXES)
+        or name == "AOI_BACKUP_ROOT"
+        or canary._is_publish_credential_name(name)
+        for name in seen
+    )
 
 
 def test_preflight_is_read_only_and_does_not_start_app_server(

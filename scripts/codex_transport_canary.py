@@ -15,10 +15,11 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tomllib
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = "aoi.codex-transport-canary.v1"
+SCHEMA_VERSION = "aoi.codex-transport-canary.v2"
 ROOT_MARKER = ".aoi-codex-transport-canary.json"
 ROOT_MARKER_SCHEMA = "aoi.codex-transport-canary-root.v1"
 _MODES = {
@@ -31,6 +32,78 @@ _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_FILES = 4096
 _MAX_FILE_BYTES = 16 * 1024 * 1024
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_LOCAL_FILES_MAX_BYTES = 1_048_576
+_LOCAL_FILES_HOME_NAMES = frozenset(
+    {"auth.json", "config.toml", "managed_config.toml"}
+)
+_LOCAL_FILES_CONFIG = {
+    "web_search": "disabled",
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+    "apps": {"_default": {"enabled": False}},
+}
+_LOCAL_FILES_MANAGED_CONFIG = {
+    "allow_remote_control": False,
+    "allowed_web_search_modes": [],
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+}
+_LOCAL_FILES_THREAD_CONFIG = {
+    "web_search": "disabled",
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+    "apps": {"_default": {"enabled": False}},
+}
+_AOI_SECRET_ENV_PREFIXES = ("AOI_CHIEF_", "AOI_ROOT_", "AOI_CREDENTIAL_")
+_AOI_SECRET_ENV_NAMES = frozenset(
+    {"AOI_CHIEF_SESSION_ID", "AOI_CHIEF_EPOCH", "AOI_CHIEF_CREDENTIAL_FILE"}
+)
+_PYTHON_RUNTIME_ENV_NAMES = frozenset(
+    {"VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "__PYVENV_LAUNCHER__"}
+)
+_PUBLISH_CREDENTIAL_NAMES = frozenset(
+    {
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_PAT",
+        "GITHUB_TOKEN",
+        "CI_JOB_TOKEN",
+        "GITLAB_PRIVATE_TOKEN",
+        "GITLAB_TOKEN",
+        "AZURE_DEVOPS_EXT_PAT",
+        "SYSTEM_ACCESSTOKEN",
+        "AZURE_ARTIFACTS_ENV_ACCESS_TOKEN",
+        "VSS_NUGET_EXTERNAL_FEED_ENDPOINTS",
+        "NPM_TOKEN",
+        "NODE_AUTH_TOKEN",
+        "NUGET_AUTH_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "RUBYGEMS_API_KEY",
+        "GEM_HOST_API_KEY",
+        "PYPI_TOKEN",
+        "TWINE_PASSWORD",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AZURE_STORAGE_CONNECTION_STRING",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "DOCKER_AUTH_CONFIG",
+        "DOCKER_PASSWORD",
+        "REGISTRY_AUTH_FILE",
+    }
+)
+_PUBLISH_CREDENTIAL_PREFIXES = ("TWINE_", "PYPI_", "ARTIFACTORY_", "JFROG_")
 
 
 class CanaryError(ValueError):
@@ -90,7 +163,12 @@ def _absolute_file(value: Any, label: str) -> Path:
         else _text(value, label, limit=4096)
     )
     path = Path(raw)
-    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+    if (
+        not path.is_absolute()
+        or not path.is_file()
+        or path.is_symlink()
+        or _is_reparse(path, label=label)
+    ):
         raise CanaryError(f"{label} must be an existing absolute regular file")
     return path.resolve()
 
@@ -98,9 +176,132 @@ def _absolute_file(value: Any, label: str) -> Path:
 def _absolute_directory(value: Any, label: str) -> Path:
     raw = _text(value, label, limit=4096)
     path = Path(raw)
-    if not path.is_absolute() or not path.is_dir() or path.is_symlink():
+    if (
+        not path.is_absolute()
+        or not path.is_dir()
+        or path.is_symlink()
+        or _is_reparse(path, label=label)
+    ):
         raise CanaryError(f"{label} must be an existing absolute directory")
     return path.resolve()
+
+
+def _is_reparse(path: Path, *, label: str) -> bool:
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError as exc:
+        raise CanaryError(f"could not inspect {label}") from exc
+    return bool(attributes & 0x400)
+
+
+def _same_physical_path(path: Path, resolved: Path) -> bool:
+    return os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(resolved))
+
+
+def _bounded_regular_bytes(path: Path, label: str) -> bytes:
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or _is_reparse(path, label=label)
+    ):
+        raise CanaryError(f"{label} must be a regular non-linked file")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError(f"could not resolve {label}") from exc
+    if not _same_physical_path(path, resolved):
+        raise CanaryError(f"{label} resolves through a link or reparse boundary")
+    try:
+        size = path.stat().st_size
+        data = path.read_bytes()
+    except OSError as exc:
+        raise CanaryError(f"could not read {label}") from exc
+    if not data or len(data) != size or size > _LOCAL_FILES_MAX_BYTES:
+        raise CanaryError(f"{label} bytes are invalid or changed while bound")
+    return data
+
+
+def _local_files_codex_home(value: Any) -> dict[str, Any]:
+    """Bind the closed policy without hashing or persisting auth content."""
+
+    raw = _text(value, "codex_home", limit=4096)
+    home = Path(raw)
+    if (
+        not home.is_absolute()
+        or home.is_symlink()
+        or not home.is_dir()
+        or _is_reparse(home, label="codex_home")
+    ):
+        raise CanaryError("codex_home must be an absolute non-link non-reparse directory")
+    try:
+        resolved_home = home.resolve(strict=True)
+    except OSError as exc:
+        raise CanaryError("could not resolve codex_home") from exc
+    if not _same_physical_path(home, resolved_home):
+        raise CanaryError("codex_home resolves through a link or reparse boundary")
+    try:
+        children = sorted(home.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise CanaryError("could not enumerate codex_home") from exc
+    if (
+        len(children) != len(_LOCAL_FILES_HOME_NAMES)
+        or {child.name for child in children} != _LOCAL_FILES_HOME_NAMES
+    ):
+        raise CanaryError(
+            "codex_home inventory must contain only auth.json, config.toml, "
+            "and managed_config.toml"
+        )
+
+    inventory: list[dict[str, Any]] = []
+    policy_files: dict[str, tuple[Path, bytes, str]] = {}
+    for child in children:
+        data = _bounded_regular_bytes(child, f"codex_home/{child.name}")
+        row: dict[str, Any] = {
+            "name": child.name,
+            "path": _contract_path(child),
+            "size_bytes": len(data),
+            "type": "file",
+        }
+        if child.name != "auth.json":
+            digest = hashlib.sha256(data).hexdigest()
+            row["sha256"] = digest
+            policy_files[child.name] = (child, data, digest)
+        inventory.append(row)
+    try:
+        config = tomllib.loads(
+            policy_files["config.toml"][1].decode("utf-8", errors="strict")
+        )
+        managed = tomllib.loads(
+            policy_files["managed_config.toml"][1].decode("utf-8", errors="strict")
+        )
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise CanaryError("codex_home policy files must be strict UTF-8 TOML") from exc
+    if config != _LOCAL_FILES_CONFIG:
+        raise CanaryError("codex_home config.toml policy differs from exact local_files profile")
+    if managed != _LOCAL_FILES_MANAGED_CONFIG:
+        raise CanaryError("codex_home managed_config.toml policy differs from exact local_files profile")
+    inventory_bytes = json.dumps(
+        inventory, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    thread_config_bytes = json.dumps(
+        _LOCAL_FILES_THREAD_CONFIG,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return {
+        "mode": "local_files",
+        "codex_home": _contract_path(resolved_home),
+        "initial_inventory": inventory,
+        "initial_inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(),
+        "config_path": _contract_path(policy_files["config.toml"][0]),
+        "config_sha256": policy_files["config.toml"][2],
+        "managed_config_path": _contract_path(
+            policy_files["managed_config.toml"][0]
+        ),
+        "managed_config_sha256": policy_files["managed_config.toml"][2],
+        "thread_config_sha256": hashlib.sha256(thread_config_bytes).hexdigest(),
+    }
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -187,7 +388,12 @@ def _runtime_pin(value: Any) -> dict[str, Any]:
 
 
 def load_spec(path: Path) -> dict[str, Any]:
-    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+    if (
+        not path.is_absolute()
+        or not path.is_file()
+        or path.is_symlink()
+        or _is_reparse(path, label="spec")
+    ):
         raise CanaryError("spec must be an existing absolute regular file")
     raw = path.read_bytes()
     if not raw or len(raw) > _MAX_JSON_BYTES:
@@ -208,8 +414,11 @@ def load_spec(path: Path) -> dict[str, Any]:
             "prompt_file",
             "codex_executable",
             "bridge_executable",
+            "bridge_executable_sha256",
+            "bridge_executable_size_bytes",
             "git_executable",
             "scratch_root",
+            "codex_home",
             "runtime_pin",
             "timeout_seconds",
             "post_git_endpoint_file",
@@ -241,7 +450,25 @@ def load_spec(path: Path) -> dict[str, Any]:
     bridge_executable = _absolute_file(
         value["bridge_executable"], "bridge_executable"
     )
+    bridge_size = value["bridge_executable_size_bytes"]
+    if (
+        isinstance(bridge_size, bool)
+        or not isinstance(bridge_size, int)
+        or bridge_size < 1
+        or bridge_size > 2**63 - 1
+    ):
+        raise CanaryError("bridge_executable_size_bytes is invalid")
+    bridge_sha256 = _sha256(
+        value["bridge_executable_sha256"], "bridge_executable_sha256"
+    )
+    if (
+        bridge_executable.stat().st_size != bridge_size
+        or hashlib.sha256(bridge_executable.read_bytes()).hexdigest()
+        != bridge_sha256
+    ):
+        raise CanaryError("bridge_executable bytes drifted")
     git_executable = _absolute_file(value["git_executable"], "git_executable")
+    codex_home_policy = _local_files_codex_home(value["codex_home"])
     timeout_seconds = value["timeout_seconds"]
     if (
         isinstance(timeout_seconds, bool)
@@ -272,8 +499,11 @@ def load_spec(path: Path) -> dict[str, Any]:
         "prompt_file": prompt_file,
         "codex_executable": codex_executable,
         "bridge_executable": bridge_executable,
+        "bridge_executable_sha256": bridge_sha256,
+        "bridge_executable_size_bytes": bridge_size,
         "git_executable": git_executable,
         "scratch_root": scratch_root,
+        "codex_home_policy": codex_home_policy,
         "runtime_pin": runtime_pin,
         "timeout_seconds": float(timeout_seconds),
         "post_git_endpoint_file": post_endpoint_path,
@@ -285,6 +515,7 @@ def _run_process(
     *,
     timeout_seconds: float,
     allow_codes: set[int] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     allowed = {0} if allow_codes is None else allow_codes
     try:
@@ -295,6 +526,7 @@ def _run_process(
             stderr=subprocess.PIPE,
             timeout=timeout_seconds,
             check=False,
+            env=None if environment is None else dict(environment),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CanaryError(f"command execution failed: {argv[0]}") from exc
@@ -306,6 +538,51 @@ def _run_process(
             f"command failed with status {completed.returncode}: {stderr}"
         )
     return completed
+
+
+def _is_publish_credential_name(name: str) -> bool:
+    upper = name.upper()
+    return upper in _PUBLISH_CREDENTIAL_NAMES or upper.startswith(
+        _PUBLISH_CREDENTIAL_PREFIXES
+    )
+
+
+def _bridge_environment(spec: Mapping[str, Any]) -> dict[str, str]:
+    """Return the bounded child environment for bridge-owned subprocesses."""
+
+    environment: dict[str, str] = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if (
+            upper == "CODEX_HOME"
+            or upper in _AOI_SECRET_ENV_NAMES
+            or upper.startswith(_AOI_SECRET_ENV_PREFIXES)
+            or upper == "AOI_BACKUP_ROOT"
+            or upper.startswith("PYTHON")
+            or upper in _PYTHON_RUNTIME_ENV_NAMES
+            or _is_publish_credential_name(name)
+        ):
+            continue
+        environment[name] = value
+    environment["CODEX_HOME"] = str(spec["codex_home_policy"]["codex_home"])
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONSAFEPATH"] = "1"
+    return environment
+
+
+def _revalidate_bridge_binding(spec: Mapping[str, Any]) -> None:
+    bridge = _absolute_file(spec["bridge_executable"], "bridge_executable")
+    if (
+        bridge.stat().st_size != spec["bridge_executable_size_bytes"]
+        or hashlib.sha256(bridge.read_bytes()).hexdigest()
+        != spec["bridge_executable_sha256"]
+    ):
+        raise CanaryError("bridge_executable bytes drifted")
+    refreshed_home = _local_files_codex_home(
+        spec["codex_home_policy"]["codex_home"]
+    )
+    if refreshed_home != spec["codex_home_policy"]:
+        raise CanaryError("codex_home policy binding drifted")
 
 
 def _git(
@@ -418,6 +695,7 @@ def _bridge_json(
     spec: Mapping[str, Any],
     args: Sequence[str],
 ) -> dict[str, Any]:
+    _revalidate_bridge_binding(spec)
     completed = _run_process(
         [
             str(spec["bridge_executable"]),
@@ -427,6 +705,7 @@ def _bridge_json(
             "--json",
         ],
         timeout_seconds=float(spec["timeout_seconds"]) + 30.0,
+        environment=_bridge_environment(spec),
     )
     try:
         value = json.loads(completed.stdout.decode("utf-8"))
@@ -517,6 +796,12 @@ def run_canary(spec: Mapping[str, Any], *, execute: bool) -> dict[str, Any]:
         "launch_id": spec["launch_id"],
         "permit_sha256": spec["permit_sha256"],
         "runtime_pin": spec["runtime_pin"],
+        "codex_home_policy": spec["codex_home_policy"],
+        "bridge_executable": {
+            "path": _contract_path(Path(spec["bridge_executable"])),
+            "size_bytes": spec["bridge_executable_size_bytes"],
+            "sha256": spec["bridge_executable_sha256"],
+        },
         "scratch_root": str(spec["scratch_root"]),
         "pre_git_snapshot": before,
         "reserved_inspect_sha256": _digest(reserved),

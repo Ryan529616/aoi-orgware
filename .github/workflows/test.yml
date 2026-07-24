@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  PUBLICATION_POLICY_SHA256: 11ad65c25fee5d4060422001a344faa7c8e06b427e452bd7d48a76231e4b905f
+  PUBLICATION_POLICY_SHA256: 75ad84ec3af30b3f588cb55f7d3c03793b29d5ead95147192c41cb1bd6bbfa09
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
