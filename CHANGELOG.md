@@ -47,6 +47,14 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   exact split. Full final-byte Windows/WSL and coverage runs, both live
   canaries, fresh review, integrity-v2 sealing, exact-SHA remote CI,
   publication/readback, promotion, and ARISE installation remain required.
+- **Release qualification now rejects stale policy bytes and causal clock
+  rollback.** The first exact successor WSL run exposed both a stale packaged
+  policy and a legacy supersession timestamp earlier than its replacement.
+  The next successor compares canonical policy bytes across wheel, sdist, and
+  the sdist-derived wheel; it also preserves strict supersession ordering
+  across bounded host/WSL clock rollback and fails before mutation on larger
+  rollback. Focused Windows/WSL tests pass, but all exact-candidate release
+  gates must be regenerated.
 - **AOI repository publication authority stays distinct from project file
   protection.** This repository's effective confidentiality mode is
   `standard`, so its reviewed source, Git refs, release artifacts, and PyPI

@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -104,6 +105,92 @@ class ReleaseMetadataTests(unittest.TestCase):
             "aoi_orgware/resources/codex_app_server/0.145.0/codex_app_server_protocol.v2.schemas.json",
         }
         self.assertTrue(expected.issubset(dist_verify.REQUIRED_PACKAGE_FILES))
+
+    def test_release_verifier_rejects_stale_packaged_policy_bytes(self) -> None:
+        canonical = b"# canonical policy\n"
+        stale = b"# stale policy\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = root / "candidate.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr(dist_verify.POLICY_RESOURCE_MEMBER, canonical)
+            dist_verify._validate_archived_policy_resource(wheel, canonical)
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr(dist_verify.POLICY_RESOURCE_MEMBER, stale)
+            with self.assertRaisesRegex(
+                dist_verify.VerificationError, "differs from canonical"
+            ):
+                dist_verify._validate_archived_policy_resource(wheel, canonical)
+
+            sdist = root / "candidate.tar.gz"
+            member_name = f"candidate/src/{dist_verify.POLICY_RESOURCE_MEMBER}"
+            with tarfile.open(sdist, "w:gz") as archive:
+                member = tarfile.TarInfo(member_name)
+                member.size = len(canonical)
+                archive.addfile(member, io.BytesIO(canonical))
+            dist_verify._validate_archived_policy_resource(sdist, canonical)
+            with tarfile.open(sdist, "w:gz") as archive:
+                member = tarfile.TarInfo(member_name)
+                member.size = len(stale)
+                archive.addfile(member, io.BytesIO(stale))
+            with self.assertRaisesRegex(
+                dist_verify.VerificationError, "differs from canonical"
+            ):
+                dist_verify._validate_archived_policy_resource(sdist, canonical)
+
+    def test_release_verifier_requires_one_exact_regular_wheel_policy(self) -> None:
+        canonical = b"# canonical policy\n"
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = Path(directory) / "candidate.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr(
+                    f"prefix/{dist_verify.POLICY_RESOURCE_MEMBER}", canonical
+                )
+            with self.assertRaisesRegex(
+                dist_verify.VerificationError, "exact wheel member"
+            ):
+                dist_verify._validate_archived_policy_resource(wheel, canonical)
+
+            with zipfile.ZipFile(wheel, "w") as archive:
+                link = zipfile.ZipInfo(dist_verify.POLICY_RESOURCE_MEMBER)
+                link.create_system = 3
+                link.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(link, canonical)
+            with self.assertRaisesRegex(
+                dist_verify.VerificationError, "regular file"
+            ):
+                dist_verify._validate_archived_policy_resource(wheel, canonical)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(wheel, "w") as archive:
+                    archive.writestr(
+                        dist_verify.POLICY_RESOURCE_MEMBER, canonical
+                    )
+                    archive.writestr(
+                        dist_verify.POLICY_RESOURCE_MEMBER, canonical
+                    )
+            with self.assertRaisesRegex(
+                dist_verify.VerificationError, "exact wheel member"
+            ):
+                dist_verify._validate_archived_policy_resource(wheel, canonical)
+
+    def test_release_verifier_rejects_oversize_canonical_policy_before_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "POLICY.md"
+            policy.write_bytes(
+                b"x" * (dist_verify.MAX_POLICY_RESOURCE_BYTES + 1)
+            )
+            with mock.patch.object(
+                Path,
+                "open",
+                side_effect=AssertionError("oversize policy must not be opened"),
+            ), self.assertRaisesRegex(
+                dist_verify.VerificationError, "size is invalid"
+            ):
+                dist_verify._read_bounded_policy_file(policy)
 
     def test_release_verifier_rejects_self_consistent_runtime_resource_tampering(
         self,
@@ -365,6 +452,7 @@ class ReleaseMetadataTests(unittest.TestCase):
                 build_python=Path(sys.executable),
                 expected_build_version=dist_verify.BUILD_FRONTEND_VERSION,
                 expected_hatchling_version=dist_verify.HATCHLING_VERSION,
+                expected_policy_bytes=dist_verify._canonical_policy_bytes(),
             )
 
     def test_release_verifier_rejects_a_mismatched_build_backend(self) -> None:
@@ -427,6 +515,8 @@ class ReleaseMetadataTests(unittest.TestCase):
             ), mock.patch.object(
                 dist_verify, "_validate_archived_runtime_resources"
             ) as runtime_validation, mock.patch.object(
+                dist_verify, "_validate_archived_policy_resource"
+            ) as policy_validation, mock.patch.object(
                 dist_verify, "_run", side_effect=run_build
             ):
                 version = dist_verify._verify_sdist_via_derived_wheel(
@@ -438,9 +528,61 @@ class ReleaseMetadataTests(unittest.TestCase):
 
             self.assertEqual(version, "0.4.0a1")
             runtime_validation.assert_called_once()
+            policy_validation.assert_called_once()
             build_call = next(command for command in calls if "build" in command)
             self.assertEqual(Path(build_call[0]), build_python.absolute())
             self.assertNotEqual(Path(build_call[0]), Path(sys.executable).resolve())
+
+    def test_sdist_derived_wheel_rejects_prefixed_policy_before_install(
+        self,
+    ) -> None:
+        canonical = b"# canonical policy\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdist = root / "candidate.tar.gz"
+            sdist.write_bytes(b"placeholder")
+            source_root = root / "source-root"
+            source_root.mkdir()
+
+            def run_build(command, *, cwd, env, timeout=180):  # type: ignore[no-untyped-def]
+                rendered = list(command)
+                output = Path(rendered[rendered.index("--outdir") + 1])
+                output.mkdir(exist_ok=True)
+                with zipfile.ZipFile(output / "derived.whl", "w") as archive:
+                    archive.writestr(
+                        f"prefix/{dist_verify.POLICY_RESOURCE_MEMBER}",
+                        canonical,
+                    )
+                return subprocess.CompletedProcess(
+                    args=rendered,
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+
+            with mock.patch.object(
+                dist_verify,
+                "_verify_build_backend",
+                return_value=Path(sys.executable),
+            ), mock.patch.object(
+                dist_verify, "_extract_sdist", return_value=source_root
+            ), mock.patch.object(
+                dist_verify, "_validate_archived_runtime_resources"
+            ), mock.patch.object(
+                dist_verify, "_verify_installed_artifact"
+            ) as installed, mock.patch.object(
+                dist_verify, "_run", side_effect=run_build
+            ), self.assertRaisesRegex(
+                dist_verify.VerificationError, "exact wheel member"
+            ):
+                dist_verify._verify_sdist_via_derived_wheel(
+                    sdist,
+                    build_python=Path(sys.executable),
+                    expected_build_version="1.5.0",
+                    expected_hatchling_version="1.27.0",
+                    expected_policy_bytes=canonical,
+                )
+            installed.assert_not_called()
 
     def test_release_verifier_rejects_multi_root_sdist_before_building(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -9575,7 +9575,12 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        self.cli(
+        replacement_time = h.parse_time(
+            str(second_record.get("recorded_at", ""))
+        )
+        self.assertIsNotNone(replacement_time)
+        assert replacement_time is not None
+        supersede_args = (
             "verification-supersede",
             "--task",
             task_id,
@@ -9590,9 +9595,50 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "--reason",
             "The original live-path artifact was replaced by a later exact passing record",
         )
+        before_rollback = state_path.read_bytes()
+        excessive_rollback = replacement_time - dt.timedelta(
+            seconds=(
+                cli_impl._LEGACY_VERIFICATION_CLOCK_SKEW_TOLERANCE_SECONDS + 1
+            )
+        )
+        with mock.patch.object(
+            cli_impl,
+            "now_iso",
+            return_value=excessive_rollback.isoformat(timespec="microseconds"),
+        ):
+            rejected = self.cli_in_process(*supersede_args, ok=False)
+        self.assertIn(
+            "system clock precedes the replacement verification time",
+            rejected.stderr,
+        )
+        self.assertEqual(before_rollback, state_path.read_bytes())
+
+        bounded_rollback = replacement_time - dt.timedelta(milliseconds=500)
+        with mock.patch.object(
+            cli_impl,
+            "now_iso",
+            return_value=bounded_rollback.isoformat(timespec="microseconds"),
+        ), mock.patch.object(
+            h,
+            "now_iso",
+            return_value=(
+                replacement_time - dt.timedelta(seconds=30)
+            ).isoformat(timespec="microseconds"),
+        ):
+            self.cli_in_process(*supersede_args)
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(migrated["verification"][0]["status"], "skipped")
         self.assertEqual(migrated["verification"][0]["supersession_version"], 2)
+        self.assertEqual(
+            migrated["verification"][0]["superseded_at"],
+            (replacement_time + dt.timedelta(microseconds=1)).isoformat(
+                timespec="microseconds"
+            ),
+        )
+        self.assertEqual(
+            migrated["updated_at"],
+            migrated["verification"][0]["superseded_at"],
+        )
         self.assertEqual(
             migrated["verification"][0]["source_record_sha256"], source_record_sha
         )

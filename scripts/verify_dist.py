@@ -21,9 +21,10 @@ from typing import Any, Sequence
 CONSOLE_SCRIPTS = ("aoi", "aoi-codex-hook", "aoi-codex-bridge", "aoi-claude-hook")
 BUILD_FRONTEND_VERSION = "1.5.0"
 HATCHLING_VERSION = "1.27.0"
+POLICY_RESOURCE_MEMBER = "aoi_orgware/resources/policy.md"
 REQUIRED_PACKAGE_FILES = (
     "aoi_orgware/__init__.py",
-    "aoi_orgware/resources/policy.md",
+    POLICY_RESOURCE_MEMBER,
     "aoi_orgware/resources/codex/SKILL.md",
     "aoi_orgware/resources/claude/SKILL.md",
     "aoi_orgware/resources/pilot/run-record.template.json",
@@ -46,6 +47,7 @@ RUNTIME_RESOURCE_MEMBERS = (
     COMBINED_SCHEMA_MEMBER,
 )
 MAX_RUNTIME_RESOURCE_BYTES = 1 * 1024 * 1024
+MAX_POLICY_RESOURCE_BYTES = 256 * 1024
 EXPECTED_RUNTIME_PIN_SIZE = 2063
 EXPECTED_RUNTIME_PIN_SHA256 = (
     "65b24853d83071a0b7dc745ecb3ae12d425a874b083323985b99c265378fa1c1"
@@ -361,8 +363,29 @@ def _unique_archive_member(members: Sequence[str], suffix: str, *, subject: str)
     return matches[0]
 
 
+def _exact_wheel_regular_member(
+    archive: zipfile.ZipFile, member: str, *, subject: str
+) -> zipfile.ZipInfo:
+    matches = [
+        info
+        for info in archive.infolist()
+        if info.filename == member or info.filename.endswith(f"/{member}")
+    ]
+    if len(matches) != 1 or matches[0].filename != member:
+        raise VerificationError(
+            f"{subject} must contain exactly one exact wheel member {member}"
+        )
+    info = matches[0]
+    file_type = (info.external_attr >> 16) & 0o170000
+    if info.is_dir() or file_type not in {0, stat.S_IFREG}:
+        raise VerificationError(
+            f"{subject} wheel member {member} must be a regular file"
+        )
+    return info
+
+
 def _read_zip_member(archive: zipfile.ZipFile, member: str, *, subject: str) -> bytes:
-    info = archive.getinfo(member)
+    info = _exact_wheel_regular_member(archive, member, subject=subject)
     if info.file_size > MAX_RUNTIME_RESOURCE_BYTES:
         raise VerificationError(f"{subject} Codex runtime resource exceeds bound")
     with archive.open(info, "r") as handle:
@@ -391,11 +414,10 @@ def _validate_archived_runtime_resources(path: Path) -> None:
 
     if path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
-            names = tuple(archive.namelist())
             payloads = tuple(
                 _read_zip_member(
                     archive,
-                    _unique_archive_member(names, member, subject=path.name),
+                    member,
                     subject=path.name,
                 )
                 for member in RUNTIME_RESOURCE_MEMBERS
@@ -416,6 +438,97 @@ def _validate_archived_runtime_resources(path: Path) -> None:
     else:
         raise VerificationError(f"unsupported distribution artifact: {path}")
     _validate_runtime_resource_payload(*payloads, subject=path.name)
+
+
+def _read_bounded_policy_file(policy: Path) -> bytes:
+    try:
+        initial = policy.lstat()
+    except OSError as exc:
+        raise VerificationError(
+            "canonical docs/POLICY.md cannot be inspected"
+        ) from exc
+    if not stat.S_ISREG(initial.st_mode):
+        raise VerificationError(
+            "canonical docs/POLICY.md must be a regular non-symlink file"
+        )
+    if initial.st_size <= 0 or initial.st_size > MAX_POLICY_RESOURCE_BYTES:
+        raise VerificationError("canonical docs/POLICY.md size is invalid")
+    try:
+        with policy.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            payload = handle.read(MAX_POLICY_RESOURCE_BYTES + 1)
+    except OSError as exc:
+        raise VerificationError("canonical docs/POLICY.md cannot be read") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_size != initial.st_size
+        or len(payload) != initial.st_size
+    ):
+        raise VerificationError(
+            "canonical docs/POLICY.md identity or size changed while reading"
+        )
+    return payload
+
+
+def _canonical_policy_bytes() -> bytes:
+    policy = Path(__file__).resolve().parents[1] / "docs" / "POLICY.md"
+    return _read_bounded_policy_file(policy)
+
+
+def _validate_archived_policy_resource(
+    path: Path, expected_policy_bytes: bytes
+) -> None:
+    """Bind one archive's packaged policy to the invoking source contract."""
+
+    if (
+        not expected_policy_bytes
+        or len(expected_policy_bytes) > MAX_POLICY_RESOURCE_BYTES
+    ):
+        raise VerificationError("expected canonical policy size is invalid")
+    if path.suffix == ".whl":
+        with zipfile.ZipFile(path) as archive:
+            info = _exact_wheel_regular_member(
+                archive, POLICY_RESOURCE_MEMBER, subject=path.name
+            )
+            if info.file_size > MAX_POLICY_RESOURCE_BYTES:
+                raise VerificationError(
+                    f"{path.name} packaged policy exceeds the size bound"
+                )
+            with archive.open(info, "r") as handle:
+                payload = handle.read(MAX_POLICY_RESOURCE_BYTES + 1)
+            if len(payload) != info.file_size:
+                raise VerificationError(
+                    f"{path.name} packaged policy size changed while reading"
+                )
+    elif path.name.endswith(".tar.gz"):
+        with tarfile.open(path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            names = tuple(member.name for member in members)
+            member_name = _unique_archive_member(
+                names, f"src/{POLICY_RESOURCE_MEMBER}", subject=path.name
+            )
+            by_name = {member.name: member for member in members}
+            tar_info = by_name[member_name]
+            if not tar_info.isfile() or tar_info.size > MAX_POLICY_RESOURCE_BYTES:
+                raise VerificationError(
+                    f"{path.name} packaged policy is not a bounded regular file"
+                )
+            tar_handle = archive.extractfile(tar_info)
+            if tar_handle is None:
+                raise VerificationError(
+                    f"{path.name} packaged policy cannot be read"
+                )
+            payload = tar_handle.read(MAX_POLICY_RESOURCE_BYTES + 1)
+            if len(payload) != tar_info.size:
+                raise VerificationError(
+                    f"{path.name} packaged policy size changed while reading"
+                )
+    else:
+        raise VerificationError(f"unsupported distribution artifact: {path}")
+    if payload != expected_policy_bytes:
+        raise VerificationError(
+            f"{path.name} packaged policy differs from canonical docs/POLICY.md"
+        )
 
 
 def _run(
@@ -470,7 +583,12 @@ def _has_suffix(members: Sequence[str], suffix: str) -> bool:
     return any(member == suffix or member.endswith(f"/{suffix}") for member in members)
 
 
-def _validate_archive_contents(wheel: Path, sdist: Path) -> None:
+def _validate_archive_contents(
+    wheel: Path,
+    sdist: Path,
+    *,
+    expected_policy_bytes: bytes | None = None,
+) -> None:
     wheel_members = _artifact_members(wheel)
     sdist_members = _artifact_members(sdist)
     _validate_member_names(wheel, wheel_members)
@@ -507,6 +625,13 @@ def _validate_archive_contents(wheel: Path, sdist: Path) -> None:
 
     _validate_archived_runtime_resources(wheel)
     _validate_archived_runtime_resources(sdist)
+    canonical_policy = (
+        _canonical_policy_bytes()
+        if expected_policy_bytes is None
+        else expected_policy_bytes
+    )
+    _validate_archived_policy_resource(wheel, canonical_policy)
+    _validate_archived_policy_resource(sdist, canonical_policy)
 
 
 def _venv_executable(environment: Path, name: str) -> Path:
@@ -696,6 +821,7 @@ def _verify_sdist_via_derived_wheel(
     build_python: Path,
     expected_build_version: str,
     expected_hatchling_version: str,
+    expected_policy_bytes: bytes | None = None,
 ) -> str:
     sdist = sdist.resolve(strict=True)
     env = _isolated_environment()
@@ -736,6 +862,14 @@ def _verify_sdist_via_derived_wheel(
         # forges its installed probe.  Validate the generated runtime resources
         # directly from the archive before executing or importing that wheel.
         _validate_archived_runtime_resources(wheels[0])
+        _validate_archived_policy_resource(
+            wheels[0],
+            (
+                _canonical_policy_bytes()
+                if expected_policy_bytes is None
+                else expected_policy_bytes
+            ),
+        )
         return _verify_installed_artifact(wheels[0])
 
 
@@ -768,13 +902,19 @@ def verify_dist(
     if wheel.stat().st_size == 0 or sdist.stat().st_size == 0:
         raise VerificationError("distribution artifacts must not be empty")
 
-    _validate_archive_contents(wheel, sdist)
+    canonical_policy = _canonical_policy_bytes()
+    _validate_archive_contents(
+        wheel,
+        sdist,
+        expected_policy_bytes=canonical_policy,
+    )
     wheel_version = _verify_installed_artifact(wheel)
     sdist_version = _verify_sdist_via_derived_wheel(
         sdist,
         build_python=build_python,
         expected_build_version=expected_build_version,
         expected_hatchling_version=expected_hatchling_version,
+        expected_policy_bytes=canonical_policy,
     )
     if wheel_version != sdist_version:
         raise VerificationError(

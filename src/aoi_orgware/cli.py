@@ -3119,6 +3119,7 @@ def cmd_reconcile(args: argparse.Namespace, paths: HarnessPaths) -> int:
 _EXACT_TEST_SEMANTIC_EVENT_TYPE = "verification_added"
 _VERIFICATION_SUPERSEDED_SEMANTIC_EVENT_TYPE = "verification_superseded"
 _DELIVERY_SET_SEMANTIC_EVENT_TYPE = "delivery_set"
+_LEGACY_VERIFICATION_CLOCK_SKEW_TOLERANCE_SECONDS = 5
 _SEMANTIC_RECORDED_AT_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
@@ -4354,6 +4355,33 @@ def cmd_verification_supersession_seal(
     return 0
 
 
+def _legacy_verification_superseded_at(
+    replacement_time: dt.datetime,
+) -> str:
+    """Return a causal legacy supersession time across bounded clock rollback."""
+
+    current_raw = now_iso()
+    current_time = parse_time(current_raw)
+    if current_time is None:
+        raise HarnessError("current verification supersession time is invalid")
+    if current_time > replacement_time:
+        return current_raw
+    rollback_delta = replacement_time - current_time
+    tolerance = dt.timedelta(
+        seconds=_LEGACY_VERIFICATION_CLOCK_SKEW_TOLERANCE_SECONDS
+    )
+    if rollback_delta > tolerance:
+        raise HarnessError(
+            "system clock precedes the replacement verification time by "
+            f"{rollback_delta.total_seconds():.6f}s "
+            "(tolerance "
+            f"{_LEGACY_VERIFICATION_CLOCK_SKEW_TOLERANCE_SECONDS}s)"
+        )
+    return (replacement_time + dt.timedelta(microseconds=1)).isoformat(
+        timespec="microseconds"
+    )
+
+
 def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """Explicitly retire one legacy verification in favor of a valid replacement."""
 
@@ -4465,19 +4493,22 @@ def cmd_verification_supersede(args: argparse.Namespace, paths: HarnessPaths) ->
         supersession_reason = require_evidence_detail(
             args.reason, "verification supersession reason"
         )
+        superseded_at = (
+            semantic_recorded_at
+            if semantic_v2
+            else _legacy_verification_superseded_at(replacement_time)
+        )
         source["original_status"] = source.get("status")
         source["status"] = "skipped"
-        source["superseded_at"] = (
-            semantic_recorded_at if semantic_v2 else now_iso()
-        )
+        source["superseded_at"] = superseded_at
         source["supersession_reason"] = supersession_reason
         source["supersession_version"] = 2
         source["source_record_sha256"] = expected_source_sha
         source["replacement_index"] = replacement_index + 1
         source["replacement_record_sha256"] = expected_replacement_sha
         bump_task(state)
+        state["updated_at"] = superseded_at
         if semantic_v2:
-            state["updated_at"] = semantic_recorded_at
             if semantic_retry_after is not None and state != semantic_retry_after:
                 raise HarnessError(
                     "semantic verification supersession retry differs from the "
