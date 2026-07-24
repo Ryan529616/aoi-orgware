@@ -118,6 +118,15 @@ _GIT_OBSERVATION_FORBIDDEN_PATHS = (
     "objects/info/alternates.lock",
     "refs/replace",
 )
+_GIT_OBSERVATION_SHARED_FORBIDDEN_PATHS = (
+    "shallow",
+    "shallow.lock",
+    "info/grafts",
+    "objects/info/alternates",
+    "objects/info/http-alternates",
+    "objects/info/alternates.lock",
+    "refs/replace",
+)
 
 
 def _file_stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
@@ -878,6 +887,22 @@ def _validate_observation_tree_links(root: Path, label: str) -> None:
                 )
 
 
+def _reject_observation_split_indexes(git_dir: Path, label: str) -> None:
+    try:
+        with os.scandir(git_dir) as entries:
+            for count, entry in enumerate(entries, start=1):
+                if count > 100_000:
+                    raise HarnessError(f"{label} exceeds its entry bound")
+                if entry.name.casefold().startswith("sharedindex."):
+                    raise HarnessError(
+                        f"{label} contains forbidden split index authority"
+                    )
+    except HarnessError:
+        raise
+    except OSError as exc:
+        raise HarnessError(f"cannot enumerate {label}: {exc}") from exc
+
+
 def _observation_config_key_allowed(key: str) -> bool:
     return key in _GIT_OBSERVATION_CONFIG_KEYS or any(
         pattern.fullmatch(key) is not None
@@ -885,21 +910,195 @@ def _observation_config_key_allowed(key: str) -> bool:
     )
 
 
-def git_observation_authority(worktree: Path) -> dict[str, Any]:
-    """Bind the standalone repository authority used for mutation evidence.
+def _observation_path_from_bytes(
+    raw: bytes,
+    *,
+    base: Path,
+    label: str,
+    prefix: str = "",
+) -> Path:
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise HarnessError(f"{label} is not strict UTF-8") from exc
+    if text.endswith("\n"):
+        text = text[:-1]
+        if text.endswith("\r"):
+            text = text[:-1]
+    if (
+        not text
+        or "\n" in text
+        or "\r" in text
+        or "\x00" in text
+        or any(ord(character) < 32 for character in text)
+        or text != text.strip()
+        or (prefix and not text.startswith(prefix))
+    ):
+        raise HarnessError(f"{label} is malformed")
+    value = text[len(prefix) :]
+    if not value or value != value.strip():
+        raise HarnessError(f"{label} is malformed")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise HarnessError(f"cannot resolve {label}: {exc}") from exc
+    if os.path.normcase(os.path.abspath(candidate)) != os.path.normcase(
+        str(resolved)
+    ):
+        raise HarnessError(f"{label} routes through a link or reparse point")
+    return resolved
 
-    Transport mutation evidence deliberately supports only an ordinary
-    standalone ``root/.git`` repository.  Linked/common worktrees, alternate
-    object/history authority, executable local config, and replacement history
-    fail closed before status, diff, or tree evidence is accepted.
+
+def _linked_observation_layout(
+    root: Path,
+    git_file: Path,
+) -> tuple[Path, Path, dict[str, Any]]:
+    git_file_bytes = _observation_file_bytes(
+        git_file,
+        "Git observation .git file",
+        required=True,
+    )
+    assert git_file_bytes is not None
+    git_dir = _observation_path_from_bytes(
+        git_file_bytes,
+        base=root,
+        label="Git observation .git file",
+        prefix="gitdir: ",
+    )
+    _require_observation_directory(git_dir, "Git observation worktree Git dir")
+
+    commondir_path = git_dir / "commondir"
+    commondir_bytes = _observation_file_bytes(
+        commondir_path,
+        "Git observation commondir",
+        required=True,
+    )
+    assert commondir_bytes is not None
+    common_dir = _observation_path_from_bytes(
+        commondir_bytes,
+        base=git_dir,
+        label="Git observation commondir",
+    )
+    _require_observation_directory(common_dir, "Git observation common Git dir")
+    worktrees_dir = common_dir / "worktrees"
+    _require_observation_directory(
+        worktrees_dir,
+        "Git observation linked-worktree registry",
+    )
+    if (
+        os.path.normcase(str(git_dir.parent))
+        != os.path.normcase(str(worktrees_dir.resolve(strict=True)))
+        or git_dir.name in {"", ".", ".."}
+    ):
+        raise HarnessError(
+            "Git observation worktree Git dir is outside the common worktree registry"
+        )
+
+    gitdir_backref_path = git_dir / "gitdir"
+    gitdir_backref_bytes = _observation_file_bytes(
+        gitdir_backref_path,
+        "Git observation gitdir back-reference",
+        required=True,
+    )
+    assert gitdir_backref_bytes is not None
+    gitdir_backref = _observation_path_from_bytes(
+        gitdir_backref_bytes,
+        base=git_dir,
+        label="Git observation gitdir back-reference",
+    )
+    if os.path.normcase(str(gitdir_backref)) != os.path.normcase(
+        str(git_file.resolve(strict=True))
+    ):
+        raise HarnessError(
+            "Git observation gitdir back-reference does not bind the worktree .git file"
+        )
+
+    for relative in (
+        "config",
+        "config.worktree",
+        "objects",
+        "worktrees",
+        *_GIT_OBSERVATION_SHARED_FORBIDDEN_PATHS,
+    ):
+        candidate = git_dir / Path(relative)
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise HarnessError(
+                f"cannot inspect Git observation worktree authority {relative}: {exc}"
+            ) from exc
+        raise HarnessError(
+            f"Git observation worktree authority contains forbidden {relative}"
+        )
+
+    layout = {
+        "layout": "linked_worktree",
+        "git_file": _observation_file_identity(
+            git_file,
+            "Git observation .git file",
+        ),
+        "git_file_sha256": hashlib.sha256(git_file_bytes).hexdigest(),
+        "commondir": _observation_file_identity(
+            commondir_path,
+            "Git observation commondir",
+        ),
+        "commondir_sha256": hashlib.sha256(commondir_bytes).hexdigest(),
+        "gitdir_backref": _observation_file_identity(
+            gitdir_backref_path,
+            "Git observation gitdir back-reference",
+        ),
+        "gitdir_backref_sha256": hashlib.sha256(
+            gitdir_backref_bytes
+        ).hexdigest(),
+        "common_git_dir": str(common_dir),
+    }
+    return git_dir, common_dir, layout
+
+
+def git_observation_authority(
+    worktree: Path,
+    *,
+    require_standalone: bool = False,
+) -> dict[str, Any]:
+    """Bind the repository authority used for mutation evidence.
+
+    Generic integrity accepts an ordinary standalone repository or a canonical
+    Git linked worktree whose per-worktree and common authority are both bound.
+    Bridge mutation evidence opts into ``require_standalone``.  Alternate
+    object/history authority, executable config, replacement history, and
+    worktree-local config fail closed before status, diff, or tree evidence is
+    accepted.
     """
 
-    root = worktree.resolve(strict=True)
-    _require_observation_directory(root, "Git observation worktree")
-    git_dir = root / ".git"
-    _require_observation_directory(git_dir, "Git observation .git")
-    objects_dir = git_dir / "objects"
-    refs_dir = git_dir / "refs"
+    lexical_root = Path(os.path.abspath(worktree))
+    _require_observation_directory(lexical_root, "Git observation worktree")
+    root = lexical_root.resolve(strict=True)
+    git_entry = root / ".git"
+    linked_layout: dict[str, Any] | None = None
+    try:
+        git_entry_metadata = git_entry.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect Git observation .git: {exc}") from exc
+    if stat.S_ISDIR(git_entry_metadata.st_mode):
+        _require_observation_directory(git_entry, "Git observation .git")
+        git_dir = git_entry
+        common_dir = git_entry
+    elif stat.S_ISREG(git_entry_metadata.st_mode) and not require_standalone:
+        git_dir, common_dir, linked_layout = _linked_observation_layout(
+            root,
+            git_entry,
+        )
+    else:
+        raise HarnessError(
+            "Git observation .git must be a local non-reparse directory"
+        )
+    objects_dir = common_dir / "objects"
+    refs_dir = common_dir / "refs"
     _require_observation_directory(objects_dir, "Git observation objects")
     _require_observation_directory(refs_dir, "Git observation refs")
     _validate_observation_tree_links(
@@ -910,6 +1109,26 @@ def git_observation_authority(worktree: Path) -> dict[str, Any]:
         refs_dir,
         "Git observation refs",
     )
+    _reject_observation_split_indexes(
+        git_dir,
+        "Git observation worktree Git dir",
+    )
+    if common_dir != git_dir:
+        _reject_observation_split_indexes(
+            common_dir,
+            "Git observation common Git dir",
+        )
+    worktree_refs_dir: Path | None = None
+    if linked_layout is not None:
+        worktree_refs_dir = git_dir / "refs"
+        _require_observation_directory(
+            worktree_refs_dir,
+            "Git observation worktree refs",
+        )
+        _validate_observation_tree_links(
+            worktree_refs_dir,
+            "Git observation worktree refs",
+        )
     head_identity = _observation_file_identity(
         git_dir / "HEAD",
         "Git observation HEAD",
@@ -937,8 +1156,13 @@ def git_observation_authority(worktree: Path) -> dict[str, Any]:
             raise HarnessError("Git observation HEAD ref is not canonical")
     elif FULL_COMMIT_RE.fullmatch(head_text) is None:
         raise HarnessError("Git observation detached HEAD is invalid")
-    for relative in _GIT_OBSERVATION_FORBIDDEN_PATHS:
-        candidate = git_dir / Path(relative)
+    forbidden_paths = (
+        _GIT_OBSERVATION_FORBIDDEN_PATHS
+        if linked_layout is None
+        else _GIT_OBSERVATION_SHARED_FORBIDDEN_PATHS
+    )
+    for relative in forbidden_paths:
+        candidate = common_dir / Path(relative)
         try:
             candidate.lstat()
         except FileNotFoundError:
@@ -951,7 +1175,7 @@ def git_observation_authority(worktree: Path) -> dict[str, Any]:
             f"Git observation authority contains forbidden {relative}"
         )
 
-    config_path = git_dir / "config"
+    config_path = common_dir / "config"
     config_before = _observation_file_bytes(
         config_path,
         "Git observation local config",
@@ -1005,7 +1229,7 @@ def git_observation_authority(worktree: Path) -> dict[str, Any]:
         config_rows.append({"key": key, "value": value})
 
     packed_refs = _observation_file_bytes(
-        git_dir / "packed-refs",
+        common_dir / "packed-refs",
         "Git observation packed-refs",
         required=False,
     )
@@ -1019,7 +1243,7 @@ def git_observation_authority(worktree: Path) -> dict[str, Any]:
     auxiliary: list[dict[str, Any]] = []
     for relative in ("info/exclude", "info/attributes"):
         data = _observation_file_bytes(
-            git_dir / Path(relative),
+            common_dir / Path(relative),
             f"Git observation {relative}",
             required=False,
         )
@@ -1044,6 +1268,12 @@ def git_observation_authority(worktree: Path) -> dict[str, Any]:
         "config": sorted(config_rows, key=lambda row: (row["key"], row["value"])),
         "auxiliary": auxiliary,
     }
+    if linked_layout is not None:
+        assert worktree_refs_dir is not None
+        linked_layout["worktree_refs_dir"] = str(
+            worktree_refs_dir.resolve(strict=True)
+        )
+        base.update(linked_layout)
     return {
         **base,
         "authority_sha256": hashlib.sha256(
@@ -1330,7 +1560,11 @@ def _lstat_snapshot_path(worktree: Path, raw_path: bytes, text_path: str) -> dic
 
 
 def task_mutation_snapshot(
-    task_id: str, worktree: Path, baseline_head: str
+    task_id: str,
+    worktree: Path,
+    baseline_head: str,
+    *,
+    require_standalone_observation_authority: bool = False,
 ) -> dict[str, Any]:
     """Capture a task-bound, content-addressed mutation snapshot.
 
@@ -1338,11 +1572,18 @@ def task_mutation_snapshot(
     v2 captures staged, unstaged, untracked, deletion, rename, and case-only
     state.  Git paths must be UTF-8 before they can be joined to AOI's claim
     namespace; this is intentionally fail-closed rather than lossy escaping.
+
+    Generic AOI integrity snapshots use authority-bound v3 and support a
+    canonical linked worktree.  Codex verified-mutation callers opt into the
+    stricter v3 standalone-repository layout explicitly.
     """
 
     task_id = _require_task_id(task_id)
     baseline_head = require_full_commit(baseline_head, "baseline_head")
-    authority_before = git_observation_authority(worktree)
+    authority_before = git_observation_authority(
+        worktree,
+        require_standalone=require_standalone_observation_authority,
+    )
     metadata = git_metadata(worktree, closed_observation=True)
     resolved = Path(metadata["worktree"])
     current_head = metadata["head_sha"]
@@ -1379,7 +1620,10 @@ def task_mutation_snapshot(
             closed_observation=True,
         )
     )
-    authority_after = git_observation_authority(resolved)
+    authority_after = git_observation_authority(
+        resolved,
+        require_standalone=require_standalone_observation_authority,
+    )
     if authority_after != authority_before:
         raise HarnessError(
             "Git observation authority changed during mutation snapshot"

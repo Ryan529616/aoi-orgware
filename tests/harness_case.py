@@ -61,6 +61,10 @@ class HarnessTestCase(unittest.TestCase):
             ["git", "-C", str(self.root), "config", "user.email", "harness@test.invalid"],
             check=True,
         )
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "core.autocrlf", "false"],
+            check=True,
+        )
         (self.root / ".harness-test-root").write_text("test root\n", encoding="utf-8")
         subprocess.run(
             ["git", "-C", str(self.root), "add", ".harness-test-root"], check=True

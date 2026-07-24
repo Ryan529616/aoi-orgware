@@ -571,7 +571,7 @@ def test_git_tree_lookup_bounds_stdout_and_stderr(fixture: MutationFixture, monk
     monkeypatch.setattr(
         git,
         "git_observation_authority",
-        lambda _worktree: {"authority_sha256": SHA_A},
+        lambda _worktree, **_kwargs: {"authority_sha256": SHA_A},
     )
     monkeypatch.setattr(git.subprocess, "Popen", lambda *_args, **_kwargs: _FakePopen(b"12345", b""))
     with pytest.raises(mutation.CodexTransportMutationError, match="output exceeds"):
@@ -579,6 +579,108 @@ def test_git_tree_lookup_bounds_stdout_and_stderr(fixture: MutationFixture, monk
     monkeypatch.setattr(git.subprocess, "Popen", lambda *_args, **_kwargs: _FakePopen(b"1234", b"12345"))
     with pytest.raises(mutation.CodexTransportMutationError, match="output exceeds"):
         mutation._git_tree(fixture.root, fixture.baseline)
+
+
+def test_git_tree_rejects_linked_worktree_before_git_subprocess(
+    fixture: MutationFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    linked = fixture.root.with_name(f"{fixture.root.name}-linked")
+    _run(
+        fixture.root,
+        "worktree",
+        "add",
+        "--detach",
+        str(linked),
+        fixture.baseline,
+    )
+    called = False
+
+    def forbidden_git(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("Bridge Git subprocess must not start")
+
+    monkeypatch.setattr(git, "_run_git_bytes_bounded", forbidden_git)
+    try:
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match=r"Git tree lookup failed.*\.git",
+        ):
+            mutation._git_tree(linked, fixture.baseline)
+        assert not called
+    finally:
+        _run(fixture.root, "worktree", "remove", "--force", str(linked))
+
+
+def test_validate_tree_rejects_noncanonical_worktree_before_git_subprocess(
+    fixture: MutationFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = fixture.endpoint()
+    called = False
+
+    def forbidden_git(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("Bridge Git subprocess must not start")
+
+    monkeypatch.setattr(git, "_run_git_bytes_bounded", forbidden_git)
+    for worktree in (
+        ".",
+        str(fixture.root.parent / "missing" / ".." / fixture.root.name),
+    ):
+        forged = {**endpoint["snapshot"], "worktree": worktree}
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match="snapshot worktree is invalid",
+        ):
+            mutation._validate_tree(endpoint["tree"], forged)
+    assert not called
+
+
+def test_validate_tree_rejects_worktree_alias_before_git_subprocess(
+    fixture: MutationFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = fixture.endpoint()
+    alias = fixture.root.with_name(f"{fixture.root.name}-alias")
+    created = False
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(fixture.root)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            pytest.skip("Windows junction creation is unavailable")
+    else:
+        os.symlink(fixture.root, alias, target_is_directory=True)
+    created = True
+    called = False
+
+    def forbidden_git(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal called
+        called = True
+        raise AssertionError("Bridge Git subprocess must not start")
+
+    monkeypatch.setattr(git, "_run_git_bytes_bounded", forbidden_git)
+    try:
+        forged = {**endpoint["snapshot"], "worktree": str(alias)}
+        with pytest.raises(
+            mutation.CodexTransportMutationError,
+            match=r"Git tree lookup failed.*non-reparse",
+        ):
+            mutation._validate_tree(endpoint["tree"], forged)
+        assert not called
+    finally:
+        if created:
+            if os.name == "nt":
+                alias.rmdir()
+            else:
+                alias.unlink()
 
 
 def test_rejects_wrong_runtime_correlation_and_tampered_cas(fixture: MutationFixture) -> None:

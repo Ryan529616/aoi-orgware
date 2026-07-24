@@ -14217,6 +14217,223 @@ class V5FeatureTests(HarnessTestCase):
             errors,
         )
 
+    def test_linked_worktree_integrity_v3_artifact_replays_current_snapshot_bytes(self) -> None:
+        """A sealed linked-worktree artifact remains its own current authority."""
+
+        task_id = "linked-integrity-v3"
+        linked_root = Path(self.backup_temp.name) / "linked-integrity-v3-worktree"
+        branch = "linked-integrity-v3-fixture"
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "core.autocrlf", "false"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(linked_root),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+        def remove_linked_worktree() -> None:
+            if linked_root.exists():
+                result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.root),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(linked_root),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.addCleanup(remove_linked_worktree)
+        linked_env = self.env.copy()
+        for name in (
+            "AOI_CHIEF_SESSION_ID",
+            "AOI_CHIEF_EPOCH",
+            "AOI_CHIEF_CREDENTIAL_FILE",
+            "AOI_CHIEF_TOKEN",
+        ):
+            linked_env.pop(name, None)
+        linked_env["AOI_ROOT"] = str(linked_root)
+        linked_env["HOME"] = str(linked_root / "home")
+        linked_env["CODEX_HOME"] = str(linked_root / "codex-home")
+        linked_env["XDG_CONFIG_HOME"] = str(linked_root / "xdg")
+        linked_env["TMPDIR"] = str(linked_root / "tmp")
+        linked_env["AOI_HOST_MOUNT_ROOT"] = str(linked_root / "host-mount")
+        (linked_root / "tmp").mkdir()
+        # The parent fixture already tracks its project config.  A linked
+        # worktree needs its own fresh state authority rather than attempting
+        # to resume that config with a missing state lock.
+        (linked_root / "aoi.toml").unlink()
+
+        def linked_cli(*args: str) -> subprocess.CompletedProcess[str]:
+            result = subprocess.run(
+                [sys.executable, "-m", CLI_MODULE, *args],
+                cwd=linked_root,
+                env=linked_env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"linked CLI failed: {' '.join(args)}\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+            return result
+
+        linked_cli("init", "--project-name", "Linked Integrity Fixture")
+        subprocess.run(
+            ["git", "-C", str(linked_root), "add", "aoi.toml", ".gitignore"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(linked_root), "commit", "-m", "initialize linked AOI"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        acquired = json.loads(
+            linked_cli(
+                "chief-acquire", "--session-id", "linked-integrity-chief", "--json"
+            ).stdout
+        )
+        linked_env["AOI_CHIEF_SESSION_ID"] = "linked-integrity-chief"
+        linked_env["AOI_CHIEF_EPOCH"] = str(acquired["authority"]["epoch"])
+        linked_env["AOI_CHIEF_CREDENTIAL_FILE"] = acquired["credential_file"]
+        linked_cli(
+            "init-task",
+            "--task-id",
+            task_id,
+            "--title",
+            "Linked integrity artifact replay",
+            "--objective",
+            "Exercise the linked worktree integrity authority",
+            "--owner",
+            "linked-test-root",
+            "--completion-boundary",
+            "The sealed artifact replays against the linked worktree bytes",
+        )
+        linked_cli(
+            "approve-plan",
+            "--task",
+            task_id,
+            "--note",
+            "Linked integrity fixture records its candidate, review, seal, and replay",
+        )
+        linked_cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "linked-integrity-fixture",
+            "--owner",
+            "linked-test-root",
+            "--kind",
+            "implementation",
+            "--lock",
+            "repo:file:.harness-test-root",
+            "--intent",
+            "Cover the linked worktree fixture mutation",
+            "--validation",
+            "Persisted artifact and linked current recapture are byte-identical",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+        )
+        linked_cli("integrity-adopt", "--task", task_id)
+        (linked_root / ".harness-test-root").write_text(
+            "linked integrity candidate\n", encoding="utf-8"
+        )
+        candidate = json.loads(
+            linked_cli(
+                "integrity-snapshot", "--task", task_id, "--purpose", "candidate", "--json"
+            ).stdout
+        )
+        review_artifact = Path(self.backup_temp.name) / "linked-integrity-review.json"
+        review_artifact.write_bytes(b'{"outcome":"clean"}\n')
+        linked_cli(
+            "integrity-review",
+            "--task",
+            task_id,
+            "--snapshot-record-sha256",
+            candidate["snapshot_record_sha256"],
+            "--reviewer-agent-id",
+            "linked-independent-reviewer",
+            "--result-artifact",
+            f"{review_artifact}={hashlib.sha256(review_artifact.read_bytes()).hexdigest()}",
+            "--outcome",
+            "clean",
+        )
+        linked_cli("integrity-seal", "--task", task_id)
+
+        linked_paths = h.get_paths(linked_root)
+        sealed = h.load_task(linked_paths, task_id)
+        self.assertEqual(sealed["worktree"], str(linked_root))
+        terminal_record_sha256 = sealed["integrity_contract"]["seal"][
+            "terminal_snapshot_record_sha256"
+        ]
+        terminal_snapshot = next(
+            record
+            for record in sealed["integrity_contract"]["records"]
+            if record["record_type"] == "snapshot"
+            and record["record_sha256"] == terminal_record_sha256
+        )
+        persisted_bytes = evidence_artifacts_impl.verify_generated_artifact_blob(
+            linked_paths,
+            task_id,
+            terminal_snapshot["artifact"],
+            label="linked integrity terminal snapshot",
+            max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        persisted_snapshot = json.loads(persisted_bytes.decode("ascii"))
+        linked_authority = git_plumbing_impl.git_observation_authority(linked_root)
+        self.assertEqual(
+            persisted_snapshot["schema"],
+            git_plumbing_impl.GIT_MUTATION_SNAPSHOT_SCHEMA,
+        )
+        self.assertEqual(linked_authority["layout"], "linked_worktree")
+        self.assertEqual(
+            persisted_snapshot["observation_authority_sha256"],
+            linked_authority["authority_sha256"],
+        )
+        current_bytes = semantic_events_impl.canonical_json_bytes(
+            git_plumbing_impl.task_mutation_snapshot(
+                task_id,
+                linked_root,
+                sealed["integrity_contract"]["baseline_head"],
+            ),
+            max_bytes=integrity_records_v2_impl.MAX_INTEGRITY_ARTIFACT_BYTES,
+        )
+        self.assertEqual(persisted_bytes, current_bytes)
+        self.assertEqual(
+            cli_impl._integrity_runtime_errors(
+                linked_paths, sealed, require_current_snapshot=True
+            ),
+            [],
+        )
+        doctor = json.loads(linked_cli("doctor", "--task", task_id, "--json").stdout)
+        self.assertTrue(doctor["ok"], doctor)
+
     def test_cancel_preserves_valid_unsealed_integrity_contract(self) -> None:
         """Cancellation closes task state without fabricating a terminal seal."""
 

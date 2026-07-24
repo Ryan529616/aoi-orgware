@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -164,7 +165,10 @@ def _git_tree(worktree: Path, head: str) -> dict[str, str]:
     """Resolve one exact commit's tree object through Git's bounded runner."""
 
     try:
-        authority_before = git.git_observation_authority(worktree)
+        authority_before = git.git_observation_authority(
+            worktree,
+            require_standalone=True,
+        )
         raw = git._run_git_bytes_bounded(
             worktree,
             ("rev-parse", f"{head}^{{tree}}"),
@@ -172,7 +176,10 @@ def _git_tree(worktree: Path, head: str) -> dict[str, str]:
             stdout_limit=MAX_GIT_TREE_OUTPUT_BYTES,
             closed_observation=True,
         )
-        if git.git_observation_authority(worktree) != authority_before:
+        if git.git_observation_authority(
+            worktree,
+            require_standalone=True,
+        ) != authority_before:
             raise HarnessError(
                 "Git observation authority changed during tree lookup"
             )
@@ -200,14 +207,25 @@ def _validate_tree(value: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dic
     base = {"schema": GIT_TREE_SCHEMA, "head": checked_head, "tree": checked_tree}
     if value.get("schema") != GIT_TREE_SCHEMA or value.get("tree_sha256") != _sha(_canonical(base, "Git tree")):
         raise CodexTransportMutationError("Git tree record digest is invalid")
-    # A self-consistent caller-supplied digest is not source evidence.  Resolve
-    # the *recorded snapshot HEAD* in its recorded worktree and require its
-    # actual Git tree object.  This intentionally does not assert current
+    # A self-consistent caller-supplied digest is not source evidence.  Preserve
+    # the lexical worktree path for strict authority validation, resolve the
+    # *recorded snapshot HEAD* there, and require its actual Git tree object.
+    # This intentionally does not assert current
     # worktree HEAD still equals a historical pre-image: that pre-image is a
     # Chief-captured fact and a turn may legitimately have changed it.
     try:
-        worktree = Path(str(snapshot["worktree"])).resolve()
-    except (KeyError, OSError) as exc:
+        worktree_text = snapshot["worktree"]
+        if (
+            not isinstance(worktree_text, str)
+            or not worktree_text
+            or worktree_text != worktree_text.strip()
+        ):
+            raise ValueError("worktree must be non-empty canonical text")
+        worktree = Path(worktree_text)
+        lexical = str(Path(os.path.abspath(worktree)))
+        if not worktree.is_absolute() or lexical != worktree_text:
+            raise ValueError("worktree must be an absolute lexical-canonical path")
+    except (KeyError, OSError, ValueError) as exc:
         raise _fail("Git tree snapshot worktree is invalid", exc) from exc
     observed = _git_tree(worktree, checked_head)
     if observed["tree"] != checked_tree:
@@ -276,7 +294,12 @@ def capture_git_endpoint(
     """Capture one bounded source/claim endpoint before or after a runtime turn."""
 
     try:
-        snapshot = git.task_mutation_snapshot(task_id, worktree, baseline_head)
+        snapshot = git.task_mutation_snapshot(
+            task_id,
+            worktree,
+            baseline_head,
+            require_standalone_observation_authority=True,
+        )
         coverage = git.task_mutation_snapshot_claim_coverage(snapshot, claims)
         claim_authority = git.capture_task_live_claim_authority(
             task_id, claims, str(snapshot["worktree"])

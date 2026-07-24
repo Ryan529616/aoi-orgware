@@ -63,15 +63,21 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   is allowlisted and digest-checked around every Git command, so includes,
   fsmonitor/hooks, filters, diff/merge drivers, credentials, and SSH commands
   are rejected before evidence collection in the cooperative canary model.
-  The bounded full `.git` inventory and exact Git-dir/common-dir/object/ref
-  paths are also bound; linked worktrees, alternates, grafts, replacement refs,
-  shallow state, nested links/reparses, hard links, and special files fail
-  closed. System attributes and replacement objects are disabled explicitly.
+  In disposable Bridge/canary endpoints, the bounded full `.git` inventory and
+  exact Git-dir/common-dir/object/ref paths are also bound; linked worktrees,
+  alternates, grafts, replacement refs, shallow state, nested links/reparses,
+  hard links, and special files fail closed. System attributes and replacement
+  objects are disabled explicitly.
   Writable Bridge elevation receives the same exact Git tuple, revalidates it
   before every nested Git process, and stores its canonical provenance in
   task-local CAS referenced by backward-compatible mutation-evidence v2. New
-  endpoint capture writes authority-bound mutation snapshot v3 while existing
-  snapshot v2 remains readable. Legacy mutation-evidence v1 readback now
+  Bridge endpoint capture writes authority-bound mutation snapshot v3.
+  Generic AOI integrity also keeps v3 and binds both the per-worktree and
+  common Git authority for a canonical linked worktree; Bridge elevation
+  explicitly remains standalone-only. Existing snapshot v2 remains readable
+  but is not newly emitted. Linked metadata routing, per-worktree refs,
+  executable/worktree config, and split indexes fail closed. Legacy
+  mutation-evidence v1 readback now
   requires a caller-bound exact Git executable and does not invent historical
   Git provenance. A no-pin committed-v2 replay restores its CAS-bound exact Git
   before any recapture or Git subprocess; a new elevation with no tuple fails

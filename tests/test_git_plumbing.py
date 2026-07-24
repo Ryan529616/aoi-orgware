@@ -298,7 +298,11 @@ class GitExecutableBindingTests(unittest.TestCase):
                 gp.use_git_executable_binding(self._binding()),
                 self.assertRaisesRegex(HarnessError, "unapproved key"),
             ):
-                gp.task_mutation_snapshot("task-1", repository, baseline)
+                gp.task_mutation_snapshot(
+                    "task-1",
+                    repository,
+                    baseline,
+                )
             self.assertFalse(marker.exists())
 
     def test_mutation_observation_rejects_executable_local_config(self) -> None:
@@ -1159,7 +1163,12 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
         index = self.repo / ".git" / "index"
         index_before = index.read_bytes()
 
-        snapshot = gp.task_mutation_snapshot(self.TASK_ID, self.repo, self.baseline)
+        snapshot = gp.task_mutation_snapshot(
+            self.TASK_ID,
+            self.repo,
+            self.baseline,
+            require_standalone_observation_authority=True,
+        )
 
         self.assertEqual(snapshot["schema"], gp.GIT_MUTATION_SNAPSHOT_SCHEMA)
         self.assertEqual(snapshot["task_id"], self.TASK_ID)
@@ -1195,6 +1204,7 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
             self.TASK_ID,
             self.repo,
             self.baseline,
+            require_standalone_observation_authority=True,
         )
         legacy = dict(current)
         legacy["schema"] = gp.LEGACY_GIT_MUTATION_SNAPSHOT_SCHEMA
@@ -1208,6 +1218,27 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
 
         self.assertEqual(task_id, self.TASK_ID)
         self.assertEqual(paths, [b"base.txt"])
+
+    def test_default_snapshot_retains_existing_v3_bytes_in_standalone_repo(
+        self,
+    ) -> None:
+        (self.repo / "base.txt").write_bytes(b"authority snapshot\n")
+
+        default = gp.task_mutation_snapshot(
+            self.TASK_ID,
+            self.repo,
+            self.baseline,
+        )
+        strict = gp.task_mutation_snapshot(
+            self.TASK_ID,
+            self.repo,
+            self.baseline,
+            require_standalone_observation_authority=True,
+        )
+
+        self.assertEqual(default, strict)
+        self.assertEqual(default["schema"], gp.GIT_MUTATION_SNAPSHOT_SCHEMA)
+        self.assertRegex(default["observation_authority_sha256"], r"^[0-9a-f]{64}$")
 
     def test_snapshot_rejects_gitlink_index_entry(self) -> None:
         self._git(
@@ -1283,6 +1314,46 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
                     else:
                         candidate.unlink()
 
+    def test_observation_authority_rejects_real_split_index(self) -> None:
+        self._git("update-index", "--split-index")
+        shared_indexes = list((self.repo / ".git").glob("sharedindex.*"))
+        self.assertTrue(shared_indexes)
+        with self.assertRaisesRegex(HarnessError, "split index authority"):
+            gp.git_observation_authority(self.repo)
+
+    def test_observation_authority_rejects_worktree_alias(self) -> None:
+        alias = self.repo.parent / f"{self.repo.name}-alias"
+        linked = False
+        try:
+            if os.name == "nt":
+                completed = subprocess.run(
+                    [
+                        "cmd",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(alias),
+                        str(self.repo),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    self.skipTest("Windows junction creation is unavailable")
+            else:
+                os.symlink(self.repo, alias, target_is_directory=True)
+            linked = True
+            with self.assertRaisesRegex(HarnessError, "non-reparse directory"):
+                gp.git_observation_authority(alias)
+        finally:
+            if linked:
+                if os.name == "nt":
+                    alias.rmdir()
+                else:
+                    alias.unlink()
+
     def test_observation_authority_rejects_linked_worktree(self) -> None:
         linked = self.repo.parent / f"{self.repo.name}-linked"
         self._git(
@@ -1294,8 +1365,266 @@ class TaskMutationSnapshotTests(TempGitRepoTests):
         )
         try:
             with self.assertRaisesRegex(HarnessError, r"\.git"):
+                gp.git_observation_authority(linked, require_standalone=True)
+        finally:
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_v3_snapshot_supports_linked_worktree_but_bridge_strict_refuses(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-authority-linked"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        try:
+            (linked / "base.txt").write_bytes(b"linked mutation\n")
+            authority = gp.git_observation_authority(linked)
+            self.assertEqual(authority["layout"], "linked_worktree")
+            self.assertEqual(
+                Path(authority["common_git_dir"]),
+                (self.repo / ".git").resolve(),
+            )
+            snapshot = gp.task_mutation_snapshot(
+                self.TASK_ID,
+                linked,
+                self.baseline,
+            )
+            self.assertEqual(snapshot["schema"], gp.GIT_MUTATION_SNAPSHOT_SCHEMA)
+            self.assertRegex(
+                snapshot["observation_authority_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            with self.assertRaisesRegex(HarnessError, r"\.git"):
+                gp.task_mutation_snapshot(
+                    self.TASK_ID,
+                    linked,
+                    self.baseline,
+                    require_standalone_observation_authority=True,
+                )
+        finally:
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_linked_worktree_authority_rejects_common_executable_config(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-config-linked"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        try:
+            for key, value in (
+                ("filter.evil.process", "must-not-run"),
+                ("include.path", "../outside.gitconfig"),
+                ("includeIf.onbranch:main.path", "../outside.gitconfig"),
+                ("extensions.worktreeConfig", "true"),
+            ):
+                with self.subTest(key=key):
+                    self._git("config", key, value)
+                    try:
+                        with self.assertRaisesRegex(HarnessError, "unapproved key"):
+                            gp.task_mutation_snapshot(
+                                self.TASK_ID,
+                                linked,
+                                self.baseline,
+                            )
+                    finally:
+                        self._git("config", "--unset-all", key)
+        finally:
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_linked_worktree_authority_rejects_metadata_tampering(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-metadata-linked"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        git_file = linked / ".git"
+        git_file_bytes = git_file.read_bytes()
+        git_dir_text = git_file_bytes.decode("utf-8").strip()
+        self.assertTrue(git_dir_text.startswith("gitdir: "))
+        git_dir = Path(git_dir_text[len("gitdir: ") :])
+        commondir = git_dir / "commondir"
+        backlink = git_dir / "gitdir"
+        commondir_bytes = commondir.read_bytes()
+        backlink_bytes = backlink.read_bytes()
+        try:
+            cases = [
+                (commondir, b".\n", "linked-worktree registry"),
+                (backlink, str(self.repo / ".git").encode("utf-8") + b"\n", "back-reference"),
+            ]
+            if os.name != "nt":
+                cases.insert(
+                    0,
+                    (git_file, b"gitdir: missing-authority\n", "resolve"),
+                )
+            for path, replacement, message in cases:
+                with self.subTest(path=path.name):
+                    original = path.read_bytes()
+                    path.write_bytes(replacement)
+                    try:
+                        with self.assertRaisesRegex(HarnessError, message):
+                            gp.git_observation_authority(linked)
+                    finally:
+                        path.write_bytes(original)
+
+            hardlink = self.repo.parent / f"{self.repo.name}-metadata-hardlink"
+            try:
+                os.link(commondir, hardlink)
+            except OSError as exc:
+                self.skipTest(f"hardlink creation unavailable: {exc}")
+            try:
+                with self.assertRaisesRegex(HarnessError, "non-linked"):
+                    gp.git_observation_authority(linked)
+            finally:
+                hardlink.unlink(missing_ok=True)
+        finally:
+            if os.name != "nt":
+                git_file.write_bytes(git_file_bytes)
+            commondir.write_bytes(commondir_bytes)
+            backlink.write_bytes(backlink_bytes)
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_linked_worktree_authority_digest_tracks_allowed_common_config(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-config-drift-linked"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        original = self._git("config", "user.name").strip()
+        try:
+            before = gp.git_observation_authority(linked)
+            self._git("config", "user.name", "AOI authority drift")
+            after = gp.git_observation_authority(linked)
+            self.assertNotEqual(
+                before["authority_sha256"],
+                after["authority_sha256"],
+            )
+        finally:
+            self._git("config", "user.name", original)
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_linked_worktree_authority_rejects_per_worktree_config(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-worktree-config-linked"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        git_file = linked / ".git"
+        git_dir_text = git_file.read_text(encoding="utf-8").strip()
+        self.assertTrue(git_dir_text.startswith("gitdir: "))
+        git_dir = Path(git_dir_text[len("gitdir: ") :])
+        config_worktree = git_dir / "config.worktree"
+        try:
+            config_worktree.write_text(
+                "[filter \"evil\"]\n\tprocess = must-not-run\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(HarnessError, "config.worktree"):
                 gp.git_observation_authority(linked)
         finally:
+            config_worktree.unlink(missing_ok=True)
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_linked_worktree_authority_rejects_linked_ref_hardlink(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-linked-ref-hardlink"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        git_dir_text = (linked / ".git").read_text(encoding="utf-8").strip()
+        self.assertTrue(git_dir_text.startswith("gitdir: "))
+        git_dir = Path(git_dir_text[len("gitdir: ") :])
+        subject = git_dir / "refs" / "aoi-test-ref"
+        hardlink = self.repo.parent / f"{self.repo.name}-linked-ref-hardlink-copy"
+        try:
+            subject.write_text(self.baseline + "\n", encoding="ascii")
+            try:
+                os.link(subject, hardlink)
+            except OSError as exc:
+                self.skipTest(f"hardlink creation unavailable: {exc}")
+            with self.assertRaisesRegex(HarnessError, "hard-linked"):
+                gp.git_observation_authority(linked)
+        finally:
+            hardlink.unlink(missing_ok=True)
+            subject.unlink(missing_ok=True)
+            self._git("worktree", "remove", "--force", str(linked))
+
+    def test_linked_worktree_authority_rejects_linked_ref_reparse(
+        self,
+    ) -> None:
+        linked = self.repo.parent / f"{self.repo.name}-linked-ref-reparse"
+        outside = self.repo.parent / f"{self.repo.name}-linked-ref-outside"
+        self._git(
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.baseline,
+        )
+        git_dir_text = (linked / ".git").read_text(encoding="utf-8").strip()
+        self.assertTrue(git_dir_text.startswith("gitdir: "))
+        git_dir = Path(git_dir_text[len("gitdir: ") :])
+        subject = git_dir / "refs" / "aoi-test-reparse"
+        outside.mkdir()
+        created = False
+        try:
+            if os.name == "nt":
+                completed = subprocess.run(
+                    [
+                        "cmd",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(subject),
+                        str(outside),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    self.skipTest("Windows junction creation is unavailable")
+            else:
+                os.symlink(outside, subject, target_is_directory=True)
+            created = True
+            with self.assertRaisesRegex(HarnessError, "link or reparse"):
+                gp.git_observation_authority(linked)
+        finally:
+            if created:
+                if os.name == "nt":
+                    subject.rmdir()
+                else:
+                    subject.unlink()
+            outside.rmdir()
             self._git("worktree", "remove", "--force", str(linked))
 
     def test_observation_authority_rejects_redirected_objects_and_refs(

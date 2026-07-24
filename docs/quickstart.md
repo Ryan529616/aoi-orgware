@@ -458,9 +458,15 @@ is not an atomic hostile-writer or dynamic-loader attestation. A completed turn
 is not task completion. If `inspect` reports `launch_unknown`, do not rerun the
 launch; reconcile the task evidence instead.
 
-New endpoint capture writes mutation snapshot v3 and binds one closed
-repository-observation authority across the pre/post pair. Existing mutation
-snapshot v2 remains readable. Legacy `codex_mutation_verification_v1` evidence
+New Bridge endpoint capture writes mutation snapshot v3 and binds one closed
+repository-observation authority across the pre/post pair. Generic AOI
+integrity also writes v3; for a canonical linked worktree its authority digest
+binds the per-worktree Git directory, HEAD/index/refs, metadata routing, and
+common repository authority. Executable/worktree config, split indexes, and
+non-canonical aliases fail closed. Bridge capture explicitly remains
+standalone-only. Existing v2 snapshots remain readable but are not newly
+emitted and cannot satisfy a new Bridge elevation. Legacy
+`codex_mutation_verification_v1` evidence
 can be inspected only while the caller has supplied an active exact Git
 executable binding; AOI does not infer historical Git provenance for that old
 record. Direct verified-mutation capture supports only an ordinary standalone

@@ -516,8 +516,14 @@ tuple; committed v2 replay recovers that tuple from CAS before any endpoint
 recapture or Git subprocess. A new elevation with no tuple fails before Git
 can start. Every nested Bridge Git process revalidates and launches that exact path, and new
 `codex_mutation_verification_v2` evidence references a task-local CAS record of
-the binding. New endpoint capture writes authority-bound mutation snapshot v3;
-the reader retains mutation snapshot v2 for existing records. A legacy
+the binding. New Bridge endpoint capture writes authority-bound mutation
+snapshot v3. Generic AOI integrity also keeps v3: in a canonical linked
+worktree it binds the worktree `.git` file, per-worktree Git directory,
+`commondir` and back-reference, common objects/refs/config, and per-worktree
+HEAD/index/refs. Split indexes are outside the v0.4 authority contract and fail
+closed. Bridge elevation explicitly retains the standalone-only layout.
+The reader validates existing snapshot v2 records, but neither new Bridge
+endpoint capture nor generic integrity capture downgrades to v2. A legacy
 `codex_mutation_verification_v1` record remains readable only when its caller
 first supplies an active exact Git executable binding. That validation does
 not manufacture historical executable provenance, so the projected legacy
@@ -600,6 +606,16 @@ same-tree HEAD-only change cannot become `verified_mutation`. Ignored-only and
 tracked-plus-ignored mixed changes fail closed. Canary JSON rejects duplicate
 keys and non-finite values, while child stdout and stderr are bounded during
 streaming execution.
+
+That standalone restriction is selected explicitly by the Bridge endpoint
+caller. AOI integrity snapshots use the same v3 observation schema from a
+legitimate linked worktree, with both its per-worktree and common authority in
+the authority digest. Executable common config, per-worktree config,
+alternate/grafted/replacement history, redirected authority, reparse points,
+split indexes, non-canonical worktree aliases, and inconsistent
+`.git`/`commondir`/back-reference routing fail closed. Existing portable v2
+records remain structurally readable but cannot be used for a new
+`verified_mutation` elevation.
 
 ## Known v0.3 alpha boundaries
 
