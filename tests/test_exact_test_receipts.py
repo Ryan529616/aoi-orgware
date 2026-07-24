@@ -845,6 +845,49 @@ def test_historical_v2_structured_receipts_remain_readable_but_not_current(
     assert parse_exact_test_receipt_bytes(historical_non_wsl_raw) == historical_non_wsl
 
 
+@pytest.mark.parametrize(
+    ("runner_version", "wsl_name"),
+    [
+        (receipts.LEGACY_RUNNER_VERSION, "WSL_DISTRO_NAME"),
+        (receipts.LEGACY_RUNNER_VERSION, "WSL_INTEROP"),
+        (receipts.PREVIOUS_RUNNER_VERSION, "WSL_DISTRO_NAME"),
+        (receipts.PREVIOUS_RUNNER_VERSION, "WSL_INTEROP"),
+    ],
+)
+def test_historical_producers_reject_v3_wsl_environment_names(
+    tmp_path: Path,
+    runner_version: str,
+    wsl_name: str,
+) -> None:
+    receipt = run_clean_commit_source_tree(
+        repo=_repo(tmp_path),
+        pytest_argv=["-q"],
+        receipt_path=tmp_path / "r.json",
+        logs_dir=tmp_path / "logs",
+    )
+    historical = copy.deepcopy(receipt)
+    if runner_version == receipts.LEGACY_RUNNER_VERSION:
+        invocation = {
+            "argv": historical["invocation"]["argv"],
+            "cwd_role": historical["invocation"]["cwd_role"],
+            "environment_names": sorted({"PYTHONHASHSEED", wsl_name}),
+            "environment_sha256": historical["invocation"]["environment_sha256"],
+        }
+    else:
+        invocation = historical["invocation"]
+        invocation["environment_names"] = sorted(
+            (set(invocation["environment_names"]) - receipts._WSL_ENV)
+            | {wsl_name}
+        )
+    historical = _reseal_with_structured_invocation(
+        historical,
+        invocation,
+        runner_version=runner_version,
+    )
+    with pytest.raises(ExactTestReceiptError):
+        canonical_exact_test_receipt_bytes(historical)
+
+
 def test_resealed_current_confinement_tampering_is_rejected(tmp_path: Path) -> None:
     receipt = run_clean_commit_source_tree(
         repo=_repo(tmp_path),

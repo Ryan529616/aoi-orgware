@@ -84,6 +84,16 @@ leaves the alpha line. Until then, minor versions may still change behavior.
   intentionally gitless blob snapshot. All `fd5984b` package, install, test,
   and review results are historical; a clean successor must regenerate every
   release gate.
+- **Historical exact-test replay keeps the producer's original environment
+  grammar.** Exact `bcd3dcb` is rejected after its clean-commit review found
+  that runner v3's new `WSL_DISTRO_NAME` and `WSL_INTEROP` allowlist entries
+  were also admitted on resealed runner-v1/v2 receipts. The successor uses a
+  producer-version-specific environment allowlist: authentic v1/v2 receipts
+  without those names remain readable, while impossible historical receipts
+  carrying either v3-only name fail closed. The `bcd3dcb` package outputs are
+  diagnostic only, and its first Windows full attempt is also inadmissible
+  because a sibling package pytest began after the zero-sibling preflight.
+  Every release gate must be restarted on the next clean successor.
 - **AOI repository publication authority stays distinct from project file
   protection.** This repository's effective confidentiality mode is
   `standard`, so its reviewed source, Git refs, release artifacts, and PyPI

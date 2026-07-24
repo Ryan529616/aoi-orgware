@@ -54,6 +54,7 @@ _ENV_ALLOWLIST = frozenset(
     }
 )
 _WSL_ENV = frozenset({"WSL_DISTRO_NAME", "WSL_INTEROP"})
+_HISTORICAL_ENV_ALLOWLIST = _ENV_ALLOWLIST - _WSL_ENV
 _WINDOWS_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))})
 _PYTEST_TRACEBACK = re.compile(r"--tb=(?:auto|long|short|line|native|no)\Z")
 _MAX_PYTEST_ARGUMENTS = 256
@@ -526,7 +527,11 @@ def validate_exact_test_receipt(
             _fail("pytest confcutdir role is invalid")
     if not isinstance(invocation["argv"], list) or not all(isinstance(x, str) for x in invocation["argv"]): _fail("pytest argv is invalid")
     if invocation["cwd_role"] != _PYTEST_SNAPSHOT_ROLE: _fail("pytest cwd role is invalid")
-    allowed_environment_names = _ENV_ALLOWLIST | _PYTEST_FIXED_ENV
+    allowed_environment_names = (
+        _ENV_ALLOWLIST
+        if producer["version"] == RUNNER_VERSION
+        else _HISTORICAL_ENV_ALLOWLIST
+    ) | _PYTEST_FIXED_ENV
     if not isinstance(invocation["environment_names"], list) or invocation["environment_names"] != sorted(invocation["environment_names"]) or len(invocation["environment_names"]) != len(set(invocation["environment_names"])) or any(x not in allowed_environment_names for x in invocation["environment_names"]): _fail("environment names are invalid")
     if producer["version"] in {PREVIOUS_RUNNER_VERSION, RUNNER_VERSION} and not _PYTEST_FIXED_ENV.issubset(invocation["environment_names"]):
         _fail("contained pytest environment is incomplete")
