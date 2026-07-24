@@ -790,8 +790,13 @@ from another SHA or destination is historical only.
 `aoi-codex-bridge` is a separate, stdlib-only finite adapter; AOI core remains
 dependency-free. Chief-fenced `issue` publishes an immutable launch intent,
 one-shot permit, exact canonical packet-arm authority, and pinned Codex
-executable/version/schema binding. `run` receives only the permit SHA and
-issuance marker. It must not receive or retain a reusable Chief credential.
+executable/version/schema binding. `preflight` receives only the permit SHA and
+exact prompt, authenticates the still-armed packet, issuance, expiry,
+confidentiality policy, and pre-Git endpoint under the state lock, and returns
+`issued_unconsumed` without reservation, semantic publication, or process
+start. `run` repeats those checks under the per-launch process lock before the
+one consuming reservation. Neither command may receive or retain a reusable
+Chief credential.
 
 The Bridge accepts only that canonical armed packet. Launch-permit consumption
 is one further semantic compare-and-append: the exact arm becomes
@@ -834,6 +839,30 @@ launch.
 `reservation_effective_at` is the
 Chief-sealed semantic event time, not a measured wall-clock consumption
 timestamp. Process-start claims derive only from journal evidence.
+
+The external release canary is evidence plumbing, not launch authority. Its
+wire-breaking v4 contract independently binds the local package-gate receipt,
+source commit/tree, wheel, PEP 610 archive hash, installed `RECORD`, complete
+AOI package/dist-info namespace, and every console launcher without importing
+the package under test. The SHA-256 check applies to the exact bounded wheel
+bytes that are parsed. Wheel ZIP members and the wheel's own `RECORD` close
+each other; each installed wheel-owned member must then equal those exact
+bytes. Installer-generated metadata and all four launchers declared by exact
+wheel entry-point metadata form the only additional installed `RECORD`
+surface, while the Bridge launcher remains separately spec-pinned. A
+self-consistent installed `RECORD` rewrite is insufficient. The
+installer-generated launcher is never executed. The driver binds the base
+Python already trusted to run the canary, invokes it with isolated/no-site/
+no-bytecode flags and a fixed installed-module bootstrap whose exact site root
+is appended after standard-library paths, and rejects ambiguous `pyvenv.cfg`
+keys or any mismatch in base home, executable, Python version, disabled
+system-site setting, or exact terminal venv prefix. It revalidates that
+closure before and after every Bridge subprocess and launches each child with
+an explicit environment allowlist; Windows system paths come from the native
+API, not ambient `SystemRoot`. This can attribute the cooperative canary to the
+declared installed bytes; it does not attest the OS loader, dynamic
+dependencies, code signature, same-user hostile races, or model-provider
+control channel.
 
 The pinned App Server dialect is its generated, line-delimited RPC schema, not
 a generic JSON-RPC 2.0 envelope. Exact correlated success-response bytes may
