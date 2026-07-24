@@ -176,6 +176,14 @@ aoi checkpoint \
   --next-action "<one exact next action>"
 ```
 
+If the checkpoint contains a fact, decision, or rejected-path history marker,
+the recent tail is not the complete record. Before resuming, read the referenced
+`state.json` field and verify its order-sensitive `json-list-utf8-v1` SHA-256;
+`aoi doctor --task <id> --json` also checks the marker and retained tail against
+current state through the fixed renderer-owned machine block. Never hide or
+summarize active claims, locks, lanes, jobs, packets, pending verification,
+open risks, or other required authority merely to fit the checkpoint ceiling.
+
 Before achieved close:
 
 1. Account for every verification, packet, claim, and job.

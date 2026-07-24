@@ -98,6 +98,9 @@ COMPACT_PACKET_HISTORY_THRESHOLD = 16
 COMPACT_PACKET_RECENT_TAIL = 3
 COMPACT_FACT_HISTORY_THRESHOLD = 16
 COMPACT_FACT_RECENT_TAIL = 8
+COMPACT_STRING_HISTORY_RECENT_TAIL = 8
+COMPACT_STRING_HISTORY_RECENT_BYTES = 4 * 1024
+CHECKPOINT_HISTORY_MACHINE_PREFIX = "<!-- AOI-CHECKPOINT-HISTORY-V1 "
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
 EXTERNAL_LOCK_NAMESPACE = "external"
@@ -4703,6 +4706,114 @@ def _compact_fact_history(
     )
 
 
+def _compact_string_history(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    field: str,
+    label: str,
+    items: list[str],
+    recent_budget_bytes: int = COMPACT_STRING_HISTORY_RECENT_BYTES,
+) -> list[str]:
+    """Project append-only string history without truncating an entry.
+
+    This is the second checkpoint fallback, not a state compaction.  The
+    authoritative list remains byte-for-byte present in state.json and its
+    order-sensitive canonical digest is recorded here.  A contiguous recent
+    tail is retained only while complete Markdown list entries fit the fixed
+    UTF-8 budget.
+    """
+
+    canonical = json.dumps(
+        items,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+
+    if recent_budget_bytes < 0:
+        raise HarnessError("checkpoint history recent-tail budget cannot be negative")
+    recent_budget_bytes = min(
+        recent_budget_bytes,
+        COMPACT_STRING_HISTORY_RECENT_BYTES,
+    )
+
+    recent_reversed: list[str] = []
+    recent_bytes = 0
+    for item in reversed(items[-COMPACT_STRING_HISTORY_RECENT_TAIL:]):
+        item_bytes = len(f"- {item}\n".encode("utf-8"))
+        if recent_bytes + item_bytes > recent_budget_bytes:
+            break
+        recent_reversed.append(item)
+        recent_bytes += item_bytes
+    recent = list(reversed(recent_reversed))
+
+    marker = (
+        f"{label}: count={len(items)}; "
+        "canonical=json-list-utf8-v1; "
+        f"history_sha256={digest}; "
+        f"record={_task_state_record_reference(paths, state, field)}; "
+        f"recent_verbatim={len(recent)}; "
+        f"recent_utf8_bytes={recent_bytes}; "
+        f"recent_budget_bytes={recent_budget_bytes}"
+    )
+    return [marker, *recent]
+
+
+def _checkpoint_history_machine_block(
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    recent_budget_bytes: int,
+) -> str:
+    fields: dict[str, dict[str, Any]] = {}
+    for field, label in (
+        ("facts", "Established fact history"),
+        ("decisions", "Decision history"),
+        ("rejected_paths", "Rejected path history"),
+    ):
+        items = list(state.get(field, []))
+        if not items:
+            continue
+        canonical = json.dumps(
+            items,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        projection = _markdown_list(
+            _compact_string_history(
+                paths,
+                state,
+                field=field,
+                label=label,
+                items=items,
+                recent_budget_bytes=recent_budget_bytes,
+            )
+        ).encode("utf-8")
+        fields[field] = {
+            "count": len(items),
+            "history_sha256": hashlib.sha256(canonical).hexdigest(),
+            "projection_sha256": hashlib.sha256(projection).hexdigest(),
+            "record": _task_state_record_reference(paths, state, field),
+        }
+    payload = {
+        "schema_version": 1,
+        "recent_budget_bytes": min(
+            recent_budget_bytes,
+            COMPACT_STRING_HISTORY_RECENT_BYTES,
+        ),
+        "fields": fields,
+    }
+    canonical_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(canonical_payload).decode("ascii").rstrip("=")
+    return f"{CHECKPOINT_HISTORY_MACHINE_PREFIX}{encoded} -->"
+
+
 def _compact_packet_result_reference(
     paths: HarnessPaths,
     state: dict[str, Any],
@@ -4785,6 +4896,8 @@ def render_checkpoint(
     state: dict[str, Any],
     *,
     compact_terminal_detail: bool = False,
+    compact_historical_detail: bool = False,
+    compact_historical_recent_bytes: int = COMPACT_STRING_HISTORY_RECENT_BYTES,
 ) -> str:
     validate_task_claim_references(paths, state)
     for packet in state.get("packets", []):
@@ -4981,16 +5094,11 @@ def render_checkpoint(
         if lane.get("status") in {"active", "waiting", "recovering", "blocked"}
     ]
     engaged_lanes.sort(key=lambda item: str(item.get("lane_id", "")))
-    lane_limit = 4 if compact_terminal_detail else 12
     lane_lines = [
         f"{lane.get('lane_id')} [{lane.get('status')}], rev={lane.get('revision')}, "
         f"owner={lane.get('owner')}, next={lane.get('next_action') or 'not recorded'}"
-        for lane in engaged_lanes[:lane_limit]
+        for lane in engaged_lanes
     ]
-    if len(engaged_lanes) > lane_limit:
-        lane_lines.append(
-            f"{len(engaged_lanes) - lane_limit} additional engaged lanes omitted; see state.json"
-        )
     active_coordination = sum(
         request.get("status") not in {"rejected", "resolved", "superseded"}
         for request in state.get("coordination_requests", [])
@@ -5050,17 +5158,59 @@ def render_checkpoint(
     facts = list(state.get("facts", []))
     compact_fact_history = (
         _compact_fact_history(paths, state, facts)
-        if compact_terminal_detail
+        if compact_terminal_detail and not compact_historical_detail
         else None
     )
     fact_lines = facts
-    if compact_fact_history is not None:
+    if compact_historical_detail and facts:
+        fact_lines = _compact_string_history(
+            paths,
+            state,
+            field="facts",
+            label="Established fact history",
+            items=facts,
+            recent_budget_bytes=compact_historical_recent_bytes,
+        )
+    elif compact_fact_history is not None:
         fact_lines = [
             compact_fact_history,
             *facts[-COMPACT_FACT_RECENT_TAIL:],
         ]
+    decision_lines = list(state.get("decisions", []))
+    if compact_historical_detail and decision_lines:
+        decision_lines = _compact_string_history(
+            paths,
+            state,
+            field="decisions",
+            label="Decision history",
+            items=decision_lines,
+            recent_budget_bytes=compact_historical_recent_bytes,
+        )
+    rejected_path_lines = list(state.get("rejected_paths", []))
+    if compact_historical_detail and rejected_path_lines:
+        rejected_path_lines = _compact_string_history(
+            paths,
+            state,
+            field="rejected_paths",
+            label="Rejected path history",
+            items=rejected_path_lines,
+            recent_budget_bytes=compact_historical_recent_bytes,
+        )
+    history_machine_block = (
+        _checkpoint_history_machine_block(
+            paths,
+            state,
+            recent_budget_bytes=compact_historical_recent_bytes,
+        )
+        if compact_historical_detail
+        else None
+    )
+    history_machine_text = (
+        f"{history_machine_block}\n" if history_machine_block is not None else ""
+    )
     return (
         f"# Checkpoint — {state['task_id']}\n\n"
+        f"{history_machine_text}"
         f"- State revision: `{state['revision']}`\n"
         f"- Updated: `{state['updated_at']}`\n"
         f"- Status / phase: `{state['status']}` / `{state['phase']}`\n\n"
@@ -5078,9 +5228,9 @@ def render_checkpoint(
         "## Established facts\n\n"
         f"{_markdown_list(fact_lines)}\n\n"
         "## Decisions\n\n"
-        f"{_markdown_list(state.get('decisions', []))}\n\n"
+        f"{_markdown_list(decision_lines)}\n\n"
         "## Rejected paths\n\n"
-        f"{_markdown_list(state.get('rejected_paths', []))}\n\n"
+        f"{_markdown_list(rejected_path_lines)}\n\n"
         "## Changed files\n\n"
         f"{_markdown_list(state.get('changed_files', []))}\n\n"
         "## Verification and evidence boundary\n\n"
@@ -5110,8 +5260,39 @@ def prepare_checkpoint(
     if len(text.encode("utf-8")) > CHECKPOINT_COMPACT_THRESHOLD_BYTES:
         text = render_checkpoint(paths, state, compact_terminal_detail=True)
     if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
+        no_tail_text = render_checkpoint(
+            paths,
+            state,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+            compact_historical_recent_bytes=0,
+        )
+        text = no_tail_text
+        no_tail_bytes = len(no_tail_text.encode("utf-8"))
+        if no_tail_bytes <= CHECKPOINT_MAX_BYTES:
+            historical_fields = ("facts", "decisions", "rejected_paths")
+            populated_fields = sum(bool(state.get(field)) for field in historical_fields)
+            if populated_fields:
+                available = CHECKPOINT_MAX_BYTES - no_tail_bytes
+                per_field_budget = min(
+                    COMPACT_STRING_HISTORY_RECENT_BYTES,
+                    max(0, (available - 256) // populated_fields),
+                )
+                if per_field_budget:
+                    with_tail_text = render_checkpoint(
+                        paths,
+                        state,
+                        compact_terminal_detail=True,
+                        compact_historical_detail=True,
+                        compact_historical_recent_bytes=per_field_budget,
+                    )
+                    if len(with_tail_text.encode("utf-8")) <= CHECKPOINT_MAX_BYTES:
+                        text = with_tail_text
+    if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
         raise HarnessError(
-            "checkpoint exceeds 32 KiB hard ceiling; summarize facts/evidence and keep raw logs outside state"
+            "checkpoint exceeds 32 KiB hard ceiling after bounded historical "
+            "projection; reduce active required detail while keeping raw logs "
+            "outside state"
         )
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return destination, text, digest
@@ -5136,9 +5317,56 @@ def checkpoint_matches(
     destination = task_dir(paths, state["task_id"]) / "checkpoint.md"
     if not destination.is_file():
         return False, "checkpoint file is missing"
-    actual = sha256_file(destination)
+    try:
+        checkpoint_bytes = destination.read_bytes()
+        text = checkpoint_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False, "checkpoint file is not readable strict UTF-8"
+    actual = hashlib.sha256(checkpoint_bytes).hexdigest()
     if actual != expected:
         return False, "checkpoint file SHA-256 differs from state"
+    lines = text.splitlines()
+    if len(lines) > 2 and lines[2].startswith(CHECKPOINT_HISTORY_MACHINE_PREFIX):
+        machine_line = lines[2]
+        if not machine_line.endswith(" -->"):
+            return False, "checkpoint history machine block is malformed"
+        encoded = machine_line[
+            len(CHECKPOINT_HISTORY_MACHINE_PREFIX) : -len(" -->")
+        ]
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            raw_payload = base64.b64decode(
+                encoded + padding,
+                altchars=b"-_",
+                validate=True,
+            )
+            payload = json.loads(raw_payload.decode("utf-8"))
+        except (
+            binascii.Error,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ):
+            return False, "checkpoint history machine block is malformed"
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "recent_budget_bytes", "fields"}
+            or payload.get("schema_version") != 1
+            or type(payload.get("recent_budget_bytes")) is not int
+            or not 0
+            <= payload["recent_budget_bytes"]
+            <= COMPACT_STRING_HISTORY_RECENT_BYTES
+            or not isinstance(payload.get("fields"), dict)
+        ):
+            return False, "checkpoint history machine block is invalid"
+        expected_machine_line = _checkpoint_history_machine_block(
+            paths,
+            state,
+            recent_budget_bytes=payload["recent_budget_bytes"],
+        )
+        if machine_line != expected_machine_line:
+            return False, "checkpoint history machine block differs from state"
     return True, "current"
 
 

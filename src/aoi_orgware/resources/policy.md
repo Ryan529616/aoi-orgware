@@ -149,11 +149,31 @@ disposition for those mutations.
 
 A checkpoint is a semantic reconstruction aid, not a transcript. The renderer
 targets at most 16 KiB and switches to a deterministic compact terminal-history
-projection when the full form exceeds that threshold. Required active and
-semantic detail is never hidden: the compact form may grow to a 32 KiB hard
-ceiling, after which checkpoint creation fails without changing state or the
-previous checkpoint. Raw logs remain outside state. The separate critical-status
-projection remains capped at 12 KiB.
+projection when the full form exceeds that threshold. If that projection still
+exceeds the 32 KiB hard ceiling, a second deterministic projection may replace
+append-only fact, decision, and rejected-path history with its count,
+order-sensitive `json-list-utf8-v1` SHA-256, exact `state.json` field
+reference, and an optional UTF-8 byte-budget tail of complete recent entries.
+`json-list-utf8-v1` is a JSON array in original order with no insignificant
+whitespace, UTF-8 non-ASCII code points emitted directly rather than as
+`\u` escapes, and `/` left unescaped. Encode quote as `\"`, backslash as `\\`,
+backspace as `\b`, tab as `\t`, LF as `\n`, form feed as `\f`, and CR as `\r`;
+encode every other U+0000--U+001F control as a lowercase `\u00xx` escape. The
+authoritative state remains complete and is not pruned; `doctor` verifies any
+projected marker and recent tail against current state through the
+renderer-owned `AOI-CHECKPOINT-HISTORY-V1` machine block placed before
+free-form task text. Marker-looking user Markdown is never used to locate this
+block.
+
+Required active authority is never projected away. Reserving claims and all
+locks, active jobs and packets, pending verification, engaged lanes, open
+incidents, blockers, open risks, changed files, objective, completion boundary,
+delivery state, and exact next action remain verbatim. Historical recent-tail
+budgets shrink deterministically before required detail can cause the projection
+to cross the ceiling. If the marker-only required view still exceeds 32 KiB,
+checkpoint creation fails without changing state or the previous checkpoint.
+Raw logs remain outside state. The separate critical-status projection remains
+capped at 12 KiB.
 
 ## Atomic publication and temporary recovery
 

@@ -257,6 +257,19 @@ detectable mismatch repaired by retrying the exact checkpoint command, and
 task state published before the index as a rebuildable stale index. Those cases
 do not establish recovery for every command or persistence boundary.
 
+The stage-two checkpoint history form is still only a replaceable projection.
+It does not prune task state, rewrite semantic events, or perform a generation
+rollover. Its history markers bind the complete ordered string list in
+`state.json` by SHA-256 and retain only complete recent entries within a fixed
+UTF-8 budget. The existing checkpoint-then-state publication order therefore
+remains sufficient: an interruption can expose a detectable mismatch, and the
+exact Chief-authorized checkpoint command converges on retry. Active authority
+is not eligible for this projection. Recent-tail budgets shrink before they can
+displace required detail, and `checkpoint_matches` verifies any history marker
+and retained tail against current state through a fixed-position,
+renderer-owned machine block before free-form task text. A marker-only required
+view can still make the command fail at the hard ceiling.
+
 `doctor` and `recover-temporaries` scan under the project state lock, so they do
 not classify an active cooperative writer's temporary by age. Recovery
 reloads `aoi.toml` after acquisition and refuses a changed digest, state root, or

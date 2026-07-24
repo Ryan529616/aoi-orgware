@@ -11,6 +11,41 @@ decisions, dissent, verification, and a bounded semantic checkpoint. A resumed
 session reconstructs from the checkpoint and current repository state instead
 of relying on conversational memory.
 
+If the checkpoint contains an `Established fact history`, `Decision history`,
+or `Rejected path history` marker, its recent entries are only a convenience
+tail. Read the exact referenced `state.json` field and encode the complete list
+as `json-list-utf8-v1`: preserve list order, emit a JSON array with comma/colon
+separators and no insignificant whitespace, emit UTF-8 non-ASCII code points
+directly, and leave `/` unescaped. Encode quote as `\"`, backslash as `\\`,
+backspace as `\b`, tab as `\t`, LF as `\n`, form feed as `\f`, and CR as `\r`;
+encode every other U+0000--U+001F control as a lowercase `\u00xx` escape.
+Verify the marker's SHA-256 before reconstructing omitted history. `aoi doctor
+--task <id> --json` independently checks the marker and retained tail against
+current state through the fixed `AOI-CHECKPOINT-HISTORY-V1` machine block
+before free-form task text. Marker-looking lines inside objectives or history
+entries have no authority.
+
+## Recover an over-limit historical checkpoint
+
+An older long-lived task may have complete state whose first compact checkpoint
+projection exceeds 32 KiB. Stop cooperative writers, preserve an exact
+repo-external backup, and upgrade through the reviewed AOI installation route
+before retrying the ordinary command:
+
+```bash
+aoi checkpoint --task <id> --next-action "<same exact next action>" --json
+aoi doctor --task <id> --json
+```
+
+The fixed runtime may use the digest-bound stage-two projection for append-only
+fact, decision, and rejected-path history. It does not mutate or delete that
+history. Optional recent tails shrink before required detail can cross the
+ceiling. A failed retry leaves both state and the previous checkpoint unchanged.
+If the marker-only retry still exceeds the ceiling, required active authority
+is itself too large; do not hand-edit state or raise the limit ad hoc. Reduce
+that authority only through truthful lifecycle operations or split future work
+into a separately governed task.
+
 ## Recover interrupted atomic publication
 
 AOI deliberately does not auto-repair bootstrap publication. `chief-acquire`

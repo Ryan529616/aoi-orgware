@@ -430,6 +430,73 @@ class CheckpointCrashTests(AtomicCrashController, HarnessTestCase):
         repaired = h.load_task(paths, task_id)
         self.assertTrue(h.checkpoint_matches(paths, repaired)[0])
 
+    def test_stage_two_checkpoint_publish_crash_exact_retry_converges(self) -> None:
+        task_id = "stage-two-checkpoint-publish-crash"
+        self.init_task(task_id)
+        paths = h.get_paths(self.root)
+        state_path = h.task_state_path(paths, task_id)
+        checkpoint_path = h.task_dir(paths, task_id) / "checkpoint.md"
+        state = h.load_task(paths, task_id)
+        state["facts"] = [
+            f"historical-fact-{index}-" + ("f" * 900)
+            for index in range(8)
+        ]
+        state["decisions"] = [
+            f"historical-decision-{index}-" + ("d" * 900)
+            for index in range(8)
+        ]
+        state["rejected_paths"] = [
+            f"historical-rejection-{index}-" + ("r" * 900)
+            for index in range(8)
+        ]
+        state["objective"] = "ACTIVE-OBJECTIVE-" + ("a" * 20000)
+        state["checkpoint_required"] = True
+        h.write_task(paths, state)
+        old_state = state_path.read_bytes()
+        old_checkpoint = checkpoint_path.read_bytes()
+        command = self.checkpoint_command(task_id)
+
+        self.kill_at_boundary(
+            destination=checkpoint_path,
+            stage="published",
+            mode="cli",
+            env=self.env,
+            cwd=self.root,
+            command=command,
+        )
+
+        self.assertEqual(state_path.read_bytes(), old_state)
+        self.assertNotEqual(checkpoint_path.read_bytes(), old_checkpoint)
+        published = checkpoint_path.read_text(encoding="utf-8")
+        self.assertIn("Decision history:", published)
+        self.assertIn("Rejected path history:", published)
+        self.assertLessEqual(
+            len(published.encode("utf-8")),
+            h.CHECKPOINT_MAX_BYTES,
+        )
+        interrupted = h.load_task(paths, task_id)
+        self.assertFalse(h.checkpoint_matches(paths, interrupted)[0])
+
+        self.cli(*command)
+
+        repaired = h.load_task(paths, task_id)
+        self.assertTrue(h.checkpoint_matches(paths, repaired)[0])
+        default_stage_two = h.render_checkpoint(
+            paths,
+            repaired,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+        )
+        self.assertGreater(
+            len(default_stage_two.encode("utf-8")),
+            h.CHECKPOINT_MAX_BYTES,
+        )
+        _, expected_checkpoint, _ = h.prepare_checkpoint(paths, repaired)
+        self.assertEqual(
+            checkpoint_path.read_text(encoding="utf-8"),
+            expected_checkpoint,
+        )
+
     def test_kill_after_state_publish_leaves_only_rebuildable_index_stale(self) -> None:
         task_id = "state-publish-crash"
         self.init_task(task_id)

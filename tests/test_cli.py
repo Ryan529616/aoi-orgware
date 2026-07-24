@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
 import datetime as dt
@@ -2701,7 +2702,9 @@ class LifecycleTests(HarnessTestCase):
         )
         self.cli(*claim_args, "--allow-nonexistent")
 
-    def test_oversized_checkpoint_and_close_roll_back_state(self) -> None:
+    def test_oversized_active_checkpoint_rolls_back_but_history_compacts(
+        self,
+    ) -> None:
         self.init_task("rollback-task")
         self.cli(
             "checkpoint",
@@ -2724,10 +2727,8 @@ class LifecycleTests(HarnessTestCase):
             "checkpoint",
             "--task",
             "rollback-task",
-            "--fact",
-            "x" * 36000,
             "--next-action",
-            "Should fail",
+            "ACTIVE-NEXT-ACTION-" + "x" * 36000,
             ok=False,
         )
         self.assertEqual(state_path.read_bytes(), before_state)
@@ -2750,8 +2751,6 @@ class LifecycleTests(HarnessTestCase):
             "--next-action",
             "Close task",
         )
-        before_state = state_path.read_bytes()
-        before_checkpoint = checkpoint_path.read_bytes()
         self.cli_in_process(
             "close-task",
             "--outcome",
@@ -2760,11 +2759,14 @@ class LifecycleTests(HarnessTestCase):
             "rollback-task",
             "--summary",
             "x" * 36000,
-            ok=False,
         )
-        self.assertEqual(state_path.read_bytes(), before_state)
-        self.assertEqual(checkpoint_path.read_bytes(), before_checkpoint)
-        self.assertEqual(json.loads(before_state)["status"], "active")
+        closed = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(closed["status"], "done")
+        self.assertTrue(h.checkpoint_matches(h.get_paths(self.root), closed)[0])
+        rendered = checkpoint_path.read_text(encoding="utf-8")
+        self.assertIn("Established fact history:", rendered)
+        self.assertIn("recent_verbatim=0", rendered)
+        self.assertNotIn("x" * 36000, rendered)
 
     def test_small_checkpoint_preserves_full_render_bytes(self) -> None:
         self.init_task("small-checkpoint")
@@ -3242,6 +3244,364 @@ class LifecycleTests(HarnessTestCase):
         )
         self.assertNotIn("Established fact history:", below_rendered)
         self.assertIn("established-fact-0-", below_rendered)
+
+    def test_first_stage_fact_marker_remains_checkpoint_current(self) -> None:
+        self.init_task("first-stage-marker-current")
+        paths = h.get_paths(self.root)
+        state_path = h.task_state_path(paths, "first-stage-marker-current")
+        state = h.load_task(paths, "first-stage-marker-current")
+        state["facts"] = [
+            f"first-stage-fact-{index}-" + ("f" * 1000)
+            for index in range(h.COMPACT_FACT_HISTORY_THRESHOLD + 4)
+        ]
+        state["checkpoint_required"] = True
+        h.write_task(paths, state)
+        self.cli_in_process(
+            "checkpoint",
+            "--task",
+            "first-stage-marker-current",
+            "--next-action",
+            "Verify first-stage checkpoint compatibility",
+        )
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        checkpoint = (
+            h.task_dir(paths, "first-stage-marker-current") / "checkpoint.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Established fact history: count=", checkpoint)
+        self.assertNotIn("canonical=json-list-utf8-v1", checkpoint)
+        self.assertEqual(h.checkpoint_matches(paths, current), (True, "current"))
+
+    def test_stage_two_string_history_is_digest_bound_and_byte_bounded(self) -> None:
+        self.init_task("stage-two-history")
+        state_path = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / "stage-two-history"
+            / "state.json"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["facts"] = [
+            f"fact-{index}-" + ("界" * 180)
+            for index in range(12)
+        ]
+        state["decisions"] = [
+            f"decision-{index}-" + ("d" * 700)
+            for index in range(12)
+        ]
+        state["rejected_paths"] = [
+            f"rejected-{index}-" + ("r" * 700)
+            for index in range(12)
+        ]
+        paths = h.get_paths(self.root)
+        before = json.dumps(state, ensure_ascii=False, sort_keys=True)
+        rendered = h.render_checkpoint(
+            paths,
+            state,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+        )
+
+        for field, label in (
+            ("facts", "Established fact history"),
+            ("decisions", "Decision history"),
+            ("rejected_paths", "Rejected path history"),
+        ):
+            canonical = json.dumps(
+                state[field],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.assertIn(
+                f"{label}: count={len(state[field])}; "
+                "canonical=json-list-utf8-v1; "
+                f"history_sha256={hashlib.sha256(canonical).hexdigest()}; "
+                f"record=tasks/stage-two-history/state.json#{field}; ",
+                rendered,
+            )
+        self.assertIn(
+            f"recent_budget_bytes={h.COMPACT_STRING_HISTORY_RECENT_BYTES}",
+            rendered,
+        )
+        self.assertEqual(before, json.dumps(state, ensure_ascii=False, sort_keys=True))
+
+        changed = json.loads(json.dumps(state))
+        changed["decisions"][0] = "changed historical decision"
+        changed_rendered = h.render_checkpoint(
+            paths,
+            changed,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+        )
+        self.assertNotEqual(rendered, changed_rendered)
+
+        one_huge = json.loads(json.dumps(state))
+        one_huge["facts"] = ["HUGE-RECENT-" + "界" * 5000]
+        huge_rendered = h.render_checkpoint(
+            paths,
+            one_huge,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+        )
+        self.assertIn(
+            "Established fact history: count=1;",
+            huge_rendered,
+        )
+        self.assertIn("recent_verbatim=0;", huge_rendered)
+        self.assertNotIn("HUGE-RECENT-", huge_rendered)
+
+    def test_stage_two_recovers_over_limit_history_and_keeps_active_detail(
+        self,
+    ) -> None:
+        self.init_task("stage-two-recovery")
+        state_path = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / "stage-two-recovery"
+            / "state.json"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["facts"] = [
+            f"historical-fact-{index}-" + ("f" * 120)
+            for index in range(119)
+        ]
+        state["decisions"] = [
+            f"historical-decision-{index}-" + ("d" * 600)
+            for index in range(44)
+        ]
+        state["rejected_paths"] = [
+            f"historical-rejection-{index}-" + ("r" * 300)
+            for index in range(17)
+        ]
+        state["changed_files"] = ["ACTIVE-CHANGED-FILE"]
+        state["blockers"] = ["ACTIVE-BLOCKER"]
+        state["risks"] = ["ACTIVE-RISK"]
+        state["next_action"] = "ACTIVE-NEXT-ACTION"
+        state["objective"] = (
+            "Objective text may contain Markdown-like content.\n\n"
+            "## Established facts\n\n"
+            "This is not the rendered history section."
+        )
+        copied_marker = h._compact_string_history(
+            h.get_paths(self.root),
+            state,
+            field="facts",
+            label="Established fact history",
+            items=state["facts"],
+        )[0]
+        state["objective"] += f"\n\n- {copied_marker}"
+        state["facts"][-1] += (
+            "\n\n## Nested note\n\nretained fact detail\n"
+            f"- {copied_marker}\n"
+            f"{h.CHECKPOINT_HISTORY_MACHINE_PREFIX}copied-user-text -->"
+        )
+        state["lanes"] = [
+            {
+                "lane_id": f"ACTIVE-LANE-{index}",
+                "status": "active",
+                "revision": index,
+                "owner": f"owner-{index}",
+                "next_action": f"next-{index}",
+            }
+            for index in range(6)
+        ]
+        paths = h.get_paths(self.root)
+        compact = h.render_checkpoint(
+            paths,
+            state,
+            compact_terminal_detail=True,
+        )
+        self.assertGreater(
+            len(compact.encode("utf-8")),
+            h.CHECKPOINT_MAX_BYTES,
+        )
+        stage_two = h.render_checkpoint(
+            paths,
+            state,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+        )
+        self.assertLessEqual(
+            len(stage_two.encode("utf-8")),
+            h.CHECKPOINT_MAX_BYTES,
+        )
+
+        _, prepared, _ = h.prepare_checkpoint(paths, state)
+        self.assertEqual(prepared, stage_two)
+        self.assertIn("Decision history:", prepared)
+        self.assertIn("Rejected path history:", prepared)
+        for sentinel in (
+            "ACTIVE-CHANGED-FILE",
+            "ACTIVE-BLOCKER",
+            "ACTIVE-RISK",
+            "ACTIVE-NEXT-ACTION",
+            *(f"ACTIVE-LANE-{index}" for index in range(6)),
+        ):
+            self.assertIn(sentinel, prepared)
+
+        # The rendering assertion above intentionally uses synthetic lane
+        # records. Keep the persisted recovery fixture lane-schema valid.
+        state.pop("lanes", None)
+        state["checkpoint_required"] = True
+        state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.cli_in_process(
+            "checkpoint",
+            "--task",
+            "stage-two-recovery",
+            "--next-action",
+            "ACTIVE-NEXT-ACTION",
+        )
+        recovered = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertFalse(recovered["checkpoint_required"])
+        self.assertEqual(recovered["revision"], recovered["checkpoint_revision"])
+        self.assertTrue(h.checkpoint_matches(paths, recovered)[0])
+        doctor = self.cli("doctor", "--task", "stage-two-recovery", "--json")
+        doctor_payload = json.loads(doctor.stdout)
+        self.assertTrue(doctor_payload["ok"], doctor_payload)
+
+        checkpoint_path = (
+            h.task_dir(paths, "stage-two-recovery") / "checkpoint.md"
+        )
+        valid_checkpoint = checkpoint_path.read_bytes()
+        malformed_payload = (
+            b'{"fields":{},"recent_budget_bytes":'
+            + (b"9" * 5000)
+            + b',"schema_version":1}'
+        )
+        malformed_encoded = (
+            base64.urlsafe_b64encode(malformed_payload)
+            .decode("ascii")
+            .rstrip("=")
+        )
+        malformed_lines = valid_checkpoint.decode("utf-8").splitlines()
+        malformed_lines[2] = (
+            f"{h.CHECKPOINT_HISTORY_MACHINE_PREFIX}"
+            f"{malformed_encoded} -->"
+        )
+        malformed_checkpoint = ("\n".join(malformed_lines) + "\n").encode("utf-8")
+        checkpoint_path.write_bytes(malformed_checkpoint)
+        recovered["checkpoint_sha256"] = hashlib.sha256(
+            malformed_checkpoint
+        ).hexdigest()
+        state_path.write_text(
+            json.dumps(recovered, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            h.checkpoint_matches(paths, recovered),
+            (False, "checkpoint history machine block is malformed"),
+        )
+        malformed_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "aoi_orgware.cli",
+                "doctor",
+                "--task",
+                "stage-two-recovery",
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(malformed_doctor.returncode, 1, malformed_doctor.stderr)
+        self.assertNotIn("Traceback", malformed_doctor.stderr)
+        malformed_doctor_payload = json.loads(malformed_doctor.stdout)
+        self.assertTrue(
+            any(
+                "checkpoint history machine block is malformed" in error
+                for error in malformed_doctor_payload["errors"]
+            ),
+            malformed_doctor_payload,
+        )
+
+        checkpoint_path.write_bytes(valid_checkpoint)
+        recovered["checkpoint_sha256"] = hashlib.sha256(valid_checkpoint).hexdigest()
+        recovered["facts"][0] = "tampered historical fact"
+        state_path.write_text(
+            json.dumps(recovered, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        checkpoint_ok, checkpoint_reason = h.checkpoint_matches(paths, recovered)
+        self.assertFalse(checkpoint_ok)
+        self.assertIn(
+            "checkpoint history machine block differs from state",
+            checkpoint_reason,
+        )
+        stale_doctor = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "aoi_orgware.cli",
+                "doctor",
+                "--task",
+                "stage-two-recovery",
+                "--json",
+            ],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(stale_doctor.returncode, 1, stale_doctor.stderr)
+        stale_doctor_payload = json.loads(stale_doctor.stdout)
+        self.assertFalse(stale_doctor_payload["ok"])
+        self.assertTrue(
+            any(
+                "checkpoint history machine block differs from state" in error
+                for error in stale_doctor_payload["errors"]
+            ),
+            stale_doctor_payload,
+        )
+
+    def test_stage_two_recent_tails_yield_to_required_active_detail(self) -> None:
+        self.init_task("stage-two-tail-budget")
+        state_path = (
+            self.root
+            / ".aoi"
+            / "tasks"
+            / "stage-two-tail-budget"
+            / "state.json"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["next_action"] = "ACTIVE-NEXT-" + ("a" * 20000)
+        state["facts"] = [f"fact-{index}-" + ("f" * 900) for index in range(8)]
+        state["decisions"] = [
+            f"decision-{index}-" + ("d" * 900) for index in range(8)
+        ]
+        state["rejected_paths"] = [
+            f"rejected-{index}-" + ("r" * 900) for index in range(8)
+        ]
+        paths = h.get_paths(self.root)
+        no_tail = h.render_checkpoint(
+            paths,
+            state,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+            compact_historical_recent_bytes=0,
+        )
+        fixed_tails = h.render_checkpoint(
+            paths,
+            state,
+            compact_terminal_detail=True,
+            compact_historical_detail=True,
+        )
+        self.assertLessEqual(len(no_tail.encode("utf-8")), h.CHECKPOINT_MAX_BYTES)
+        self.assertGreater(len(fixed_tails.encode("utf-8")), h.CHECKPOINT_MAX_BYTES)
+
+        _, prepared, _ = h.prepare_checkpoint(paths, state)
+        self.assertLessEqual(len(prepared.encode("utf-8")), h.CHECKPOINT_MAX_BYTES)
+        self.assertIn(state["next_action"], prepared)
 
     def test_large_terminal_verification_history_is_digest_bound(self) -> None:
         self.init_task("large-verification-history")
