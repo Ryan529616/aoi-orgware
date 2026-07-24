@@ -259,12 +259,12 @@ def _fixture(
     prompt_path.write_text("hello", encoding="utf-8")
     prompt = prompt_path.read_bytes()
     pin = {
-        **contracts.pinned_runtime_binding(),
+        **contracts.pinned_runtime_binding_v2(),
         "executable_path": Path(sys.executable).resolve().as_posix(),
     }
     intent = contracts.seal_launch_intent(
         {
-            "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
+            "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2,
             "task_id": "task-1",
             "packet_id": "packet-1",
             "routing_binding": {
@@ -286,6 +286,7 @@ def _fixture(
             "requested_effort": "high",
             "sandbox": sandbox,
             "approval": "never",
+            "network_access": False,
             "runtime_pin": pin,
             "pre_git_binding": mutation.endpoint_pre_git_binding(pre_endpoint),
         }
@@ -442,12 +443,22 @@ class FakeAdapter:
         self.on_process_start_pending(self._process("process_start_pending", None))
         self.on_process_started(self._process("process_started", 42))
 
-    def _request(self, method: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        result: Mapping[str, Any],
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
         self.request_count[method] = self.request_count.get(method, 0) + 1
         request = json.dumps(
-            {"id": request_id, "method": method, "params": {}},
+            {
+                "id": request_id,
+                "method": method,
+                "params": {} if params is None else dict(params),
+            },
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
         self.on_send_pending(
@@ -514,20 +525,59 @@ class FakeAdapter:
             },
         )
 
-    def start_thread_from_intent(self, *, intent: object) -> str:
-        result = self._request("thread/start", {"thread": {"id": "thread-1"}})
+    def start_thread_from_intent(self, *, intent: Any) -> str:
+        result = self._request(
+            "thread/start",
+            {"thread": {"id": "thread-1"}},
+            params={
+                "cwd": intent.cwd,
+                "approvalPolicy": "never",
+                "sandbox": {
+                    "readOnly": "read-only",
+                    "workspaceWrite": "workspace-write",
+                }[intent.sandbox],
+                "serviceName": "aoi-orgware",
+                "ephemeral": True,
+                "model": intent.model,
+                "config": contracts._THREAD_START_CONFIG,
+            },
+        )
         return str(result["thread"]["id"])
 
     def start_turn_from_intent(
-        self, *, thread_id: str, prompt: str, intent: object
+        self, *, thread_id: str, prompt: str, intent: Any
     ) -> str:
         result = self._request(
-            "turn/start", {"turn": {"id": "turn-1", "status": "inProgress"}}
+            "turn/start",
+            {"turn": {"id": "turn-1", "status": "inProgress"}},
+            params={
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": (
+                    {"type": "readOnly", "networkAccess": False}
+                    if intent.sandbox == "readOnly"
+                    else {
+                        "type": "workspaceWrite",
+                        "networkAccess": False,
+                        "writableRoots": [intent.cwd],
+                        "excludeSlashTmp": True,
+                        "excludeTmpdirEnvVar": True,
+                    }
+                ),
+                "cwd": intent.cwd,
+                "model": intent.model,
+                "effort": intent.effort,
+            },
         )
         return str(result["turn"]["id"])
 
     def interrupt_turn(self, *, thread_id: str, turn_id: str) -> dict[str, Any]:
-        return self._request("turn/interrupt", {})
+        return self._request(
+            "turn/interrupt",
+            {},
+            params={"threadId": thread_id, "turnId": turn_id},
+        )
 
     def observe_turn(
         self, *, thread_id: str, turn_id: str, timeout_seconds: float
@@ -664,6 +714,21 @@ def test_cli_issue_run_inspect_and_no_resend(
     assert bridge.main(_run_args(value, wrong)) == 2
     assert "do not match" in capsys.readouterr().err
     assert created == []
+    assert bridge.main(
+        [
+            "--root",
+            str(value.root),
+            "inspect",
+            "--task",
+            "task-1",
+            "--launch-id",
+            "launch-1",
+            "--json",
+        ]
+    ) == 0
+    reserved_view = json.loads(capsys.readouterr().out)
+    assert reserved_view["evidence_level"] == "transport_reserved"
+    assert [row["event_type"] for row in reserved_view["lifecycle"]] == ["reserved"]
 
     assert bridge.main(_run_args(value, value.prompt_path)) == 0
     completed = json.loads(capsys.readouterr().out)
@@ -696,9 +761,25 @@ def test_cli_issue_run_inspect_and_no_resend(
         ]
     ) == 0
     inspected = json.loads(capsys.readouterr().out)
-    assert inspected["terminal_receipt_sha256"] == completed["terminal_receipt_sha256"]
-    assert inspected["pending_journal_event_sha256"] is None
-    assert inspected["pending_terminal_receipt_sha256"] is None
+    assert inspected["terminal_receipts"][0]["receipt_sha256"] == completed[
+        "terminal_receipt_sha256"
+    ]
+    assert all(row["classification"] == "committed" for row in inspected["lifecycle"])
+    assert inspected["reservation"]["evidence_level"] == "transport_reserved"
+    assert inspected["evidence_level"] == "codex_runtime_observed"
+    assert inspected["task_completion"] == "not_inferred"
+    assert bridge.main(
+        [
+            "--root",
+            str(value.root),
+            "inspect",
+            "--task",
+            "task-1",
+            "--json",
+        ]
+    ) == 0
+    aggregate = json.loads(capsys.readouterr().out)
+    assert aggregate["launches"] == [inspected]
 
 
 def test_cli_thread_start_loss_is_launch_unknown_and_never_resent(
@@ -1657,10 +1738,16 @@ def test_cli_workspace_write_elevation_is_separate_committed_evidence(
     assert verified["task_completion"] == "not_inferred"
     assert verified["idempotent_replay"] is False
 
-    # Once committed, later worktree drift cannot rewrite the sealed elevation;
-    # inspection/retry returns the existing exact binding without recapture.
+    # Idempotent replay is bound to the exact committed Post A endpoint.  A
+    # current Post B cannot borrow the older committed elevation.
     (value.worktree / "src" / "tracked.txt").write_text(
         "later drift\n", encoding="utf-8"
+    )
+    assert bridge.main(verify_args) == 2
+    assert "differs from committed mutation endpoint" in capsys.readouterr().err
+
+    (value.worktree / "src" / "tracked.txt").write_text(
+        "after\n", encoding="utf-8"
     )
     assert bridge.main(verify_args) == 0
     replay = json.loads(capsys.readouterr().out)

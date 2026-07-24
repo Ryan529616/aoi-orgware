@@ -564,7 +564,12 @@ def validate_materialized_mutation(
         _worktree_for_intent(post_snapshot, checked_intent)
         if endpoint_pre_git_binding(pre) != checked_intent["pre_git_binding"]:
             raise CodexTransportMutationError("materialized pre Git endpoint does not match launch intent")
-        return {"object_sha256": wrapped["object_sha256"], "task_completion": "not_inferred"}
+        return {
+            "object_sha256": wrapped["object_sha256"],
+            "pre_endpoint_sha256": pre["endpoint_sha256"],
+            "post_endpoint_sha256": post["endpoint_sha256"],
+            "task_completion": "not_inferred",
+        }
     except (HarnessError, contracts.CodexTransportContractError, objects.SemanticObjectError, KeyError, TypeError) as exc:
         raise _fail("materialized Codex mutation validation failed", exc) from exc
 
@@ -677,6 +682,8 @@ def inspect_verified_mutation_commit(
             "semantic_object": mutation_object,
             "verified_terminal_receipt": verified_receipt,
             "object_sha256": validated["object_sha256"],
+            "pre_endpoint_sha256": validated["pre_endpoint_sha256"],
+            "post_endpoint_sha256": validated["post_endpoint_sha256"],
             "task_completion": "not_inferred",
         }
     except CodexTransportMutationError:
@@ -725,6 +732,12 @@ def commit_verified_mutation(
             sealed_claim_scope=sealed_claim_scope,
         )
         if existing["status"] == "committed":
+            validate_committed_post_endpoint(
+                existing,
+                post_endpoint=post_endpoint,
+                claims=claims,
+                sealed_claim_scope=sealed_claim_scope,
+            )
             return {**existing, "idempotent_replay": True}
         launch = runtime.load_codex_transport_launch(
             paths, task_id, launch_id, records
@@ -855,6 +868,35 @@ def commit_verified_mutation(
         raise _fail("cannot commit verified Codex mutation", exc) from exc
 
 
+def validate_committed_post_endpoint(
+    committed: Mapping[str, Any],
+    *,
+    post_endpoint: Mapping[str, Any],
+    claims: Sequence[Mapping[str, Any]],
+    sealed_claim_scope: bool = False,
+) -> dict[str, Any]:
+    """Bind an idempotent replay to the exact post endpoint already committed."""
+
+    if (
+        not isinstance(committed, Mapping)
+        or committed.get("status") != "committed"
+        or not isinstance(committed.get("post_endpoint_sha256"), str)
+    ):
+        raise CodexTransportMutationError(
+            "committed mutation inspection lacks a post endpoint binding"
+        )
+    checked_post = validate_git_endpoint(
+        post_endpoint,
+        claims,
+        sealed_claim_scope=sealed_claim_scope,
+    )
+    if checked_post["endpoint_sha256"] != committed["post_endpoint_sha256"]:
+        raise CodexTransportMutationError(
+            "supplied post endpoint differs from committed mutation endpoint"
+        )
+    return checked_post
+
+
 __all__ = [
     "CLAIM_ENDPOINT_SCHEMA", "CODEX_MUTATION_NAMESPACE_KEY", "CODEX_MUTATION_NAMESPACE_VERSION",
     "GIT_ENDPOINT_SCHEMA", "GIT_TREE_SCHEMA", "LEGACY_GIT_ENDPOINT_SCHEMA",
@@ -862,5 +904,6 @@ __all__ = [
     "CodexTransportMutationError", "capture_git_endpoint", "commit_verified_mutation",
     "endpoint_pre_git_binding", "inspect_verified_mutation_commit",
     "load_preserved_git_endpoint", "materialize_verified_mutation",
-    "preserve_git_endpoint", "validate_git_endpoint", "validate_materialized_mutation",
+    "preserve_git_endpoint", "validate_committed_post_endpoint",
+    "validate_git_endpoint", "validate_materialized_mutation",
 ]

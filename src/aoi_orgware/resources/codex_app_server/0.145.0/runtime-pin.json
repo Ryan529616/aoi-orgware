@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "release_tag": "rust-v0.145.0",
   "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
   "codex_cli_version": "codex-cli 0.145.0",
@@ -35,10 +35,11 @@
     ],
     "experimental": false,
     "file_count": 273,
-    "manifest_format": "canonical-json sorted array of path,sha256,size; POSIX relative paths; ASCII; no trailing newline",
-    "manifest_size": 36135,
-    "manifest_sha256": "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262",
-    "combined_v2_schema_size": 491906,
-    "combined_v2_schema_sha256": "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec"
+    "canonicalization": "strict UTF-8 JSON; duplicate keys and non-finite numbers rejected; recursive key sort; compact separators; ASCII escapes; no trailing newline",
+    "manifest_format": "canonical-json sorted array of path,sha256,size; sha256 and size bind canonical per-file JSON; POSIX relative paths; ASCII; no trailing newline",
+    "manifest_size": 36091,
+    "manifest_sha256": "c05875501c6e9a6778cc4afc5488cdb87aae539217121ebbb5c8dd14c79bc025",
+    "combined_v2_schema_size": 269688,
+    "combined_v2_schema_sha256": "27f8d983f19d8e1a5548d52176de0a460fb05aaf2a72110f913c6f4af2bd4f27"
   }
 }

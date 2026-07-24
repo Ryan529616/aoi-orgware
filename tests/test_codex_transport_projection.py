@@ -36,6 +36,13 @@ def runtime_pin() -> dict[str, Any]:
     }
 
 
+def runtime_pin_v2() -> dict[str, Any]:
+    return {
+        **contracts.pinned_runtime_binding_v2(),
+        "executable_path": "C:/AOI/codex-app-server.exe",
+    }
+
+
 def intent() -> dict[str, Any]:
     return {
         "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
@@ -361,3 +368,126 @@ def test_namespace_rejects_identity_tamper_and_bound_overflow() -> None:
     }
     with pytest.raises(projection.CodexTransportProjectionError, match="over bound"):
         projection.validate_codex_transport_namespace(too_many)
+
+
+def test_frozen_v1_terminal_and_projection_hashes_remain_stage_readable() -> None:
+    sealed_intent, sealed_reservation = material()
+    journal: list[dict[str, Any]] = []
+    domain: dict[str, Any] = {}
+    lifecycle = (
+        ("reserved", "reserved", correlation()),
+        ("process_start_pending", "reserved", correlation()),
+        ("process_started", "reserved", correlation()),
+        ("initialize_send_pending", "reserved", correlation()),
+        ("initialized", "reserved", correlation()),
+        ("thread_start_send_pending", "reserved", correlation()),
+        ("thread_started", "thread_started", correlation("thread-1")),
+        ("turn_start_send_pending", "thread_started", correlation("thread-1")),
+        ("turn_started", "turn_started", correlation("thread-1", "turn-1")),
+        ("completed", "completed", correlation("thread-1", "turn-1")),
+    )
+    for event_type, state, runtime in lifecycle:
+        row = sealed_event(
+            sealed_intent,
+            sealed_reservation,
+            journal,
+            event_type,
+            state,
+            runtime,
+        )
+        journal = contracts.append_transport_journal_event(journal, row)
+        domain = advance(domain, sealed_intent, sealed_reservation, journal)
+    assert sealed_intent["intent_sha256"] == "40649722e5443a972fd36fdcabe42d7e2da0dcdc87eddc563b1ef9be6108e59d"
+    assert sealed_reservation["reservation_sha256"] == "8a22dd149643d093e0743a8a2a76651dac2bcc7b349236ce46970e9238268a15"
+    assert [row["event_sha256"] for row in journal] == [
+        "b2e957e5e8ff16974c0daf15dff09fb48fca0777e5e55d2e18b61e925707741a",
+        "474eabe245006b78faf2f782fc41704cb84d03d564ba4d86f8906069b3f3d00c",
+        "59af78fc64f2af6b619ee5ad6fc5923ea2a73948a749bf27f7b08ae8106d7a2c",
+        "174a1436934443cb7b314d1ffe4b2525626756453c3a9dea4657e0a8fcc444d7",
+        "4fe09f16f4bb1d1f0c1a58607fc6ac566a33173b25449b867631ea028b6a8292",
+        "ab211c8360fc9a85aeff18e0afab7c9e29dc4e6bced9992d30fb09fcbaed995c",
+        "91ff95415986d6d9da5b2e22197ea31a1bbcb7c85d1796fd8983f16669a6e3bd",
+        "9dd876244de3d5a7d117291a698268e31dc23370e3079e8b536d59e587cf7c94",
+        "c12f17c6ba730f8f8ea2487b3ee9e089259ec175df141a8ae9188e73c3d0afda",
+        "5103b868e9758ed1dffc15f0af207b9f946e6e686fef1c4c2582c633b0bbe64a",
+    ]
+    terminal_row = domain[projection.CODEX_TRANSPORT_NAMESPACE_KEY]["launches"]["launch-1"]
+    assert terminal_row["schema_version"] == 1
+    assert terminal_row["launch_row_sha256"] == "cff685ed6291a77ab3a558f86eef1d285098904326701550b092c11b7fb5082b"
+    receipt = contracts.seal_terminal_receipt(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_TERMINAL_RECEIPT_V1,
+            "reservation_sha256": sealed_reservation["reservation_sha256"],
+            "journal_head_sha256": journal[-1]["event_sha256"],
+            "terminal_state": "completed",
+            "correlation": correlation("thread-1", "turn-1"),
+            "evidence_level": "codex_runtime_observed",
+            "mutation_verification": {"status": "unavailable", "object_sha256": None},
+        }
+    )
+    assert receipt["receipt_sha256"] == "bfa5b79b7a4ac42cc21eb755db5d6820628e621d2a83598059a4c3c42258607f"
+    published = advance(domain, sealed_intent, sealed_reservation, journal, receipt=receipt)
+    published_row = published[projection.CODEX_TRANSPORT_NAMESPACE_KEY]["launches"]["launch-1"]
+    assert published_row["launch_row_sha256"] == "cd8d8b3c317164bacf3dcd5deab38534dea780f7a69f0e592f4e2ca6cb6e3612"
+    assert projection.validate_codex_transport_namespace(
+        published[projection.CODEX_TRANSPORT_NAMESPACE_KEY]
+    )["launches"]["launch-1"] == published_row
+
+
+def test_namespace_may_hold_frozen_v1_and_new_v2_rows() -> None:
+    v1_intent, v1_reservation = material()
+    v1_reserved = sealed_event(
+        v1_intent, v1_reservation, [], "reserved", "reserved", correlation()
+    )
+    domain = advance({}, v1_intent, v1_reservation, [v1_reserved])
+    v2_intent = contracts.seal_launch_intent(
+        {
+            **intent(),
+            "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2,
+            "network_access": False,
+            "packet_id": "packet-2",
+            "runtime_pin": runtime_pin_v2(),
+        }
+    )
+    v2_reservation = contracts.seal_reservation(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V2,
+            "reservation_id": "reservation-2",
+            "launch_intent_sha256": v2_intent["intent_sha256"],
+            "permit_sha256": SHA_D,
+            "runtime_pin": runtime_pin_v2(),
+            "state": "reserved",
+            "correlation": correlation(),
+            "evidence_level": "transport_reserved",
+        }
+    )
+    raw_reserved = {
+        key: value
+        for key, value in sealed_event(
+            v1_intent, v1_reservation, [], "reserved", "reserved", correlation()
+        ).items()
+        if key != "event_sha256"
+    }
+    raw_reserved.update(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2,
+            "event_id": "v2-reserved",
+            "launch_intent_sha256": v2_intent["intent_sha256"],
+            "reservation_sha256": v2_reservation["reservation_sha256"],
+            "request_witness": None,
+        }
+    )
+    v2_reserved = contracts.seal_journal_event(raw_reserved)
+    mixed_namespace = projection.advance_codex_transport_projection(
+        domain,
+        launch_id="launch-2",
+        intent=v2_intent,
+        reservation=v2_reservation,
+        journal=[v2_reserved],
+    )
+    rows = mixed_namespace[projection.CODEX_TRANSPORT_NAMESPACE_KEY]["launches"]
+    assert rows["launch-1"]["schema_version"] == 1
+    assert rows["launch-2"]["schema_version"] == 2
+    assert rows["launch-2"]["launch_row_sha256"] == (
+        "1cd7942d735f98edcbc63d42ee3ea24b99a681aa3d047d2768e652af321b5357"
+    )

@@ -390,3 +390,32 @@ def test_case_only_rename_and_bounded_endpoint_records(fixture: MutationFixture,
     monkeypatch.setattr(mutation, "MAX_MUTATION_RECORD_BYTES", 1)
     with pytest.raises(mutation.CodexTransportMutationError, match="bounded"):
         fixture.endpoint()
+
+
+def test_public_committed_post_binding_rejects_post_b_replay(
+    fixture: MutationFixture,
+) -> None:
+    post_a = fixture.endpoint()
+    committed = {
+        "status": "committed",
+        "post_endpoint_sha256": post_a["endpoint_sha256"],
+    }
+    assert mutation.validate_committed_post_endpoint(
+        committed,
+        post_endpoint=post_a,
+        claims=fixture.claims,
+    )["endpoint_sha256"] == post_a["endpoint_sha256"]
+    (fixture.root / "src" / "tracked.txt").write_text(
+        "post-b\n", encoding="utf-8"
+    )
+    post_b = fixture.endpoint()
+    assert post_b["endpoint_sha256"] != post_a["endpoint_sha256"]
+    with pytest.raises(
+        mutation.CodexTransportMutationError,
+        match="differs from committed mutation endpoint",
+    ):
+        mutation.validate_committed_post_endpoint(
+            committed,
+            post_endpoint=post_b,
+            claims=fixture.claims,
+        )

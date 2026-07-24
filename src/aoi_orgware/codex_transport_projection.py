@@ -20,6 +20,7 @@ from . import semantic_events as semantic
 
 
 CODEX_TRANSPORT_PROJECTION_VERSION = 1
+CODEX_TRANSPORT_PROJECTION_VERSION_V2 = 2
 CODEX_TRANSPORT_NAMESPACE_KEY = "codex_transport_v1"
 MAX_CODEX_TRANSPORT_LAUNCHES = 128
 MAX_CODEX_TRANSPORT_NAMESPACE_BYTES = 2 * 1024 * 1024
@@ -122,7 +123,10 @@ def _row_base(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _ROW_FIELDS:
         _fail("transport launch row schema is invalid")
     item = _clone(dict(value), maximum=MAX_CODEX_TRANSPORT_NAMESPACE_BYTES)
-    if item["schema_version"] != CODEX_TRANSPORT_PROJECTION_VERSION:
+    if item["schema_version"] not in {
+        CODEX_TRANSPORT_PROJECTION_VERSION,
+        CODEX_TRANSPORT_PROJECTION_VERSION_V2,
+    }:
         _fail("transport launch row version is invalid")
     state = item["state"]
     if not isinstance(state, str) or state not in _KNOWN_STATES:
@@ -145,7 +149,7 @@ def _row_base(value: Mapping[str, Any]) -> dict[str, Any]:
     if state not in _TERMINAL_STATES and receipt is not None:
         _fail("nonterminal transport row cannot name terminal receipt")
     return {
-        "schema_version": CODEX_TRANSPORT_PROJECTION_VERSION,
+        "schema_version": item["schema_version"],
         "launch_id": _launch_id(item["launch_id"]),
         "intent_sha256": _sha(item["intent_sha256"], "transport intent SHA-256"),
         "reservation_sha256": _sha(
@@ -269,6 +273,24 @@ def _checked_material(
         or first["reservation_sha256"] != checked_reservation["reservation_sha256"]
     ):
         _fail("transport journal does not bind launch intent and reservation")
+    version_suffixes = {
+        checked_intent["contract_type"].rsplit("_", 1)[-1],
+        checked_reservation["contract_type"].rsplit("_", 1)[-1],
+        first["contract_type"].rsplit("_", 1)[-1],
+    }
+    if len(version_suffixes) != 1:
+        _fail("transport intent, reservation, and journal versions differ")
+    for event in records:
+        witness = event.get("request_witness")
+        if witness is not None:
+            try:
+                contracts.validate_request_witness_against_launch(
+                    witness, checked_intent, checked_reservation
+                )
+            except contracts.CodexTransportContractError as exc:
+                raise CodexTransportProjectionError(
+                    "transport request witness differs from launch policy"
+                ) from exc
     return checked_intent, checked_reservation, journal_state, records
 
 
@@ -278,12 +300,13 @@ def _row_from_journal(
     reservation_sha256: str,
     state: contracts.JournalState,
     *,
+    projection_version: int,
     receipt_sha256: str | None,
 ) -> dict[str, Any]:
     correlation = state.correlation
     return seal_launch_row(
         {
-            "schema_version": CODEX_TRANSPORT_PROJECTION_VERSION,
+            "schema_version": projection_version,
             "launch_id": launch_id,
             "intent_sha256": intent_sha256,
             "reservation_sha256": reservation_sha256,
@@ -324,6 +347,12 @@ def advance_codex_transport_projection(
     checked_intent, checked_reservation, journal_state, records = _checked_material(
         intent, reservation, journal
     )
+    projection_version = (
+        CODEX_TRANSPORT_PROJECTION_VERSION
+        if records[0]["contract_type"]
+        == contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1
+        else CODEX_TRANSPORT_PROJECTION_VERSION_V2
+    )
     current = namespace["launches"].get(identity)
     if current is None:
         if len(records) != 1 or journal_state.state != "reserved" or terminal_receipt is not None:
@@ -335,10 +364,13 @@ def advance_codex_transport_projection(
             checked_intent["intent_sha256"],
             checked_reservation["reservation_sha256"],
             journal_state,
+            projection_version=projection_version,
             receipt_sha256=None,
         )
     else:
         if (
+            current["schema_version"] != projection_version
+            or
             current["intent_sha256"] != checked_intent["intent_sha256"]
             or current["reservation_sha256"] != checked_reservation["reservation_sha256"]
         ):
@@ -366,6 +398,7 @@ def advance_codex_transport_projection(
                 checked_intent["intent_sha256"],
                 checked_reservation["reservation_sha256"],
                 journal_state,
+                projection_version=projection_version,
                 receipt_sha256=sealed_receipt["receipt_sha256"],
             )
         else:
@@ -382,6 +415,7 @@ def advance_codex_transport_projection(
                 checked_intent["intent_sha256"],
                 checked_reservation["reservation_sha256"],
                 journal_state,
+                projection_version=projection_version,
                 receipt_sha256=None,
             )
     namespace["launches"][identity] = next_row
@@ -398,6 +432,7 @@ def advance_codex_transport_projection(
 __all__ = [
     "CODEX_TRANSPORT_NAMESPACE_KEY",
     "CODEX_TRANSPORT_PROJECTION_VERSION",
+    "CODEX_TRANSPORT_PROJECTION_VERSION_V2",
     "CodexTransportProjectionError",
     "MAX_CODEX_TRANSPORT_LAUNCHES",
     "MAX_CODEX_TRANSPORT_NAMESPACE_BYTES",

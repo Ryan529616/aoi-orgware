@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Sequence
+from typing import Any, Sequence
 
 
 CONSOLE_SCRIPTS = ("aoi", "aoi-codex-hook", "aoi-codex-bridge", "aoi-claude-hook")
@@ -46,24 +46,24 @@ RUNTIME_RESOURCE_MEMBERS = (
     COMBINED_SCHEMA_MEMBER,
 )
 MAX_RUNTIME_RESOURCE_BYTES = 1 * 1024 * 1024
-EXPECTED_RUNTIME_PIN_SIZE = 1848
+EXPECTED_RUNTIME_PIN_SIZE = 2063
 EXPECTED_RUNTIME_PIN_SHA256 = (
-    "190519cd4f6d5792b9fdf26373cdb734fb728fbcc31f84470307b5da4c005fdc"
+    "65b24853d83071a0b7dc745ecb3ae12d425a874b083323985b99c265378fa1c1"
 )
-EXPECTED_SCHEMA_MANIFEST_SIZE = 36135
+EXPECTED_SCHEMA_MANIFEST_SIZE = 36091
 EXPECTED_SCHEMA_MANIFEST_SHA256 = (
-    "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262"
+    "c05875501c6e9a6778cc4afc5488cdb87aae539217121ebbb5c8dd14c79bc025"
 )
-EXPECTED_COMBINED_SCHEMA_SIZE = 491906
+EXPECTED_COMBINED_SCHEMA_SIZE = 269688
 EXPECTED_COMBINED_SCHEMA_SHA256 = (
-    "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec"
+    "27f8d983f19d8e1a5548d52176de0a460fb05aaf2a72110f913c6f4af2bd4f27"
 )
 
 # This is intentionally independent from ``aoi_orgware`` source. A release
 # verifier must anchor the published runtime provenance rather than trust the
 # checkout that invoked it or code contained in a candidate archive.
 EXPECTED_CODEX_RUNTIME_PIN = {
-    "schema_version": 1,
+    "schema_version": 2,
     "release_tag": "rust-v0.145.0",
     "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
     "codex_cli_version": "codex-cli 0.145.0",
@@ -99,7 +99,8 @@ EXPECTED_CODEX_RUNTIME_PIN = {
         ],
         "experimental": False,
         "file_count": 273,
-        "manifest_format": "canonical-json sorted array of path,sha256,size; POSIX relative paths; ASCII; no trailing newline",
+        "canonicalization": "strict UTF-8 JSON; duplicate keys and non-finite numbers rejected; recursive key sort; compact separators; ASCII escapes; no trailing newline",
+        "manifest_format": "canonical-json sorted array of path,sha256,size; sha256 and size bind canonical per-file JSON; POSIX relative paths; ASCII; no trailing newline",
         "manifest_size": EXPECTED_SCHEMA_MANIFEST_SIZE,
         "manifest_sha256": EXPECTED_SCHEMA_MANIFEST_SHA256,
         "combined_v2_schema_size": EXPECTED_COMBINED_SCHEMA_SIZE,
@@ -174,7 +175,7 @@ combined_schema_bytes = resource_bytes(
 )
 try:
     runtime_pin = json.loads(runtime_pin_bytes)
-    runtime_binding = codex_transport_contracts.pinned_runtime_binding()
+    runtime_binding = codex_transport_contracts.pinned_runtime_binding_v2()
 except (json.JSONDecodeError, codex_transport_contracts.CodexTransportContractError) as exc:
     raise SystemExit("installed package Codex runtime binding rejected: " + str(exc))
 
@@ -202,6 +203,40 @@ print(
 
 class VerificationError(RuntimeError):
     """A distribution artifact failed a release-blocking check."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise VerificationError(f"Codex runtime JSON repeats key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise VerificationError(f"Codex runtime JSON contains non-finite number {value}")
+
+
+def _strict_json(payload: bytes, *, subject: str) -> Any:
+    try:
+        return json.loads(
+            payload,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VerificationError(f"{subject} is not strict UTF-8 JSON") from exc
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def _exact_value(actual: object, expected: object) -> bool:
@@ -238,12 +273,25 @@ def _validate_runtime_resource_payload(
         for payload in (runtime_pin_bytes, schema_manifest_bytes, combined_schema_bytes)
     ):
         raise VerificationError(f"{subject} Codex runtime resource exceeds bound")
-    try:
-        runtime_pin = json.loads(runtime_pin_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise VerificationError(f"{subject} runtime-pin.json is invalid JSON") from exc
+    runtime_pin = _strict_json(
+        runtime_pin_bytes, subject=f"{subject} runtime-pin.json"
+    )
+    manifest = _strict_json(
+        schema_manifest_bytes, subject=f"{subject} schema-manifest.json"
+    )
+    combined = _strict_json(
+        combined_schema_bytes,
+        subject=f"{subject} codex_app_server_protocol.v2.schemas.json",
+    )
     if not _exact_value(runtime_pin, EXPECTED_CODEX_RUNTIME_PIN):
         raise VerificationError(f"{subject} Codex runtime provenance differs from 0.145.0")
+    if (
+        _canonical_json(manifest) != schema_manifest_bytes
+        or _canonical_json(combined) != combined_schema_bytes
+    ):
+        raise VerificationError(
+            f"{subject} Codex generated schemas are not canonical JSON"
+        )
     if (
         len(runtime_pin_bytes) != EXPECTED_RUNTIME_PIN_SIZE
         or hashlib.sha256(runtime_pin_bytes).hexdigest()
@@ -268,6 +316,42 @@ def _validate_runtime_resource_payload(
     for name, payload, expected_size, expected_sha256 in expected_digests:
         if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
             raise VerificationError(f"{subject} {name} digest differs from 0.145.0")
+    if not isinstance(manifest, list) or len(manifest) != 273:
+        raise VerificationError(f"{subject} schema manifest shape is invalid")
+    previous: str | None = None
+    combined_entry: dict[str, Any] | None = None
+    for entry in manifest:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "sha256", "size"}
+            or not isinstance(entry["path"], str)
+            or not isinstance(entry["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+            or not isinstance(entry["size"], int)
+            or isinstance(entry["size"], bool)
+            or entry["size"] <= 0
+        ):
+            raise VerificationError(f"{subject} schema manifest entry is invalid")
+        path = entry["path"]
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or pure.as_posix() != path
+            or any(part in {"", ".", ".."} for part in pure.parts)
+            or (previous is not None and path <= previous)
+        ):
+            raise VerificationError(f"{subject} schema manifest path is invalid")
+        previous = path
+        if path == "codex_app_server_protocol.v2.schemas.json":
+            combined_entry = entry
+    if combined_entry != {
+        "path": "codex_app_server_protocol.v2.schemas.json",
+        "sha256": EXPECTED_COMBINED_SCHEMA_SHA256,
+        "size": EXPECTED_COMBINED_SCHEMA_SIZE,
+    }:
+        raise VerificationError(
+            f"{subject} schema manifest does not bind combined v2 schema"
+        )
 
 
 def _unique_archive_member(members: Sequence[str], suffix: str, *, subject: str) -> str:

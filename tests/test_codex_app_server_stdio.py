@@ -285,7 +285,7 @@ def _fake_runtime_pin(
     app_server_version: str = "fake-app-server 0.145.0",
 ) -> RuntimePin:
     executable = Path(sys.executable).resolve()
-    binding = contracts.pinned_runtime_binding()
+    binding = contracts.pinned_runtime_binding_v2()
     return RuntimePin(
         codex_cli_version=str(binding["codex_cli_version"]),
         executable_sha256=executable_sha256 or hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -362,7 +362,7 @@ def _intent_payload(
 ) -> dict[str, object]:
     prompt_bytes = prompt.encode("utf-8")
     return {
-        "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
+        "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2,
         "task_id": "task-1",
         "packet_id": "packet-1",
         "routing_binding": {
@@ -384,8 +384,9 @@ def _intent_payload(
         "requested_effort": "medium",
         "sandbox": sandbox,
         "approval": "never",
+        "network_access": False,
         "runtime_pin": {
-            **contracts.pinned_runtime_binding(),
+            **contracts.pinned_runtime_binding_v2(),
             "executable_path": (executable or Path(sys.executable)).resolve().as_posix(),
         },
         "pre_git_binding": {
@@ -599,6 +600,19 @@ def test_pinned_notification_and_item_allowlists_match_generated_schema() -> Non
     )
 
 
+def test_adapter_loads_only_the_v2_canonical_semantic_schema_pin() -> None:
+    runtime_pin = stdio._load_packaged_runtime_pin()
+    assert runtime_pin.schema_manifest_sha256 == (
+        "c05875501c6e9a6778cc4afc5488cdb87aae539217121ebbb5c8dd14c79bc025"
+    )
+    assert runtime_pin.combined_v2_schema_sha256 == (
+        "27f8d983f19d8e1a5548d52176de0a460fb05aaf2a72110f913c6f4af2bd4f27"
+    )
+    assert runtime_pin.schema_manifest_sha256 != (
+        contracts.pinned_runtime_binding()["schema_manifest_sha256"]
+    )
+
+
 def test_pinned_rpc_envelopes_do_not_define_jsonrpc_member() -> None:
     root = (
         Path(contracts.__file__).resolve().parent
@@ -618,13 +632,13 @@ def test_pinned_rpc_envelopes_do_not_define_jsonrpc_member() -> None:
         for entry in json.loads((root / "schema-manifest.json").read_bytes())
     }
     assert manifest["ClientNotification.json"] == (
-        "a30b3041578845b11add3d07d5a63cd3a12d5d126e87b8c591862b4aeb68d97c"
+        "4446a1ae8626aa55d812836bfc2dae24213500d87c4759af2698f6199ea5b59f"
     )
     assert manifest["v1/InitializeResponse.json"] == (
-        "86dcd236d0576a82c85b933586dc45731260eab1b6edb3447b03f790277322b1"
+        "747401b5d7d395b71e4023d3d13aaaaefb0f6ae044d611675f59838672720c3d"
     )
     assert manifest["JSONRPCResponse.json"] == (
-        "94ecf5e81bdbc2af858afad0044b95c7fb4decf77d7fd7d6321324dad79eef57"
+        "a126ce01981bfe6223693d17fe273cbcd17d27627c324ee82608543578399a8e"
     )
 
 

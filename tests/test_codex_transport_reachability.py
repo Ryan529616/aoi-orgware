@@ -459,7 +459,7 @@ class CodexTransportReachabilityTests(HarnessTestCase):
         endpoint_path.write_bytes(semantic.canonical_json_bytes(endpoint))
         launch_intent = contracts.seal_launch_intent(
             {
-                "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
+                "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2,
                 "task_id": TASK,
                 "packet_id": PACKET,
                 "routing_binding": {
@@ -477,8 +477,9 @@ class CodexTransportReachabilityTests(HarnessTestCase):
                 "requested_effort": "high",
                 "sandbox": "readOnly",
                 "approval": "never",
+                "network_access": False,
                 "runtime_pin": {
-                    **contracts.pinned_runtime_binding(),
+                    **contracts.pinned_runtime_binding_v2(),
                     "executable_path": Path(sys.executable).resolve().as_posix(),
                 },
                 "pre_git_binding": mutation.endpoint_pre_git_binding(endpoint),

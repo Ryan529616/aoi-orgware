@@ -101,15 +101,25 @@ def _stub_canonical_launch_authority(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def pin() -> dict[str, object]:
-    return {**contracts.pinned_runtime_binding(), "executable_path": "C:/AOI/codex-app-server.exe"}
+    return {
+        **contracts.pinned_runtime_binding_v2(),
+        "executable_path": "C:/AOI/codex-app-server.exe",
+    }
+
+
+def pin_v1() -> dict[str, object]:
+    return {
+        **contracts.pinned_runtime_binding(),
+        "executable_path": "C:/AOI/codex-app-server.exe",
+    }
 
 
 def intent() -> dict[str, object]:
     return contracts.seal_launch_intent({
-        "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1, "task_id": "task-1", "packet_id": "packet-1",
+        "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2, "task_id": "task-1", "packet_id": "packet-1",
         "routing_binding": {"kind": "cohort", "cohort_id": "cohort-1", "cohort_sha256": SHA_A, "wave_index": 0, "transport_slot_sha256": SHA_B, "routing_authority_sha256": SHA_C, "transport": "codex", "parent_session_id": "chief-1", "expected_agent_type": "worker"},
         "expected_semantic_head_sha256": SHA_D, "prompt_sha256": SHA_A, "prompt_size_bytes": 1, "cwd": "C:/scratch/aoi",
-        "requested_model": "gpt-5.6-terra", "requested_effort": "high", "sandbox": "readOnly", "approval": "never", "runtime_pin": pin(),
+        "requested_model": "gpt-5.6-terra", "requested_effort": "high", "sandbox": "readOnly", "approval": "never", "network_access": False, "runtime_pin": pin(),
         "pre_git_binding": {"git_head_sha256": SHA_A, "git_tree_sha256": SHA_B, "git_status_sha256": SHA_C, "claim_coverage_sha256": SHA_D},
     })
 
@@ -148,6 +158,34 @@ def test_prepare_binds_exact_cohort_route_and_one_reserved_event() -> None:
     assert tx["result_domain"]["packets"][0]["dispatch_version"] == 2
 
 
+def test_prepare_rejects_new_v1_launch_but_v1_contracts_remain_readable() -> None:
+    events = chain()
+    head = str(events[-1]["event_sha256"])
+    raw = intent()
+    raw["contract_type"] = contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1
+    raw.pop("network_access")
+    raw["runtime_pin"] = pin_v1()
+    raw["expected_semantic_head_sha256"] = head
+    sealed = contracts.seal_launch_intent(
+        {key: raw[key] for key in raw if key != "intent_sha256"}
+    )
+    assert contracts.validate_launch_intent(sealed) == sealed
+    decision, permit = decision_and_permit(head, sealed)
+    with pytest.raises(runtime.CodexTransportRuntimeError, match="frozen read-only"):
+        runtime.prepare_codex_launch_transaction(
+            task_id="task-1",
+            event_chain=events,
+            intent=sealed,
+            decision=decision,
+            permit=permit,
+            launch_authority_contract=launch_authority_for(sealed),
+            launch_id="launch-1",
+            command_id="reserve-v1",
+            recorded_at="2026-07-20T00:01:00Z",
+            current_time=NOW,
+        )
+
+
 def test_prepare_fails_closed_for_head_drift_and_permit_replay_shape() -> None:
     events = chain(); head = str(events[-1]["event_sha256"])
     raw = intent(); raw["expected_semantic_head_sha256"] = head
@@ -161,7 +199,7 @@ def test_prepare_fails_closed_for_head_drift_and_permit_replay_shape() -> None:
 
 def test_pending_thread_start_requires_exact_request_and_unknown_is_not_retryable() -> None:
     sealed = intent()
-    reservation = contracts.seal_reservation({"contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1, "reservation_id": "r-1", "launch_intent_sha256": sealed["intent_sha256"], "permit_sha256": SHA_A, "runtime_pin": pin(), "state": "reserved", "correlation": {"thread_id": None, "turn_id": None, "item_id": None}})
+    reservation = contracts.seal_reservation({"contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V2, "reservation_id": "r-1", "launch_intent_sha256": sealed["intent_sha256"], "permit_sha256": SHA_A, "runtime_pin": pin(), "state": "reserved", "correlation": {"thread_id": None, "turn_id": None, "item_id": None}, "evidence_level": "transport_reserved"})
     with pytest.raises(runtime.CodexTransportRuntimeError, match="request milestone"):
         runtime._event_for(sealed, reservation, event_id="x", sequence=1, previous=contracts.ZERO_SHA256, event_type="thread_start_send_pending", correlation={"thread_id": None, "turn_id": None, "item_id": None})
 
@@ -194,13 +232,14 @@ def test_runtime_event_factory_uses_contract_response_method_mapping(
     sealed = intent()
     reservation = contracts.seal_reservation(
         {
-            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1,
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V2,
             "reservation_id": "r-1",
             "launch_intent_sha256": sealed["intent_sha256"],
             "permit_sha256": SHA_A,
             "runtime_pin": pin(),
             "state": "reserved",
             "correlation": {"thread_id": None, "turn_id": None, "item_id": None},
+            "evidence_level": "transport_reserved",
         }
     )
     event = runtime._event_for(
@@ -674,7 +713,7 @@ def test_process_start_window_uses_earliest_permit_or_arm_expiry() -> None:
     short_permit = permits.seal_transition_permit(permit_base)
     reservation = contracts.seal_reservation(
         {
-            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1,
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V2,
             "reservation_id": "launch-1",
             "launch_intent_sha256": sealed["intent_sha256"],
             "permit_sha256": short_permit["permit_sha256"],
@@ -685,6 +724,7 @@ def test_process_start_window_uses_earliest_permit_or_arm_expiry() -> None:
                 "turn_id": None,
                 "item_id": None,
             },
+            "evidence_level": "transport_reserved",
         }
     )
     launch = {
@@ -1094,6 +1134,35 @@ def test_filesystem_milestone_and_terminal_publication_recover_exactly(
         assert loaded["task_completion"] == "not_inferred"
 
         prior = loaded["journal"]
+        pending_witness = contracts.seal_request_witness(
+            {
+                "schema_version": 1,
+                "launch_intent_sha256": loaded["intent"]["intent_sha256"],
+                "permit_sha256": loaded["reservation"]["permit_sha256"],
+                "expected_semantic_head_sha256": loaded["intent"][
+                    "expected_semantic_head_sha256"
+                ],
+                "request_id": "process:launch-1",
+                "wire_method": "process/start",
+                "request_envelope_sha256": SHA_A,
+                "request_size_bytes": 42,
+                "prompt_sha256": loaded["intent"]["prompt_sha256"],
+                "prompt_size_bytes": loaded["intent"]["prompt_size_bytes"],
+                "cwd": loaded["intent"]["cwd"],
+                "requested_model": loaded["intent"]["requested_model"],
+                "requested_effort": loaded["intent"]["requested_effort"],
+                "approval": loaded["intent"]["approval"],
+                "sandbox": loaded["intent"]["sandbox"],
+                "network_access": False,
+                "runtime_pin": loaded["intent"]["runtime_pin"],
+                "thread_start_config": None,
+                "correlation": {
+                    "thread_id": None,
+                    "turn_id": None,
+                    "item_id": None,
+                },
+            }
+        )
         pending = runtime._event_for(
             loaded["intent"],
             loaded["reservation"],
@@ -1105,6 +1174,7 @@ def test_filesystem_milestone_and_terminal_publication_recover_exactly(
             request_id="process:launch-1",
             request_bytes_sha256=SHA_A,
             payload_size_bytes=42,
+            request_witness=pending_witness,
         )
 
         original_append = store.append_semantic_transition
@@ -1189,7 +1259,7 @@ def test_filesystem_milestone_and_terminal_publication_recover_exactly(
         terminal_state = contracts.validate_transport_journal(terminal_journal)
         receipt = contracts.seal_terminal_receipt(
             {
-                "contract_type": contracts.CODEX_TRANSPORT_TERMINAL_RECEIPT_V1,
+                "contract_type": contracts.CODEX_TRANSPORT_TERMINAL_RECEIPT_V2,
                 "reservation_sha256": loaded["reservation"]["reservation_sha256"],
                 "journal_head_sha256": terminal_state.head_sha256,
                 "terminal_state": "failed",

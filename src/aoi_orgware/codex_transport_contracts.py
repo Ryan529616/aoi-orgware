@@ -28,11 +28,15 @@ MAX_WIRE_PAYLOAD_BYTES = 4 * 1024 * 1024
 ZERO_SHA256 = "0" * 64
 
 CODEX_TRANSPORT_LAUNCH_INTENT_V1 = "codex_transport_launch_intent_v1"
+CODEX_TRANSPORT_LAUNCH_INTENT_V2 = "codex_transport_launch_intent_v2"
 CODEX_LAUNCH_AUTHORITY_V1 = "codex_launch_authority_v1"
 CODEX_PACKET_TRANSPORT_OWNERSHIP_V1 = "codex_packet_transport_ownership_v1"
 CODEX_TRANSPORT_RESERVATION_V1 = "codex_transport_reservation_v1"
+CODEX_TRANSPORT_RESERVATION_V2 = "codex_transport_reservation_v2"
 CODEX_TRANSPORT_JOURNAL_EVENT_V1 = "codex_transport_journal_event_v1"
+CODEX_TRANSPORT_JOURNAL_EVENT_V2 = "codex_transport_journal_event_v2"
 CODEX_TRANSPORT_TERMINAL_RECEIPT_V1 = "codex_transport_terminal_receipt_v1"
+CODEX_TRANSPORT_TERMINAL_RECEIPT_V2 = "codex_transport_terminal_receipt_v2"
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _STATES = frozenset(
@@ -184,6 +188,7 @@ _INTENT_FIELDS = {
     "runtime_pin",
     "pre_git_binding",
 }
+_INTENT_FIELDS_V2 = _INTENT_FIELDS | {"network_access"}
 _LAUNCH_AUTHORITY_FIELDS = {
     "contract_type",
     "task_id",
@@ -224,6 +229,7 @@ _RESERVATION_FIELDS = {
     "state",
     "correlation",
 }
+_RESERVATION_FIELDS_V2 = _RESERVATION_FIELDS | {"evidence_level"}
 _EVENT_FIELDS = {
     "contract_type",
     "event_id",
@@ -246,6 +252,7 @@ _EVENT_FIELDS = {
     "fault_evidence_size_bytes",
     "correlation",
 }
+_EVENT_FIELDS_V2 = _EVENT_FIELDS | {"request_witness"}
 _TERMINAL_FIELDS = {
     "contract_type",
     "reservation_sha256",
@@ -254,6 +261,36 @@ _TERMINAL_FIELDS = {
     "correlation",
     "evidence_level",
     "mutation_verification",
+}
+_REQUEST_WITNESS_FIELDS = {
+    "schema_version",
+    "launch_intent_sha256",
+    "permit_sha256",
+    "expected_semantic_head_sha256",
+    "request_id",
+    "wire_method",
+    "request_envelope_sha256",
+    "request_size_bytes",
+    "prompt_sha256",
+    "prompt_size_bytes",
+    "cwd",
+    "requested_model",
+    "requested_effort",
+    "approval",
+    "sandbox",
+    "network_access",
+    "runtime_pin",
+    "thread_start_config",
+    "correlation",
+}
+_THREAD_START_CONFIG = {
+    "web_search": "disabled",
+    "features": {
+        "apps": False,
+        "remote_plugin": False,
+        "multi_agent": False,
+    },
+    "apps": {"_default": {"enabled": False}},
 }
 
 
@@ -445,7 +482,29 @@ def _correlation(value: Any, label: str = "correlation") -> dict[str, str | None
     }
 
 
-def _runtime_pin(value: Any) -> dict[str, Any]:
+def _network_denied(value: Any, label: str = "network_access") -> bool:
+    if value is not False:
+        _fail(f"{label} must be false")
+    return False
+
+
+def _thread_start_config(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        normalized = json.loads(
+            canonical_json_bytes(value, max_bytes=MAX_CONTRACT_BYTES)
+        )
+    except (SemanticEventError, TypeError, ValueError) as exc:
+        raise CodexTransportContractError(
+            "request witness thread_start_config is not bounded canonical JSON"
+        ) from exc
+    if normalized != _THREAD_START_CONFIG:
+        _fail("request witness thread_start_config is outside the closed allowlist")
+    return normalized
+
+
+def _runtime_pin_shape(value: Any) -> dict[str, Any]:
     fields = {
         "codex_cli_version",
         "codex_app_server_version",
@@ -467,9 +526,24 @@ def _runtime_pin(value: Any) -> dict[str, Any]:
             item["executable_size_bytes"], "runtime_pin.executable_size_bytes", 2**63 - 1
         ),
     }
+    return result
+
+
+def _runtime_pin_v1(value: Any) -> dict[str, Any]:
+    result = _runtime_pin_shape(value)
     expected = pinned_runtime_binding()
     if {key: result[key] for key in expected} != expected:
-        _fail("runtime_pin differs from packaged stable Codex App Server pin")
+        _fail("runtime_pin differs from frozen V1 Codex App Server pin")
+    return result
+
+
+def _runtime_pin_v2(value: Any) -> dict[str, Any]:
+    result = _runtime_pin_shape(value)
+    expected = pinned_runtime_binding_v2()
+    if {key: result[key] for key in expected} != expected:
+        _fail(
+            "runtime_pin differs from canonical-semantic V2 Codex App Server pin"
+        )
     return result
 
 
@@ -480,9 +554,16 @@ def _pre_git_binding(value: Any) -> dict[str, str]:
 
 
 def _intent_base(value: Any) -> dict[str, Any]:
-    item = _object(value, _INTENT_FIELDS, "launch intent")
-    if item["contract_type"] != CODEX_TRANSPORT_LAUNCH_INTENT_V1:
+    if not isinstance(value, Mapping):
+        _fail("launch intent must be an object")
+    contract_type = value.get("contract_type")
+    if contract_type == CODEX_TRANSPORT_LAUNCH_INTENT_V1:
+        fields = _INTENT_FIELDS
+    elif contract_type == CODEX_TRANSPORT_LAUNCH_INTENT_V2:
+        fields = _INTENT_FIELDS_V2
+    else:
         _fail("launch intent contract_type is invalid")
+    item = _object(value, fields, "launch intent")
     requested_model = _text(item["requested_model"], "requested_model")
     requested_effort = _text(item["requested_effort"], "requested_effort")
     sandbox = _text(item["sandbox"], "sandbox")
@@ -495,8 +576,8 @@ def _intent_base(value: Any) -> dict[str, Any]:
         _fail("sandbox is not an approved App Server sandbox")
     if approval != "never":
         _fail("approval must be never for the transport bridge")
-    return {
-        "contract_type": CODEX_TRANSPORT_LAUNCH_INTENT_V1,
+    result = {
+        "contract_type": contract_type,
         "task_id": _text(item["task_id"], "task_id"),
         "packet_id": _text(item["packet_id"], "packet_id"),
         "routing_binding": _routing_binding(item["routing_binding"]),
@@ -508,9 +589,16 @@ def _intent_base(value: Any) -> dict[str, Any]:
         "requested_effort": requested_effort,
         "sandbox": sandbox,
         "approval": approval,
-        "runtime_pin": _runtime_pin(item["runtime_pin"]),
+        "runtime_pin": (
+            _runtime_pin_v1(item["runtime_pin"])
+            if contract_type == CODEX_TRANSPORT_LAUNCH_INTENT_V1
+            else _runtime_pin_v2(item["runtime_pin"])
+        ),
         "pre_git_binding": _pre_git_binding(item["pre_git_binding"]),
     }
+    if contract_type == CODEX_TRANSPORT_LAUNCH_INTENT_V2:
+        result["network_access"] = _network_denied(item["network_access"])
+    return result
 
 
 def launch_intent_sha256(intent: Mapping[str, Any]) -> str:
@@ -525,9 +613,19 @@ def seal_launch_intent(intent: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def validate_launch_intent(intent: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(intent, Mapping) or set(intent) != _INTENT_FIELDS | {"intent_sha256"}:
+    if not isinstance(intent, Mapping):
         _fail("sealed launch intent schema is invalid")
-    base = _intent_base({field: intent[field] for field in _INTENT_FIELDS})
+    contract_type = intent.get("contract_type")
+    fields = (
+        _INTENT_FIELDS
+        if contract_type == CODEX_TRANSPORT_LAUNCH_INTENT_V1
+        else _INTENT_FIELDS_V2
+        if contract_type == CODEX_TRANSPORT_LAUNCH_INTENT_V2
+        else set()
+    )
+    if not fields or set(intent) != fields | {"intent_sha256"}:
+        _fail("sealed launch intent schema is invalid")
+    base = _intent_base({field: intent[field] for field in fields})
     supplied = _sha256(intent["intent_sha256"], "intent_sha256")
     expected = _canonical_hash(base, "launch intent")
     if supplied != expected:
@@ -683,21 +781,39 @@ def validate_packet_transport_ownership(
 
 
 def _reservation_base(value: Any) -> dict[str, Any]:
-    item = _object(value, _RESERVATION_FIELDS, "reservation receipt")
-    if item["contract_type"] != CODEX_TRANSPORT_RESERVATION_V1 or item["state"] != "reserved":
+    if not isinstance(value, Mapping):
+        _fail("reservation receipt must be an object")
+    contract_type = value.get("contract_type")
+    if contract_type == CODEX_TRANSPORT_RESERVATION_V1:
+        fields = _RESERVATION_FIELDS
+    elif contract_type == CODEX_TRANSPORT_RESERVATION_V2:
+        fields = _RESERVATION_FIELDS_V2
+    else:
+        _fail("reservation receipt contract_type is invalid")
+    item = _object(value, fields, "reservation receipt")
+    if item["state"] != "reserved":
         _fail("reservation receipt must be reserved")
     correlation = _correlation(item["correlation"])
     if any(value is not None for value in correlation.values()):
         _fail("reserved receipt cannot name a runtime object")
-    return {
-        "contract_type": CODEX_TRANSPORT_RESERVATION_V1,
+    result = {
+        "contract_type": contract_type,
         "reservation_id": _text(item["reservation_id"], "reservation_id"),
         "launch_intent_sha256": _sha256(item["launch_intent_sha256"], "launch_intent_sha256"),
         "permit_sha256": _sha256(item["permit_sha256"], "permit_sha256"),
-        "runtime_pin": _runtime_pin(item["runtime_pin"]),
+        "runtime_pin": (
+            _runtime_pin_v1(item["runtime_pin"])
+            if contract_type == CODEX_TRANSPORT_RESERVATION_V1
+            else _runtime_pin_v2(item["runtime_pin"])
+        ),
         "state": "reserved",
         "correlation": correlation,
     }
+    if contract_type == CODEX_TRANSPORT_RESERVATION_V2:
+        if item["evidence_level"] != "transport_reserved":
+            _fail("V2 reservation evidence_level must be transport_reserved")
+        result["evidence_level"] = "transport_reserved"
+    return result
 
 
 def reservation_sha256(receipt: Mapping[str, Any]) -> str:
@@ -710,9 +826,19 @@ def seal_reservation(receipt: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def validate_reservation(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(receipt, Mapping) or set(receipt) != _RESERVATION_FIELDS | {"reservation_sha256"}:
+    if not isinstance(receipt, Mapping):
         _fail("sealed reservation schema is invalid")
-    base = _reservation_base({field: receipt[field] for field in _RESERVATION_FIELDS})
+    contract_type = receipt.get("contract_type")
+    fields = (
+        _RESERVATION_FIELDS
+        if contract_type == CODEX_TRANSPORT_RESERVATION_V1
+        else _RESERVATION_FIELDS_V2
+        if contract_type == CODEX_TRANSPORT_RESERVATION_V2
+        else set()
+    )
+    if not fields or set(receipt) != fields | {"reservation_sha256"}:
+        _fail("sealed reservation schema is invalid")
+    base = _reservation_base({field: receipt[field] for field in fields})
     supplied = _sha256(receipt["reservation_sha256"], "reservation_sha256")
     expected = _canonical_hash(base, "reservation receipt")
     if supplied != expected:
@@ -731,13 +857,159 @@ def validate_reservation_against_intent(
         _fail("reservation does not bind the supplied launch intent")
     if normalized_receipt["runtime_pin"] != normalized_intent["runtime_pin"]:
         _fail("reservation runtime pin does not match launch intent")
+    versions = (
+        normalized_receipt["contract_type"].rsplit("_", 1)[-1],
+        normalized_intent["contract_type"].rsplit("_", 1)[-1],
+    )
+    if versions[0] != versions[1]:
+        _fail("reservation and launch intent contract versions differ")
     return normalized_receipt
 
 
+def _request_witness_base(value: Any) -> dict[str, Any]:
+    item = _object(value, _REQUEST_WITNESS_FIELDS, "request witness")
+    if item["schema_version"] != 1:
+        _fail("request witness schema_version is invalid")
+    method = _text(item["wire_method"], "request witness wire_method")
+    if method not in {
+        "process/start",
+        "initialize",
+        "model/list",
+        "thread/start",
+        "turn/start",
+        "turn/interrupt",
+    }:
+        _fail("request witness wire_method is invalid")
+    config = _thread_start_config(item["thread_start_config"])
+    if (method == "thread/start") != (config is not None):
+        _fail("request witness thread_start_config does not match its method")
+    requested_model = _text(
+        item["requested_model"], "request witness requested_model"
+    )
+    requested_effort = _text(
+        item["requested_effort"], "request witness requested_effort"
+    )
+    sandbox = _text(item["sandbox"], "request witness sandbox")
+    approval = _text(item["approval"], "request witness approval")
+    if requested_model not in _REQUESTED_MODELS:
+        _fail("request witness requested_model is invalid")
+    if requested_effort not in _REQUESTED_EFFORTS:
+        _fail("request witness requested_effort is invalid")
+    if sandbox not in _SANDBOXES or approval != "never":
+        _fail("request witness sandbox/approval policy is invalid")
+    return {
+        "schema_version": 1,
+        "launch_intent_sha256": _sha256(
+            item["launch_intent_sha256"],
+            "request witness launch_intent_sha256",
+        ),
+        "permit_sha256": _sha256(
+            item["permit_sha256"], "request witness permit_sha256"
+        ),
+        "expected_semantic_head_sha256": _sha256(
+            item["expected_semantic_head_sha256"],
+            "request witness expected_semantic_head_sha256",
+        ),
+        "request_id": _text(item["request_id"], "request witness request_id"),
+        "wire_method": method,
+        "request_envelope_sha256": _sha256(
+            item["request_envelope_sha256"],
+            "request witness request_envelope_sha256",
+        ),
+        "request_size_bytes": _bounded_positive_int(
+            item["request_size_bytes"],
+            "request witness request_size_bytes",
+            MAX_WIRE_PAYLOAD_BYTES,
+        ),
+        "prompt_sha256": _sha256(
+            item["prompt_sha256"], "request witness prompt_sha256"
+        ),
+        "prompt_size_bytes": _bounded_positive_int(
+            item["prompt_size_bytes"],
+            "request witness prompt_size_bytes",
+            MAX_PROMPT_BYTES,
+        ),
+        "cwd": _absolute_path(item["cwd"], "request witness cwd"),
+        "requested_model": requested_model,
+        "requested_effort": requested_effort,
+        "approval": approval,
+        "sandbox": sandbox,
+        "network_access": _network_denied(
+            item["network_access"], "request witness network_access"
+        ),
+        "runtime_pin": _runtime_pin_shape(item["runtime_pin"]),
+        "thread_start_config": config,
+        "correlation": _correlation(
+            item["correlation"], "request witness correlation"
+        ),
+    }
+
+
+def seal_request_witness(value: Mapping[str, Any]) -> dict[str, Any]:
+    base = _request_witness_base(value)
+    return {
+        **base,
+        "witness_sha256": _canonical_hash(base, "request witness"),
+    }
+
+
+def validate_request_witness(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != (
+        _REQUEST_WITNESS_FIELDS | {"witness_sha256"}
+    ):
+        _fail("sealed request witness schema is invalid")
+    base = _request_witness_base(
+        {field: value[field] for field in _REQUEST_WITNESS_FIELDS}
+    )
+    supplied = _sha256(value["witness_sha256"], "request witness SHA-256")
+    expected = _canonical_hash(base, "request witness")
+    if supplied != expected:
+        _fail("request witness SHA-256 does not match contents")
+    return {**base, "witness_sha256": expected}
+
+
+def validate_request_witness_against_launch(
+    value: Mapping[str, Any],
+    intent: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+) -> dict[str, Any]:
+    witness = validate_request_witness(value)
+    checked_intent = validate_launch_intent(intent)
+    checked_reservation = validate_reservation_against_intent(
+        reservation, checked_intent
+    )
+    expected = {
+        "launch_intent_sha256": checked_intent["intent_sha256"],
+        "permit_sha256": checked_reservation["permit_sha256"],
+        "expected_semantic_head_sha256": checked_intent[
+            "expected_semantic_head_sha256"
+        ],
+        "prompt_sha256": checked_intent["prompt_sha256"],
+        "prompt_size_bytes": checked_intent["prompt_size_bytes"],
+        "cwd": checked_intent["cwd"],
+        "requested_model": checked_intent["requested_model"],
+        "requested_effort": checked_intent["requested_effort"],
+        "approval": checked_intent["approval"],
+        "sandbox": checked_intent["sandbox"],
+        "network_access": checked_intent.get("network_access"),
+        "runtime_pin": checked_intent["runtime_pin"],
+    }
+    if any(witness[key] != value for key, value in expected.items()):
+        _fail("request witness differs from immutable launch policy")
+    return witness
+
+
 def _event_base(value: Any) -> dict[str, Any]:
-    item = _object(value, _EVENT_FIELDS, "transport journal event")
-    if item["contract_type"] != CODEX_TRANSPORT_JOURNAL_EVENT_V1:
+    if not isinstance(value, Mapping):
+        _fail("transport journal event must be an object")
+    contract_type = value.get("contract_type")
+    if contract_type == CODEX_TRANSPORT_JOURNAL_EVENT_V1:
+        fields = _EVENT_FIELDS
+    elif contract_type == CODEX_TRANSPORT_JOURNAL_EVENT_V2:
+        fields = _EVENT_FIELDS_V2
+    else:
         _fail("journal event contract_type is invalid")
+    item = _object(value, fields, "transport journal event")
     if not isinstance(item["sequence"], int) or isinstance(item["sequence"], bool) or not 1 <= item["sequence"] <= MAX_JOURNAL_EVENTS:
         _fail("journal event sequence is invalid")
     event_type = item["event_type"]
@@ -905,8 +1177,30 @@ def _event_base(value: Any) -> dict[str, Any]:
         _fail("runtime event must bind a nonzero wire payload size")
     if has_fault and payload_size_bytes != fault_evidence_size_bytes:
         _fail("fault payload size differs from fault evidence size")
-    return {
-        "contract_type": CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+    request_witness: dict[str, Any] | None = None
+    if contract_type == CODEX_TRANSPORT_JOURNAL_EVENT_V2:
+        raw_witness = item["request_witness"]
+        if request_bound:
+            if not isinstance(raw_witness, Mapping):
+                _fail("V2 request-bound event requires a sealed request witness")
+            request_witness = validate_request_witness(raw_witness)
+            if (
+                request_witness["launch_intent_sha256"]
+                != item["launch_intent_sha256"]
+                or request_witness["request_id"] != request_id
+                or request_witness["request_envelope_sha256"]
+                != request_bytes_sha256
+                or request_witness["wire_method"] != wire_method
+                or request_witness["correlation"]
+                != _correlation(item["correlation"])
+            ):
+                _fail("V2 request witness does not bind its journal event")
+            if pending and request_witness["request_size_bytes"] != payload_size_bytes:
+                _fail("V2 request witness size differs from pending event payload")
+        elif raw_witness is not None:
+            _fail("V2 non-request event cannot carry a request witness")
+    result = {
+        "contract_type": contract_type,
         "event_id": _text(item["event_id"], "event_id"),
         "sequence": item["sequence"],
         "prev_event_sha256": _sha256(item["prev_event_sha256"], "prev_event_sha256"),
@@ -927,6 +1221,9 @@ def _event_base(value: Any) -> dict[str, Any]:
         "fault_evidence_size_bytes": fault_evidence_size_bytes,
         "correlation": _correlation(item["correlation"]),
     }
+    if contract_type == CODEX_TRANSPORT_JOURNAL_EVENT_V2:
+        result["request_witness"] = request_witness
+    return result
 
 
 def journal_event_sha256(event: Mapping[str, Any]) -> str:
@@ -939,9 +1236,19 @@ def seal_journal_event(event: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def validate_journal_event(event: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(event, Mapping) or set(event) != _EVENT_FIELDS | {"event_sha256"}:
+    if not isinstance(event, Mapping):
         _fail("sealed journal event schema is invalid")
-    base = _event_base({field: event[field] for field in _EVENT_FIELDS})
+    contract_type = event.get("contract_type")
+    fields = (
+        _EVENT_FIELDS
+        if contract_type == CODEX_TRANSPORT_JOURNAL_EVENT_V1
+        else _EVENT_FIELDS_V2
+        if contract_type == CODEX_TRANSPORT_JOURNAL_EVENT_V2
+        else set()
+    )
+    if not fields or set(event) != fields | {"event_sha256"}:
+        _fail("sealed journal event schema is invalid")
+    base = _event_base({field: event[field] for field in fields})
     supplied = _sha256(event["event_sha256"], "event_sha256")
     expected = _canonical_hash(base, "transport journal event")
     if supplied != expected:
@@ -1098,8 +1405,14 @@ def validate_transport_journal(events: Sequence[Mapping[str, Any]]) -> JournalSt
     event_ids: set[str] = set()
     item_lifecycle: dict[str, str] = {}
     binding: tuple[str, str] | None = None
+    journal_contract_type: str | None = None
+    last_request_witness_sha256: str | None = None
     for raw in events:
         event = validate_journal_event(raw)
+        if journal_contract_type is None:
+            journal_contract_type = event["contract_type"]
+        elif event["contract_type"] != journal_contract_type:
+            _fail("transport journal cannot mix V1 and V2 event contracts")
         if event["event_id"] in event_ids:
             _fail("stored journal contains a duplicate event_id")
         event_ids.add(event["event_id"])
@@ -1109,6 +1422,22 @@ def validate_transport_journal(events: Sequence[Mapping[str, Any]]) -> JournalSt
         elif binding != current_binding:
             _fail("journal event does not bind the same intent/reservation")
         state = _transition(state, event)
+        witness = event.get("request_witness")
+        if event["event_type"].endswith("_pending"):
+            last_request_witness_sha256 = (
+                None if witness is None else witness["witness_sha256"]
+            )
+        elif (
+            event["event_type"] == "launch_unknown"
+            and event["contract_type"] == CODEX_TRANSPORT_JOURNAL_EVENT_V2
+        ):
+            if (
+                witness is None
+                or witness["witness_sha256"] != last_request_witness_sha256
+            ):
+                _fail(
+                    "launch_unknown must preserve the exact pending request witness"
+                )
         if event["event_type"] == "item_started":
             item_id = event["correlation"]["item_id"]
             assert item_id is not None
@@ -1221,7 +1550,11 @@ def _mutation_verification_reference(
 
 def _terminal_base(value: Any) -> dict[str, Any]:
     item = _object(value, _TERMINAL_FIELDS, "terminal receipt")
-    if item["contract_type"] != CODEX_TRANSPORT_TERMINAL_RECEIPT_V1:
+    contract_type = item["contract_type"]
+    if contract_type not in {
+        CODEX_TRANSPORT_TERMINAL_RECEIPT_V1,
+        CODEX_TRANSPORT_TERMINAL_RECEIPT_V2,
+    }:
         _fail("terminal receipt contract_type is invalid")
     terminal_state = item["terminal_state"]
     evidence_level = item["evidence_level"]
@@ -1249,7 +1582,7 @@ def _terminal_base(value: Any) -> dict[str, Any]:
     ):
         _fail("runtime_unknown terminal receipt requires the known thread and turn")
     return {
-        "contract_type": CODEX_TRANSPORT_TERMINAL_RECEIPT_V1,
+        "contract_type": contract_type,
         "reservation_sha256": _sha256(item["reservation_sha256"], "reservation_sha256"),
         "journal_head_sha256": _sha256(item["journal_head_sha256"], "journal_head_sha256"),
         "terminal_state": terminal_state,
@@ -1294,6 +1627,13 @@ def validate_terminal_receipt_against_journal(
     normalized = validate_terminal_receipt(receipt)
     journal = validate_transport_journal(events)
     first = validate_journal_event(events[0])
+    expected_terminal_contract = (
+        CODEX_TRANSPORT_TERMINAL_RECEIPT_V1
+        if first["contract_type"] == CODEX_TRANSPORT_JOURNAL_EVENT_V1
+        else CODEX_TRANSPORT_TERMINAL_RECEIPT_V2
+    )
+    if normalized["contract_type"] != expected_terminal_contract:
+        _fail("terminal receipt and journal contract versions differ")
     if normalized["reservation_sha256"] != first["reservation_sha256"]:
         _fail("terminal receipt reservation does not match journal")
     if normalized["journal_head_sha256"] != journal.head_sha256:
@@ -1309,8 +1649,18 @@ def _resource_root() -> Path:
     return Path(__file__).resolve().parent / "resources" / "codex_app_server" / "0.145.0"
 
 
-_PACKAGED_RUNTIME_PIN_0_145_0: dict[str, Any] = {
-    "schema_version": 1,
+_FROZEN_V1_RUNTIME_BINDING: dict[str, str | int] = {
+    "codex_cli_version": "codex-cli 0.145.0",
+    "codex_app_server_version": "codex-app-server 0.145.0",
+    "app_server_executable_sha256": "5163c75ed88d460b35b03c8d8f4ef190b3bdd09971d7ac2bd90b48c435f1cf14",
+    "executable_size_bytes": 299117872,
+    "schema_manifest_sha256": "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262",
+    "combined_v2_schema_sha256": "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec",
+}
+
+
+_PACKAGED_RUNTIME_PIN_0_145_0_V2: dict[str, Any] = {
+    "schema_version": 2,
     "release_tag": "rust-v0.145.0",
     "release_url": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
     "codex_cli_version": "codex-cli 0.145.0",
@@ -1341,11 +1691,12 @@ _PACKAGED_RUNTIME_PIN_0_145_0: dict[str, Any] = {
         "generator_arguments": ["app-server", "generate-json-schema", "--out", "<fresh-empty-directory>"],
         "experimental": False,
         "file_count": 273,
-        "manifest_format": "canonical-json sorted array of path,sha256,size; POSIX relative paths; ASCII; no trailing newline",
-        "manifest_size": 36135,
-        "manifest_sha256": "6b8bfa74e475c6c9b46926c46f287f47873d188b13ab3df8db4633602db73262",
-        "combined_v2_schema_size": 491906,
-        "combined_v2_schema_sha256": "6253fd70273c2f33c42d0b6090eac771580c994b3c6eed4277598de08a5e69ec",
+        "canonicalization": "strict UTF-8 JSON; duplicate keys and non-finite numbers rejected; recursive key sort; compact separators; ASCII escapes; no trailing newline",
+        "manifest_format": "canonical-json sorted array of path,sha256,size; sha256 and size bind canonical per-file JSON; POSIX relative paths; ASCII; no trailing newline",
+        "manifest_size": 36091,
+        "manifest_sha256": "c05875501c6e9a6778cc4afc5488cdb87aae539217121ebbb5c8dd14c79bc025",
+        "combined_v2_schema_size": 269688,
+        "combined_v2_schema_sha256": "27f8d983f19d8e1a5548d52176de0a460fb05aaf2a72110f913c6f4af2bd4f27",
     },
 }
 _MAX_PACKAGED_RUNTIME_METADATA_BYTES = 64 * 1024
@@ -1382,6 +1733,10 @@ def _reject_packaged_json_duplicates(
     return value
 
 
+def _reject_packaged_json_constant(value: str) -> None:
+    _fail(f"packaged Codex runtime metadata has non-finite number {value}")
+
+
 def _read_bounded_packaged_resource(
     path: Path, *, maximum_bytes: int, label: str
 ) -> bytes:
@@ -1407,22 +1762,40 @@ def _validate_packaged_runtime_payload(
     tuple must be, without starting a process.
     """
 
-    expected_app = _PACKAGED_RUNTIME_PIN_0_145_0["app_server_executable"]
-    expected_stable = _PACKAGED_RUNTIME_PIN_0_145_0["stable_schema"]
+    expected_app = _PACKAGED_RUNTIME_PIN_0_145_0_V2["app_server_executable"]
+    expected_stable = _PACKAGED_RUNTIME_PIN_0_145_0_V2["stable_schema"]
     try:
         pin = json.loads(
-            pin_bytes, object_pairs_hook=_reject_packaged_json_duplicates
+            pin_bytes,
+            object_pairs_hook=_reject_packaged_json_duplicates,
+            parse_constant=_reject_packaged_json_constant,
         )
         manifest = json.loads(
-            manifest_bytes, object_pairs_hook=_reject_packaged_json_duplicates
+            manifest_bytes,
+            object_pairs_hook=_reject_packaged_json_duplicates,
+            parse_constant=_reject_packaged_json_constant,
+        )
+        combined = json.loads(
+            combined_bytes,
+            object_pairs_hook=_reject_packaged_json_duplicates,
+            parse_constant=_reject_packaged_json_constant,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexTransportContractError("packaged Codex runtime pin is unreadable") from exc
     if canonical_json_bytes(manifest, max_bytes=MAX_CONTRACT_BYTES) != manifest_bytes:
         _fail("schema-manifest.json is not canonical JSON")
+    if (
+        canonical_json_bytes(
+            combined, max_bytes=_MAX_PACKAGED_COMBINED_SCHEMA_BYTES
+        )
+        != combined_bytes
+    ):
+        _fail("combined v2 schema is not canonical JSON")
     if not isinstance(pin, Mapping) or not isinstance(manifest, list):
         _fail("packaged Codex runtime pin schema is invalid")
-    _require_exact_packaged_pin(pin, _PACKAGED_RUNTIME_PIN_0_145_0, "runtime-pin.json")
+    _require_exact_packaged_pin(
+        pin, _PACKAGED_RUNTIME_PIN_0_145_0_V2, "runtime-pin.json"
+    )
     if (
         expected_stable["manifest_size"] != len(manifest_bytes)
         or expected_stable["combined_v2_schema_size"] != len(combined_bytes)
@@ -1433,6 +1806,7 @@ def _validate_packaged_runtime_payload(
         _fail("packaged Codex runtime pin/schema digest drifted")
     previous_path: str | None = None
     paths: set[str] = set()
+    combined_manifest_entry: Mapping[str, Any] | None = None
     for entry in manifest:
         if not isinstance(entry, Mapping) or set(entry) != {"path", "size", "sha256"}:
             _fail("packaged schema manifest entry is invalid")
@@ -1451,9 +1825,21 @@ def _validate_packaged_runtime_payload(
         if not isinstance(entry["size"], int) or isinstance(entry["size"], bool) or entry["size"] <= 0:
             _fail("packaged schema manifest size is invalid")
         _sha256(entry["sha256"], "packaged schema manifest sha256")
+        if path == "codex_app_server_protocol.v2.schemas.json":
+            combined_manifest_entry = entry
+    if combined_manifest_entry != {
+        "path": "codex_app_server_protocol.v2.schemas.json",
+        "size": len(combined_bytes),
+        "sha256": hashlib.sha256(combined_bytes).hexdigest(),
+    }:
+        _fail("packaged schema manifest does not bind the combined v2 schema")
     return {
-        "codex_cli_version": _PACKAGED_RUNTIME_PIN_0_145_0["codex_cli_version"],
-        "codex_app_server_version": _PACKAGED_RUNTIME_PIN_0_145_0["codex_app_server_version"],
+        "codex_cli_version": _PACKAGED_RUNTIME_PIN_0_145_0_V2[
+            "codex_cli_version"
+        ],
+        "codex_app_server_version": _PACKAGED_RUNTIME_PIN_0_145_0_V2[
+            "codex_app_server_version"
+        ],
         "app_server_executable_sha256": expected_app["sha256"],
         "executable_size_bytes": expected_app["size"],
         "schema_manifest_sha256": expected_stable["manifest_sha256"],
@@ -1462,11 +1848,22 @@ def _validate_packaged_runtime_payload(
 
 
 def pinned_runtime_binding() -> dict[str, str | int]:
-    """Read and verify the packaged 0.145.0 pin and generated schema bytes.
+    """Return the frozen raw-byte runtime identity accepted by V1 readers.
+
+    V1 records are content-addressed and cannot be reinterpreted after the
+    discovery that generator object ordering is nondeterministic. New launch
+    writers must use :func:`pinned_runtime_binding_v2`.
+    """
+
+    return dict(_FROZEN_V1_RUNTIME_BINDING)
+
+
+def pinned_runtime_binding_v2() -> dict[str, str | int]:
+    """Read and verify the canonical-semantic 0.145.0 generated-schema pin.
 
     This is read-only by design.  It checks the canonical 273-file manifest and
     the combined-v2 schema before returning the only runtime binding accepted by
-    the launch-intent contract.
+    new V2 launch-intent and reservation contracts.
     """
 
     root = _resource_root()

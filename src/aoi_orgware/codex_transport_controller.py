@@ -203,6 +203,24 @@ class CodexTransportController:
             raise CodexTransportControllerError(
                 "reserved journal does not bind controller launch material"
             )
+        expected_event_contract = (
+            contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2
+            if self.intent["contract_type"]
+            == contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2
+            else contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1
+        )
+        if first["contract_type"] != expected_event_contract:
+            raise CodexTransportControllerError(
+                "controller intent/reservation/journal versions differ"
+            )
+        try:
+            for row in self.journal:
+                if row.get("request_witness") is not None:
+                    self._require_witness_launch_binding(row["request_witness"])
+        except contracts.CodexTransportContractError as exc:
+            raise CodexTransportControllerError(
+                f"controller request witness is invalid: {exc}"
+            ) from exc
         self.launch_id = self.reservation["reservation_id"]
         self._persist_milestone = persist_milestone
         self._publish_terminal = publish_terminal
@@ -212,6 +230,32 @@ class CodexTransportController:
     @property
     def state(self) -> contracts.JournalState:
         return contracts.validate_transport_journal(self.journal)
+
+    def _require_witness_launch_binding(
+        self, witness: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        checked = contracts.validate_request_witness(witness)
+        expected = {
+            "launch_intent_sha256": self.intent["intent_sha256"],
+            "permit_sha256": self.reservation["permit_sha256"],
+            "expected_semantic_head_sha256": self.intent[
+                "expected_semantic_head_sha256"
+            ],
+            "prompt_sha256": self.intent["prompt_sha256"],
+            "prompt_size_bytes": self.intent["prompt_size_bytes"],
+            "cwd": self.intent["cwd"],
+            "requested_model": self.intent["requested_model"],
+            "requested_effort": self.intent["requested_effort"],
+            "approval": self.intent["approval"],
+            "sandbox": self.intent["sandbox"],
+            "network_access": self.intent.get("network_access"),
+            "runtime_pin": self.intent["runtime_pin"],
+        }
+        if any(checked[key] != value for key, value in expected.items()):
+            raise CodexTransportControllerError(
+                "request witness differs from immutable launch policy"
+            )
+        return checked
 
     def _event(
         self,
@@ -228,10 +272,17 @@ class CodexTransportController:
         fault_kind: str | None = None,
         fault_evidence_sha256: str | None = None,
         fault_evidence_size_bytes: int | None = None,
+        request_witness: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         sequence = len(self.journal) + 1
+        contract_type = (
+            contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2
+            if self.journal[0]["contract_type"]
+            == contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2
+            else contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1
+        )
         raw = {
-            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+            "contract_type": contract_type,
             "event_id": f"{self.launch_id}:{sequence}:{event_type}",
             "sequence": sequence,
             "prev_event_sha256": self.journal[-1]["event_sha256"],
@@ -252,12 +303,162 @@ class CodexTransportController:
             "fault_evidence_size_bytes": fault_evidence_size_bytes,
             "correlation": dict(correlation),
         }
+        if contract_type == contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2:
+            raw["request_witness"] = (
+                None if request_witness is None else dict(request_witness)
+            )
         try:
             return contracts.seal_journal_event(raw)
         except (KeyError, contracts.CodexTransportContractError) as exc:
             raise CodexTransportControllerError(
                 f"controller milestone is invalid: {exc}"
             ) from exc
+
+    def _request_witness(
+        self,
+        *,
+        request_id: str,
+        method: str,
+        raw: bytes,
+        digest: str,
+        correlation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        thread_start_config: Mapping[str, Any] | None = None
+        if method != "process/start":
+            message = _strict_object(raw)
+            if set(message) != {"id", "method", "params"}:
+                raise CodexTransportControllerError(
+                    "App Server request envelope is not closed"
+                )
+            if (
+                str(message["id"]) != request_id
+                or message["method"] != method
+            ):
+                raise CodexTransportControllerError(
+                    "App Server request envelope correlation differs"
+                )
+            params = _object(message["params"], f"{method} request params")
+            if method == "thread/start":
+                expected_fields = {
+                    "cwd",
+                    "approvalPolicy",
+                    "sandbox",
+                    "serviceName",
+                    "ephemeral",
+                    "model",
+                    "config",
+                }
+                if set(params) != expected_fields:
+                    raise CodexTransportControllerError(
+                        "thread/start config envelope is not closed"
+                    )
+                expected_sandbox = {
+                    "readOnly": "read-only",
+                    "workspaceWrite": "workspace-write",
+                }[self.intent["sandbox"]]
+                if (
+                    params["cwd"] != self.intent["cwd"]
+                    or params["approvalPolicy"] != self.intent["approval"]
+                    or params["sandbox"] != expected_sandbox
+                    or params["serviceName"] != "aoi-orgware"
+                    or params["ephemeral"] is not True
+                    or params["model"] != self.intent["requested_model"]
+                    or not isinstance(params["config"], Mapping)
+                ):
+                    raise CodexTransportControllerError(
+                        "thread/start request differs from sealed policy"
+                    )
+                thread_start_config = dict(params["config"])
+            elif method == "turn/start":
+                if set(params) != {
+                    "threadId",
+                    "input",
+                    "approvalPolicy",
+                    "sandboxPolicy",
+                    "cwd",
+                    "model",
+                    "effort",
+                }:
+                    raise CodexTransportControllerError(
+                        "turn/start request envelope is not closed"
+                    )
+                sandbox_policy = _object(
+                    params["sandboxPolicy"], "turn/start sandboxPolicy"
+                )
+                expected_policy: dict[str, Any] = {
+                    "type": self.intent["sandbox"],
+                    "networkAccess": False,
+                }
+                if self.intent["sandbox"] == "workspaceWrite":
+                    expected_policy.update(
+                        {
+                            "writableRoots": [self.intent["cwd"]],
+                            "excludeSlashTmp": True,
+                            "excludeTmpdirEnvVar": True,
+                        }
+                    )
+                inputs = params["input"]
+                if (
+                    params["threadId"] != correlation["thread_id"]
+                    or params["approvalPolicy"] != self.intent["approval"]
+                    or sandbox_policy != expected_policy
+                    or params["cwd"] != self.intent["cwd"]
+                    or params["model"] != self.intent["requested_model"]
+                    or params["effort"] != self.intent["requested_effort"]
+                    or not isinstance(inputs, list)
+                    or len(inputs) != 1
+                    or not isinstance(inputs[0], Mapping)
+                    or set(inputs[0]) != {"type", "text"}
+                    or inputs[0]["type"] != "text"
+                    or not isinstance(inputs[0]["text"], str)
+                ):
+                    raise CodexTransportControllerError(
+                        "turn/start request differs from sealed policy"
+                    )
+                prompt_bytes = inputs[0]["text"].encode("utf-8")
+                if (
+                    len(prompt_bytes) != self.intent["prompt_size_bytes"]
+                    or hashlib.sha256(prompt_bytes).hexdigest()
+                    != self.intent["prompt_sha256"]
+                ):
+                    raise CodexTransportControllerError(
+                        "turn/start request prompt differs from sealed intent"
+                    )
+            elif method == "turn/interrupt":
+                if (
+                    set(params) != {"threadId", "turnId"}
+                    or params["threadId"] != correlation["thread_id"]
+                    or params["turnId"] != correlation["turn_id"]
+                ):
+                    raise CodexTransportControllerError(
+                        "turn/interrupt request correlation differs"
+                    )
+        witness = contracts.seal_request_witness(
+            {
+                "schema_version": 1,
+                "launch_intent_sha256": self.intent["intent_sha256"],
+                "permit_sha256": self.reservation["permit_sha256"],
+                "expected_semantic_head_sha256": self.intent[
+                    "expected_semantic_head_sha256"
+                ],
+                "request_id": request_id,
+                "wire_method": method,
+                "request_envelope_sha256": digest,
+                "request_size_bytes": len(raw),
+                "prompt_sha256": self.intent["prompt_sha256"],
+                "prompt_size_bytes": self.intent["prompt_size_bytes"],
+                "cwd": self.intent["cwd"],
+                "requested_model": self.intent["requested_model"],
+                "requested_effort": self.intent["requested_effort"],
+                "approval": self.intent["approval"],
+                "sandbox": self.intent["sandbox"],
+                "network_access": self.intent.get("network_access"),
+                "runtime_pin": self.intent["runtime_pin"],
+                "thread_start_config": thread_start_config,
+                "correlation": dict(correlation),
+            }
+        )
+        return self._require_witness_launch_binding(witness)
 
     def _persist(self, event: Mapping[str, Any]) -> None:
         try:
@@ -286,14 +487,24 @@ class CodexTransportController:
             raise CodexTransportControllerError(
                 "process pending callback has invalid phase/PID"
             )
+        correlation = _correlation()
+        request_id = f"process:{self.launch_id}"
+        witness = self._request_witness(
+            request_id=request_id,
+            method="process/start",
+            raw=entry.payload_bytes,
+            digest=entry.sha256,
+            correlation=correlation,
+        )
         self._persist(
             self._event(
                 "process_start_pending",
                 wire_method="process/start",
-                correlation=_correlation(),
+                correlation=correlation,
                 payload_size_bytes=len(entry.payload_bytes),
-                request_id=f"process:{self.launch_id}",
+                request_id=request_id,
                 request_bytes_sha256=entry.sha256,
+                request_witness=witness,
             )
         )
 
@@ -324,14 +535,23 @@ class CodexTransportController:
                 f"unsupported pending request method: {entry.method}"
             ) from exc
         correlation = self.state.correlation
+        request_id = str(entry.request_id)
+        witness = self._request_witness(
+            request_id=request_id,
+            method=entry.method,
+            raw=entry.wire_bytes,
+            digest=entry.sha256,
+            correlation=correlation,
+        )
         self._persist(
             self._event(
                 event_type,
                 wire_method=entry.method,
                 correlation=correlation,
                 payload_size_bytes=len(entry.wire_bytes),
-                request_id=str(entry.request_id),
+                request_id=request_id,
                 request_bytes_sha256=entry.sha256,
+                request_witness=witness,
             )
         )
 
@@ -583,6 +803,7 @@ class CodexTransportController:
                     payload_size_bytes=size,
                     request_id=state.last_request_id,
                     request_bytes_sha256=state.last_request_bytes_sha256,
+                    request_witness=last.get("request_witness"),
                     fault_kind=fault_kind,
                     fault_evidence_sha256=digest,
                     fault_evidence_size_bytes=size,
@@ -615,7 +836,12 @@ class CodexTransportController:
             )
         receipt = contracts.seal_terminal_receipt(
             {
-                "contract_type": contracts.CODEX_TRANSPORT_TERMINAL_RECEIPT_V1,
+                "contract_type": (
+                    contracts.CODEX_TRANSPORT_TERMINAL_RECEIPT_V2
+                    if self.journal[0]["contract_type"]
+                    == contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2
+                    else contracts.CODEX_TRANSPORT_TERMINAL_RECEIPT_V1
+                ),
                 "reservation_sha256": self.reservation["reservation_sha256"],
                 "journal_head_sha256": state.head_sha256,
                 "terminal_state": state.state,
@@ -653,6 +879,17 @@ class CodexTransportController:
         if self.state.state != "reserved" or self.state.last_event_type != "reserved":
             raise CodexTransportControllerError(
                 "controller run is not fresh; reconcile persisted state without launching"
+            )
+        if (
+            self.intent["contract_type"]
+            != contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2
+            or self.reservation["contract_type"]
+            != contracts.CODEX_TRANSPORT_RESERVATION_V2
+            or self.journal[0]["contract_type"]
+            != contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2
+        ):
+            raise CodexTransportControllerError(
+                "V1 transport material is frozen read-only and cannot launch"
             )
         callbacks = (
             adapter.on_process_start_pending,

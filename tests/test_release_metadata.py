@@ -155,7 +155,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             (
                 dist_verify.SCHEMA_MANIFEST_MEMBER,
                 altered_manifest,
-                "schema-manifest.json digest differs",
+                "not canonical JSON",
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +203,40 @@ class ReleaseMetadataTests(unittest.TestCase):
                 bad_probe, artifact=Path("candidate.whl")
             )
 
+    def test_release_verifier_rejects_noncanonical_or_changed_schema_json(
+        self,
+    ) -> None:
+        pin = (SRC / dist_verify.RUNTIME_PIN_MEMBER).read_bytes()
+        manifest = (SRC / dist_verify.SCHEMA_MANIFEST_MEMBER).read_bytes()
+        combined = (SRC / dist_verify.COMBINED_SCHEMA_MEMBER).read_bytes()
+        with self.assertRaisesRegex(dist_verify.VerificationError, "repeats key"):
+            dist_verify._validate_runtime_resource_payload(
+                pin,
+                manifest,
+                b'{"value":1,"value":1}',
+                subject="test",
+            )
+        parsed = json.loads(combined)
+        reordered = json.dumps(parsed, indent=2).encode("utf-8")
+        self.assertEqual(json.loads(reordered), parsed)
+        with self.assertRaisesRegex(
+            dist_verify.VerificationError, "not canonical JSON"
+        ):
+            dist_verify._validate_runtime_resource_payload(
+                pin, manifest, reordered, subject="test"
+            )
+        changed = dict(parsed)
+        changed["title"] = "semantic drift"
+        changed_bytes = json.dumps(
+            changed, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        with self.assertRaisesRegex(
+            dist_verify.VerificationError, "digest differs"
+        ):
+            dist_verify._validate_runtime_resource_payload(
+                pin, manifest, changed_bytes, subject="test"
+            )
+
     def test_sdist_derived_wheel_runtime_resources_are_checked_before_install(
         self,
     ) -> None:
@@ -245,7 +279,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     dist_verify.VerificationError,
-                    "schema-manifest.json digest differs",
+                    "not canonical JSON",
                 ):
                     dist_verify._verify_sdist_via_derived_wheel(
                         sdist,

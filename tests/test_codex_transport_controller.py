@@ -52,12 +52,12 @@ def correlation(
 def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     prompt = b"hello"
     pin = {
-        **contracts.pinned_runtime_binding(),
+        **contracts.pinned_runtime_binding_v2(),
         "executable_path": "C:/AOI/codex-app-server.exe",
     }
     intent = contracts.seal_launch_intent(
         {
-            "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V1,
+            "contract_type": contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2,
             "task_id": "task-1",
             "packet_id": "packet-1",
             "routing_binding": {
@@ -79,6 +79,7 @@ def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, An
             "requested_effort": "high",
             "sandbox": "readOnly",
             "approval": "never",
+            "network_access": False,
             "runtime_pin": pin,
             "pre_git_binding": {
                 "git_head_sha256": SHA_A,
@@ -90,18 +91,19 @@ def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, An
     )
     reservation = contracts.seal_reservation(
         {
-            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1,
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V2,
             "reservation_id": "launch-1",
             "launch_intent_sha256": intent["intent_sha256"],
             "permit_sha256": SHA_C,
             "runtime_pin": pin,
             "state": "reserved",
             "correlation": correlation(),
+            "evidence_level": "transport_reserved",
         }
     )
     reserved = contracts.seal_journal_event(
         {
-            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2,
             "event_id": "launch-1:1:reserved",
             "sequence": 1,
             "prev_event_sha256": contracts.ZERO_SHA256,
@@ -121,6 +123,7 @@ def launch_material() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, An
             "fault_evidence_sha256": None,
             "fault_evidence_size_bytes": None,
             "correlation": correlation(),
+            "request_witness": None,
         }
     )
     return intent, reservation, [reserved]
@@ -202,6 +205,7 @@ class FakeAdapter:
         self.terminal_sealed = False
         self.reroute_event: RuntimeEvent | None = None
         self._next_id = 1
+        self.written_methods: list[str] = []
 
     @staticmethod
     def _process_entry(phase: str, pid: int | None) -> ProcessJournalEntry:
@@ -218,23 +222,39 @@ class FakeAdapter:
             raise AppServerError("Popen outcome lost")
         self.on_process_started(self._process_entry("process_started", 42))
 
-    def _request(self, method: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        result: Mapping[str, Any],
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
         self.request_count[method] = self.request_count.get(method, 0) + 1
         request_raw = json.dumps(
-            {"id": request_id, "method": method, "params": {}},
+            {
+                "id": request_id,
+                "method": method,
+                "params": {} if params is None else dict(params),
+            },
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
-        self.on_send_pending(
-            RequestJournalEntry(
-                request_id,
-                method,
-                RequestPhase.SEND_PENDING,
-                request_raw,
-                hashlib.sha256(request_raw).hexdigest(),
+        try:
+            self.on_send_pending(
+                RequestJournalEntry(
+                    request_id,
+                    method,
+                    RequestPhase.SEND_PENDING,
+                    request_raw,
+                    hashlib.sha256(request_raw).hexdigest(),
+                )
             )
-        )
+        except Exception as exc:
+            raise AppServerError(
+                "send_pending journal callback failed; request was not written"
+            ) from exc
+        self.written_methods.append(method)
         if self.mode == method.replace("/", "_") + "_loss":
             raise RuntimeDisconnected(f"{method} response lost")
         if self.mode == method.replace("/", "_") + "_schema_error":
@@ -300,20 +320,49 @@ class FakeAdapter:
             },
         )
 
-    def start_thread_from_intent(self, *, intent: object) -> str:
-        result = self._request("thread/start", {"thread": {"id": "thread-1"}})
+    def start_thread_from_intent(self, *, intent: Any) -> str:
+        result = self._request(
+            "thread/start",
+            {"thread": {"id": "thread-1"}},
+            params={
+                "cwd": intent.cwd,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "serviceName": "aoi-orgware",
+                "ephemeral": True,
+                "model": intent.model,
+                "config": contracts._THREAD_START_CONFIG,
+            },
+        )
         return str(result["thread"]["id"])
 
     def start_turn_from_intent(
-        self, *, thread_id: str, prompt: str, intent: object
+        self, *, thread_id: str, prompt: str, intent: Any
     ) -> str:
         result = self._request(
-            "turn/start", {"turn": {"id": "turn-1", "status": "inProgress"}}
+            "turn/start",
+            {"turn": {"id": "turn-1", "status": "inProgress"}},
+            params={
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {
+                    "type": "readOnly",
+                    "networkAccess": False,
+                },
+                "cwd": intent.cwd,
+                "model": intent.model,
+                "effort": intent.effort,
+            },
         )
         return str(result["turn"]["id"])
 
     def interrupt_turn(self, *, thread_id: str, turn_id: str) -> dict[str, Any]:
-        return self._request("turn/interrupt", {})
+        return self._request(
+            "turn/interrupt",
+            {},
+            params={"threadId": thread_id, "turnId": turn_id},
+        )
 
     def observe_turn(
         self, *, thread_id: str, turn_id: str, timeout_seconds: float
@@ -466,6 +515,35 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
         "thread_started": "thread/start",
         "turn_started": "turn/start",
     }
+    assert sink.published == [result.terminal_receipt]
+    assert adapter.closed is True
+
+
+def test_durable_send_pending_failure_never_writes_request_bytes() -> None:
+    value, sink, adapter = controller()
+    original = value._persist_milestone
+    failed = False
+
+    def fail_once(event: Mapping[str, Any]) -> Any:
+        nonlocal failed
+        if event["event_type"] == "initialize_send_pending" and not failed:
+            failed = True
+            raise RuntimeError("synthetic durable sink failure")
+        return original(event)
+
+    value._persist_milestone = fail_once
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+    assert result.terminal_state == "failed"
+    assert adapter.written_methods == []
+    assert all(
+        row["event_type"] != "initialize_send_pending" for row in result.journal
+    )
+    assert [row["event_type"] for row in result.journal] == [
+        "reserved",
+        "process_start_pending",
+        "process_started",
+        "failed",
+    ]
     assert sink.published == [result.terminal_receipt]
     assert adapter.closed is True
 
@@ -947,6 +1025,11 @@ def test_crash_and_protocol_faults_terminalize_without_resend(
         assert hashlib.sha256(sink.fault_evidence[0][1]).hexdigest() == terminal_event[
             "fault_evidence_sha256"
         ]
+    if terminal == "launch_unknown":
+        pending_event = result.journal[-2]
+        assert pending_event["event_type"].endswith("_pending")
+        assert pending_event["request_witness"] is not None
+        assert terminal_event["request_witness"] == pending_event["request_witness"]
     assert all(count == 1 for count in adapter.request_count.values())
     assert adapter.closed is True
 

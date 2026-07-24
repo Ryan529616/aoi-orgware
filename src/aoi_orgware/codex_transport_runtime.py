@@ -106,6 +106,7 @@ def _event_for(
     item_type: str | None = None, payload_size_bytes: int | None = None,
     fault_kind: str | None = None, fault_evidence_sha256: str | None = None,
     fault_evidence_size_bytes: int | None = None,
+    request_witness: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     pending = event_type.endswith("_pending")
     if event_type == "reserved":
@@ -119,8 +120,14 @@ def _event_for(
     status = {"item_completed": "completed", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "unknown", "runtime_unknown": "unknown"}.get(event_type, "observed")
     state = {"reserved": "reserved", "process_start_pending": "reserved", "process_started": "reserved", "initialize_send_pending": "reserved", "initialized": "reserved", "thread_start_send_pending": "reserved", "thread_started": "thread_started", "turn_start_send_pending": "thread_started", "turn_started": "turn_started", "interrupt_send_pending": "turn_started", "interrupt_observed": "turn_started", "item_started": "turn_started", "item_completed": "turn_started", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "launch_unknown", "runtime_unknown": "runtime_unknown"}[event_type]
     try:
-        return contracts.seal_journal_event({
-            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+        contract_type = (
+            contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2
+            if intent["contract_type"]
+            == contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2
+            else contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1
+        )
+        raw = {
+            "contract_type": contract_type,
             "event_id": event_id, "sequence": sequence, "prev_event_sha256": previous,
             "launch_intent_sha256": intent["intent_sha256"], "reservation_sha256": reservation["reservation_sha256"],
             "event_type": event_type, "state": state, "wire_method": method,
@@ -130,7 +137,12 @@ def _event_for(
             "fault_evidence_sha256": fault_evidence_sha256,
             "fault_evidence_size_bytes": fault_evidence_size_bytes,
             "correlation": dict(correlation),
-        })
+        }
+        if contract_type == contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V2:
+            raw["request_witness"] = (
+                None if request_witness is None else dict(request_witness)
+            )
+        return contracts.seal_journal_event(raw)
     except contracts.CodexTransportContractError as exc:
         raise _fail("Codex transport milestone is invalid", exc) from exc
 
@@ -147,6 +159,13 @@ def _validate_launch_material(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     try:
         checked_intent = contracts.validate_launch_intent(intent)
+        if (
+            checked_intent["contract_type"]
+            != contracts.CODEX_TRANSPORT_LAUNCH_INTENT_V2
+        ):
+            raise CodexTransportRuntimeError(
+                "V1 Codex launch intents are frozen read-only; new launches require V2"
+            )
         checked_authority = contracts.validate_launch_authority(authority_contract)
         pair = permits.validate_decision_permit_pair(decision, permit)
         checked_decision, checked_permit = pair["decision"], pair["permit"]
@@ -202,8 +221,8 @@ def prepare_codex_launch_transaction(*, task_id: str, event_chain: Iterable[Mapp
     task_id = h.validate_id(task_id, "task id")
     records, state, head = _records(event_chain, task_id)
     checked_intent, checked_decision, checked_permit, checked_authority = _validate_launch_material(task_id, intent, decision, permit, launch_authority_contract, _launch_id(launch_id), head, current_time)
-    reservation = contracts.seal_reservation({"contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1, "reservation_id": launch_id,
-        "launch_intent_sha256": checked_intent["intent_sha256"], "permit_sha256": checked_permit["permit_sha256"], "runtime_pin": checked_intent["runtime_pin"], "state": "reserved", "correlation": {"thread_id": None, "turn_id": None, "item_id": None}})
+    reservation = contracts.seal_reservation({"contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V2, "reservation_id": launch_id,
+        "launch_intent_sha256": checked_intent["intent_sha256"], "permit_sha256": checked_permit["permit_sha256"], "runtime_pin": checked_intent["runtime_pin"], "state": "reserved", "correlation": {"thread_id": None, "turn_id": None, "item_id": None}, "evidence_level": "transport_reserved"})
     reserved = _event_for(checked_intent, reservation, event_id=f"{launch_id}:reserved", sequence=1, previous=contracts.ZERO_SHA256, event_type="reserved", correlation={"thread_id": None, "turn_id": None, "item_id": None})
     owned = launch_authority.reserve_packet_for_codex_launch(
         state,
@@ -1081,6 +1100,30 @@ def load_codex_transport_launch(
         "intent": intent,
         "launch_authority": authority_contract,
         "launch_permit": launch_permit,
+        "issuance_marker": marker_candidates[0],
+        "transport_bindings": [
+            {
+                key: item[key]
+                for key in (
+                    "binding_kind",
+                    "binding_key",
+                    "binding_sha256",
+                    "expected_semantic_head_sha256",
+                    "planned_event_sha256",
+                    "result_projection_sha256",
+                    "classification",
+                )
+            }
+            for item in report["bindings"]
+            if (
+                item["binding_kind"] == "codex_launch_reservation"
+                and item["binding_key"] == identity
+            )
+            or (
+                item["binding_kind"] == "codex_transport_milestone"
+                and str(item["binding_key"]).startswith(f"{identity}:")
+            )
+        ],
         "reservation_effective_at": marker_candidates[0]["recorded_at"],
         "pre_git_endpoint_cas_sha256": marker_candidates[0][
             "pre_git_endpoint_cas_sha256"
@@ -1339,6 +1382,150 @@ def require_codex_process_start_authority(
         raise _fail("cannot validate Codex process-start ownership", exc) from exc
 
 
+def _inspect_launch_view(launch: Mapping[str, Any]) -> dict[str, Any]:
+    committed_events = [
+        {
+            "classification": "committed",
+            "contract_type": row["contract_type"],
+            "event_sha256": row["event_sha256"],
+            "sequence": row["sequence"],
+            "event_type": row["event_type"],
+            "state": row["state"],
+            "wire_method": row["wire_method"],
+            "status": row["status"],
+            "correlation": row["correlation"],
+            "request_witness": row.get("request_witness"),
+        }
+        for row in launch["journal"]
+    ]
+    pending = launch["pending_journal_event"]
+    lifecycle = list(committed_events)
+    if pending is not None:
+        lifecycle.append(
+            {
+                "classification": "pending",
+                "contract_type": pending["contract_type"],
+                "event_sha256": pending["event_sha256"],
+                "sequence": pending["sequence"],
+                "event_type": pending["event_type"],
+                "state": pending["state"],
+                "wire_method": pending["wire_method"],
+                "status": pending["status"],
+                "correlation": pending["correlation"],
+                "request_witness": pending.get("request_witness"),
+            }
+        )
+    runtime_observed = any(
+        row["event_type"]
+        not in {
+            "reserved",
+            "process_start_pending",
+            "initialize_send_pending",
+            "model_list_send_pending",
+            "thread_start_send_pending",
+            "turn_start_send_pending",
+            "interrupt_send_pending",
+            "launch_unknown",
+        }
+        for row in launch["journal"]
+    )
+    marker = launch["issuance_marker"]
+    terminal_receipts = []
+    for classification, key in (
+        ("committed", "terminal_receipt"),
+        ("pending", "pending_terminal_receipt"),
+        ("verified_mutation_committed", "verified_terminal_receipt"),
+        ("verified_mutation_pending", "pending_verified_terminal_receipt"),
+    ):
+        receipt = launch[key]
+        if receipt is not None:
+            terminal_receipts.append(
+                {
+                    "classification": classification,
+                    "receipt_sha256": receipt["receipt_sha256"],
+                    "contract_type": receipt["contract_type"],
+                    "terminal_state": receipt["terminal_state"],
+                    "evidence_level": receipt["evidence_level"],
+                    "correlation": receipt["correlation"],
+                }
+            )
+    intent = launch["intent"]
+    reservation = launch["reservation"]
+    return {
+        "task_id": launch["task_id"],
+        "launch_id": launch["launch_id"],
+        "semantic_head_sha256": launch["semantic_head_sha256"],
+        "contract_version": intent["contract_type"].rsplit("_", 1)[-1],
+        "intent": {
+            key: intent[key]
+            for key in (
+                "contract_type",
+                "intent_sha256",
+                "task_id",
+                "packet_id",
+                "routing_binding",
+                "expected_semantic_head_sha256",
+                "prompt_sha256",
+                "prompt_size_bytes",
+                "cwd",
+                "requested_model",
+                "requested_effort",
+                "sandbox",
+                "approval",
+                "runtime_pin",
+                "pre_git_binding",
+            )
+        }
+        | (
+            {"network_access": intent["network_access"]}
+            if "network_access" in intent
+            else {}
+        ),
+        "reservation": {
+            "classification": "committed",
+            "contract_type": reservation["contract_type"],
+            "reservation_sha256": reservation["reservation_sha256"],
+            "permit_sha256": reservation["permit_sha256"],
+            "state": reservation["state"],
+            "evidence_level": reservation.get(
+                "evidence_level", "transport_reserved"
+            ),
+            "correlation": reservation["correlation"],
+        },
+        "lifecycle": lifecycle,
+        "terminal_receipts": terminal_receipts,
+        "issuance": {
+            "classification": "committed",
+            "issuance_sha256": marker["issuance_sha256"],
+            "binding_sha256": marker["binding_sha256"],
+            "planned_event_sha256": marker["planned_event_sha256"],
+            "expected_semantic_head_sha256": marker[
+                "expected_semantic_head_sha256"
+            ],
+            "launch_authority_sha256": marker["launch_authority_sha256"],
+            "permit_sha256": marker["permit_sha256"],
+        },
+        "bindings": list(launch["transport_bindings"]),
+        "evidence_level": (
+            "codex_runtime_observed" if runtime_observed else "transport_reserved"
+        ),
+        "task_completion": "not_inferred",
+    }
+
+
+def inspect_codex_transport_launch(
+    paths: h.HarnessPaths,
+    task_id: str,
+    launch_id: str,
+    event_chain: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return the same authenticated launch view used by aggregate inspection."""
+
+    return _inspect_launch_view(
+        load_codex_transport_launch(paths, task_id, launch_id, event_chain)
+    )
+
+
 def inspect_codex_transport_runtime(paths: h.HarnessPaths, task_id: str, event_chain: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Read-only authenticated transport report; never upgrades task evidence."""
     records, state, head = _live_records(paths, task_id, event_chain)
@@ -1363,8 +1550,10 @@ def inspect_codex_transport_runtime(paths: h.HarnessPaths, task_id: str, event_c
         marker = markers.get(launch_id)
         if marker is None or marker["intent_sha256"] != row["intent_sha256"] or marker["reservation_sha256"] != row["reservation_sha256"]:
             raise CodexTransportRuntimeError("transport launch lacks an authentic issuance marker")
-        rows.append({"launch_id": launch_id, "state": row["state"], "thread_id": row["thread_id"], "turn_id": row["turn_id"], "terminal_receipt_sha256": row["terminal_receipt_sha256"], "issuance_sha256": marker["issuance_sha256"], "evidence_level": "codex_runtime_observed", "task_completion": "not_inferred"})
+        rows.append(
+            inspect_codex_transport_launch(paths, task_id, launch_id, records)
+        )
     return {"task_id": task_id, "semantic_head_sha256": head, "launches": rows, "pending_binding_sha256s": report["pending_binding_sha256s"], "task_completion": "not_inferred"}
 
 
-__all__ = ["CodexTransportRuntimeError", "ISSUANCE_DIRECTORY", "ISSUANCE_SCHEMA_VERSION", "RUN_LOCK_DIRECTORY", "codex_launch_process_lock", "inspect_codex_launch_issuance", "issue_codex_launch_transaction", "inspect_codex_transport_runtime", "load_codex_transport_launch", "prepare_codex_launch_transaction", "publish_terminal_receipt", "reconstruct_issued_launch_transaction", "record_milestone", "require_codex_process_start_authority", "require_codex_process_start_window", "reserve_codex_launch"]
+__all__ = ["CodexTransportRuntimeError", "ISSUANCE_DIRECTORY", "ISSUANCE_SCHEMA_VERSION", "RUN_LOCK_DIRECTORY", "codex_launch_process_lock", "inspect_codex_launch_issuance", "inspect_codex_transport_launch", "issue_codex_launch_transaction", "inspect_codex_transport_runtime", "load_codex_transport_launch", "prepare_codex_launch_transaction", "publish_terminal_receipt", "reconstruct_issued_launch_transaction", "record_milestone", "require_codex_process_start_authority", "require_codex_process_start_window", "reserve_codex_launch"]

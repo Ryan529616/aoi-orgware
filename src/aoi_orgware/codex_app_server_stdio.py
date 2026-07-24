@@ -2515,7 +2515,7 @@ def _sha256_file(path: Path) -> str:
 
 def _load_packaged_runtime_pin() -> RuntimePin:
     try:
-        binding = contracts.pinned_runtime_binding()
+        binding = contracts.pinned_runtime_binding_v2()
         return RuntimePin(
             codex_cli_version=str(binding["codex_cli_version"]),
             executable_sha256=str(binding["app_server_executable_sha256"]),

@@ -694,36 +694,12 @@ def _inspect(args: argparse.Namespace) -> dict[str, Any]:
             report = runtime.inspect_codex_transport_runtime(paths, args.task, events)
             if args.launch_id is None:
                 return report
-            launch = runtime.load_codex_transport_launch(
+            return runtime.inspect_codex_transport_launch(
                 paths, args.task, args.launch_id, events
             )
     except (h.HarnessError, store.SemanticStoreError, runtime.CodexTransportRuntimeError) as exc:
         raise CodexTransportCLIError(str(exc)) from exc
-    terminal = launch["terminal_receipt"]
-    return {
-        "task_id": args.task,
-        "launch_id": args.launch_id,
-        "semantic_head_sha256": launch["semantic_head_sha256"],
-        "intent_sha256": launch["intent"]["intent_sha256"],
-        "reservation_sha256": launch["reservation"]["reservation_sha256"],
-        "journal_event_sha256s": [row["event_sha256"] for row in launch["journal"]],
-        "pending_journal_event_sha256": None
-        if launch["pending_journal_event"] is None
-        else launch["pending_journal_event"]["event_sha256"],
-        "terminal_receipt_sha256": None
-        if terminal is None
-        else terminal["receipt_sha256"],
-        "pending_terminal_receipt_sha256": None
-        if launch["pending_terminal_receipt"] is None
-        else launch["pending_terminal_receipt"]["receipt_sha256"],
-        "verified_terminal_receipt_sha256": None
-        if launch["verified_terminal_receipt"] is None
-        else launch["verified_terminal_receipt"]["receipt_sha256"],
-        "pending_verified_terminal_receipt_sha256": None
-        if launch["pending_verified_terminal_receipt"] is None
-        else launch["pending_verified_terminal_receipt"]["receipt_sha256"],
-        "task_completion": "not_inferred",
-    }
+    raise CodexTransportCLIError("unreachable Codex transport inspect state")
 
 
 def _verify_mutation(args: argparse.Namespace) -> dict[str, Any]:
@@ -733,6 +709,11 @@ def _verify_mutation(args: argparse.Namespace) -> dict[str, Any]:
         None
         if args.pre_git_endpoint_file is None
         else _read_object(args.pre_git_endpoint_file, "pre-turn Git endpoint")
+    )
+    supplied_post_endpoint = (
+        None
+        if args.post_git_endpoint_file is None
+        else _read_object(args.post_git_endpoint_file, "post-turn Git endpoint")
     )
     try:
         with h.state_lock(paths, create_layout=False):
@@ -773,41 +754,34 @@ def _verify_mutation(args: argparse.Namespace) -> dict[str, Any]:
                 raise CodexTransportCLIError(
                     "supplied pre-turn endpoint differs from issuance-bound CAS bytes"
                 )
-            existing = mutation.inspect_verified_mutation_commit(
-                paths,
-                task_id=args.task,
-                launch_id=args.launch_id,
-                event_chain=events,
-                claims=claims,
-                sealed_claim_scope=args.sealed_claim_scope,
-            )
-            if existing["status"] == "committed":
-                committed = {**existing, "idempotent_replay": True}
-            else:
-                checked_pre = pre_endpoint
-                if (
-                    mutation.endpoint_pre_git_binding(checked_pre)
-                    != launch["intent"]["pre_git_binding"]
-                ):
-                    raise CodexTransportCLIError(
-                        "pre-turn Git endpoint does not match immutable launch intent"
-                    )
-                post_endpoint = mutation.capture_git_endpoint(
+            checked_pre = pre_endpoint
+            if (
+                mutation.endpoint_pre_git_binding(checked_pre)
+                != launch["intent"]["pre_git_binding"]
+            ):
+                raise CodexTransportCLIError(
+                    "pre-turn Git endpoint does not match immutable launch intent"
+                )
+            post_endpoint = (
+                supplied_post_endpoint
+                if supplied_post_endpoint is not None
+                else mutation.capture_git_endpoint(
                     args.task,
                     Path(str(checked_pre["snapshot"]["worktree"])),
                     str(checked_pre["snapshot"]["baseline_head"]),
                     claims,
                 )
-                committed = mutation.commit_verified_mutation(
-                    paths,
-                    task_id=args.task,
-                    launch_id=args.launch_id,
-                    event_chain=events,
-                    pre_endpoint=checked_pre,
-                    post_endpoint=post_endpoint,
-                    claims=claims,
-                    sealed_claim_scope=args.sealed_claim_scope,
-                )
+            )
+            committed = mutation.commit_verified_mutation(
+                paths,
+                task_id=args.task,
+                launch_id=args.launch_id,
+                event_chain=events,
+                pre_endpoint=checked_pre,
+                post_endpoint=post_endpoint,
+                claims=claims,
+                sealed_claim_scope=args.sealed_claim_scope,
+            )
     except (
         h.HarnessError,
         store.SemanticStoreError,
@@ -882,6 +856,7 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--task", required=True)
     verify.add_argument("--launch-id", required=True)
     verify.add_argument("--pre-git-endpoint-file")
+    verify.add_argument("--post-git-endpoint-file")
     verify.add_argument("--sealed-claim-scope", action="store_true")
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(handler=_verify_mutation)
