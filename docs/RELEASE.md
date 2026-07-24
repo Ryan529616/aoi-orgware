@@ -169,8 +169,13 @@ aoi add-verification --task <release-task> \
 Record the resulting verification index. Only then create the unused annotated
 tag and build a composite preflight that re-reads that exact CAS artifact,
 current approved plan, local tag object/peeled commit, effective push
-destination, current remote absence, and destination-aware confidentiality
-decision:
+destination, and destination-aware confidentiality decision. Its one
+endpoint-pinned remote advertisement query requests `refs/heads/main`, the tag
+ref, and the peeled tag ref together. Preflight accepts that observation only
+when canonical `main` equals the exact-CI commit and both tag rows are absent;
+the receipt binds the remote-main OID, the expected annotated-tag object and
+peeled commit, exact push transport/destination, exact-CI commit, and the
+content-addressed advertisement digest:
 
 Before either release-tag command performs remote inspection, audit URL rewrite
 configuration. Any configured Git `insteadOf` or `pushInsteadOf` rewrite makes
@@ -218,7 +223,7 @@ aoi release-tag-push-preflight --task <release-task> \
 tag_preflight_sha256="$(sha256sum "$tag_preflight" | awk '{print $1}')"
 aoi add-verification --task <release-task> \
   --category delivery_check --status pass \
-  --evidence "Exact CI, plan, annotated tag, destination, and confidentiality gate bound" \
+  --evidence "Exact CI, current remote main, absent tag pair, destination, and confidentiality gate bound" \
   --command "aoi release-tag-push-preflight for $tag" \
   --boundary "Cooperative pre-push authorization; not remote delivery" \
   --artifact-ref "$tag_preflight=$tag_preflight_sha256"
@@ -227,8 +232,8 @@ aoi add-verification --task <release-task> \
 Record that second verification index. Immediately before the push, rerun the
 same preflight in CAS-backed recheck mode. That mode must reopen the named
 current passing verification and its content-addressed artifact, repeat the
-plan/config/HEAD/tag/remote-absence checks, and emit bytes only when the stored
-receipt and freshly rebuilt receipt are identical. Read the exact tag object,
+plan/config/HEAD/tag/main-plus-remote-absence checks, and emit bytes only when
+the stored receipt and freshly rebuilt receipt are identical. Read the exact tag object,
 tag ref, and credential-free raw push transport from those verified bytes; do
 not push the mutable local tag ref, the canonical destination identity, or a
 remote name. The empty force-with-lease is create-only: a competing tag
@@ -286,9 +291,9 @@ aoi release-tag-push-verify --task <release-task> \
 tag_delivery_sha256="$(sha256sum "$tag_delivery" | awk '{print $1}')"
 aoi add-verification --task <release-task> \
   --category delivery_check --status pass \
-  --evidence "Remote annotated tag object and peeled commit matched preflight" \
+  --evidence "One remote advertisement jointly matched main, annotated tag, peeled commit, and exact CI" \
   --command "aoi release-tag-push-verify for $tag" \
-  --boundary "Authenticated remote tag readback; not GitHub Release, PyPI, or task completion" \
+  --boundary "Single endpoint-pinned remote advertisement; not remote authentication, a cross-command transaction, GitHub Release, PyPI, or task completion" \
   --artifact-ref "$tag_delivery=$tag_delivery_sha256"
 ```
 
@@ -296,9 +301,14 @@ Do not retry an ambiguous push blindly. Run the readback command first: if the
 exact object arrived, it reconciles the outcome; if it did not, rerun the full
 preflight and byte comparison before considering another create-only push. A
 known successful push must be read back as the same remote annotated tag object
-and peeled commit. The delivery receipt also binds the exact task-CAS
-verification index, verification-record SHA-256, artifact SHA-256, and
-preflight receipt SHA-256 used for that readback.
+and peeled commit. Verification performs one endpoint-pinned advertisement
+query for canonical `main`, the tag object, and the peeled tag, rejects anything
+except exactly those three rows, and requires
+`remote_main_oid == tag_peeled_commit_oid == exact_ci_commit`. The canonical
+delivery receipt binds those OIDs, the tag object OID, exact transport and
+destination, exact-CI identity, and the advertisement digest. It also binds the
+exact task-CAS verification index, verification-record SHA-256, artifact
+SHA-256, and preflight receipt SHA-256 used for that readback.
 
 The two `release-tag-*` commands are read-only consumers of current AOI state;
 only the Chief-fenced `add-verification` calls mutate task state. The composite
@@ -315,6 +325,15 @@ not atomically lock Git configuration. Public release-tag receipt validation
 independently checks the embedded confidentiality
 preflight's exact schema and canonical self-digest, in addition to the outer
 receipt digest; a merely matching embedded digest field is insufficient.
+
+The preflight advertisement, create-only push, and delivery advertisement are
+three separate commands. Together they form a fail-closed observation bracket,
+not one atomic transaction. AOI holds no server-side lock across them, cannot
+promise exactly-once delivery, and does not claim that a preflight observation
+remains current after its command returns. A moved `main`, created or replaced
+tag, endpoint/config drift, malformed/duplicate/missing/unexpected advertisement
+row, mixed SHA-1/SHA-256 object format, or stale observation digest forces a new
+preflight or explicit readback reconciliation.
 
 The tag push may start another test run. If present, verify that its `headSha`
 equals the peeled tag commit, but treat it only as supplementary evidence.

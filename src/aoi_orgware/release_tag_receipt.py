@@ -8,7 +8,8 @@ import json
 import re
 from typing import Any, NoReturn
 
-from . import confidentiality, release_ci_receipt
+from . import confidentiality, git_plumbing, release_ci_receipt
+from .harnesslib import HarnessError
 
 
 MAX_RELEASE_TAG_RECEIPT_BYTES = 1024 * 1024
@@ -84,6 +85,59 @@ def _validate_confidentiality_preflight(value: object) -> str:
         _fail(f"release-tag confidentiality preflight is invalid: {exc}")
 
 
+def _validate_remote_advertisement(
+    value: object,
+    *,
+    tag_state: str,
+    push_transport: str,
+    tag_ref: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _fail("remote release advertisement must be an object")
+    try:
+        return git_plumbing.validate_remote_release_advertisement_snapshot(
+            value,
+            expected_tag_state=tag_state,
+            expected_push_transport=push_transport,
+            expected_tag_ref=tag_ref,
+        )
+    except HarnessError as exc:
+        _fail(f"remote release advertisement is invalid: {exc}")
+
+
+def _receipt_remote_advertisement(
+    value: Mapping[str, Any],
+    *,
+    tag_state: str,
+) -> dict[str, Any]:
+    tag_ref = _text(value.get("tag_ref"), "release tag ref")
+    return _validate_remote_advertisement(
+        {
+            "schema": git_plumbing.GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA,
+            "tag_state": tag_state,
+            "push_transport": value.get("push_transport"),
+            "main_ref": value.get("main_ref"),
+            "remote_main_oid": value.get("remote_main_oid"),
+            "tag_ref": tag_ref,
+            "tag_object_oid": (
+                None if tag_state == "tag_absent" else value.get("tag_object_oid")
+            ),
+            "tag_peeled_ref": f"{tag_ref}^{{}}",
+            "tag_peeled_commit_oid": (
+                None
+                if tag_state == "tag_absent"
+                else value.get("tag_peeled_commit_oid")
+            ),
+            "observation_sha256": value.get("advertisement_observation_sha256"),
+        },
+        tag_state=tag_state,
+        push_transport=_text(
+            value.get("push_transport"), "release push transport"
+        ),
+        tag_ref=tag_ref,
+    )
+
+
 def build_release_tag_preflight(
     *,
     task_id: str,
@@ -98,6 +152,7 @@ def build_release_tag_preflight(
     push_transport: str,
     destination: str,
     confidentiality_preflight: Mapping[str, Any],
+    remote_advertisement: Mapping[str, Any],
 ) -> dict[str, Any]:
     exact_ci = release_ci_receipt.validate_exact_ci_receipt(exact_ci_receipt)
     tag = _text(tag, "release tag")
@@ -107,13 +162,26 @@ def build_release_tag_preflight(
     commit = _oid(exact_ci["commit"], "release peeled commit")
     if len(tag_object_oid) != len(commit) or tag_object_oid == commit:
         _fail("release tag must be one annotated tag object distinct from its commit")
+    tag_ref = f"refs/tags/{tag}"
+    push_transport = _text(push_transport, "release push transport")
+    advertisement = _validate_remote_advertisement(
+        remote_advertisement,
+        tag_state="tag_absent",
+        push_transport=push_transport,
+        tag_ref=tag_ref,
+    )
+    remote_main_oid = _oid(
+        advertisement["remote_main_oid"], "remote canonical main"
+    )
+    if remote_main_oid != commit:
+        _fail("remote canonical main differs from the exact-CI commit")
     preflight_digest = _validate_confidentiality_preflight(
         confidentiality_preflight
     )
     base = {
-        "schema_version": 1,
+        "schema_version": 2,
         "action": "release_tag_push_preflight",
-        "boundary": "aoi_cooperative_preflight_not_system_dlp",
+        "boundary": "single_pre_push_advertisement_not_transaction_or_lock",
         "task_id": _text(task_id, "task id"),
         "task_plan_sha256": _sha256(task_plan_sha256, "task plan SHA-256"),
         "release_ci_verification": {
@@ -133,15 +201,22 @@ def build_release_tag_preflight(
         "repository": exact_ci["repository"],
         "branch": exact_ci["branch"],
         "event": exact_ci["event"],
+        "exact_ci_commit": commit,
         "tag": tag,
-        "tag_ref": f"refs/tags/{tag}",
+        "tag_ref": tag_ref,
         "tag_object_oid": tag_object_oid,
-        "peeled_commit_oid": commit,
+        "tag_peeled_commit_oid": commit,
+        "main_ref": git_plumbing.GIT_REMOTE_RELEASE_MAIN_REF,
+        "remote_main_oid": remote_main_oid,
+        "remote_tag_state": "absent",
+        "advertisement_observation_sha256": advertisement[
+            "observation_sha256"
+        ],
         "remote": _text(remote, "release remote"),
         # This is the exact credential-free transport string used for the
         # push/readback.  URL interpretation belongs in the command layer;
         # receipts only bind the supplied canonical text end-to-end.
-        "push_transport": _text(push_transport, "release push transport"),
+        "push_transport": push_transport,
         "destination": _text(destination, "release destination"),
         "confidentiality_preflight": dict(confidentiality_preflight),
         "confidentiality_preflight_sha256": preflight_digest,
@@ -167,10 +242,15 @@ def validate_release_tag_preflight(
         "repository",
         "branch",
         "event",
+        "exact_ci_commit",
         "tag",
         "tag_ref",
         "tag_object_oid",
-        "peeled_commit_oid",
+        "tag_peeled_commit_oid",
+        "main_ref",
+        "remote_main_oid",
+        "remote_tag_state",
+        "advertisement_observation_sha256",
         "remote",
         "push_transport",
         "destination",
@@ -187,17 +267,26 @@ def validate_release_tag_preflight(
     tag = _text(value.get("tag"), "release tag")
     tag_ref = _text(value.get("tag_ref"), "release tag ref")
     tag_object = _oid(value.get("tag_object_oid"), "release tag object")
-    peeled_commit = _oid(value.get("peeled_commit_oid"), "release peeled commit")
+    peeled_commit = _oid(
+        value.get("tag_peeled_commit_oid"), "release peeled commit"
+    )
+    exact_ci_commit = _oid(value.get("exact_ci_commit"), "exact-CI commit")
+    remote_main_oid = _oid(
+        value.get("remote_main_oid"), "remote canonical main"
+    )
     if (
         type(value.get("schema_version")) is not int
-        or value.get("schema_version") != 1
+        or value.get("schema_version") != 2
         or value.get("action") != "release_tag_push_preflight"
-        or value.get("boundary") != "aoi_cooperative_preflight_not_system_dlp"
+        or value.get("boundary")
+        != "single_pre_push_advertisement_not_transaction_or_lock"
         or value.get("decision") != "allowed"
         or value.get("repository") != exact_ci["repository"]
         or value.get("branch") != exact_ci["branch"]
         or value.get("event") != exact_ci["event"]
-        or peeled_commit != exact_ci["commit"]
+        or exact_ci_commit != exact_ci["commit"]
+        or peeled_commit != exact_ci_commit
+        or remote_main_oid != exact_ci_commit
         or _TAG.fullmatch(tag) is None
         or tag_ref != f"refs/tags/{tag}"
         or len(tag_object) != len(peeled_commit)
@@ -209,6 +298,15 @@ def validate_release_tag_preflight(
         )
     ):
         _fail("release-tag preflight receipt identity is invalid")
+    advertisement = _receipt_remote_advertisement(
+        value, tag_state="tag_absent"
+    )
+    if (
+        value.get("main_ref") != git_plumbing.GIT_REMOTE_RELEASE_MAIN_REF
+        or value.get("remote_tag_state") != "absent"
+        or advertisement["remote_main_oid"] != remote_main_oid
+    ):
+        _fail("release-tag preflight advertisement identity is invalid")
     verification = value.get("release_ci_verification")
     if not isinstance(verification, Mapping) or set(verification) != {
         "verification_index",
@@ -258,29 +356,43 @@ def build_release_tag_delivery(
     preflight_verification_index: int,
     preflight_verification_record_sha256: str,
     preflight_artifact_sha256: str,
-    remote_tag_object_oid: str,
-    remote_peeled_commit_oid: str,
+    remote_advertisement: Mapping[str, Any],
     observed_destination: str,
 ) -> dict[str, Any]:
     validated = validate_release_tag_preflight(
         preflight, exact_ci_receipt=exact_ci_receipt
     )
+    advertisement = _validate_remote_advertisement(
+        remote_advertisement,
+        tag_state="tag_present",
+        push_transport=validated["push_transport"],
+        tag_ref=validated["tag_ref"],
+    )
+    remote_main_oid = _oid(
+        advertisement["remote_main_oid"], "remote canonical main"
+    )
     remote_tag_object_oid = _oid(
-        remote_tag_object_oid, "remote release tag object"
+        advertisement["tag_object_oid"], "remote release tag object"
     )
     remote_peeled_commit_oid = _oid(
-        remote_peeled_commit_oid, "remote release peeled commit"
+        advertisement["tag_peeled_commit_oid"],
+        "remote release peeled commit",
     )
     if (
         remote_tag_object_oid != validated["tag_object_oid"]
-        or remote_peeled_commit_oid != validated["peeled_commit_oid"]
+        or remote_peeled_commit_oid != validated["tag_peeled_commit_oid"]
+        or remote_main_oid != validated["exact_ci_commit"]
+        or remote_peeled_commit_oid != validated["exact_ci_commit"]
         or observed_destination != validated["destination"]
     ):
-        _fail("remote release tag readback differs from its preflight")
+        _fail("remote release advertisement differs from its preflight")
     base = {
-        "schema_version": 1,
+        "schema_version": 2,
         "action": "release_tag_delivery_verified",
-        "boundary": "authenticated_remote_tag_readback_not_task_completion",
+        "boundary": (
+            "single_endpoint_pinned_remote_advertisement_not_task_completion_"
+            "or_transaction"
+        ),
         "task_id": validated["task_id"],
         "task_plan_sha256": validated["task_plan_sha256"],
         "preflight_receipt_sha256": validated["receipt_sha256"],
@@ -306,14 +418,22 @@ def build_release_tag_delivery(
             "receipt_sha256"
         ],
         "repository": validated["repository"],
+        "exact_ci_commit": validated["exact_ci_commit"],
+        "main_ref": git_plumbing.GIT_REMOTE_RELEASE_MAIN_REF,
+        "remote_main_oid": remote_main_oid,
         "tag": validated["tag"],
         "tag_ref": validated["tag_ref"],
         "tag_object_oid": remote_tag_object_oid,
-        "peeled_commit_oid": remote_peeled_commit_oid,
+        "tag_peeled_commit_oid": remote_peeled_commit_oid,
+        "advertisement_observation_sha256": advertisement[
+            "observation_sha256"
+        ],
         "remote": validated["remote"],
         "push_transport": validated["push_transport"],
         "destination": observed_destination,
-        "observation": "remote_ref_and_peeled_commit_match",
+        "observation": (
+            "single_endpoint_pinned_main_and_annotated_tag_match_exact_ci"
+        ),
     }
     return validate_release_tag_delivery(
         _seal(base),
@@ -345,10 +465,14 @@ def validate_release_tag_delivery(
         "release_ci_artifact_sha256",
         "release_ci_receipt_sha256",
         "repository",
+        "exact_ci_commit",
+        "main_ref",
+        "remote_main_oid",
         "tag",
         "tag_ref",
         "tag_object_oid",
-        "peeled_commit_oid",
+        "tag_peeled_commit_oid",
+        "advertisement_observation_sha256",
         "remote",
         "push_transport",
         "destination",
@@ -400,11 +524,15 @@ def validate_release_tag_delivery(
     )
     if (
         type(value.get("schema_version")) is not int
-        or value.get("schema_version") != 1
+        or value.get("schema_version") != 2
         or value.get("action") != "release_tag_delivery_verified"
         or value.get("boundary")
-        != "authenticated_remote_tag_readback_not_task_completion"
-        or value.get("observation") != "remote_ref_and_peeled_commit_match"
+        != (
+            "single_endpoint_pinned_remote_advertisement_not_task_completion_"
+            "or_transaction"
+        )
+        or value.get("observation")
+        != "single_endpoint_pinned_main_and_annotated_tag_match_exact_ci"
         or value.get("task_id") != validated_preflight.get("task_id")
         or value.get("task_plan_sha256")
         != validated_preflight.get("task_plan_sha256")
@@ -425,18 +553,32 @@ def validate_release_tag_delivery(
         or value.get("release_ci_receipt_sha256")
         != verification.get("receipt_sha256")
         or value.get("repository") != validated_preflight.get("repository")
+        or value.get("exact_ci_commit")
+        != validated_preflight.get("exact_ci_commit")
+        or value.get("main_ref") != git_plumbing.GIT_REMOTE_RELEASE_MAIN_REF
+        or value.get("remote_main_oid")
+        != validated_preflight.get("exact_ci_commit")
         or value.get("tag") != validated_preflight.get("tag")
         or value.get("tag_ref") != validated_preflight.get("tag_ref")
         or value.get("tag_object_oid")
         != validated_preflight.get("tag_object_oid")
-        or value.get("peeled_commit_oid")
-        != validated_preflight.get("peeled_commit_oid")
+        or value.get("tag_peeled_commit_oid")
+        != validated_preflight.get("tag_peeled_commit_oid")
         or value.get("remote") != validated_preflight.get("remote")
         or value.get("push_transport")
         != validated_preflight.get("push_transport")
         or value.get("destination") != validated_preflight.get("destination")
     ):
         _fail("release-tag delivery receipt identity is invalid")
+    advertisement = _receipt_remote_advertisement(
+        value, tag_state="tag_present"
+    )
+    if (
+        advertisement["remote_main_oid"] != value.get("exact_ci_commit")
+        or advertisement["tag_peeled_commit_oid"]
+        != value.get("exact_ci_commit")
+    ):
+        _fail("release-tag delivery advertisement identity is invalid")
     _text(value.get("task_id"), "release-tag delivery task id")
     _sha256(
         value.get("task_plan_sha256"), "release-tag delivery task plan SHA-256"
@@ -454,10 +596,12 @@ def validate_release_tag_delivery(
         "release-tag delivery exact-CI receipt SHA-256",
     )
     _text(value.get("repository"), "release-tag delivery repository")
+    _oid(value.get("exact_ci_commit"), "release-tag delivery exact-CI commit")
+    _oid(value.get("remote_main_oid"), "release-tag delivery remote main")
     _text(value.get("tag"), "release-tag delivery tag")
     _text(value.get("tag_ref"), "release-tag delivery tag ref")
     _oid(value.get("tag_object_oid"), "release-tag delivery object")
-    _oid(value.get("peeled_commit_oid"), "release-tag delivery commit")
+    _oid(value.get("tag_peeled_commit_oid"), "release-tag delivery commit")
     _text(value.get("remote"), "release-tag delivery remote")
     _text(value.get("push_transport"), "release-tag delivery push transport")
     _text(value.get("destination"), "release-tag delivery destination")

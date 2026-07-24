@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from aoi_orgware import confidentiality
+from aoi_orgware import git_plumbing
 from aoi_orgware import release_ci_receipt
 from aoi_orgware import release_tag_receipt
 
@@ -91,6 +92,30 @@ def _confidentiality_preflight() -> dict[str, Any]:
     return base
 
 
+def _advertisement(
+    *,
+    tag_state: str,
+    main_oid: str = "a" * 40,
+    tag_object_oid: str | None = None,
+    tag_peeled_commit_oid: str | None = None,
+    push_transport: str = "https://github.com/Ryan529616/aoi-orgware.git",
+    tag_ref: str = "refs/tags/v0.4.0a3",
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "schema": git_plumbing.GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA,
+        "tag_state": tag_state,
+        "push_transport": push_transport,
+        "main_ref": git_plumbing.GIT_REMOTE_RELEASE_MAIN_REF,
+        "remote_main_oid": main_oid,
+        "tag_ref": tag_ref,
+        "tag_object_oid": tag_object_oid,
+        "tag_peeled_ref": f"{tag_ref}^{{}}",
+        "tag_peeled_commit_oid": tag_peeled_commit_oid,
+    }
+    base["observation_sha256"] = hashlib.sha256(_canonical(base)).hexdigest()
+    return base
+
+
 def _preflight(
     *,
     exact_ci: dict[str, Any] | None = None,
@@ -109,6 +134,7 @@ def _preflight(
         push_transport="https://github.com/Ryan529616/aoi-orgware.git",
         destination="https://github.com/Ryan529616/aoi-orgware.git",
         confidentiality_preflight=_confidentiality_preflight(),
+        remote_advertisement=_advertisement(tag_state="tag_absent"),
     )
     return receipt, exact
 
@@ -119,6 +145,8 @@ def _delivery(
     *,
     remote_tag_object_oid: str = "b" * 40,
     remote_peeled_commit_oid: str = "a" * 40,
+    remote_main_oid: str = "a" * 40,
+    push_transport: str | None = None,
 ) -> dict[str, Any]:
     return release_tag_receipt.build_release_tag_delivery(
         preflight=preflight,
@@ -126,8 +154,13 @@ def _delivery(
         preflight_verification_index=11,
         preflight_verification_record_sha256="7" * 64,
         preflight_artifact_sha256=hashlib.sha256(_canonical(preflight)).hexdigest(),
-        remote_tag_object_oid=remote_tag_object_oid,
-        remote_peeled_commit_oid=remote_peeled_commit_oid,
+        remote_advertisement=_advertisement(
+            tag_state="tag_present",
+            main_oid=remote_main_oid,
+            tag_object_oid=remote_tag_object_oid,
+            tag_peeled_commit_oid=remote_peeled_commit_oid,
+            push_transport=push_transport or preflight["push_transport"],
+        ),
         observed_destination=preflight["destination"],
     )
 
@@ -170,6 +203,11 @@ def test_preflight_and_delivery_round_trip_are_canonical() -> None:
 
     delivery = _delivery(preflight, exact_ci)
     assert delivery["push_transport"] == preflight["push_transport"]
+    assert delivery["boundary"] == (
+        "single_endpoint_pinned_remote_advertisement_not_task_completion_"
+        "or_transaction"
+    )
+    assert "authenticated" not in delivery["boundary"]
     assert delivery["preflight_verification"] == {
         "verification_index": 11,
         "verification_record_sha256": "7" * 64,
@@ -188,6 +226,63 @@ def test_preflight_and_delivery_round_trip_are_canonical() -> None:
     )
 
 
+def test_preflight_and_delivery_reject_stale_advertisements() -> None:
+    exact_ci = _exact_ci()
+    with pytest.raises(
+        release_tag_receipt.ReleaseTagReceiptError,
+        match="remote canonical main differs",
+    ):
+        release_tag_receipt.build_release_tag_preflight(
+            task_id="release-task",
+            task_plan_sha256="3" * 64,
+            verification_index=7,
+            verification_record_sha256="4" * 64,
+            verification_artifact_sha256="5" * 64,
+            exact_ci_receipt=exact_ci,
+            tag="v0.4.0a3",
+            tag_object_oid="b" * 40,
+            remote="github",
+            push_transport="https://github.com/Ryan529616/aoi-orgware.git",
+            destination="https://github.com/Ryan529616/aoi-orgware.git",
+            confidentiality_preflight=_confidentiality_preflight(),
+            remote_advertisement=_advertisement(
+                tag_state="tag_absent", main_oid="c" * 40
+            ),
+        )
+
+    preflight, exact_ci = _preflight()
+    with pytest.raises(
+        release_tag_receipt.ReleaseTagReceiptError,
+        match="endpoint is stale",
+    ):
+        _delivery(
+            preflight,
+            exact_ci,
+            push_transport="https://attacker.invalid/repo.git",
+        )
+    with pytest.raises(
+        release_tag_receipt.ReleaseTagReceiptError,
+        match="canonical main and peeled release tag differ",
+    ):
+        _delivery(
+            preflight,
+            exact_ci,
+            remote_main_oid="c" * 40,
+        )
+
+    delivery = _delivery(preflight, exact_ci)
+    stale = deepcopy(delivery)
+    stale["advertisement_observation_sha256"] = preflight[
+        "advertisement_observation_sha256"
+    ]
+    stale = _reseal(stale)
+    with pytest.raises(
+        release_tag_receipt.ReleaseTagReceiptError,
+        match="advertisement digest is invalid",
+    ):
+        _validate_delivery(stale, preflight, exact_ci)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -196,7 +291,7 @@ def test_preflight_and_delivery_round_trip_are_canonical() -> None:
         ("tag", "release-0.4.0", "identity"),
         ("tag_ref", "refs/tags/other", "identity"),
         ("tag_object_oid", "a" * 40, "identity"),
-        ("peeled_commit_oid", "c" * 40, "identity"),
+        ("tag_peeled_commit_oid", "c" * 40, "identity"),
         ("repository", "attacker/fork", "identity"),
         ("event", "workflow_dispatch", "identity"),
     ],
@@ -318,6 +413,10 @@ def test_builders_reject_nonmapping_or_wrong_remote_delivery() -> None:
             push_transport="https://example.invalid/repo.git",
             destination="https://example.invalid/repo.git",
             confidentiality_preflight=[],  # type: ignore[arg-type]
+            remote_advertisement=_advertisement(
+                tag_state="tag_absent",
+                push_transport="https://example.invalid/repo.git",
+            ),
         )
 
     malformed = _confidentiality_preflight()
@@ -339,6 +438,10 @@ def test_builders_reject_nonmapping_or_wrong_remote_delivery() -> None:
             push_transport="https://example.invalid/repo.git",
             destination="https://example.invalid/repo.git",
             confidentiality_preflight=malformed,
+            remote_advertisement=_advertisement(
+                tag_state="tag_absent",
+                push_transport="https://example.invalid/repo.git",
+            ),
         )
 
     preflight, exact_ci = _preflight(exact_ci=exact_ci)
@@ -391,8 +494,11 @@ def test_delivery_rejects_resealed_correlation_tamper() -> None:
     for field, value in (
         ("preflight_receipt_sha256", "7" * 64),
         ("release_ci_artifact_sha256", "8" * 64),
+        ("exact_ci_commit", "c" * 40),
+        ("remote_main_oid", "c" * 40),
         ("tag_object_oid", "c" * 40),
-        ("peeled_commit_oid", "d" * 40),
+        ("tag_peeled_commit_oid", "d" * 40),
+        ("advertisement_observation_sha256", "e" * 64),
         ("push_transport", "ssh://git@attacker.invalid/repo.git"),
         ("destination", "https://attacker.invalid/repo.git"),
     ):
@@ -400,7 +506,8 @@ def test_delivery_rejects_resealed_correlation_tamper() -> None:
         tampered[field] = value
         tampered = _reseal(tampered)
         with pytest.raises(
-            release_tag_receipt.ReleaseTagReceiptError, match="identity"
+            release_tag_receipt.ReleaseTagReceiptError,
+            match="identity|digest",
         ):
             _validate_delivery(tampered, preflight, exact_ci)
 
@@ -500,4 +607,8 @@ def test_preflight_rejects_noncanonical_push_transport(
             push_transport=push_transport,
             destination="https://example.invalid/repo.git",
             confidentiality_preflight=_confidentiality_preflight(),
+            remote_advertisement=_advertisement(
+                tag_state="tag_absent",
+                push_transport=push_transport,
+            ),
         )

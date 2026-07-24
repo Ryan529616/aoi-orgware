@@ -428,7 +428,7 @@ def _require_release_tag_no_git_url_rewrites(worktree: Path) -> None:
 def cmd_release_tag_push_preflight(
     args: argparse.Namespace, paths: h.HarnessPaths
 ) -> int:
-    """Bind task-CAS exact-CI evidence to one unused annotated tag push."""
+    """Bind exact CI to current remote main and one absent annotated tag."""
 
     action = "preflight a release tag for"
     with h.state_lock(paths):
@@ -492,6 +492,7 @@ def cmd_release_tag_push_preflight(
                         "0" * len(local_tag["tag_object_oid"]),
                     ),
                 ),
+                _verify_remote_state=False,
                 forbid_url_rewrites=True,
                 required_push_transport=push_transport_before,
             )
@@ -500,6 +501,17 @@ def cmd_release_tag_push_preflight(
                     "release-tag exact push transport is unavailable while "
                     "Git URL rewrites exist"
                 )
+            remote_advertisement = (
+                git_plumbing.remote_release_advertisement_snapshot(
+                    worktree,
+                    push_transport_before,
+                    tag_ref,
+                    tag_state="tag_absent",
+                    before_network=lambda: _require_release_tag_no_git_url_rewrites(
+                        worktree
+                    ),
+                )
+            )
             paths, refreshed_state, refreshed_git, refreshed_worktree = (
                 _revalidate_release_context(
                     paths,
@@ -579,6 +591,7 @@ def cmd_release_tag_push_preflight(
                 push_transport=push_transport_after,
                 destination=destination_after,
                 confidentiality_preflight=git_receipt,
+                remote_advertisement=remote_advertisement,
             )
             if recorded_preflight_after is not None:
                 (
@@ -612,7 +625,7 @@ def cmd_release_tag_push_preflight(
 def cmd_release_tag_push_verify(
     args: argparse.Namespace, paths: h.HarnessPaths
 ) -> int:
-    """Revalidate a CAS-recorded preflight and read back the pushed remote tag."""
+    """Jointly read back canonical main and the pushed annotated-tag pair."""
 
     action = "verify release-tag delivery for"
     with h.state_lock(paths):
@@ -672,7 +685,7 @@ def cmd_release_tag_push_verify(
             if (
                 binding.get("verification_record_sha256") != ci_record_sha
                 or validated["tag"] != args.tag
-                or validated["peeled_commit_oid"] != args.expected_commit
+                or validated["tag_peeled_commit_oid"] != args.expected_commit
                 or validated["remote"] != args.remote
                 or validated["destination"]
                 != confidentiality.canonical_publication_destination(
@@ -694,7 +707,7 @@ def cmd_release_tag_push_verify(
                 config_sha256=paths.project.sha256,
                 remote=validated["remote"],
                 destination=validated["destination"],
-                commit=validated["peeled_commit_oid"],
+                commit=validated["tag_peeled_commit_oid"],
                 remote_ref=validated["tag_ref"],
             )
             if git_digest != validated["confidentiality_preflight_sha256"]:
@@ -707,7 +720,7 @@ def cmd_release_tag_push_verify(
             if (
                 local_tag_before["tag_object_oid"] != validated["tag_object_oid"]
                 or local_tag_before["peeled_commit_oid"]
-                != validated["peeled_commit_oid"]
+                != validated["tag_peeled_commit_oid"]
             ):
                 raise h.HarnessError(
                     "release-tag local annotated tag differs from its preflight"
@@ -723,13 +736,16 @@ def cmd_release_tag_push_verify(
                 raise h.HarnessError(
                     "release-tag preflight push transport differs from the current push endpoint"
                 )
-            remote_tag = git_plumbing.remote_annotated_tag_snapshot(
-                worktree,
-                push_transport_before,
-                validated["tag_ref"],
-                before_network=lambda: _require_release_tag_no_git_url_rewrites(
-                    worktree
-                ),
+            remote_advertisement = (
+                git_plumbing.remote_release_advertisement_snapshot(
+                    worktree,
+                    push_transport_before,
+                    validated["tag_ref"],
+                    tag_state="tag_present",
+                    before_network=lambda: _require_release_tag_no_git_url_rewrites(
+                        worktree
+                    ),
+                )
             )
             paths, refreshed_state, refreshed_git, refreshed_worktree = (
                 _revalidate_release_context(
@@ -795,7 +811,7 @@ def cmd_release_tag_push_verify(
                     config_sha256=paths.project.sha256,
                     remote=validated["remote"],
                     destination=validated["destination"],
-                    commit=validated["peeled_commit_oid"],
+                    commit=validated["tag_peeled_commit_oid"],
                     remote_ref=validated["tag_ref"],
                 )
             )
@@ -810,8 +826,7 @@ def cmd_release_tag_push_verify(
                 preflight_verification_index=args.preflight_verification_index,
                 preflight_verification_record_sha256=preflight_record_sha_after,
                 preflight_artifact_sha256=args.preflight_artifact_sha256,
-                remote_tag_object_oid=remote_tag["tag_object_oid"],
-                remote_peeled_commit_oid=remote_tag["peeled_commit_oid"],
+                remote_advertisement=remote_advertisement,
                 observed_destination=destination_after,
             )
         except (
@@ -978,8 +993,8 @@ def register_release_commands(
     tag_preflight = sub.add_parser(
         "release-tag-push-preflight",
         help=(
-            "bind one task-CAS exact-CI receipt to an unused annotated release "
-            "tag and destination-aware Git preflight"
+            "bind one task-CAS exact-CI receipt to canonical remote main, an "
+            "unused annotated release tag, and destination-aware Git preflight"
         ),
     )
     tag_preflight.add_argument("--task", required=True)
@@ -995,8 +1010,8 @@ def register_release_commands(
     tag_verify = sub.add_parser(
         "release-tag-push-verify",
         help=(
-            "revalidate a CAS-recorded release-tag preflight and exact remote "
-            "annotated-tag readback"
+            "revalidate a CAS-recorded preflight and one exact remote-main plus "
+            "annotated-tag advertisement"
         ),
     )
     tag_verify.add_argument("--task", required=True)

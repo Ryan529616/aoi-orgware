@@ -253,6 +253,197 @@ class TempGitRepoTests(unittest.TestCase):
                 self.repo, str(remote), "refs/tags/lightweight-v2"
             )
 
+    def test_remote_release_advertisement_uses_one_exact_pinned_query(
+        self,
+    ) -> None:
+        transport = "https://example.invalid/owner/repo.git"
+        tag_ref = "refs/tags/v1.0.0"
+        raw = (
+            f"{self.baseline}\trefs/heads/main\n"
+            f"{'b' * 40}\t{tag_ref}\n"
+            f"{self.baseline}\t{tag_ref}^{{}}\n"
+        ).encode("ascii")
+        guard_calls: list[str] = []
+        with (
+            mock.patch.object(
+                gp, "_run_git_bytes_bounded", return_value=raw
+            ) as runner,
+            mock.patch.object(
+                gp,
+                "_direct_annotated_tag_metadata",
+                return_value={
+                    "tag_ref": tag_ref,
+                    "tag_object_oid": "b" * 40,
+                    "peeled_commit_oid": self.baseline,
+                },
+            ),
+        ):
+            snapshot = gp.remote_release_advertisement_snapshot(
+                self.repo,
+                transport,
+                tag_ref,
+                tag_state="tag_present",
+                before_network=lambda: guard_calls.append("called"),
+            )
+        self.assertEqual(guard_calls, ["called"])
+        self.assertEqual(snapshot["remote_main_oid"], self.baseline)
+        self.assertEqual(snapshot["tag_peeled_commit_oid"], self.baseline)
+        self.assertEqual(snapshot["tag_object_oid"], "b" * 40)
+        self.assertEqual(
+            runner.call_args.args[1],
+            (
+                "ls-remote",
+                "--exit-code",
+                "--",
+                transport,
+                "refs/heads/main",
+                tag_ref,
+                f"{tag_ref}^{{}}",
+            ),
+        )
+        self.assertEqual(
+            runner.call_args.kwargs["transport_identity"], transport
+        )
+
+    def test_remote_release_advertisement_accepts_sha1_and_sha256(
+        self,
+    ) -> None:
+        tag_ref = "refs/tags/v1.0.0"
+        for oid_length in (40, 64):
+            with self.subTest(oid_length=oid_length):
+                main = "a" * oid_length
+                raw = (
+                    f"{main}\trefs/heads/main\n"
+                    f"{'b' * oid_length}\t{tag_ref}\n"
+                    f"{main}\t{tag_ref}^{{}}\n"
+                ).encode("ascii")
+                snapshot = gp._parse_remote_release_advertisement(
+                    raw,
+                    push_transport="https://example.invalid/repo.git",
+                    tag_ref=tag_ref,
+                    tag_state="tag_present",
+                )
+                self.assertEqual(snapshot["remote_main_oid"], main)
+                self.assertEqual(
+                    gp.validate_remote_release_advertisement_snapshot(
+                        snapshot,
+                        expected_tag_state="tag_present",
+                        expected_push_transport=(
+                            "https://example.invalid/repo.git"
+                        ),
+                        expected_tag_ref=tag_ref,
+                    ),
+                    snapshot,
+                )
+
+    def test_remote_release_preflight_requires_main_and_tag_absence(
+        self,
+    ) -> None:
+        tag_ref = "refs/tags/v1.0.0"
+        main = "a" * 40
+        snapshot = gp._parse_remote_release_advertisement(
+            f"{main}\trefs/heads/main\n".encode("ascii"),
+            push_transport="https://example.invalid/repo.git",
+            tag_ref=tag_ref,
+            tag_state="tag_absent",
+        )
+        self.assertEqual(snapshot["remote_main_oid"], main)
+        self.assertIsNone(snapshot["tag_object_oid"])
+        with self.assertRaisesRegex(HarnessError, "requires.*absent tag"):
+            gp._parse_remote_release_advertisement(
+                (
+                    f"{main}\trefs/heads/main\n"
+                    f"{'b' * 40}\t{tag_ref}\n"
+                ).encode("ascii"),
+                push_transport="https://example.invalid/repo.git",
+                tag_ref=tag_ref,
+                tag_state="tag_absent",
+            )
+
+    def test_remote_release_advertisement_parser_fails_closed(self) -> None:
+        tag_ref = "refs/tags/v1.0.0"
+        main = "a" * 40
+        tag = "b" * 40
+        peeled = f"{tag_ref}^{{}}"
+        fixtures = {
+            "missing": (
+                f"{main}\trefs/heads/main\n"
+                f"{tag}\t{tag_ref}\n"
+            ).encode("ascii"),
+            "duplicate": (
+                f"{main}\trefs/heads/main\n"
+                f"{main}\trefs/heads/main\n"
+                f"{tag}\t{tag_ref}\n"
+                f"{main}\t{peeled}\n"
+            ).encode("ascii"),
+            "unexpected": (
+                f"{main}\trefs/heads/main\n"
+                f"{tag}\t{tag_ref}\n"
+                f"{main}\t{peeled}\n"
+                f"{main}\trefs/heads/other\n"
+            ).encode("ascii"),
+            "malformed": (
+                f"{main} refs/heads/main\n"
+                f"{tag}\t{tag_ref}\n"
+                f"{main}\t{peeled}\n"
+            ).encode("ascii"),
+            "uppercase": (
+                f"{'A' * 40}\trefs/heads/main\n"
+                f"{tag}\t{tag_ref}\n"
+                f"{main}\t{peeled}\n"
+            ).encode("ascii"),
+            "mixed-object-format": (
+                f"{main}\trefs/heads/main\n"
+                f"{'b' * 64}\t{tag_ref}\n"
+                f"{main}\t{peeled}\n"
+            ).encode("ascii"),
+            "main-tag-mismatch": (
+                f"{main}\trefs/heads/main\n"
+                f"{tag}\t{tag_ref}\n"
+                f"{'c' * 40}\t{peeled}\n"
+            ).encode("ascii"),
+        }
+        for label, raw in fixtures.items():
+            with self.subTest(label=label):
+                with self.assertRaises(HarnessError):
+                    gp._parse_remote_release_advertisement(
+                        raw,
+                        push_transport="https://example.invalid/repo.git",
+                        tag_ref=tag_ref,
+                        tag_state="tag_present",
+                    )
+
+    def test_remote_release_advertisement_rejects_stale_correlation(self) -> None:
+        snapshot = gp._parse_remote_release_advertisement(
+            f"{'a' * 40}\trefs/heads/main\n".encode("ascii"),
+            push_transport="https://example.invalid/repo.git",
+            tag_ref="refs/tags/v1.0.0",
+            tag_state="tag_absent",
+        )
+        for kwargs, message in (
+            (
+                {"expected_tag_state": "tag_present"},
+                "tag state is stale",
+            ),
+            (
+                {
+                    "expected_push_transport": (
+                        "https://attacker.invalid/repo.git"
+                    )
+                },
+                "endpoint is stale",
+            ),
+            (
+                {"expected_tag_ref": "refs/tags/v2.0.0"},
+                "tag ref is stale",
+            ),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(HarnessError, message):
+                    gp.validate_remote_release_advertisement_snapshot(
+                        snapshot, **kwargs
+                    )
+
     def test_remote_tag_snapshot_identity_pin_overrides_local_and_ambient_rewrites(
         self,
     ) -> None:

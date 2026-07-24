@@ -51,6 +51,23 @@ GIT_STATUS_SNAPSHOT_SCHEMA = "aoi.git-status-porcelain-v2.snapshot.v1"
 GIT_MUTATION_SNAPSHOT_SCHEMA = "aoi.git-mutation-snapshot.v2"
 GIT_TASK_CLAIM_SCOPE_SCHEMA = "aoi.git-task-live-claim-scope.v1"
 GIT_TASK_CLAIM_AUTHORITY_SCHEMA = "aoi.git-task-live-claim-authority.v1"
+GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA = (
+    "aoi.git-remote-release-advertisement.v1"
+)
+GIT_REMOTE_RELEASE_MAIN_REF = "refs/heads/main"
+_LOWER_FULL_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_REMOTE_RELEASE_ADVERTISEMENT_KEYS = {
+    "schema",
+    "tag_state",
+    "push_transport",
+    "main_ref",
+    "remote_main_oid",
+    "tag_ref",
+    "tag_object_oid",
+    "tag_peeled_ref",
+    "tag_peeled_commit_oid",
+    "observation_sha256",
+}
 
 
 def _b64(raw: bytes) -> str:
@@ -1662,6 +1679,218 @@ def _validated_tag_ref(tag_ref: str) -> str:
     return tag_ref
 
 
+def _remote_release_advertisement_digest(
+    value: Mapping[str, Any],
+) -> str:
+    base = dict(value)
+    base.pop("observation_sha256", None)
+    return hashlib.sha256(_canonical_json_bytes(base)).hexdigest()
+
+
+def validate_remote_release_advertisement_snapshot(
+    value: Mapping[str, Any],
+    *,
+    expected_tag_state: str | None = None,
+    expected_push_transport: str | None = None,
+    expected_tag_ref: str | None = None,
+) -> dict[str, Any]:
+    """Validate one content-addressed, endpoint-bound remote advertisement.
+
+    ``tag_absent`` is the pre-push side of the bracket: canonical ``main`` must
+    be present while both tag rows are absent. ``tag_present`` is the post-push
+    side: all three rows must be present in one ``ls-remote`` response and the
+    peeled tag must equal canonical ``main``. The snapshot is one observation,
+    not a lease or a transaction spanning another Git command.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != (
+        _REMOTE_RELEASE_ADVERTISEMENT_KEYS
+    ):
+        raise HarnessError("remote release advertisement schema is invalid")
+    state = value.get("tag_state")
+    transport = value.get("push_transport")
+    tag_ref = value.get("tag_ref")
+    peeled_ref = value.get("tag_peeled_ref")
+    main_oid = value.get("remote_main_oid")
+    tag_object = value.get("tag_object_oid")
+    peeled_commit = value.get("tag_peeled_commit_oid")
+    digest = value.get("observation_sha256")
+    if (
+        value.get("schema") != GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA
+        or state not in {"tag_absent", "tag_present"}
+        or value.get("main_ref") != GIT_REMOTE_RELEASE_MAIN_REF
+        or not isinstance(transport, str)
+        or _require_transport_identity(transport) != transport
+        or not isinstance(tag_ref, str)
+        or _validated_tag_ref(tag_ref) != tag_ref
+        or peeled_ref != f"{tag_ref}^{{}}"
+        or not isinstance(main_oid, str)
+        or _LOWER_FULL_OID_RE.fullmatch(main_oid) is None
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise HarnessError("remote release advertisement identity is invalid")
+    if expected_tag_state is not None and state != expected_tag_state:
+        raise HarnessError("remote release advertisement tag state is stale")
+    if (
+        expected_push_transport is not None
+        and transport != expected_push_transport
+    ):
+        raise HarnessError("remote release advertisement endpoint is stale")
+    if expected_tag_ref is not None and tag_ref != expected_tag_ref:
+        raise HarnessError("remote release advertisement tag ref is stale")
+    if state == "tag_absent":
+        if tag_object is not None or peeled_commit is not None:
+            raise HarnessError(
+                "remote release preflight advertisement requires an absent tag"
+            )
+    else:
+        if (
+            not isinstance(tag_object, str)
+            or _LOWER_FULL_OID_RE.fullmatch(tag_object) is None
+            or not isinstance(peeled_commit, str)
+            or _LOWER_FULL_OID_RE.fullmatch(peeled_commit) is None
+            or len({len(main_oid), len(tag_object), len(peeled_commit)}) != 1
+            or tag_object == peeled_commit
+        ):
+            raise HarnessError(
+                "remote release delivery advertisement has invalid object identities"
+            )
+        if main_oid != peeled_commit:
+            raise HarnessError(
+                "remote canonical main and peeled release tag differ"
+            )
+    if digest != _remote_release_advertisement_digest(value):
+        raise HarnessError("remote release advertisement digest is invalid")
+    return dict(value)
+
+
+def _parse_remote_release_advertisement(
+    raw: bytes,
+    *,
+    push_transport: str,
+    tag_ref: str,
+    tag_state: str,
+) -> dict[str, Any]:
+    """Strictly parse one bounded ``ls-remote`` response for the release refs."""
+
+    transport = _require_transport_identity(push_transport)
+    tag_ref = _validated_tag_ref(tag_ref)
+    if tag_state not in {"tag_absent", "tag_present"}:
+        raise HarnessError("remote release advertisement tag state is invalid")
+    try:
+        lines = raw.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise HarnessError("remote release advertisement is not ASCII") from exc
+    peeled_ref = f"{tag_ref}^{{}}"
+    expected_refs = {GIT_REMOTE_RELEASE_MAIN_REF, tag_ref, peeled_ref}
+    observed: dict[str, str] = {}
+    for line in lines:
+        if line.count("\t") != 1:
+            raise HarnessError("remote release advertisement is malformed")
+        oid, observed_ref = line.split("\t", 1)
+        if (
+            observed_ref not in expected_refs
+            or observed_ref in observed
+            or _LOWER_FULL_OID_RE.fullmatch(oid) is None
+        ):
+            raise HarnessError(
+                "remote release advertisement is ambiguous or invalid"
+            )
+        observed[observed_ref] = oid
+    required_refs = (
+        {GIT_REMOTE_RELEASE_MAIN_REF}
+        if tag_state == "tag_absent"
+        else expected_refs
+    )
+    if set(observed) != required_refs:
+        if tag_state == "tag_absent":
+            raise HarnessError(
+                "remote release preflight advertisement requires canonical main "
+                "and absent tag refs"
+            )
+        raise HarnessError(
+            "remote release delivery advertisement requires canonical main, "
+            "annotated tag, and peeled tag refs"
+        )
+    base: dict[str, Any] = {
+        "schema": GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA,
+        "tag_state": tag_state,
+        "push_transport": transport,
+        "main_ref": GIT_REMOTE_RELEASE_MAIN_REF,
+        "remote_main_oid": observed[GIT_REMOTE_RELEASE_MAIN_REF],
+        "tag_ref": tag_ref,
+        "tag_object_oid": observed.get(tag_ref),
+        "tag_peeled_ref": peeled_ref,
+        "tag_peeled_commit_oid": observed.get(peeled_ref),
+    }
+    return validate_remote_release_advertisement_snapshot(
+        {
+            **base,
+            "observation_sha256": _remote_release_advertisement_digest(base),
+        },
+        expected_tag_state=tag_state,
+        expected_push_transport=transport,
+        expected_tag_ref=tag_ref,
+    )
+
+
+def remote_release_advertisement_snapshot(
+    worktree: Path,
+    transport_destination: str,
+    tag_ref: str,
+    *,
+    tag_state: str,
+    before_network: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Observe canonical main and the release-tag pair in one pinned query."""
+
+    transport = _require_transport_identity(transport_destination)
+    tag_ref = _validated_tag_ref(tag_ref)
+    peeled_ref = f"{tag_ref}^{{}}"
+    if tag_state not in {"tag_absent", "tag_present"}:
+        raise HarnessError("remote release advertisement tag state is invalid")
+    if before_network is not None:
+        if not callable(before_network):
+            raise HarnessError("remote release advertisement network guard is invalid")
+        before_network()
+    raw = _run_git_bytes_bounded(
+        worktree,
+        (
+            "ls-remote",
+            "--exit-code",
+            "--",
+            transport,
+            GIT_REMOTE_RELEASE_MAIN_REF,
+            tag_ref,
+            peeled_ref,
+        ),
+        label=f"remote release {tag_state} advertisement",
+        timeout=30,
+        stdout_limit=12 * 1024,
+        transport_identity=transport,
+    )
+    snapshot = _parse_remote_release_advertisement(
+        raw,
+        push_transport=transport,
+        tag_ref=tag_ref,
+        tag_state=tag_state,
+    )
+    if tag_state == "tag_present":
+        tag_object = str(snapshot["tag_object_oid"])
+        local = _direct_annotated_tag_metadata(
+            worktree,
+            tag_object=tag_object,
+            tag_ref=tag_ref,
+            label="remote release tag",
+        )
+        if local["peeled_commit_oid"] != snapshot["tag_peeled_commit_oid"]:
+            raise HarnessError(
+                "remote release tag object does not match the advertised peeled tag"
+            )
+    return snapshot
+
+
 def _direct_annotated_tag_metadata(
     worktree: Path,
     *,
@@ -1836,6 +2065,8 @@ __all__ = [
     "COMMIT_RE",
     "FULL_COMMIT_RE",
     "GIT_MUTATION_SNAPSHOT_SCHEMA",
+    "GIT_REMOTE_RELEASE_ADVERTISEMENT_SCHEMA",
+    "GIT_REMOTE_RELEASE_MAIN_REF",
     "GIT_STATUS_SNAPSHOT_SCHEMA",
     "GIT_TASK_CLAIM_AUTHORITY_SCHEMA",
     "GIT_TASK_CLAIM_SCOPE_SCHEMA",
@@ -1861,8 +2092,10 @@ __all__ = [
     "local_annotated_tag_snapshot",
     "mutation_claim_coverage",
     "remote_annotated_tag_snapshot",
+    "remote_release_advertisement_snapshot",
     "remote_ref_tip",
     "resolve_task_commit",
     "state_worktree",
     "worktree_integrity_errors",
+    "validate_remote_release_advertisement_snapshot",
 ]

@@ -68,6 +68,7 @@ local_cas = true
             capture_output=True,
         )
         self.git("remote", "add", "github", str(self.remote))
+        self.git("push", "-q", "github", "HEAD:refs/heads/main")
         self.init_task(TASK)
         self.head = self.git("rev-parse", "HEAD").strip().lower()
         self.exact_ci_path, self.exact_ci_sha256 = self._record_exact_ci()
@@ -215,6 +216,12 @@ local_cas = true
             capture_output=True,
         )
         self.git(
+            "push",
+            "-q",
+            push_remote.as_posix(),
+            f"{self.head}:refs/heads/main",
+        )
+        self.git(
             "remote",
             "set-url",
             "--add",
@@ -308,6 +315,17 @@ local_cas = true
         )
         self.assertFalse(result.stdout.endswith("\n"))
         delivery = json.loads(result.stdout)
+        self.assertEqual(preflight["remote_main_oid"], self.head)
+        self.assertEqual(preflight["remote_tag_state"], "absent")
+        self.assertEqual(preflight["exact_ci_commit"], self.head)
+        self.assertEqual(preflight["tag_peeled_commit_oid"], self.head)
+        self.assertEqual(delivery["remote_main_oid"], self.head)
+        self.assertEqual(delivery["exact_ci_commit"], self.head)
+        self.assertEqual(delivery["tag_peeled_commit_oid"], self.head)
+        self.assertNotEqual(
+            preflight["advertisement_observation_sha256"],
+            delivery["advertisement_observation_sha256"],
+        )
         state = h.load_task(h.get_paths(self.root), TASK)
         preflight_record_sha256 = evidence_artifacts.canonical_record_sha256(
             state["verification"][preflight_index - 1]
@@ -590,7 +608,7 @@ local_cas = true
             self.remote.as_posix(),
             ok=False,
         )
-        self.assertIn("pre-push remote state", existing.stderr)
+        self.assertIn("preflight advertisement", existing.stderr)
 
     def test_preflight_remote_state_uses_push_url_not_fetch_url(self) -> None:
         push_remote = self._split_push_remote()
@@ -618,7 +636,40 @@ local_cas = true
             push_remote.as_posix(),
             ok=False,
         )
-        self.assertIn("pre-push remote state", result.stderr)
+        self.assertIn("preflight advertisement", result.stderr)
+
+    def test_preflight_rejects_remote_main_that_differs_from_exact_ci(
+        self,
+    ) -> None:
+        parent = self.git("rev-parse", f"{self.head}^").strip()
+        self.git(
+            "push",
+            "-q",
+            "--force",
+            "github",
+            f"{parent}:refs/heads/main",
+        )
+        self.git("tag", "-a", TAG, "-m", "release", self.head)
+        result = self._without_chief(
+            "release-tag-push-preflight",
+            "--task",
+            TASK,
+            "--verification-index",
+            "1",
+            "--artifact-sha256",
+            self.exact_ci_sha256,
+            "--tag",
+            TAG,
+            "--remote",
+            "github",
+            "--destination",
+            self.remote.as_posix(),
+            ok=False,
+        )
+        self.assertIn(
+            "remote canonical main differs from the exact-CI commit",
+            result.stderr,
+        )
 
     def test_preflight_binds_raw_push_transport_not_fetch_url(self) -> None:
         push_remote = self._split_push_remote()
@@ -658,6 +709,49 @@ local_cas = true
             "",
         )
 
+    def test_preflight_network_guard_rejects_late_rewrite(self) -> None:
+        self.git("tag", "-a", TAG, "-m", "release", self.head)
+        original_snapshot = (
+            release_commands.git_plumbing.remote_release_advertisement_snapshot
+        )
+        original_bounded = release_commands.git_plumbing._run_git_bytes_bounded
+        network_commands: list[tuple[str, ...]] = []
+
+        def inject_rewrite_then_observe(
+            *args: Any, **kwargs: Any
+        ) -> dict[str, Any]:
+            self._configure_chained_url_rewrites()
+            return original_snapshot(*args, **kwargs)
+
+        def observe_bounded(
+            worktree: Path, arguments: Any, **kwargs: Any
+        ) -> bytes:
+            command = tuple(arguments)
+            if command and command[0] == "ls-remote":
+                network_commands.append(command)
+            return original_bounded(worktree, command, **kwargs)
+
+        with (
+            mock.patch.object(
+                release_commands.git_plumbing,
+                "remote_release_advertisement_snapshot",
+                side_effect=inject_rewrite_then_observe,
+            ),
+            mock.patch.object(
+                release_commands.git_plumbing,
+                "_run_git_bytes_bounded",
+                side_effect=observe_bounded,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                h.HarnessError, "Git URL rewrites exist"
+            ):
+                release_commands.cmd_release_tag_push_preflight(
+                    self._preflight_namespace(),
+                    h.get_paths(self.root),
+                )
+        self.assertEqual(network_commands, [])
+
     def test_verify_rejects_push_transport_drift(self) -> None:
         preflight, preflight_index, preflight_sha = self._create_preflight()
         self._push_exact_preflight(preflight)
@@ -685,6 +779,40 @@ local_cas = true
         )
         self.assertIn("push transport differs", result.stderr)
 
+    def test_verify_rejects_remote_main_moved_after_tag_push(self) -> None:
+        preflight, preflight_index, preflight_sha = self._create_preflight()
+        self._push_exact_preflight(preflight)
+        parent = self.git("rev-parse", f"{self.head}^").strip()
+        self.git(
+            "push",
+            "-q",
+            "--force",
+            "github",
+            f"{parent}:refs/heads/main",
+        )
+        result = self._without_chief(
+            "release-tag-push-verify",
+            "--task",
+            TASK,
+            "--preflight-verification-index",
+            str(preflight_index),
+            "--preflight-artifact-sha256",
+            preflight_sha,
+            "--tag",
+            TAG,
+            "--expected-commit",
+            self.head,
+            "--remote",
+            "github",
+            "--destination",
+            self.remote.as_posix(),
+            ok=False,
+        )
+        self.assertIn(
+            "remote canonical main and peeled release tag differ",
+            result.stderr,
+        )
+
     def test_verify_rejects_any_url_rewrite_before_remote_readback(self) -> None:
         preflight, preflight_index, preflight_sha = self._create_preflight()
         self._push_exact_preflight(preflight)
@@ -699,7 +827,7 @@ local_cas = true
             ) as effective_transport,
             mock.patch.object(
                 release_commands.git_plumbing,
-                "remote_annotated_tag_snapshot",
+                "remote_release_advertisement_snapshot",
             ) as remote_readback,
         ):
             with self.assertRaisesRegex(
@@ -750,7 +878,7 @@ local_cas = true
             push_remote.as_posix(),
             ok=False,
         )
-        self.assertIn("remote annotated release tag readback", result.stderr)
+        self.assertIn("delivery advertisement", result.stderr)
 
     def test_repeated_preflight_changes_when_local_tag_ref_moves(self) -> None:
         first, _index, _digest = self._create_preflight()
@@ -906,9 +1034,11 @@ local_cas = true
     def test_verify_rechecks_config_after_remote_readback(self) -> None:
         preflight, preflight_index, preflight_sha = self._create_preflight()
         self._push_exact_preflight(preflight)
-        original = release_commands.git_plumbing.remote_annotated_tag_snapshot
+        original = (
+            release_commands.git_plumbing.remote_release_advertisement_snapshot
+        )
 
-        def drift_config(*args: Any, **kwargs: Any) -> dict[str, str]:
+        def drift_config(*args: Any, **kwargs: Any) -> dict[str, Any]:
             snapshot = original(*args, **kwargs)
             config = self.root / "aoi.toml"
             config.write_text(
@@ -919,7 +1049,7 @@ local_cas = true
 
         with mock.patch.object(
             release_commands.git_plumbing,
-            "remote_annotated_tag_snapshot",
+            "remote_release_advertisement_snapshot",
             side_effect=drift_config,
         ):
             with self.assertRaisesRegex(h.HarnessError, "aoi.toml changed"):
@@ -936,11 +1066,15 @@ local_cas = true
     ) -> None:
         preflight, preflight_index, preflight_sha = self._create_preflight()
         self._push_exact_preflight(preflight)
-        original_snapshot = release_commands.git_plumbing.remote_annotated_tag_snapshot
+        original_snapshot = (
+            release_commands.git_plumbing.remote_release_advertisement_snapshot
+        )
         original_bounded = release_commands.git_plumbing._run_git_bytes_bounded
         network_commands: list[tuple[str, ...]] = []
 
-        def inject_rewrite_then_readback(*args: Any, **kwargs: Any) -> dict[str, str]:
+        def inject_rewrite_then_readback(
+            *args: Any, **kwargs: Any
+        ) -> dict[str, Any]:
             # The command performed its last outer rewrite audit immediately
             # before entering the snapshot helper.  The callback supplied to
             # that helper must still reject this race before ls-remote starts.
@@ -958,7 +1092,7 @@ local_cas = true
         with (
             mock.patch.object(
                 release_commands.git_plumbing,
-                "remote_annotated_tag_snapshot",
+                "remote_release_advertisement_snapshot",
                 side_effect=inject_rewrite_then_readback,
             ),
             mock.patch.object(
@@ -980,9 +1114,11 @@ local_cas = true
     def test_verify_rechecks_plan_after_remote_readback(self) -> None:
         preflight, preflight_index, preflight_sha = self._create_preflight()
         self._push_exact_preflight(preflight)
-        original = release_commands.git_plumbing.remote_annotated_tag_snapshot
+        original = (
+            release_commands.git_plumbing.remote_release_advertisement_snapshot
+        )
 
-        def drift_plan(*args: Any, **kwargs: Any) -> dict[str, str]:
+        def drift_plan(*args: Any, **kwargs: Any) -> dict[str, Any]:
             snapshot = original(*args, **kwargs)
             plan = self.root / ".aoi" / "tasks" / TASK / "plan.md"
             plan.write_text(
@@ -993,7 +1129,7 @@ local_cas = true
 
         with mock.patch.object(
             release_commands.git_plumbing,
-            "remote_annotated_tag_snapshot",
+            "remote_release_advertisement_snapshot",
             side_effect=drift_plan,
         ):
             with self.assertRaisesRegex(
@@ -1010,9 +1146,11 @@ local_cas = true
     def test_verify_rechecks_local_tag_after_remote_readback(self) -> None:
         preflight, preflight_index, preflight_sha = self._create_preflight()
         self._push_exact_preflight(preflight)
-        original = release_commands.git_plumbing.remote_annotated_tag_snapshot
+        original = (
+            release_commands.git_plumbing.remote_release_advertisement_snapshot
+        )
 
-        def move_tag(*args: Any, **kwargs: Any) -> dict[str, str]:
+        def move_tag(*args: Any, **kwargs: Any) -> dict[str, Any]:
             snapshot = original(*args, **kwargs)
             self.git(
                 "tag",
@@ -1027,7 +1165,7 @@ local_cas = true
 
         with mock.patch.object(
             release_commands.git_plumbing,
-            "remote_annotated_tag_snapshot",
+            "remote_release_advertisement_snapshot",
             side_effect=move_tag,
         ):
             with self.assertRaisesRegex(
