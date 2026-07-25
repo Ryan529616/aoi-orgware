@@ -43,7 +43,7 @@ def _kernel32() -> Any:
         raise OSError("Windows handle identity is unavailable on this platform")
     import ctypes
 
-    return ctypes.WinDLL("kernel32", use_last_error=True)
+    return ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
 
 def _identity_from_handle(handle_value: int) -> WindowsHandleIdentity:
@@ -89,7 +89,7 @@ def _identity_from_handle(handle_value: int) -> WindowsHandleIdentity:
     get_information.restype = wintypes.BOOL
     information = _BY_HANDLE_FILE_INFORMATION()
     if not get_information(handle, ctypes.byref(information)):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
     get_information_ex = kernel32.GetFileInformationByHandleEx
     get_information_ex.argtypes = [
@@ -101,7 +101,7 @@ def _identity_from_handle(handle_value: int) -> WindowsHandleIdentity:
     get_information_ex.restype = wintypes.BOOL
     basic = _FILE_BASIC_INFO()
     if not get_information_ex(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
     get_final_path = kernel32.GetFinalPathNameByHandleW
     get_final_path.argtypes = [
@@ -116,7 +116,7 @@ def _identity_from_handle(handle_value: int) -> WindowsHandleIdentity:
         buffer = ctypes.create_unicode_buffer(buffer_size)
         length = get_final_path(handle, buffer, buffer_size, 0)
         if length == 0:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
         if length < buffer_size:
             break
         buffer_size = length + 1
@@ -137,7 +137,7 @@ def opened_file_identity(fd: int) -> WindowsHandleIdentity | None:
         return None
     import msvcrt
 
-    return _identity_from_handle(msvcrt.get_osfhandle(fd))
+    return _identity_from_handle(msvcrt.get_osfhandle(fd))  # type: ignore[attr-defined]
 
 
 def handle_matches_path(identity: WindowsHandleIdentity | None, path: Path) -> bool:
@@ -210,7 +210,7 @@ class DirectoryHandle:
         create_event.restype = wintypes.HANDLE
         event = create_event(None, True, False, None)
         if not event:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
         overlapped = _OVERLAPPED()
         overlapped.hEvent = wintypes.HANDLE(event)
         buffer = ctypes.create_string_buffer(64 * 1024)
@@ -240,9 +240,9 @@ class DirectoryHandle:
                 ctypes.byref(overlapped),
                 None,
             ):
-                error = ctypes.get_last_error()
+                error = ctypes.get_last_error()  # type: ignore[attr-defined]
                 if error != 997:  # ERROR_IO_PENDING
-                    raise ctypes.WinError(error)
+                    raise ctypes.WinError(error)  # type: ignore[attr-defined]
             self._change_watch_enabled = True
         except BaseException:
             self._release_change_watch()
@@ -287,12 +287,12 @@ class DirectoryHandle:
         cancel.restype = wintypes.BOOL
         cancellation_error: OSError | None = None
         if not cancel(wintypes.HANDLE(self._handle), ctypes.byref(self._change_overlapped)):
-            error = ctypes.get_last_error()
+            error = ctypes.get_last_error()  # type: ignore[attr-defined]
             if error != 1168:  # ERROR_NOT_FOUND: completion raced with cancellation.
                 # Even an unexpected cancellation failure leaves the request's
                 # lifetime unresolved.  Drain this exact OVERLAPPED before
                 # releasing any resource, then re-raise this original error.
-                cancellation_error = ctypes.WinError(error)
+                cancellation_error = ctypes.WinError(error)  # type: ignore[attr-defined]
 
         get_result = kernel32.GetOverlappedResult
         get_result.argtypes = [
@@ -312,11 +312,11 @@ class DirectoryHandle:
         completion_error: OSError | None = None
         watch_changed = bool(completed)
         if not completed:
-            error = ctypes.get_last_error()
+            error = ctypes.get_last_error()  # type: ignore[attr-defined]
             if error == 995:  # ERROR_OPERATION_ABORTED: exact cancellation won.
                 watch_changed = False
             else:
-                completion_error = ctypes.WinError(error)
+                completion_error = ctypes.WinError(error)  # type: ignore[attr-defined]
         # A normal return from GetOverlappedResult(..., TRUE) proves this exact
         # operation has completed, including a completed error result.
         try:
@@ -387,10 +387,10 @@ class DirectoryHandle:
                 buffer,
                 buffer_size,
             ):
-                error = ctypes.get_last_error()
+                error = ctypes.get_last_error()  # type: ignore[attr-defined]
                 if error == 18:  # ERROR_NO_MORE_FILES
                     break
-                raise ctypes.WinError(error)
+                raise ctypes.WinError(error)  # type: ignore[attr-defined]
             restart = False
             offset = 0
             while offset < buffer_size:
@@ -487,7 +487,7 @@ def _close_handle(handle_value: int) -> None:
     close.argtypes = [wintypes.HANDLE]
     close.restype = wintypes.BOOL
     if not close(wintypes.HANDLE(handle_value)):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
 
 
 def open_directory_identity(path: Path, *, watch_changes: bool = False) -> DirectoryHandle:
@@ -524,7 +524,7 @@ def open_directory_identity(path: Path, *, watch_changes: bool = False) -> Direc
     )
     invalid = ctypes.c_void_p(-1).value
     if handle == invalid:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
     directory: DirectoryHandle | None = None
     try:
         directory = DirectoryHandle(int(handle), None)
