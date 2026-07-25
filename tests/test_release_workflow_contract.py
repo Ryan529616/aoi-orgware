@@ -798,9 +798,21 @@ def test_coverage_job_uses_a_hashed_dedicated_toolchain_and_provenance_combine()
     assert "coverage==7.15.2" in lock
     assert "pytest==9.1.1" in lock
     assert "aoi-orgware" not in lock
-    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 8
+    # Six pure-Python dependencies pin one wheel each; coverage pins four
+    # compiled per-interpreter wheels (cp313/cp314 for manylinux x86_64 and
+    # win_amd64) so every interpreter that runs this lock gets the C tracer.
+    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == 10
+    # coverage's pure-Python py3-none-any wheel resolves on every platform, so
+    # pinning it turns a missing compiled wheel into a silent fallback to the
+    # pure tracer: that emits a no-ctracer CoverageWarning on child stderr and
+    # traces slowly enough to break exact-stderr and lock-timing contracts. A
+    # platform gap must fail the install instead.
+    assert "eb6bcae8d1a9d305351ecb108232441d11c5cfe9de840a04388ba5d2db8d735c" not in lock
 
     coverage_job = _job(_test_workflow(), "coverage")
+    # Fail in seconds if the lock or resolver ever regresses, rather than as
+    # unrelated test failures two hours into the suite.
+    assert "import coverage.tracer" in coverage_job
     assert "requirements/coverage-tools.lock" in coverage_job
     assert "--require-hashes" in coverage_job
     assert '--no-index --find-links "$RUNNER_TEMP/coverage-wheelhouse"' in coverage_job
