@@ -1,8 +1,17 @@
 # CI coverage-only toolchain.  Keep independent of release publishing tools.
 --only-binary=:all:
 
+# coverage pins only compiled per-interpreter wheels: cp313/cp314 on
+# manylinux x86_64 and win_amd64, the exact interpreters and platforms that run
+# this lock.  The pure-Python `py3-none-any` wheel is deliberately absent.  It
+# is resolvable everywhere, so pinning it lets any platform gap silently fall
+# back to the pure-Python tracer, which emits a `no-ctracer` CoverageWarning on
+# child stderr and slows tracing enough to break exact-stderr and lock-timing
+# contracts.  A missing platform must fail the install, not degrade the run.
 coverage==7.15.2 \
-    --hash=sha256:eb6bcae8d1a9d305351ecb108232441d11c5cfe9de840a04388ba5d2db8d735c \
+    --hash=sha256:7dc2950a2992cd676d35c20ae63522836deeb034f08874699d14068710af3dc1 \
+    --hash=sha256:26c3b04a6377fd7c09800921fa934e3a17c0020439cd59df73e73ae1d4b6a78c \
+    --hash=sha256:b9a6367e4aff723e8ee8190836836124284e8fcd4265e307c844010cfa074f3f \
     --hash=sha256:9911f31aad8906abe337c271343485cf20df5e70df5d2f57f9f136e7b55f26bc
 colorama==0.4.6 \
     --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6

@@ -233,6 +233,15 @@ jobs:
             --no-index --find-links "$RUNNER_TEMP/coverage-wheelhouse" --require-hashes \
             --no-compile -r requirements/coverage-tools.lock
           echo "COVERAGE_PYTHON=$RUNNER_TEMP/coverage-tools/bin/python" >> "$GITHUB_ENV"
+      - name: Assert the compiled coverage tracer resolved
+        # requirements/coverage-tools.lock pins only compiled per-interpreter
+        # wheels, so this must hold.  Assert it in seconds: without the C
+        # tracer coverage emits a `no-ctracer` CoverageWarning on every child's
+        # stderr and traces slowly enough to break exact-stderr and lock-timing
+        # contracts, which otherwise surfaces as unrelated test failures ~2
+        # hours into the suite.
+        run: |
+          "$COVERAGE_PYTHON" -c "import coverage.tracer; print('compiled coverage tracer active')"
       - name: Enable subprocess coverage
         # Most of the suite drives the CLI through real subprocesses; without
         # process_startup the measured number understates coverage by ~30

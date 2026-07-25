@@ -9,6 +9,30 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ### v0.4.0a4 (unreleased; qualification in progress)
 
+- **Coverage toolchain pins compiled tracers only (WSL/Linux gate repair).**
+  The canonical Linux coverage gate for exact `71f2944` failed with
+  `3 failed, 2333 passed, 46 skipped, 490 subtests passed in 6567.78s`.
+  `requirements/coverage-tools.lock` declares `--only-binary=:all:` but pinned
+  `coverage==7.15.2` to only `cp314-cp314-win_amd64` and the pure-Python
+  `py3-none-any` wheel, so every Linux interpreter — the ext4 WSL gate and the
+  `ubuntu-latest` coverage job alike — could resolve only the pure-Python
+  wheel. The recorded setup log confirms
+  `coverage-7.15.2-py3-none-any.whl` was installed and the run's stderr
+  carried `CoverageWarning: Couldn't import C tracer ... (no-ctracer)`. That
+  warning broke
+  `test_release_cli.py::ReleaseCliTests::test_manifest_observation_stdout_is_exact_canonical_without_newline`,
+  which asserts an empty child stderr, and the pure tracer's overhead broke
+  `test_codex_transport_cli.py::test_concurrent_run_uses_one_controller_and_one_process_owner`
+  and
+  `test_codex_transport_runtime.py::test_launch_process_lock_serializes_independent_os_processes`.
+  The lock now pins the compiled `cp313`/`cp314` wheels for both
+  `manylinux_x86_64` and `win_amd64`, and deliberately drops `py3-none-any`:
+  that wheel is resolvable on every platform, so pinning it converts a missing
+  platform into a silent pure-tracer degradation instead of an install
+  failure. The coverage job additionally asserts `import coverage.tracer`
+  immediately after install, so a lock or resolver regression fails in seconds
+  rather than as unrelated test failures two hours into the suite. No product
+  code changed; `scripts/combine_coverage.py` records the new lock digest.
 - **Semantic-v2 typed claim lifecycle.** The successor implements typed
   `claim_acquired`, `claim_status_changed`, and
   `claim_released` authority; immutable claim-object/task-head bindings;
