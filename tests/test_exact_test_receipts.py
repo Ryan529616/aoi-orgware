@@ -670,7 +670,7 @@ def test_post_identity_mutation_rejects_terminal_receipt(tmp_path: Path, monkeyp
             (repo / "index-change").write_text("x")
             subprocess.run(["git", "-C", str(repo), "add", "index-change"], check=True)
         else:
-            subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "head-change"], check=True)
+            subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "head-change"], check=True)
         return original_snapshot(*args, **kwargs)
     monkeypatch.setattr(receipts, "_snapshot", mutate_then_snapshot)
     receipt = run_clean_commit_source_tree(repo=repo, pytest_argv=["-q"], receipt_path=tmp_path / f"{mutation}.json", logs_dir=tmp_path / "logs")
@@ -707,12 +707,12 @@ def test_symlink_and_gitlink_tree_entries_rejected(tmp_path: Path) -> None:
     # The zero object is rejected by Git itself; write a real blob instead.
     blob = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=b"target", stdout=subprocess.PIPE, check=True).stdout.decode().strip()
     subprocess.run(["git", "-C", str(repo), "update-index", "--add", "--cacheinfo", f"120000,{blob},link"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "link"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "link"], check=True)
     with pytest.raises(ExactTestReceiptError): run_clean_commit_source_tree(repo=repo, pytest_argv=["-q"], receipt_path=tmp_path / "link.json", logs_dir=tmp_path / "logs")
     gitlink = _repo(tmp_path / "gitlink")
     head = subprocess.run(["git", "-C", str(gitlink), "rev-parse", "HEAD"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
     subprocess.run(["git", "-C", str(gitlink), "update-index", "--add", "--cacheinfo", f"160000,{head},submodule"], check=True)
-    subprocess.run(["git", "-C", str(gitlink), "commit", "-qm", "gitlink"], check=True)
+    subprocess.run(["git", "-C", str(gitlink), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "gitlink"], check=True)
     with pytest.raises(ExactTestReceiptError): run_clean_commit_source_tree(repo=gitlink, pytest_argv=["-q"], receipt_path=tmp_path / "gitlink.json", logs_dir=tmp_path / "logs2")
 
 
