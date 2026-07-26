@@ -733,6 +733,30 @@ def _generated_script(
     return digest
 
 
+def _invoked_launcher(
+    invoked: str | os.PathLike[str], expected: Path, label: str
+) -> Path:
+    """Canonicalize an invoked launcher, admitting only distlib's Windows alias."""
+
+    if os.name == "nt":
+        raw_value = os.fspath(invoked)
+        raw = Path(raw_value)
+        alias = expected.with_suffix("")
+        # Deliberately do not use normpath here: it would turn a missing path
+        # such as ``Scripts\\missing\\..\\aoi`` into the approved alias.
+        # Case and separator spelling are harmless Windows differences, but
+        # every canonical path component must already be exact.
+        raw_spelling = os.path.normcase(raw_value).replace("/", "\\")
+        alias_spelling = os.path.normcase(os.fspath(alias)).replace("/", "\\")
+        if raw.is_absolute() and raw_spelling == alias_spelling:
+            # distlib's Windows launcher can rewrite sys.argv[0] from the
+            # RECORD-bound ``aoi.exe`` to this otherwise non-existent alias.
+            # Return the already canonical expected path; no arbitrary missing
+            # invocation is admitted by this exception.
+            return expected
+    return _canonical_existing(invoked, label)
+
+
 def _launcher(
     prefix: Path,
     name: str,
@@ -747,7 +771,7 @@ def _launcher(
     expected = scripts / (f"{name}.exe" if os.name == "nt" else name)
     checked = _canonical_existing(expected, label)
     _require_executable(checked, label)
-    if invoked is not None and _canonical_existing(invoked, f"invoked {label}") != checked:
+    if invoked is not None and _invoked_launcher(invoked, checked, f"invoked {label}") != checked:
         _fail(f"invoked {label} is not the promoted launcher")
     digest = _verify_recorded(checked, record, label)
     if os.name == "nt":

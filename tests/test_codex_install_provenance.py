@@ -176,7 +176,11 @@ def _environment(
 
 
 def _local_v2_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: Path, bundle_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: Path,
+    bundle_file: Path,
+    invoked_console: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     """Build the alpha-only exact-wheel v2 proof for a fixture install."""
 
@@ -220,7 +224,7 @@ def _local_v2_receipt(
 
     monkeypatch.setattr(provenance, "_local_install_contract", local_contract)
     return provenance.validate_codex_local_install_provenance(
-        bundle_file, "a" * 64, _launcher(prefix, "aoi")
+        bundle_file, "a" * 64, invoked_console or _launcher(prefix, "aoi")
     )
 
 
@@ -230,6 +234,109 @@ def _runtime_kwargs(prefix: Path) -> dict[str, Any]:
         "runtime_module_path": _site_packages(prefix) / "aoi_orgware" / "codex_hook.py",
         "runtime_argv_prefix": list(provenance.CODEX_HOOK_RUNTIME_ARGV_PREFIX),
     }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="distlib's extensionless argv alias is Windows-only")
+def test_windows_distlib_extensionless_console_alias_is_record_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    launcher = _launcher(prefix, "aoi")
+
+    receipt = provenance.validate_codex_install_provenance(
+        bundle_file, "a" * 64, launcher.with_suffix("")
+    )
+
+    assert receipt["console_entry_point"]["path"] == str(launcher.resolve())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="distlib's extensionless argv alias is Windows-only")
+def test_windows_local_proof_accepts_distlib_extensionless_console_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    launcher = _launcher(prefix, "aoi")
+
+    receipt = _local_v2_receipt(
+        tmp_path, monkeypatch, prefix, bundle_file, launcher.with_suffix("")
+    )
+
+    assert receipt["console_entry_point"]["path"] == str(launcher.resolve())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="distlib's extensionless argv alias is Windows-only")
+def test_windows_distlib_alias_requires_exact_canonical_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, _bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    launcher = _launcher(prefix, "aoi").resolve()
+    alternate_spelling = str(launcher.with_suffix("")).upper().replace("\\", "/")
+    traversal = str(launcher.parent / "missing") + "\\..\\" + launcher.stem
+
+    assert provenance._invoked_launcher(
+        alternate_spelling, launcher, "invoked console launcher"
+    ) == launcher
+    with pytest.raises(provenance.CodexInstallProvenanceError, match="parent traversal"):
+        provenance._invoked_launcher(traversal, launcher, "invoked console launcher")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="distlib's extensionless argv alias is Windows-only")
+def test_windows_public_provenance_rejects_distlib_alias_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    launcher = _launcher(prefix, "aoi")
+    traversal = str(launcher.parent / "missing") + "\\..\\" + launcher.stem
+
+    with pytest.raises(provenance.CodexInstallProvenanceError, match="invoked console launcher"):
+        provenance.validate_codex_install_provenance(bundle_file, "a" * 64, traversal)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="distlib's extensionless argv alias is Windows-only")
+def test_windows_local_proof_rejects_distlib_alias_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    launcher = _launcher(prefix, "aoi")
+    traversal = str(launcher.parent / "missing") + "\\..\\" + launcher.stem
+
+    with pytest.raises(provenance.CodexInstallProvenanceError, match="invoked console launcher"):
+        _local_v2_receipt(tmp_path, monkeypatch, prefix, bundle_file, traversal)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="distlib's extensionless argv alias is Windows-only")
+@pytest.mark.parametrize(
+    "variant", ["missing", "wrong_launcher", "suffix_drift", "path_shadow"]
+)
+def test_windows_distlib_alias_rejects_non_expected_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+    if variant == "missing":
+        invoked = tmp_path / "shadow" / "aoi"
+    elif variant == "wrong_launcher":
+        invoked = _launcher(prefix, "aoi-codex-hook")
+    elif variant == "path_shadow":
+        invoked = tmp_path / "shadow" / "aoi.exe"
+        invoked.parent.mkdir()
+        invoked.write_bytes(_launcher(prefix, "aoi").read_bytes())
+    else:
+        invoked = _launcher(prefix, "aoi").with_suffix(".cmd")
+
+    with pytest.raises(provenance.CodexInstallProvenanceError, match="invoked console launcher"):
+        provenance.validate_codex_install_provenance(bundle_file, "a" * 64, invoked)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows distlib alias is intentionally admitted")
+def test_posix_rejects_missing_extensionless_console_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
+
+    with pytest.raises(provenance.CodexInstallProvenanceError, match="does not exist"):
+        provenance.validate_codex_install_provenance(
+            bundle_file, "a" * 64, _launcher(prefix, "aoi").with_suffix(".missing")
+        )
 
 
 def test_validates_real_recorded_native_launchers_and_returns_deterministic_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
