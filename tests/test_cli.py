@@ -47,6 +47,7 @@ HOOK_MODULE = "aoi_orgware.codex_hook"
 from tests.harness_case import HarnessTestCase  # noqa: E402
 from tests.test_commands_codex_onboarding import (  # noqa: E402
     fake_local_provenance_receipt,
+    mock_fake_local_codex_client_skill_binding,
 )
 
 
@@ -14641,14 +14642,16 @@ class ConfigurationTests(HarnessTestCase):
 
 
 class CodexLocalProvenanceDoctorTests(HarnessTestCase):
-    def test_doctor_consumes_strict_local_v2_receipt_and_reports_runtime_drift(
+    def test_doctor_wraps_strict_local_v2_receipt_and_reports_runtime_drift(
         self,
     ) -> None:
-        """Doctor must preserve strict v2 loading and surface liveness drift.
+        """Doctor must preserve strict v2 proof and surface liveness drift.
 
         The local receipt fixture is intentionally a fully shaped schema-v2
-        receipt.  This test owns the doctor boundary only: the dedicated
-        provenance tests exercise the real wheel/RECORD/bundle construction.
+        receipt. Codex onboarding wraps it in schema-v3 client-adapter binding
+        without rewriting the immutable v2 proof. This test owns the doctor
+        boundary only: dedicated provenance tests exercise the real
+        wheel/RECORD/bundle construction.
         """
 
         receipt = fake_local_provenance_receipt(self.root, salt="doctor-v2")
@@ -14660,10 +14663,13 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
         )
         local_bundle = self.root / "reviewed-local-install.json"
         expected_bundle_sha256 = "b" * 64
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "validate_codex_local_install_provenance",
-            return_value=receipt,
+        with (
+            mock_fake_local_codex_client_skill_binding(receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=receipt,
+            ),
         ):
             initialized = self.cli_in_process(
                 "codex-init",
@@ -14676,18 +14682,49 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
                 "--json",
             )
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
-        self.assertEqual(
+        persisted = (
             codex_install_provenance_impl.load_codex_install_provenance_receipt(
                 self.root
-            ),
-            receipt,
+            )
         )
+        self.assertEqual(persisted["schema_version"], 3)
+        self.assertEqual(persisted["install_provenance_schema_version"], 2)
+        self.assertEqual(
+            persisted["install_provenance_receipt_sha256"],
+            receipt["provenance_receipt_sha256"],
+        )
+        self.assertEqual(
+            persisted["codex_client_skill"]["role"], "client_adapter_only"
+        )
+        expected_native, expected_windows = cli_impl._codex_hook_commands_for_receipt(
+            persisted, self.root
+        )
+        self.assertIn(f"-m {HOOK_MODULE}", expected_native)
+        hooks = json.loads((self.root / ".codex" / "hooks.json").read_text())[
+            "hooks"
+        ]
+        for event, entries in hooks.items():
+            with self.subTest(event=event):
+                handler = entries[0]["hooks"][0]
+                self.assertEqual(
+                    handler["command"],
+                    cli_impl.codex_onboarding_impl.bind_codex_hook_event(
+                        expected_native, event
+                    ),
+                )
+                self.assertEqual(
+                    handler["commandWindows"],
+                    cli_impl.codex_onboarding_impl.bind_codex_hook_event(
+                        expected_windows, event
+                    ),
+                )
 
         def doctor_with_runtime_verifier(
             *, side_effect: Exception | None = None
         ) -> tuple[int, dict[str, object]]:
             stdout = io.StringIO()
             with (
+                mock_fake_local_codex_client_skill_binding(receipt),
                 mock.patch.dict(os.environ, self.env, clear=True),
                 mock.patch("sys.stdout", stdout),
                 mock.patch("sys.stderr", new=io.StringIO()),
@@ -14703,7 +14740,7 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
 
         accepted_code, accepted = doctor_with_runtime_verifier()
         self.assertEqual(accepted_code, 0, accepted)
-        self.assertEqual(accepted["codex_install_provenance"], receipt)
+        self.assertEqual(accepted["codex_install_provenance"], persisted)
 
         for drift in (
             "current wheel RECORD differs from provenance receipt",
@@ -14717,10 +14754,151 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
                     )
                 )
                 self.assertEqual(code, 1, payload)
-                self.assertEqual(payload["codex_install_provenance"], receipt)
+                self.assertEqual(payload["codex_install_provenance"], persisted)
                 self.assertIn(
                     f"Codex install provenance is invalid: {drift}",
                     payload["errors"],
+                )
+
+    def test_doctor_disabled_adapter_matrix_preserves_provenance_failures(self) -> None:
+        """Disabled hooks downgrade only user-adapter drift, never provenance."""
+
+        receipt = fake_local_provenance_receipt(self.root, salt="doctor-disabled")
+        with (
+            mock_fake_local_codex_client_skill_binding(receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=receipt,
+            ),
+        ):
+            initialized = self.cli_in_process(
+                "codex-init",
+                "--local-artifact-bundle-file",
+                str(self.root / "reviewed-local-install.json"),
+                "--expected-local-artifact-bundle-sha256",
+                "c" * 64,
+                "--user-skills-root",
+                str(self.root / "user-skills"),
+                "--json",
+            )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        persisted = codex_install_provenance_impl.load_codex_install_provenance_receipt(
+            self.root
+        )
+        skill_path = Path(persisted["codex_client_skill"]["installed_skill"]["path"])
+        original_skill = skill_path.read_bytes()
+        config_path = self.root / "aoi.toml"
+        enabled_config = config_path.read_text(encoding="utf-8")
+        disabled_config = enabled_config.replace(
+            "[hooks.codex]\nenabled = true", "[hooks.codex]\nenabled = false"
+        )
+        self.assertNotEqual(disabled_config, enabled_config)
+
+        def doctor() -> tuple[int, dict[str, object]]:
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, self.env, clear=True),
+                mock.patch("sys.stdout", stdout),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                returncode = cli_impl.main(["doctor", "--json"])
+            return returncode, json.loads(stdout.getvalue())
+
+        config_path.write_text(disabled_config, encoding="utf-8")
+        for status in ("missing", "drifted", "uninspectable"):
+            with self.subTest(hooks="disabled", status=status):
+                if status == "missing":
+                    skill_path.unlink()
+                elif status == "drifted":
+                    skill_path.write_bytes(b"drifted client adapter\n")
+                else:
+                    skill_path.unlink()
+                    skill_path.mkdir()
+                with mock_fake_local_codex_client_skill_binding(receipt):
+                    code, payload = doctor()
+                self.assertEqual(code, 0, payload)
+                report = payload["codex_client_skill"]
+                self.assertEqual(report["status"], status)
+                self.assertTrue(
+                    any(
+                        "Codex client adapter is not exact while Codex hooks are disabled"
+                        in warning
+                        for warning in payload["warnings"]
+                    ),
+                    payload,
+                )
+                self.assertFalse(
+                    any("Codex client skill binding is not exact" in error for error in payload["errors"]),
+                    payload,
+                )
+                if skill_path.is_dir():
+                    skill_path.rmdir()
+                skill_path.write_bytes(original_skill)
+
+        config_path.write_text(enabled_config, encoding="utf-8")
+        for status in ("missing", "drifted", "uninspectable"):
+            with self.subTest(hooks="enabled", status=status):
+                if status == "missing":
+                    skill_path.unlink()
+                elif status == "drifted":
+                    skill_path.write_bytes(b"drifted client adapter\n")
+                else:
+                    skill_path.unlink()
+                    skill_path.mkdir()
+                with mock_fake_local_codex_client_skill_binding(receipt), mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "verify_runtime_hook_provenance",
+                    return_value=receipt,
+                ):
+                    code, payload = doctor()
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_client_skill"]["status"], status)
+                self.assertTrue(
+                    any("Codex client skill binding is not exact" in error for error in payload["errors"]),
+                    payload,
+                )
+                if skill_path.is_dir():
+                    skill_path.rmdir()
+                skill_path.write_bytes(original_skill)
+
+        config_path.write_text(disabled_config, encoding="utf-8")
+        provenance_path = (
+            self.root / codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_RECEIPT
+        )
+        original_receipt = provenance_path.read_bytes()
+        for corruption in ("receipt", "schema"):
+            with self.subTest(hooks="disabled", corruption=corruption):
+                if corruption == "receipt":
+                    provenance_path.write_text("{}\n", encoding="utf-8")
+                else:
+                    malformed = dict(persisted)
+                    malformed["schema_version"] = 99
+                    provenance_path.write_text(json.dumps(malformed), encoding="utf-8")
+                code, payload = doctor()
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_client_skill"]["status"], "uninspectable")
+                self.assertTrue(
+                    any("Codex client skill binding is uninspectable" in error for error in payload["errors"]),
+                    payload,
+                )
+                provenance_path.write_bytes(original_receipt)
+
+        for corruption in ("package", "wheel"):
+            with self.subTest(hooks="disabled", corruption=corruption):
+                with mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "_recorded_codex_client_skill",
+                    side_effect=codex_install_provenance_impl.CodexInstallProvenanceError(
+                        f"proved {corruption} bytes differ from installed package"
+                    ),
+                ):
+                    code, payload = doctor()
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_client_skill"]["status"], "uninspectable")
+                self.assertTrue(
+                    any("Codex client skill binding is not exact" in error for error in payload["errors"]),
+                    payload,
                 )
 
 

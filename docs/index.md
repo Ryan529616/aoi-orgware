@@ -11,9 +11,9 @@ you set the goal
        |
 Codex / Claude Code          reasoning, tools, implementation
        |
-AOI skill + hooks            lifecycle context and runtime observations
+AOI client adapter + hooks   lifecycle context and runtime observations
        |
-AOI core                     authority, ownership, evidence, recovery
+AOI CLI/runtime/ledger       authority, ownership, evidence, recovery
        |
 Git + tests + build / EDA    source of truth
 ```
@@ -31,11 +31,13 @@ ran.
 
 ## Install
 
-!!! warning "These docs describe the v0.4 alpha line"
+!!! warning "These docs describe an unpublished ARISE Operational Alpha candidate"
 
-    This checkpoint supports either a public release-promotion bundle or an
-    independent reviewed local-install bundle. It does not claim a tag, GitHub
-    Release, PyPI publication, or live Codex hook trust.
+    It is not a complete v0.5 release. Current schema-v3 hooks require reviewed
+    local-v2 exact-wheel proof. Public schema-v1 receipts remain readable and
+    historically upgradable but cannot newly enable current hooks; the public
+    current-hook route is deferred. It claims neither publication nor live
+    Codex hook trust.
 
 For a reviewed local install, create a repository-external venv, install the
 exact bundle-bound wheel with `--no-index --no-deps`, then run the venv's exact
@@ -50,10 +52,8 @@ exact bundle-bound wheel with `--no-index --no-deps`, then run the venv's exact
 
 The local `reviewed_local_install_bundle` has
 `proof_scope=exact_local_wheel_install_only`: it is neither a release nor a
-promotion. Public releases instead use
-`--promotion-bundle-file` with `--expected-promotion-bundle-sha256`. Half a
-pair, both pairs, or no pair fails before mutation. See the full
-[v0.4 quickstart](quickstart.md).
+promotion, and local-v2 console/bridge/legacy-launcher evidence is not v3
+active-hook authority. See the full [Operational Alpha quickstart](quickstart.md).
 
 ## What AOI records
 

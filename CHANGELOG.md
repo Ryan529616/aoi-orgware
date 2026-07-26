@@ -9,6 +9,40 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ### v0.4.0a4 (unreleased; not release-ready)
 
+- **ARISE Operational Alpha boundary (supersedes earlier current-v3 wording).**
+  This unpublished candidate is not a complete v0.5 release. A current
+  schema-v3 hook may be created only from reviewed local-v2 exact-wheel proof.
+  Public schema-v1 receipts remain readable and historically upgradable but
+  cannot newly enable current hooks; the public current-hook route is deferred.
+  Any older entry that describes a public pair, a local-v2 console/bridge
+  launcher, or `aoi-codex-hook` as current-hook authority is superseded here;
+  those forms remain historical or diagnostic evidence within their own
+  boundaries.
+- **Current runtime form and fault boundary.** Current hooks use the receipt's
+  exact absolute venv Python with `-I -B -m aoi_orgware.codex_hook` as the
+  active command, superseding the pip `aoi-codex-hook` launcher (v1/v2
+  historical/diagnostic only), with its exact no-shell WSL wrapper where
+  applicable, binding Python
+  invocation/resolved hash/prefix/
+  cache tag, wheel-bound module/`RECORD` hash, and argv prefix. Once AOI `main`
+  has entered, provenance, payload, dispatch, and receipt faults on `PreToolUse`
+  deny; non-mutation lifecycle adapters fail open. This is cooperative
+  post-import drift detection, not protection from interpreter, site/import,
+  same-user, or pre-import tampering. With hooks disabled, user-adapter
+  missing/drift/uninspectable states are warning/status only; receipt/schema/
+  package/wheel provenance corruption still blocks `doctor`.
+- **Codex client-adapter binding and event-bound hooks.** `codex-init` now
+  records schema-v3 provenance that binds the AOI-distribution Codex client
+  adapter to the installed package version and `RECORD`; `doctor` distinguishes
+  `not_configured`, `exact`, `missing`, `drifted`, `uninspectable`, and
+  `legacy_unbound` states.
+  Current protocol-v6 hook handlers bind one immutable `--expected-event`.
+  An unbound v6 handler is upgradeable legacy and cannot process a mutation;
+  bootstrap, provenance, payload, event-dispatch, or receipt faults on trusted
+  event-bound `PreToolUse` return the fixed fail-closed deny. Non-mutation
+  lifecycle adapters remain fail-open. This is a local successor change only:
+  it does not claim a public release, Codex/Claude parity, or all-provider
+  coverage.
 - **Explicit legacy resource-config migration.** A new read-only
   `codex-config-migrate-legacy-plan` command exposes the exact event and
   immutable receipt digests for one pre-applicability resource event.

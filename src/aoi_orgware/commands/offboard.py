@@ -25,6 +25,7 @@ from typing import Any
 from .. import harnesslib as h
 from ..harnesslib import HarnessError
 from ..codex_install_provenance import (
+    CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION,
     CodexInstallProvenanceError,
     load_codex_install_provenance_receipt,
 )
@@ -149,7 +150,9 @@ def _json_object(raw: bytes, label: str) -> dict[str, Any]:
     return value
 
 
-def _codex_handler_ownership(handler: dict[str, Any], root: Path) -> str:
+def _codex_handler_ownership(
+    handler: dict[str, Any], root: Path, *, event: str
+) -> str:
     """Return current, legacy, or foreign without guessing current ownership."""
 
     commands: list[tuple[str, str]] = []
@@ -161,25 +164,64 @@ def _codex_handler_ownership(handler: dict[str, Any], root: Path) -> str:
         return "foreign"
     receipt: dict[str, Any] | None = None
     hook: dict[str, Any] | None = None
+    current_identity: dict[str, Any] | None = None
     try:
         receipt = load_codex_install_provenance_receipt(root)
         hook = receipt["codex_hook_entry_point"]
-        current_pair = codex.is_current_codex_hook_command_pair(
+        if (
+            receipt.get("schema_version")
+            == CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+        ):
+            runtime = receipt["codex_hook_runtime"]
+            expected_command, expected_command_windows = (
+                codex.build_codex_python_hook_commands(
+                    runtime["python_invocation"],
+                    root,
+                    receipt["provenance_receipt_sha256"],
+                )
+            )
+            current_identity = {
+                "expected_python": runtime["python_invocation"],
+            }
+        else:
+            expected_command, expected_command_windows = (
+                codex.build_codex_hook_commands(
+                    hook["path"],
+                    root,
+                    receipt["provenance_receipt_sha256"],
+                )
+            )
+            current_identity = {
+                "expected_launcher": hook["path"],
+            }
+        current_pair = event in codex.CODEX_HOOK_EVENTS and (
+            codex.is_exact_codex_hook_command_pair(
+                handler.get("command"),
+                handler.get("commandWindows"),
+                expected_command=codex.bind_codex_hook_event(expected_command, event),
+                expected_command_windows=codex.bind_codex_hook_event(
+                    expected_command_windows, event
+                ),
+            )
+        )
+        unbound_pair = codex.is_exact_codex_hook_command_pair(
             handler.get("command"),
             handler.get("commandWindows"),
-            expected_launcher=hook["path"],
-            expected_project_root=root,
-            expected_provenance_sha256=receipt["provenance_receipt_sha256"],
+            expected_command=expected_command,
+            expected_command_windows=expected_command_windows,
         )
-    except (CodexInstallProvenanceError, KeyError, TypeError):
+    except (CodexInstallProvenanceError, KeyError, TypeError, codex.CodexOnboardingError):
         current_pair = False
+        unbound_pair = False
     if current_pair:
         return "current"
-    if hook is not None and receipt is not None:
+    if unbound_pair:
+        return "legacy"
+    if hook is not None and receipt is not None and current_identity is not None:
         individually_current = [
             codex.is_aoi_codex_hook_command(
                 command,
-                expected_launcher=hook["path"],
+                **current_identity,
                 expected_project_root=root,
                 expected_provenance_sha256=receipt["provenance_receipt_sha256"],
             )
@@ -253,7 +295,7 @@ def _hook_settings(
                             f".codex/configuration event {event!r} has a non-string {command_key}"
                         )
                 try:
-                    ownership = _codex_handler_ownership(handler, root)
+                    ownership = _codex_handler_ownership(handler, root, event=event)
                 except codex.CodexOnboardingError as exc:
                     raise OffboardError(str(exc)) from exc
                 if ownership == "legacy":

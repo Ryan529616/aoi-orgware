@@ -27,9 +27,9 @@ you set the goal
        |
 Codex / Claude Code          reasoning, tools, implementation
        |
-AOI skill + hooks            lifecycle context and runtime observations
+AOI client adapter + hooks   lifecycle context and runtime observations
        |
-AOI core                     authority, ownership, evidence, recovery
+AOI CLI/runtime/ledger       authority, ownership, evidence, recovery
        |
 Git + tests + build / EDA    source of truth
 ```
@@ -106,9 +106,12 @@ project hooks is a supply-chain and trust decision.
 
 ### Direct install
 
-> **This README documents the v0.4 alpha line, whose current source target is
-> the unreleased successor `0.4.0a4`.** This is not a release-ready or promoted
-> build. Install it only when an exact reviewed proof names that version
+> **This README documents the unpublished ARISE Operational Alpha candidate,
+> whose source target is `0.4.0a4`, not a complete v0.5 release.** Current
+> schema-v3 hooks may be created only from reviewed local-v2 exact-wheel proof.
+> Public schema-v1 receipts remain readable and historically upgradable, but
+> cannot newly enable current hooks; the public current-hook route is deferred.
+> Install it only when an exact reviewed proof names that version
 > and wheel SHA-256. A
 > `reviewed_local_install_bundle` has
 > `proof_scope=exact_local_wheel_install_only`: it is not a release record or
@@ -136,25 +139,28 @@ $aoiLauncher = (Resolve-Path (Join-Path $aoiToolRoot 'Scripts\aoi.exe')).Path
   --json
 ```
 
-`codex-init` accepts exactly one complete proof pair: the local pair shown
-above, or the public `--promotion-bundle-file` plus
-`--expected-promotion-bundle-sha256` pair. Half a pair, both pairs, or neither
-fails before mutation. On POSIX, invoke `<venv>/bin/aoi codex-init ...`, never
-the module entry point. Use a dedicated venv without `--system-site-packages`
+`codex-init` for current hooks accepts the complete reviewed local-v2 pair shown
+above; a public schema-v1/promotion proof cannot activate a current hook. On
+POSIX, invoke `<venv>/bin/aoi codex-init ...`, never the module entry point.
+Use a dedicated venv without `--system-site-packages`
 or unrelated development tools. Reinstalling Setuptools or another executable
 `.pth` makes onboarding and every governed hook fail closed until the tool
-environment is cleaned and requalified. A public pair is valid only when the
-current Chief created it through `release-promote` after exact GitHub Release
-and PyPI readback; workflow success alone is insufficient. The installed
-package version must equal the version named by the selected proof (for this
-source target, `0.4.0a4`). See the
-[v0.4 quickstart](docs/quickstart.md) for both routes and the complete
-isolated-install, mini-task, status, and offboarding sequence.
+environment is cleaned and requalified. The installed package version must
+equal the version named by the selected proof (for this source target,
+`0.4.0a4`). See the [Operational Alpha quickstart](docs/quickstart.md) for the
+complete isolated-install, mini-task, status, and offboarding sequence.
 
-When onboarding from canonical WSL, AOI emits a direct Linux hook plus a
-canonical no-shell `wsl.exe --distribution ... --user ... --cd ... --exec ...`
-`commandWindows` bound to the same absolute launcher, project root, and
-provenance digest. It derives the route from consistent WSL runtime signals;
+Current schema-v3 hooks invoke the exact absolute venv Python as
+`-I -B -m aoi_orgware.codex_hook`; the pip `aoi-codex-hook` launcher is v1/v2
+history/diagnostics only. When onboarding from canonical WSL, AOI emits that
+direct Linux Python-module command plus a canonical no-shell
+`wsl.exe --distribution ... --user ... --cd ... --exec ...` `commandWindows`
+bound to the same absolute Python, project root, provenance digest, and module
+argv prefix. The v3 receipt binds Python invocation/resolved hash/prefix/cache
+tag, exact wheel-bound module/`RECORD` hash, and argv prefix. That is
+cooperative post-import drift detection after AOI `main` enters, not protection
+from interpreter, site/import, same-user, or pre-import tampering. AOI derives
+the route from consistent WSL runtime signals;
 there is no arbitrary command override. Partial signals, WSL UNC onboarding
 from native Windows, or any route drift fails closed. A proof-changing
 reinstall may rotate only the complete exact pair reconstructed from the
@@ -172,10 +178,28 @@ bound source identity is review context: the bundle does not independently
 attest source-to-wheel derivation, the builder toolchain, or execution of the
 caller-supplied test summary.
 
-| Client | Repository-local integration | User-scope skill |
+| Client | Repository-local integration | User-scope client adapter |
 |---|---|---|
-| Codex | `.codex/config.toml` and `.codex/hooks.json` | `$HOME/.agents/skills/aoi/SKILL.md` |
-| Claude Code | `.claude/settings.json` | `$HOME/.claude/skills/aoi/SKILL.md` |
+| Codex | `.codex/config.toml` and `.codex/hooks.json` | `$HOME/.agents/skills/aoi/SKILL.md`, installed only from the AOI distribution and bound by its `RECORD`, version, and schema-v3 install provenance |
+| Claude Code | `.claude/settings.json` | legacy/onboarding surface only; no schema-v3 client-adapter binding or provider-parity claim in this release |
+
+The Codex user-scope file is a transitional client adapter, not a governance
+authority. AOI authority is the installed deterministic CLI/runtime and its
+ledger, together with the repository's `aoi.toml`, AOI-managed `POLICY.md`, and
+repository instructions. A copied, edited, missing, or stale client adapter
+cannot acquire Chief authority, create or consume a claim, issue a mutation, or
+make evidence valid. When Codex hooks are enabled, `aoi doctor --json` reports
+the adapter as `not_configured`, `exact`, `missing`, `drifted`,
+`uninspectable`, or `legacy_unbound`; only `exact` is the current bound form.
+The other states are
+integrity failures for the enabled Codex integration, not an invitation to
+trust a user-scope file.
+
+With hooks disabled, missing, drifted, or user-path-uninspectable adapter state
+is warning/status only and does not block `doctor`; corrupt receipt/schema,
+package/`RECORD`, or exact-wheel provenance remains blocking. Console/Bridge
+launcher records in local-v2 proof do not establish v3 active-hook authority;
+the Bridge has a separate boundary.
 
 Codex still requires the user to review and trust the exact hook definitions in
 its own `/hooks` UI; AOI does not cross that boundary on the user's behalf.

@@ -1,25 +1,16 @@
-# AOI v0.4 quickstart
+# ARISE Operational Alpha quickstart
 
-This guide targets the unreleased successor
-`aoi-orgware==0.4.0a4`. It is not release-ready or promoted. Use it only when
-the selected reviewed proof names that exact version and wheel SHA-256; source presence, a
-tag, workflow success, or PyPI visibility alone is not promotion authority. Do
-not substitute an unpinned package, a different wheel, or a newer build. The
-package install, Codex hook trust, provider routing, and reviewer identity are
-separate claims.
-
-There are two deliberately separate proof routes:
-
-- A public **release-promotion bundle** has tag, release, and PyPI publication
-  semantics; use `--promotion-bundle-file` and
-  `--expected-promotion-bundle-sha256`.
-- A **reviewed_local_install_bundle** has
-  `proof_scope=exact_local_wheel_install_only`; it is not published and is not
-  a release or promotion. Use `--local-artifact-bundle-file` and
-  `--expected-local-artifact-bundle-sha256`.
-
-This checkpoint uses the local route. `codex-init` requires exactly one
-complete pair. A half pair, both pairs, or neither pair fails before mutation.
+This guide targets the unpublished Operational Alpha candidate
+`aoi-orgware==0.4.0a4`, not a complete v0.5 release. Current schema-v3 hooks
+may be created only from one reviewed local-v2 exact-wheel proof:
+`reviewed_local_install_bundle` with
+`proof_scope=exact_local_wheel_install_only`. It is neither published nor a
+release/promotion. Public schema-v1 receipts remain readable and can take their
+historical upgrade path, but cannot newly enable current hooks; the public
+current-hook route is deferred. Do not substitute an unpinned package, a
+different wheel, source presence, a tag, workflow success, or PyPI visibility.
+The package install, Codex hook trust, provider routing, and reviewer identity
+are separate claims.
 
 ## 1. Install one verified wheel in an isolated environment
 
@@ -61,9 +52,9 @@ Run this from the Git repository to govern. The bundle expected SHA is the
 caller's trust anchor: use the canonical digest recorded in the bundle's
 `bundle_sha256` field, not the raw JSON file SHA-256, and do not infer it from
 installed metadata. Use the exact installed `aoi.exe` launcher: provenance
-validates its `sys.argv[0]` identity. The same local schema-v2 proof also
-verifies the installed `aoi-codex-hook` and `aoi-codex-bridge` entry points,
-launchers, generated scripts when present, modules, and `RECORD` bindings.
+validates its `sys.argv[0]` identity. Local-v2 launcher/bridge records are
+historical or diagnostic evidence only; they do not establish schema-v3
+active-hook authority. The Bridge has its own launch/receipt boundary.
 
 ```powershell
 & $aoiLauncher codex-init `
@@ -89,15 +80,16 @@ python3 -m venv "$AOI_TOOL_ROOT"
   --json
 ```
 
-When run from a canonical WSL session, `codex-init` does not copy the Linux
-launcher into `commandWindows`. It requires consistent Microsoft-kernel,
-`WSL_DISTRO_NAME`, absolute `WSL_INTEROP`, POSIX launcher/root, and passwd-user
-signals, then writes an exact pair:
+When run from a canonical WSL session, `codex-init` does not render a legacy
+Linux launcher into `commandWindows`. It requires consistent Microsoft-kernel,
+`WSL_DISTRO_NAME`, absolute `WSL_INTEROP`, recorded absolute Python/runtime/root,
+and passwd-user signals, then writes an exact pair:
 
-- `command` directly invokes the absolute Linux `aoi-codex-hook` with the
-  project root and provenance digest;
+- `command` directly invokes the recorded absolute Linux venv Python as
+  `-I -B -m aoi_orgware.codex_hook` with the project root and provenance digest;
 - `commandWindows` uses only
-  `wsl.exe --distribution <distro> --user <user> --cd <root> --exec <hook>`
+  `wsl.exe --distribution <distro> --user <user> --cd <root> --exec <python>
+  -I -B -m aoi_orgware.codex_hook`
   followed by those same exact hook arguments.
 
 AOI does not accept a shell prefix or arbitrary Windows command override.
@@ -131,25 +123,10 @@ does not establish a tag, GitHub Release, PyPI publication, or live Codex
 bundle does not independently attest that the wheel was built from that source,
 which builder toolchain ran, or that the caller-supplied test summary executed.
 
-### Public release-promotion route
-
-Use this only when a reviewed public release-promotion bundle exists. The
-current Chief must have created it with `release-promote` after exact GitHub
-Release and PyPI readback; a workflow result or public package alone is
-insufficient. Replace the two local-proof flags above with this complete pair;
-do not combine routes:
-
-```powershell
-& $aoiLauncher codex-init `
-  --project-name 'My Project' `
-  --promotion-bundle-file 'C:\approved-release\promotion-bundle.json' `
-  --expected-promotion-bundle-sha256 '<approved-promotion-bundle-sha256>' `
-  --json
-```
-
-On Linux/WSL, use the same public pair with the installed
-`<venv>/bin/aoi codex-init ...` launcher. Never use `python -m` as a substitute
-for either route: the provenance receipt validates the launcher identity.
+The public current-hook route is intentionally unavailable in this candidate.
+Do not use a public schema-v1 receipt, promotion bundle, console/bridge launcher
+record, or historical `aoi-codex-hook` entry point as a substitute for the
+reviewed local-v2 proof and schema-v3 Python-module binding above.
 
 Then inspect the exact absolute AOI hook definition and provenance digest in
 Codex's `/hooks` UI and make the trust decision there. Hook installation is
@@ -157,6 +134,28 @@ not runtime trust, and `aoi doctor --json` is only a structural check; neither
 proves that Codex executed or trusted a hook. If the MCP registry is unavailable
 for a requested integration, record that integration as **uncovered** rather
 than assuming the hook or registry path ran.
+
+`codex-init` also installs the AOI-distribution Codex client adapter at
+`$HOME/.agents/skills/aoi/SKILL.md`. It is not a governance rule source or a
+mutation authority: the installed CLI/runtime/ledger and the repository's
+`aoi.toml`, managed `POLICY.md`, and instructions remain authoritative. The
+schema-v3 receipt binds the adapter to the installed package version and
+`RECORD`; doctor reports `not_configured`, `exact`, `missing`, `drifted`,
+`uninspectable`, or `legacy_unbound`. Do not copy or edit the skill to repair
+those states. Instead, inspect the actual user-scope file digest and,
+under the same reviewed distribution/proof, rerun provenance-qualified
+`aoi codex-init`; a differing file requires its reviewed
+`--replace-user-skill-sha256` acknowledgement. Reinstalling a wheel alone does
+not repair a user-scope file. This guide makes no equivalent Claude or
+all-provider binding claim.
+
+With hooks disabled, missing, drifted, or user-path-uninspectable adapter state
+is warning/status only and does not block `doctor`. Corrupt receipt/schema,
+package/`RECORD`, or exact-wheel provenance remains blocking even then. Once
+AOI `main` enters, the hook rechecks its Python invocation/resolved hash/prefix/
+cache tag, exact module and argv prefix; it is cooperative post-import drift
+detection, not protection from interpreter, site/import, same-user, or
+pre-import tampering.
 
 For a WSL-governed project used by Windows Codex, also exercise the installed
 `commandWindows` from Windows against a disposable project and confirm a new

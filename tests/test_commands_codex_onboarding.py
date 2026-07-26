@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -16,6 +17,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any, Iterator
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -25,10 +27,14 @@ from harness_case import HarnessTestCase  # noqa: E402
 from aoi_orgware import cli as cli_impl  # noqa: E402
 from aoi_orgware import harnesslib as h  # noqa: E402
 from aoi_orgware.commands import codex_onboarding as co  # noqa: E402
-from aoi_orgware.semantic_events import canonical_sha256  # noqa: E402
+from aoi_orgware.semantic_events import (  # noqa: E402
+    canonical_json_bytes,
+    canonical_sha256,
+)
 
 
 TEST_HOOK_LAUNCHER = "/opt/aoi/bin/aoi-codex-hook"
+TEST_HOOK_PYTHON = "/opt/aoi/bin/python3.14"
 TEST_PROJECT_ROOT = "/work/aoi-project"
 TEST_PROVENANCE_SHA256 = "a" * 64
 CURRENT_HOOK_COMMAND = co.build_codex_hook_command(
@@ -73,6 +79,8 @@ def fake_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
     hook = _test_launcher(scripts, "aoi-codex-hook")
     metadata = dist_info / "METADATA"
     package_init = package / "__init__.py"
+    package_skill = package / "resources" / "codex" / "SKILL.md"
+    package_skill.parent.mkdir(parents=True, exist_ok=True)
     hook_script: Path | None = None
     if os.name == "nt":
         console.write_bytes(f"console-{salt}".encode())
@@ -99,6 +107,11 @@ def fake_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         hook.chmod(0o755)
     metadata.write_bytes(f"metadata-{salt}".encode())
     package_init.write_bytes(f"package-{salt}".encode())
+    package_skill.write_text(
+        cli_impl._resource_text("codex/SKILL.md"),
+        encoding="utf-8",
+        newline="",
+    )
     record = dist_info / "RECORD"
 
     def record_row(path: Path) -> str:
@@ -110,7 +123,7 @@ def fake_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         return f"{relative},sha256={digest},{len(raw)}"
 
     record_relative = os.path.relpath(record, site_root).replace("\\", "/")
-    recorded = [metadata, package_init, console, hook]
+    recorded = [metadata, package_init, package_skill, console, hook]
     if hook_script is not None:
         recorded.append(hook_script)
     record.write_text(
@@ -119,12 +132,23 @@ def fake_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
         encoding="utf-8",
     )
     package_manifest = {
-        "files": [
-            {
-                "path": "__init__.py",
-                "sha256": hashlib.sha256(package_init.read_bytes()).hexdigest(),
-            }
-        ]
+        "files": sorted(
+            [
+                {
+                    "path": "__init__.py",
+                    "sha256": hashlib.sha256(
+                        package_init.read_bytes()
+                    ).hexdigest(),
+                },
+                {
+                    "path": "resources/codex/SKILL.md",
+                    "sha256": hashlib.sha256(
+                        package_skill.read_bytes()
+                    ).hexdigest(),
+                },
+            ],
+            key=lambda item: item["path"],
+        )
     }
     base = {
         "schema_version": 1,
@@ -162,7 +186,7 @@ def fake_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
             else {"path": None, "record_sha256": None}
         ),
         "package_runtime_manifest": {
-            "count": 1,
+            "count": 2,
             "sha256": canonical_sha256(package_manifest, max_bytes=64 * 1024),
         },
     }
@@ -337,6 +361,95 @@ def fake_local_provenance_receipt(root: Path, *, salt: str = "a") -> dict:
     }
 
 
+@contextlib.contextmanager
+def mock_fake_local_codex_client_skill_binding(
+    receipt: dict[str, Any],
+) -> Iterator[None]:
+    """Test-only bypass for deliberately non-wheel local-validator fixtures.
+
+    The integration provenance tests exercise the real archive/member/RECORD
+    verification.  These CLI wiring fixtures instead mock the local validator
+    and only supply the package skill bytes it already created, so they do not
+    accidentally weaken production revalidation.  This is module-level for
+    the doctor fixture in ``test_cli.py`` as well.
+    """
+
+    provenance_impl = cli_impl.codex_install_provenance_impl
+    resource = (
+        Path(str(receipt["package_root"]))
+        / "resources"
+        / "codex"
+        / "SKILL.md"
+    ).resolve()
+    raw = resource.read_bytes()
+    resource_sha256 = hashlib.sha256(raw).hexdigest()
+    def fake_runtime_binding(
+        prefix: Path,
+        installed_package_root: Path,
+        _record: object,
+        *,
+        invocation: str | os.PathLike[str] | None = None,
+    ) -> dict[str, object]:
+        del invocation
+        runtime_python = prefix / ("Scripts" if os.name == "nt" else "bin") / (
+            "python.exe" if os.name == "nt" else "python"
+        )
+        module_path = installed_package_root / "codex_hook.py"
+        return {
+            "contract_version": provenance_impl.CODEX_HOOK_RUNTIME_CONTRACT_VERSION,
+            "kind": provenance_impl.CODEX_HOOK_RUNTIME_KIND,
+            "python_invocation": str(runtime_python),
+            "python_resolved_path": str(runtime_python),
+            "python_resolved_sha256": "f" * 64,
+            "venv_prefix": str(prefix),
+            "python_cache_tag": "test-cache-tag",
+            "module": provenance_impl.CODEX_HOOK_RUNTIME_MODULE,
+            "module_path": str(module_path),
+            "module_record_sha256": "e" * 64,
+            "argv_prefix": list(provenance_impl.CODEX_HOOK_RUNTIME_ARGV_PREFIX),
+            "trust_class": provenance_impl.CODEX_HOOK_RUNTIME_TRUST_CLASS,
+        }
+
+    # This fixture deliberately is not an installed wheel in the interpreter
+    # running the test. Keep the production local-v2 verifier strict; only
+    # bypass host-runtime checks after the fake validator supplied a sealed
+    # local-v2 receipt. Archive/RECORD tests cover real-install checks.
+    with (
+        mock.patch.object(
+            provenance_impl,
+            "_recorded_codex_client_skill",
+            return_value=(resource, resource_sha256, raw),
+        ),
+        mock.patch.object(provenance_impl, "_require_dedicated_venv"),
+        mock.patch.object(provenance_impl, "_under"),
+        mock.patch.object(
+            provenance_impl,
+            "_codex_hook_runtime_binding",
+            side_effect=fake_runtime_binding,
+        ),
+    ):
+        yield
+
+
+def seed_historical_public_v1_codex_onboarding(root: Path) -> dict[str, Any]:
+    """Install a historical v1 receipt/legacy launcher over an existing AOI state."""
+
+    public = fake_provenance_receipt(root, salt="historical-public-v1")
+    receipt_path = root / ".aoi" / "codex-install-provenance-v1.json"
+    receipt_path.write_bytes(canonical_json_bytes(public))
+    hooks_path = root / ".codex" / "hooks.json"
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    legacy = f'"{public["codex_hook_entry_point"]["path"]}" --hook-version 6'
+    for entries in hooks["hooks"].values():
+        for entry in entries:
+            for handler in entry.get("hooks", []):
+                if "command" in handler:
+                    handler["command"] = legacy
+                    handler["commandWindows"] = legacy
+    hooks_path.write_bytes(canonical_json_bytes(hooks))
+    return public
+
+
 def make_directory_symlink_or_skip(link: Path, target: Path) -> None:
     try:
         os.symlink(target, link, target_is_directory=True)
@@ -395,8 +508,13 @@ class HookMergeTests(unittest.TestCase):
         aoi_entry = merged["hooks"]["SessionStart"][1]
         self.assertEqual(aoi_entry["matcher"], co.SESSION_START_MATCHER)
         handler = aoi_entry["hooks"][0]
-        self.assertEqual(handler["command"], CURRENT_HOOK_COMMAND)
-        self.assertEqual(handler["commandWindows"], CURRENT_HOOK_COMMAND)
+        self.assertEqual(
+            handler["command"], co._bind_hook_event(CURRENT_HOOK_COMMAND, "SessionStart")
+        )
+        self.assertEqual(
+            handler["commandWindows"],
+            co._bind_hook_event(CURRENT_HOOK_COMMAND, "SessionStart"),
+        )
         self.assertEqual(handler["timeout"], co.HOOK_TIMEOUT_SECONDS)
 
     def test_merge_is_idempotent(self) -> None:
@@ -404,6 +522,44 @@ class HookMergeTests(unittest.TestCase):
         twice, added = co.merge_codex_hook_settings(once, **CURRENT_HOOK_KWARGS)
         self.assertEqual(added, [])
         self.assertEqual(once, twice)
+
+    def test_event_bound_native_and_wsl_commands_are_canonical(self) -> None:
+        native = co._bind_hook_event(CURRENT_HOOK_COMMAND, "PreToolUse")
+        self.assertTrue(co.is_aoi_codex_hook_command(native))
+        self.assertFalse(co.is_aoi_codex_hook_command(native + ' --extra "x"'))
+
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            TEST_HOOK_LAUNCHER,
+            TEST_PROJECT_ROOT,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        bound_native = co._bind_hook_event(command, "PreToolUse")
+        bound_windows = co._bind_hook_event(command_windows, "PreToolUse")
+        self.assertTrue(co.is_aoi_codex_hook_command(bound_windows))
+        self.assertTrue(
+            co.is_exact_codex_hook_command_pair(
+                bound_native,
+                bound_windows,
+                expected_command=bound_native,
+                expected_command_windows=bound_windows,
+            )
+        )
+        self.assertFalse(
+            co.is_exact_codex_hook_command_pair(
+                bound_native,
+                co._bind_hook_event(command_windows, "PostToolUse"),
+                expected_command=bound_native,
+                expected_command_windows=bound_windows,
+            )
+        )
 
     def test_merge_rejects_invalid_event_shape(self) -> None:
         with self.assertRaises(co.CodexOnboardingError):
@@ -592,6 +748,8 @@ class HookMergeTests(unittest.TestCase):
             host_os_name="posix",
             wsl_user="tester",
         )
+        command = co.bind_codex_hook_event(command, "Stop")
+        command_windows = co.bind_codex_hook_event(command_windows, "Stop")
         other_digest = "b" * 64
         cases = (
             {"command": command},
@@ -626,7 +784,8 @@ class HookMergeTests(unittest.TestCase):
                 "command": (
                     f'"{TEST_HOOK_LAUNCHER}" --project-root '
                     f'"{TEST_PROJECT_ROOT}" --hook-version 6 '
-                    f'--provenance-sha256 "{TEST_PROVENANCE_SHA256}"'
+                    f'--provenance-sha256 "{TEST_PROVENANCE_SHA256}" '
+                    '--expected-event "Stop"'
                 ),
                 "commandWindows": command_windows.replace(
                     '--distribution "Ubuntu" --user "tester"',
@@ -729,7 +888,171 @@ class HookMergeTests(unittest.TestCase):
             stop_entries[0]["hooks"],
             [{"type": "command", "command": "other-stop"}],
         )
-        self.assertEqual(stop_entries[1]["hooks"][0]["command"], CURRENT_HOOK_COMMAND)
+        self.assertEqual(
+            stop_entries[1]["hooks"][0]["command"],
+            co._bind_hook_event(CURRENT_HOOK_COMMAND, "Stop"),
+        )
+
+    def test_unbound_v6_handler_is_upgraded_to_event_bound_form(self) -> None:
+        existing = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": CURRENT_HOOK_COMMAND,
+                                "commandWindows": CURRENT_HOOK_COMMAND,
+                                "timeout": 30,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+        merged, added = co.merge_codex_hook_settings(existing, **CURRENT_HOOK_KWARGS)
+
+        self.assertEqual(
+            added,
+            [
+                "SessionStart",
+                "UserPromptSubmit",
+                "SubagentStart",
+                "SubagentStop",
+                "PreToolUse",
+                "PostToolUse",
+            ],
+        )
+        self.assertEqual(
+            merged["hooks"]["Stop"][0]["hooks"][0]["command"],
+            co.bind_codex_hook_event(CURRENT_HOOK_COMMAND, "Stop"),
+        )
+
+    def test_unbound_v6_route_drift_is_not_silently_upgraded(self) -> None:
+        def settings_for(command: str, command_windows: str) -> dict[str, object]:
+            return {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": command,
+                                    "commandWindows": command_windows,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+
+        direct_cases = (
+            (
+                "launcher",
+                co.build_codex_hook_command(
+                    "/opt/other/aoi-codex-hook",
+                    TEST_PROJECT_ROOT,
+                    TEST_PROVENANCE_SHA256,
+                ),
+            ),
+            (
+                "root",
+                co.build_codex_hook_command(
+                    TEST_HOOK_LAUNCHER,
+                    "/work/other-project",
+                    TEST_PROVENANCE_SHA256,
+                ),
+            ),
+            (
+                "digest",
+                co.build_codex_hook_command(
+                    TEST_HOOK_LAUNCHER,
+                    TEST_PROJECT_ROOT,
+                    "b" * 64,
+                ),
+            ),
+        )
+        for label, drifted in direct_cases:
+            with self.subTest(platform="direct", drift=label):
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError, "partial or route-drifted"
+                ):
+                    co.merge_codex_hook_settings(
+                        settings_for(drifted, drifted), **CURRENT_HOOK_KWARGS
+                    )
+
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        command, command_windows = co.build_codex_hook_commands(
+            TEST_HOOK_LAUNCHER,
+            TEST_PROJECT_ROOT,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        wsl_drift_pairs = (
+            (
+                "launcher",
+                co.build_codex_hook_commands(
+                    "/opt/other/aoi-codex-hook",
+                    TEST_PROJECT_ROOT,
+                    TEST_PROVENANCE_SHA256,
+                    environment=environment,
+                    kernel_release="6.6.0-microsoft-standard-WSL2",
+                    host_os_name="posix",
+                    wsl_user="tester",
+                ),
+            ),
+            (
+                "root",
+                co.build_codex_hook_commands(
+                    TEST_HOOK_LAUNCHER,
+                    "/work/other-project",
+                    TEST_PROVENANCE_SHA256,
+                    environment=environment,
+                    kernel_release="6.6.0-microsoft-standard-WSL2",
+                    host_os_name="posix",
+                    wsl_user="tester",
+                ),
+            ),
+            (
+                "digest",
+                co.build_codex_hook_commands(
+                    TEST_HOOK_LAUNCHER,
+                    TEST_PROJECT_ROOT,
+                    "b" * 64,
+                    environment=environment,
+                    kernel_release="6.6.0-microsoft-standard-WSL2",
+                    host_os_name="posix",
+                    wsl_user="tester",
+                ),
+            ),
+        )
+        for label, (existing_command, existing_windows) in wsl_drift_pairs:
+            with self.subTest(platform="wsl", drift=label):
+                with self.assertRaisesRegex(
+                    co.CodexOnboardingError, "partial or route-drifted"
+                ):
+                    co.merge_codex_hook_settings(
+                        settings_for(existing_command, existing_windows),
+                        command=command,
+                        command_windows=command_windows,
+                    )
+        _wrong_native, wrong_windows = wsl_drift_pairs[-1][1]
+        with self.subTest(platform="wsl", drift="cross-bound"):
+            with self.assertRaisesRegex(
+                co.CodexOnboardingError, "partial or route-drifted"
+            ):
+                co.merge_codex_hook_settings(
+                    settings_for(command, wrong_windows),
+                    command=command,
+                    command_windows=command_windows,
+                )
 
     def test_legacy_wsl_handler_upgrades_to_exact_pair_without_dropping_foreign_hook(
         self,
@@ -795,7 +1118,10 @@ class HookMergeTests(unittest.TestCase):
                 stop_entries[1]["hooks"][0]["command"],
                 stop_entries[1]["hooks"][0]["commandWindows"],
             ),
-            (command, command_windows),
+            (
+                co._bind_hook_event(command, "Stop"),
+                co._bind_hook_event(command_windows, "Stop"),
+            ),
         )
 
     def test_current_command_requires_exact_bound_absolute_command(self) -> None:
@@ -870,6 +1196,139 @@ class HookMergeTests(unittest.TestCase):
             with self.subTest(launcher=launcher, root=root, digest=digest):
                 with self.assertRaises(co.CodexOnboardingError):
                     co.build_codex_hook_command(launcher, root, digest)
+
+    def test_python_module_hook_builders_render_and_parse_exact_forms(self) -> None:
+        direct = co.build_codex_python_hook_command(
+            TEST_HOOK_PYTHON, TEST_PROJECT_ROOT, TEST_PROVENANCE_SHA256
+        )
+        self.assertEqual(
+            direct,
+            f'"{TEST_HOOK_PYTHON}" -I -B -m aoi_orgware.codex_hook '
+            f'--hook-version 6 --project-root "{TEST_PROJECT_ROOT}" '
+            f'--provenance-sha256 "{TEST_PROVENANCE_SHA256}"',
+        )
+        self.assertTrue(co.is_aoi_codex_hook_command(direct))
+        self.assertTrue(
+            co.is_aoi_codex_hook_command(
+                direct,
+                expected_python=TEST_HOOK_PYTHON,
+                expected_project_root=TEST_PROJECT_ROOT,
+                expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+            )
+        )
+        self.assertFalse(
+            co.is_aoi_codex_hook_command(
+                direct,
+                expected_launcher=TEST_HOOK_LAUNCHER,
+                expected_project_root=TEST_PROJECT_ROOT,
+                expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+            )
+        )
+
+        windows_python = r"C:\AOI\Python\python.exe"
+        windows_root = r"C:\work\aoi-project"
+        windows = co.build_codex_python_hook_command(
+            windows_python, windows_root, TEST_PROVENANCE_SHA256
+        )
+        self.assertTrue(co.is_aoi_codex_hook_command(windows))
+        self.assertTrue(
+            co.is_aoi_codex_hook_command(
+                windows,
+                expected_python=windows_python,
+                expected_project_root=windows_root,
+                expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+            )
+        )
+
+        environment = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/123_interop",
+        }
+        native, wrapped = co.build_codex_python_hook_commands(
+            TEST_HOOK_PYTHON,
+            TEST_PROJECT_ROOT,
+            TEST_PROVENANCE_SHA256,
+            environment=environment,
+            kernel_release="6.6.0-microsoft-standard-WSL2",
+            host_os_name="posix",
+            wsl_user="tester",
+        )
+        self.assertEqual(native, direct)
+        self.assertIn('--exec "' + TEST_HOOK_PYTHON + '" -I -B -m ', wrapped)
+        self.assertTrue(co.is_aoi_codex_hook_command(wrapped))
+        self.assertTrue(
+            co.is_current_codex_hook_command_pair(
+                native,
+                wrapped,
+                expected_python=TEST_HOOK_PYTHON,
+                expected_project_root=TEST_PROJECT_ROOT,
+                expected_provenance_sha256=TEST_PROVENANCE_SHA256,
+                environment=environment,
+                kernel_release="6.6.0-microsoft-standard-WSL2",
+                host_os_name="posix",
+                wsl_user="tester",
+            )
+        )
+
+    def test_python_module_hook_form_refuses_mixed_and_malformed_pairs(self) -> None:
+        direct = co.build_codex_python_hook_command(
+            TEST_HOOK_PYTHON, TEST_PROJECT_ROOT, TEST_PROVENANCE_SHA256
+        )
+        launcher = co.build_codex_hook_command(
+            TEST_HOOK_LAUNCHER, TEST_PROJECT_ROOT, TEST_PROVENANCE_SHA256
+        )
+        with self.assertRaisesRegex(co.CodexOnboardingError, "must bind one exact"):
+            co._validate_codex_hook_command_pair(
+                direct, launcher, label="test Python mixed pair"
+            )
+        malformed = direct.replace("-I -B -m", "-B -I -m")
+        self.assertFalse(co.is_aoi_codex_hook_command(malformed))
+        self.assertTrue(co.references_aoi_codex_hook(malformed))
+        for candidate in (
+            direct.replace("aoi_orgware.codex_hook", "aoi_orgware.other"),
+            direct.replace('"' + TEST_HOOK_PYTHON + '"', '"/opt/aoi/bin/node"'),
+            direct.replace("-I -B -m", "-I -m"),
+            direct + ' --expected-event "Bogus"',
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertFalse(co.is_aoi_codex_hook_command(candidate))
+                self.assertTrue(co.references_aoi_codex_hook(candidate))
+
+    def test_python_module_unbound_pair_upgrades_but_cross_bound_pair_refuses(self) -> None:
+        direct = co.build_codex_python_hook_command(
+            TEST_HOOK_PYTHON, TEST_PROJECT_ROOT, TEST_PROVENANCE_SHA256
+        )
+        settings = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": direct,
+                                "commandWindows": direct,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        merged, _added = co.merge_codex_hook_settings(
+            settings, command=direct, command_windows=direct
+        )
+        self.assertEqual(
+            merged["hooks"]["Stop"][0]["hooks"][0]["command"],
+            co.bind_codex_hook_event(direct, "Stop"),
+        )
+
+        wrong = co.build_codex_python_hook_command(
+            "/opt/aoi/other/python3.14", TEST_PROJECT_ROOT, TEST_PROVENANCE_SHA256
+        )
+        settings["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] = wrong
+        with self.assertRaisesRegex(co.CodexOnboardingError, "partial or route-drifted"):
+            co.merge_codex_hook_settings(
+                settings, command=direct, command_windows=direct
+            )
 
     def test_current_recognition_rejects_unquoted_or_reordered_fields(self) -> None:
         unquoted = CURRENT_HOOK_COMMAND.replace('"/opt/aoi/bin/aoi-codex-hook"', "/opt/aoi/bin/aoi-codex-hook")
@@ -1027,6 +1486,19 @@ class ConfigMergeTests(unittest.TestCase):
 
 
 class InstallHelperTests(unittest.TestCase):
+    def test_missing_user_skill_preflight_and_install_create_exact_utf8_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            skills_root = Path(temporary) / ".agents" / "skills"
+            packaged_text = "# AOI\n"
+            preflight = co.preflight_codex_user_skill(skills_root, packaged_text)
+            self.assertIsNone(preflight["existing_sha256"])
+            self.assertTrue(preflight["changed"])
+
+            result = co.install_codex_user_skill(skills_root, packaged_text)
+            skill_path = skills_root / "aoi" / "SKILL.md"
+            self.assertTrue(result["created"])
+            self.assertEqual(skill_path.read_bytes(), packaged_text.encode("utf-8"))
+
     def test_hooks_config_and_skill_install_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1077,7 +1549,7 @@ class InstallHelperTests(unittest.TestCase):
             skills_root = Path(temporary) / ".agents" / "skills"
             skill_path = skills_root / "aoi" / "SKILL.md"
             skill_path.parent.mkdir(parents=True)
-            skill_path.write_text("# local customization\n", encoding="utf-8")
+            skill_path.write_bytes(b"# local customization\n")
             digest = co.preflight_codex_user_skill(
                 skills_root, "# local customization\n"
             )["existing_sha256"]
@@ -1090,6 +1562,46 @@ class InstallHelperTests(unittest.TestCase):
             )
             self.assertTrue(result["updated"])
             self.assertEqual(skill_path.read_text(encoding="utf-8"), "# packaged\n")
+
+    def test_user_skill_crlf_requires_raw_byte_replacement_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            skills_root = Path(temporary) / ".agents" / "skills"
+            skill_path = skills_root / "aoi" / "SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            existing_bytes = b"# AOI\r\n"
+            packaged_text = "# AOI\n"
+            packaged_bytes = packaged_text.encode("utf-8")
+            skill_path.write_bytes(existing_bytes)
+            existing_digest = hashlib.sha256(existing_bytes).hexdigest()
+
+            with self.assertRaisesRegex(
+                co.CodexOnboardingError, existing_digest
+            ):
+                co.preflight_codex_user_skill(skills_root, packaged_text)
+
+            preflight = co.preflight_codex_user_skill(
+                skills_root,
+                packaged_text,
+                replace_sha256=existing_digest,
+            )
+            self.assertTrue(preflight["changed"])
+            self.assertEqual(preflight["existing_sha256"], existing_digest)
+            self.assertEqual(
+                preflight["packaged_sha256"],
+                hashlib.sha256(packaged_bytes).hexdigest(),
+            )
+
+            result = co.install_codex_user_skill(
+                skills_root,
+                packaged_text,
+                replace_sha256=existing_digest,
+            )
+            self.assertTrue(result["updated"])
+            self.assertEqual(skill_path.read_bytes(), packaged_bytes)
+            self.assertEqual(
+                hashlib.sha256(skill_path.read_bytes()).hexdigest(),
+                preflight["packaged_sha256"],
+            )
 
     def test_invalid_hook_json_is_not_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1405,17 +1917,20 @@ class FreshCodexInitCliTests(unittest.TestCase):
             skills_root = root / "user-skills"
             args = argparse.Namespace(
                 project_name=None,
-                promotion_bundle_file="unused-by-this-failure-injection",
-                expected_promotion_bundle_sha256="a" * 64,
+                promotion_bundle_file=None,
+                expected_promotion_bundle_sha256=None,
+                local_artifact_bundle_file="unused-by-this-failure-injection",
+                expected_local_artifact_bundle_sha256="a" * 64,
                 user_skills_root=str(skills_root),
                 replace_user_skill_sha256=None,
                 json=True,
             )
-            provenance = fake_provenance_receipt(root)
+            provenance = fake_local_provenance_receipt(root)
             with (
+                mock_fake_local_codex_client_skill_binding(provenance),
                 mock.patch.object(
                     cli_impl.codex_install_provenance_impl,
-                    "validate_codex_install_provenance",
+                    "validate_codex_local_install_provenance",
                     return_value=provenance,
                 ),
                 mock.patch.object(
@@ -1461,17 +1976,22 @@ class FreshCodexInitCliTests(unittest.TestCase):
             env["AOI_CHIEF_CREDENTIAL_FILE"] = authority["credential_file"]
             env["AOI_ROOT"] = str(root)
             captured = io.StringIO()
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
-                cli_impl.codex_install_provenance_impl,
-                "validate_codex_install_provenance",
-                return_value=provenance,
-            ), mock.patch.object(sys, "stdout", captured):
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock_fake_local_codex_client_skill_binding(provenance),
+                mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "validate_codex_local_install_provenance",
+                    return_value=provenance,
+                ),
+                mock.patch.object(sys, "stdout", captured),
+            ):
                 returncode = cli_impl.main(
                     [
                     "codex-init",
-                    "--promotion-bundle-file",
-                    str(root / "promotion-bundle.json"),
-                    "--expected-promotion-bundle-sha256",
+                    "--local-artifact-bundle-file",
+                    str(root / "reviewed-local-install.json"),
+                    "--expected-local-artifact-bundle-sha256",
                     "a" * 64,
                     "--user-skills-root",
                     str(skills_root),
@@ -1519,6 +2039,39 @@ class FreshCodexInitCliTests(unittest.TestCase):
             self.assertFalse((root / "aoi.toml").exists())
             self.assertFalse((root / ".codex").exists())
 
+    def test_public_v1_proof_is_refused_before_any_onboarding_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            public = fake_provenance_receipt(root, salt="historical-public-v1")
+            args = argparse.Namespace(
+                project_name=None,
+                promotion_bundle_file=str(root / "promotion.json"),
+                expected_promotion_bundle_sha256="a" * 64,
+                local_artifact_bundle_file=None,
+                expected_local_artifact_bundle_sha256=None,
+                user_skills_root=str(root / "user-skills"),
+                replace_user_skill_sha256=None,
+                json=True,
+            )
+            with mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_install_provenance",
+                return_value=public,
+            ), self.assertRaisesRegex(
+                h.HarnessError, "requires local-v2 exact-wheel proof"
+            ):
+                cli_impl.cmd_codex_init(args, h.get_paths(root))
+            self.assertFalse((root / "aoi.toml").exists())
+            self.assertFalse((root / ".aoi").exists())
+            self.assertFalse((root / ".codex").exists())
+            self.assertFalse((root / "user-skills").exists())
+
     def test_fresh_repo_initializes_aoi_and_codex_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1549,27 +2102,34 @@ class FreshCodexInitCliTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env["PYTHONPATH"] = str(HERE.parent / "src")
-            provenance = fake_provenance_receipt(root)
+            provenance = fake_local_provenance_receipt(root)
             args = argparse.Namespace(
                 project_name="Fresh AOI",
-                promotion_bundle_file=str(root / "promotion-bundle.json"),
-                expected_promotion_bundle_sha256="a" * 64,
+                promotion_bundle_file=None,
+                expected_promotion_bundle_sha256=None,
+                local_artifact_bundle_file=str(root / "reviewed-local-install.json"),
+                expected_local_artifact_bundle_sha256="a" * 64,
                 user_skills_root=str(root / "user-skills"),
                 replace_user_skill_sha256=None,
                 json=True,
             )
             captured = io.StringIO()
-            with mock.patch.object(
-                cli_impl.codex_install_provenance_impl,
-                "validate_codex_install_provenance",
-                return_value=provenance,
-            ), mock.patch.object(
-                cli_impl.confidentiality_impl,
-                "require_publication_action_allowed",
-                side_effect=AssertionError(
-                    "inbound AOI installation is not project-file publication"
+            with (
+                mock_fake_local_codex_client_skill_binding(provenance),
+                mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "validate_codex_local_install_provenance",
+                    return_value=provenance,
                 ),
-            ), mock.patch.object(sys, "stdout", captured):
+                mock.patch.object(
+                    cli_impl.confidentiality_impl,
+                    "require_publication_action_allowed",
+                    side_effect=AssertionError(
+                        "inbound AOI installation is not project-file publication"
+                    ),
+                ),
+                mock.patch.object(sys, "stdout", captured),
+            ):
                 self.assertEqual(cli_impl.cmd_codex_init(args, h.get_paths(root)), 0)
             payload = json.loads(captured.getvalue())
             self.assertTrue(payload["created_config"])
@@ -1590,25 +2150,35 @@ class CodexInitCliTests(HarnessTestCase):
     def codex_init(
         self, *args: str, ok: bool = True
     ) -> subprocess.CompletedProcess[str]:
-        self.provenance_receipt = fake_provenance_receipt(self.root)
+        install_provenance_receipt = fake_local_provenance_receipt(self.root)
+        with mock_fake_local_codex_client_skill_binding(install_provenance_receipt):
+            self.provenance_receipt = (
+                cli_impl.codex_install_provenance_impl.bind_codex_client_skill(
+                    install_provenance_receipt,
+                    (self.root / "user-skills" / "aoi" / "SKILL.md").resolve(),
+                )
+            )
         (
             self.expected_hook_command,
             self.expected_hook_command_windows,
-        ) = co.build_codex_hook_commands(
-            self.provenance_receipt["codex_hook_entry_point"]["path"],
+        ) = co.build_codex_python_hook_commands(
+            self.provenance_receipt["codex_hook_runtime"]["python_invocation"],
             self.root,
             self.provenance_receipt["provenance_receipt_sha256"],
         )
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "validate_codex_install_provenance",
-            return_value=self.provenance_receipt,
+        with (
+            mock_fake_local_codex_client_skill_binding(install_provenance_receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=install_provenance_receipt,
+            ),
         ):
             return self.cli_in_process(
                 "codex-init",
-                "--promotion-bundle-file",
-                str(self.root / "promotion-bundle.json"),
-                "--expected-promotion-bundle-sha256",
+                "--local-artifact-bundle-file",
+                str(self.root / "reviewed-local-install.json"),
+                "--expected-local-artifact-bundle-sha256",
                 "a" * 64,
                 "--user-skills-root",
                 str(self.root / "user-skills"),
@@ -1634,11 +2204,13 @@ class CodexInitCliTests(HarnessTestCase):
         )
         self.assertEqual(
             hooks["hooks"]["SubagentStart"][0]["hooks"][0]["command"],
-            self.expected_hook_command,
+            co._bind_hook_event(self.expected_hook_command, "SubagentStart"),
         )
         self.assertEqual(
             hooks["hooks"]["SubagentStart"][0]["hooks"][0]["commandWindows"],
-            self.expected_hook_command_windows,
+            co._bind_hook_event(
+                self.expected_hook_command_windows, "SubagentStart"
+            ),
         )
         self.assertEqual(
             result["install_provenance"]["provenance_receipt_sha256"],
@@ -1650,13 +2222,35 @@ class CodexInitCliTests(HarnessTestCase):
         self.assertIn("Govern work with AOI", skill_text)
         self.assertEqual(result["skill"]["scope"], "user")
         self.assertFalse((self.root / ".agents" / "skills" / "aoi").exists())
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "verify_runtime_hook_provenance",
-            return_value=self.provenance_receipt,
+        with (
+            mock_fake_local_codex_client_skill_binding(self.provenance_receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "verify_runtime_hook_provenance",
+                return_value=self.provenance_receipt,
+            ),
         ):
             doctor = json.loads(self.cli_in_process("doctor", "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["codex_client_skill"]["status"], "exact")
+        self.assertEqual(
+            doctor["codex_client_skill"]["role"], "client_adapter_only"
+        )
+        self.assertEqual(
+            doctor["codex_client_skill"]["expected_sha256"],
+            doctor["codex_client_skill"]["actual_sha256"],
+        )
+
+    def test_doctor_distinguishes_no_provenance_from_legacy_unbound(self) -> None:
+        doctor = json.loads(self.cli_in_process("doctor", "--json").stdout)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(
+            doctor["codex_client_skill"]["status"], "not_configured"
+        )
+        self.assertEqual(
+            doctor["codex_client_skill"]["reason"],
+            "no_persisted_codex_install_provenance",
+        )
 
     def test_codex_init_is_idempotent(self) -> None:
         first = json.loads(self.codex_init("--json").stdout)
@@ -1671,6 +2265,7 @@ class CodexInitCliTests(HarnessTestCase):
         expected_sha256 = "b" * 64
         invoked_console = Path(sys.argv[0]).resolve()
         with (
+            mock_fake_local_codex_client_skill_binding(receipt),
             mock.patch.object(
                 cli_impl.codex_install_provenance_impl,
                 "validate_codex_install_provenance",
@@ -1681,6 +2276,12 @@ class CodexInitCliTests(HarnessTestCase):
                 return_value=receipt,
             ) as local_validator,
         ):
+            expected = (
+                cli_impl.codex_install_provenance_impl.bind_codex_client_skill(
+                    receipt,
+                    (self.root / "user-skills" / "aoi" / "SKILL.md").resolve(),
+                )
+            )
             result = self.cli_in_process(
                 "codex-init",
                 "--local-artifact-bundle-file",
@@ -1701,33 +2302,22 @@ class CodexInitCliTests(HarnessTestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(persisted, receipt)
-        self.assertEqual(persisted["schema_version"], 2)
+        self.assertEqual(persisted, expected)
+        self.assertEqual(persisted["schema_version"], 3)
+        self.assertEqual(persisted["install_provenance_schema_version"], 2)
         self.assertEqual(
             persisted["install_proof"]["proof_scope"],
             "exact_local_wheel_install_only",
         )
 
     def test_public_to_local_proof_change_archives_without_release_promotion_state(self) -> None:
-        public = fake_provenance_receipt(self.root, salt="public")
+        # Public v1 provenance is historical readback only.  Seed it as an
+        # already-existing state, then prove the supported local-v2 upgrade.
+        self.codex_init("--json")
+        persisted_public = seed_historical_public_v1_codex_onboarding(self.root)
         local = fake_local_provenance_receipt(self.root, salt="local")
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "validate_codex_install_provenance",
-            return_value=public,
-        ):
-            first = self.cli_in_process(
-                "codex-init",
-                "--promotion-bundle-file",
-                str(self.root / "promotion.json"),
-                "--expected-promotion-bundle-sha256",
-                "a" * 64,
-                "--user-skills-root",
-                str(self.root / "user-skills"),
-                "--json",
-            )
-        self.assertEqual(first.returncode, 0, first.stderr)
         with (
+            mock_fake_local_codex_client_skill_binding(local),
             mock.patch.object(
                 cli_impl.codex_install_provenance_impl,
                 "validate_codex_install_provenance",
@@ -1738,6 +2328,12 @@ class CodexInitCliTests(HarnessTestCase):
                 return_value=local,
             ) as local_validator,
         ):
+            expected_local = (
+                cli_impl.codex_install_provenance_impl.bind_codex_client_skill(
+                    local,
+                    (self.root / "user-skills" / "aoi" / "SKILL.md").resolve(),
+                )
+            )
             second = self.cli_in_process(
                 "codex-init",
                 "--local-artifact-bundle-file",
@@ -1753,7 +2349,10 @@ class CodexInitCliTests(HarnessTestCase):
         local_validator.assert_called_once()
         history = self.root / ".aoi" / "codex-install-provenance-history-v1"
         self.assertTrue(
-            (history / f"{public['provenance_receipt_sha256']}.json").is_file()
+            (
+                history
+                / f"{persisted_public['provenance_receipt_sha256']}.json"
+            ).is_file()
         )
         self.assertFalse((self.root / ".aoi" / "release_promotions").exists())
         current = json.loads(
@@ -1761,28 +2360,106 @@ class CodexInitCliTests(HarnessTestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(current, local)
-        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(current, expected_local)
+        self.assertEqual(current["schema_version"], 3)
+        self.assertEqual(current["install_provenance_schema_version"], 2)
+
+    def test_proof_rotation_rejects_symlink_archive_without_losing_prior_receipt(
+        self,
+    ) -> None:
+        self.codex_init("--json")
+        persisted_public = seed_historical_public_v1_codex_onboarding(self.root)
+        receipt_path = (
+            self.root / ".aoi" / "codex-install-provenance-v1.json"
+        )
+        prior_bytes = receipt_path.read_bytes()
+        history = (
+            self.root / ".aoi" / "codex-install-provenance-history-v1"
+        )
+        history.mkdir()
+        archive = (
+            history
+            / f"{persisted_public['provenance_receipt_sha256']}.json"
+        )
+        try:
+            os.symlink(receipt_path, archive)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"file symlink is unavailable: {exc}")
+
+        local = fake_local_provenance_receipt(self.root, salt="local-symlink")
+        with mock_fake_local_codex_client_skill_binding(local):
+            candidate = (
+                cli_impl.codex_install_provenance_impl.bind_codex_client_skill(
+                    local,
+                    (self.root / "user-skills" / "aoi" / "SKILL.md").resolve(),
+                )
+            )
+        with self.assertRaisesRegex(
+            h.HarnessError, "provenance history archive"
+        ):
+            cli_impl._install_codex_provenance_receipt(
+                h.get_paths(self.root), candidate
+            )
+
+        self.assertTrue(archive.is_symlink())
+        self.assertEqual(receipt_path.read_bytes(), prior_bytes)
+        self.assertEqual(
+            json.loads(prior_bytes),
+            persisted_public,
+        )
+
+    def test_proof_rotation_rejects_hardlinked_archive_without_mutation(
+        self,
+    ) -> None:
+        self.codex_init("--json")
+        seed_historical_public_v1_codex_onboarding(self.root)
+        receipt_path = (
+            self.root / ".aoi" / "codex-install-provenance-v1.json"
+        )
+        prior_bytes = receipt_path.read_bytes()
+        persisted_public = json.loads(prior_bytes)
+        history = (
+            self.root / ".aoi" / "codex-install-provenance-history-v1"
+        )
+        history.mkdir()
+        archive = (
+            history
+            / f"{persisted_public['provenance_receipt_sha256']}.json"
+        )
+        try:
+            os.link(receipt_path, archive)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"file hard link is unavailable: {exc}")
+
+        local = fake_local_provenance_receipt(self.root, salt="local-hardlink")
+        with mock_fake_local_codex_client_skill_binding(local):
+            candidate = (
+                cli_impl.codex_install_provenance_impl.bind_codex_client_skill(
+                    local,
+                    (self.root / "user-skills" / "aoi" / "SKILL.md").resolve(),
+                )
+            )
+        with self.assertRaisesRegex(
+            h.HarnessError, "private regular non-linked file"
+        ):
+            cli_impl._install_codex_provenance_receipt(
+                h.get_paths(self.root), candidate
+            )
+
+        self.assertEqual(receipt_path.read_bytes(), prior_bytes)
+        self.assertEqual(archive.read_bytes(), prior_bytes)
 
     def test_proof_rotation_receipt_write_failure_is_resumable(self) -> None:
-        public = fake_provenance_receipt(self.root, salt="public-crash")
+        self.codex_init("--json")
+        persisted_public = seed_historical_public_v1_codex_onboarding(self.root)
         local = fake_local_provenance_receipt(self.root, salt="local-crash")
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "validate_codex_install_provenance",
-            return_value=public,
-        ):
-            first = self.cli_in_process(
-                "codex-init",
-                "--promotion-bundle-file",
-                str(self.root / "promotion.json"),
-                "--expected-promotion-bundle-sha256",
-                "a" * 64,
-                "--user-skills-root",
-                str(self.root / "user-skills"),
-                "--json",
+        with mock_fake_local_codex_client_skill_binding(local):
+            bound_local = (
+                cli_impl.codex_install_provenance_impl.bind_codex_client_skill(
+                    local,
+                    (self.root / "user-skills" / "aoi" / "SKILL.md").resolve(),
+                )
             )
-        self.assertEqual(first.returncode, 0, first.stderr)
 
         local_args = (
             "codex-init",
@@ -1795,6 +2472,7 @@ class CodexInitCliTests(HarnessTestCase):
             "--json",
         )
         with (
+            mock_fake_local_codex_client_skill_binding(local),
             mock.patch.object(
                 cli_impl.codex_install_provenance_impl,
                 "validate_codex_local_install_provenance",
@@ -1814,24 +2492,27 @@ class CodexInitCliTests(HarnessTestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(persisted, public)
-        expected_local_pair = co.build_codex_hook_commands(
-            local["codex_hook_entry_point"]["path"],
+        self.assertEqual(persisted, persisted_public)
+        expected_local_pair = co.build_codex_python_hook_commands(
+            bound_local["codex_hook_runtime"]["python_invocation"],
             self.root,
-            local["provenance_receipt_sha256"],
+            bound_local["provenance_receipt_sha256"],
         )
         handler = json.loads(
             (self.root / ".codex" / "hooks.json").read_text(encoding="utf-8")
         )["hooks"]["Stop"][0]["hooks"][0]
         self.assertEqual(
             (handler["command"], handler["commandWindows"]),
-            expected_local_pair,
+            tuple(co._bind_hook_event(command, "Stop") for command in expected_local_pair),
         )
 
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "validate_codex_local_install_provenance",
-            return_value=local,
+        with (
+            mock_fake_local_codex_client_skill_binding(local),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=local,
+            ),
         ):
             resumed = self.cli_in_process(*local_args)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
@@ -1840,7 +2521,7 @@ class CodexInitCliTests(HarnessTestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(final_receipt, local)
+        self.assertEqual(final_receipt, bound_local)
 
     def test_fresh_policy_flip_refuses_a_chief_acquired_after_bootstrap(self) -> None:
         paths = h.get_paths(self.root)
@@ -1855,17 +2536,20 @@ class CodexInitCliTests(HarnessTestCase):
     def test_partial_atomic_write_failure_is_reported_and_resumable(self) -> None:
         args = argparse.Namespace(
             project_name=None,
-            promotion_bundle_file="unused-by-this-failure-injection",
-            expected_promotion_bundle_sha256="a" * 64,
+            promotion_bundle_file=None,
+            expected_promotion_bundle_sha256=None,
+            local_artifact_bundle_file="unused-by-this-failure-injection",
+            expected_local_artifact_bundle_sha256="a" * 64,
             user_skills_root=str(self.root / "user-skills"),
             replace_user_skill_sha256=None,
             json=True,
         )
-        provenance = fake_provenance_receipt(self.root)
+        provenance = fake_local_provenance_receipt(self.root)
         with (
+            mock_fake_local_codex_client_skill_binding(provenance),
             mock.patch.object(
                 cli_impl.codex_install_provenance_impl,
-                "validate_codex_install_provenance",
+                "validate_codex_local_install_provenance",
                 return_value=provenance,
             ),
             mock.patch.object(
@@ -1887,17 +2571,20 @@ class CodexInitCliTests(HarnessTestCase):
     def test_policy_post_write_failure_is_reported_and_resumable(self) -> None:
         args = argparse.Namespace(
             project_name=None,
-            promotion_bundle_file="unused-by-this-failure-injection",
-            expected_promotion_bundle_sha256="a" * 64,
+            promotion_bundle_file=None,
+            expected_promotion_bundle_sha256=None,
+            local_artifact_bundle_file="unused-by-this-failure-injection",
+            expected_local_artifact_bundle_sha256="a" * 64,
             user_skills_root=str(self.root / "user-skills"),
             replace_user_skill_sha256=None,
             json=True,
         )
-        provenance = fake_provenance_receipt(self.root)
+        provenance = fake_local_provenance_receipt(self.root)
         with (
+            mock_fake_local_codex_client_skill_binding(provenance),
             mock.patch.object(
                 cli_impl.codex_install_provenance_impl,
-                "validate_codex_install_provenance",
+                "validate_codex_local_install_provenance",
                 return_value=provenance,
             ),
             mock.patch.object(cli_impl, "write_index", side_effect=OSError("disk fault")),
@@ -1929,13 +2616,85 @@ class CodexInitCliTests(HarnessTestCase):
             0, {"hooks": [{"type": "command", "command": "other-stop"}]}
         )
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "verify_runtime_hook_provenance",
-            return_value=self.provenance_receipt,
+        with (
+            mock_fake_local_codex_client_skill_binding(self.provenance_receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "verify_runtime_hook_provenance",
+                return_value=self.provenance_receipt,
+            ),
         ):
             doctor = json.loads(self.cli_in_process("doctor", "--json").stdout)
         self.assertTrue(doctor["ok"], doctor)
+
+    def test_doctor_rejects_legacy_unbound_v1_and_v2_when_hooks_enabled(
+        self,
+    ) -> None:
+        self.codex_init("--json")
+        receipt_path = (
+            self.root / ".aoi" / "codex-install-provenance-v1.json"
+        )
+        legacy_receipts = (
+            fake_provenance_receipt(self.root, salt="legacy-v1"),
+            fake_local_provenance_receipt(self.root, salt="legacy-v2"),
+        )
+        for legacy in legacy_receipts:
+            with self.subTest(schema_version=legacy["schema_version"]):
+                receipt_path.write_bytes(canonical_json_bytes(legacy))
+                with mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "verify_runtime_hook_provenance",
+                    return_value=legacy,
+                ), mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output:
+                    returncode = cli_impl.cmd_doctor(
+                        argparse.Namespace(task=None, json=True),
+                        h.get_paths(self.root),
+                    )
+                self.assertEqual(returncode, 1)
+                doctor = json.loads(output.getvalue())
+                self.assertEqual(
+                    doctor["codex_client_skill"]["status"],
+                    "legacy_unbound",
+                )
+                self.assertTrue(
+                    any(
+                        "legacy_unbound" in error
+                        for error in doctor["errors"]
+                    ),
+                    doctor,
+                )
+
+    def test_doctor_rejects_drifted_v3_client_skill(self) -> None:
+        self.codex_init("--json")
+        installed = self.root / "user-skills" / "aoi" / "SKILL.md"
+        installed.write_bytes(b"# independently drifted client prose\n")
+        with (
+            mock_fake_local_codex_client_skill_binding(self.provenance_receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "verify_runtime_hook_provenance",
+                return_value=self.provenance_receipt,
+            ),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output,
+        ):
+            returncode = cli_impl.cmd_doctor(
+                argparse.Namespace(task=None, json=True),
+                h.get_paths(self.root),
+            )
+        self.assertEqual(returncode, 1)
+        doctor = json.loads(output.getvalue())
+        report = doctor["codex_client_skill"]
+        self.assertEqual(report["status"], "drifted")
+        self.assertNotEqual(
+            report["actual_sha256"], report["expected_sha256"]
+        )
+        self.assertTrue(
+            any(
+                "Codex client skill binding is not exact: drifted" in error
+                for error in doctor["errors"]
+            ),
+            doctor,
+        )
 
     def test_doctor_rejects_platform_command_pair_drift(self) -> None:
         self.codex_init("--json")

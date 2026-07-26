@@ -300,7 +300,7 @@ resulting routing, permit, and packet delta roots. Chief issuance and the first
 unreserved consumption both apply the complete core packet contract, open-task,
 approved-plan, parent/root-session mapping, canonical current resource event,
 bound receipt, exact session registration, topology, resource-envelope, and
-skill-canary authority gate.
+skill-canary qualification gate.
 The no-Chief consumer then commits routing authority, permit projection, and
 canonical `ready -> armed` state in one semantic compare-and-append. A terminal
 task can never be armed. Cohort transaction schema v2 remains separate and does
@@ -334,11 +334,13 @@ output cannot terminate that agent. For supported Codex tool handlers,
 the local `codex-cli 0.144.0` canary confirmed this for Bash. That is a narrow
 tool gate, not a collaboration pre-spawn gate: handler coverage is not complete,
 and agent spawning still relies on the prior arm plus `SubagentStart` accounting.
-The Claude Code adapter can likewise deny its governed pre-tool requests, but
-neither adapter turns non-cooperating or workflow-orchestrated spawning into a
-pre-spawn hard block. For any `PreToolUse` event, any internal adapter fault
-returns the fixed deny response (fail-closed); only non-`PreToolUse`
-lifecycle adapters remain fail-open. This is not a security boundary;
+The current claim here is Codex-specific. A Claude Code integration, where
+configured, has its own provider-specific contract and is not evidence of
+Codex/Claude parity. Neither integration turns non-cooperating or
+workflow-orchestrated spawning into a pre-spawn hard block. For any trusted
+Codex `PreToolUse` event, any internal adapter fault returns the fixed deny
+response (fail-closed); only non-`PreToolUse` lifecycle adapters remain
+fail-open. This is not a security boundary;
 classified mapping, arm, and authority failures deny normally. A start with no
 unique valid arm therefore
 creates an idempotent open `unmanaged_subagent_start` incident and instructs the
@@ -352,7 +354,8 @@ before `packet-update --status dispatched` can register the truthful fallback.
 The fallback consumes that prior permit, records `manual_unverified`, the
 registration time, and a reason; it never calls that time the agent start time.
 Before consuming it, AOI revalidates expiry, Chief epoch, plan and packet
-identity, execution topology, lane/Steward snapshots, and skill authority. An
+identity, execution topology, lane/Steward snapshots, and qualified
+skill-canary state. An
 expired or stale permit is rejected and may be re-armed only after the expired
 attempt is durably closed.
 Direct `ready -> dispatched` registration is rejected for new packets, so work
@@ -583,9 +586,11 @@ unavailable unless independently observed.
 
 ## Improvement Pipeline
 
-Reusable skills originate from observed pain, not top-down guesses. A normal
-proposal requires durable recurrence; a critical one-off may enter review only
-through explicit Chief arbitration.
+Reusable skills originate from observed pain, not top-down guesses. They are
+workflow content, never a governance authority: a skill must ship with its
+reviewed distribution or be explicitly repository-scoped and qualified. A
+normal proposal requires durable recurrence; a critical one-off may enter
+review only through explicit Chief arbitration.
 
 Before release, a skill must have a bounded scope, representative and
 adversarial fixtures, blind forward checks, permission review, independent
@@ -857,28 +862,73 @@ exact pre/post Git tree and claim binding may add `verified_mutation`; neither
 receipt implies packet or task completion. `turn/interrupt` acknowledgement
 is nonterminal until correlated `turn/completed` arrives.
 
+## Governance authority and Codex client adapter
+
+This ARISE Operational Alpha candidate is unpublished and is not a complete
+v0.5 release. Its current schema-v3 path may be created only from a reviewed
+local-v2 exact-wheel proof. Public schema-v1 receipts remain readable and may
+follow their historical upgrade path, but they cannot newly enable current
+hooks; the public current-hook route is deferred. Historical v1/v2 descriptions
+below are compatibility/diagnostic context, not active schema-v3 authority.
+
+AOI governance authority is the installed deterministic CLI/runtime, ledger,
+and lock domain, interpreted with the repository's `aoi.toml`, this
+AOI-managed `POLICY.md`, and repository instructions. A Codex skill is not a
+governance rule source and cannot acquire Chief authority, create or consume a
+claim, authorize a mutation, or make evidence valid. The optional user-scope
+Codex skill is only a transitional client adapter shipped with the same AOI
+distribution: schema-v3 install provenance binds its exact bytes to that
+distribution's version and `RECORD`. When Codex hooks are enabled, `doctor`
+reports the adapter as `not_configured`, `exact`, `missing`, `drifted`,
+`uninspectable`, or `legacy_unbound`; only `exact` is current. Copying,
+editing, or retaining an
+unbound adapter never upgrades it into authority. This release makes no
+equivalent Claude or all-provider client-adapter binding claim.
+
+When hooks are disabled, a missing, drifted, or user-path-uninspectable client
+adapter is a warning/status observation and does not block `doctor`. Corrupt
+provenance receipts, wrong schema, package/`RECORD` drift, or failed exact-wheel
+proof remain blocking integrity faults regardless of hook enablement.
+
 ## Optional Codex hooks
 
 Hooks are disabled by default. When explicitly enabled, installed, and trusted
 through Codex `/hooks`, they can restore checkpoints, warn about lifecycle
 violations, consume Chief-issued one-time packet arms, and record task-local
-unmanaged-start incidents. For supported tool handlers, `PreToolUse` can also
+unmanaged-start incidents. Each current handler command binds exactly one
+event with `--expected-event "<event>"`. A protocol-v6 handler without that
+argument is upgradeable legacy only: it is not trusted to process a mutation
+event. For a trusted event-bound `PreToolUse` handler, bootstrap, provenance,
+payload, event-mismatch, dispatch, or receipt faults always return the fixed
+deny response. For supported tool handlers, `PreToolUse` can otherwise
 synchronously deny a governed tool request before it executes; the Bash canary
 proves that narrow path only. Tool-handler coverage is not complete, and
 collaboration spawn is not a pre-spawn hook path: it remains governed by an arm
-and later `SubagentStart` accounting. Any internal `PreToolUse` fault is
-fail-closed deny; only non-`PreToolUse` lifecycle adapters remain fail-open.
-Hooks are procedural guardrails, not a sandbox, identity provider, or pre-spawn
-security boundary.
+and later `SubagentStart` accounting. Non-mutation lifecycle adapters remain
+fail-open. Hooks are procedural guardrails, not a sandbox, identity provider,
+or pre-spawn security boundary.
 
-One installed Codex handler is an exact native/Windows command pair. Native
-Windows and non-WSL POSIX use direct provenance-bound commands. Canonical WSL
+Once AOI `main` has entered, a schema-v3 hook checks the persisted receipt
+against its actual Python invocation, resolved executable hash, venv prefix,
+cache tag, exact wheel-bound `aoi_orgware.codex_hook` module and `RECORD` hash,
+and argv prefix `-I -B -m aoi_orgware.codex_hook`. This is cooperative
+post-import drift detection only. It does not resist tampering with the
+interpreter, site/import machinery, same-user host, or anything that occurs
+before AOI `main` enters.
+
+One installed schema-v3 Codex handler is an exact native/Windows command pair.
+Native Windows and non-WSL POSIX use the recorded absolute venv Python:
+
+`"<absolute-python>" -I -B -m aoi_orgware.codex_hook --hook-version 6 --project-root "<root>" --provenance-sha256 "<digest>" --expected-event "<event>"`
+
+The pip `aoi-codex-hook` launcher is v1/v2 historical or diagnostic only; it
+is not current hook authority. Canonical WSL
 onboarding requires consistent non-Windows host, Microsoft-kernel,
-distribution, absolute interop endpoint, POSIX launcher/root, and passwd-user
-signals. It emits a direct Linux `command` plus only this no-shell Windows
+distribution, absolute interop endpoint, recorded absolute Python/runtime/root,
+and passwd-user signals. It emits a direct Linux `command` plus only this no-shell Windows
 grammar:
 
-`wsl.exe --distribution "<distro>" --user "<user>" --cd "<root>" --exec "<absolute-hook>" --hook-version 6 --project-root "<same-root>" --provenance-sha256 "<digest>"`
+`wsl.exe --distribution "<distro>" --user "<user>" --cd "<root>" --exec "<absolute-python>" -I -B -m aoi_orgware.codex_hook --hook-version 6 --project-root "<same-root>" --provenance-sha256 "<digest>" --expected-event "<event>"`
 
 There is no arbitrary wrapper override. Partial/contradictory WSL signals,
 native-Windows WSL UNC onboarding, relative/PATH-resolved inner launchers,
@@ -896,6 +946,10 @@ quote failures carrying an AOI hook signature and CMD caret-normalized AOI
 executable signatures as AOI-shaped drift. It is not an exhaustive shell
 parser or DLP. This does not make `wsl.exe`, Codex hook trust, or the same-user
 host an adversarial boundary.
+
+Local-v2 evidence that records console, bridge, or legacy hook launchers does
+not itself establish schema-v3 active-hook authority. The console is the
+onboarding CLI surface; the optional Bridge has its own launch/receipt boundary.
 
 ## Configuration drift
 

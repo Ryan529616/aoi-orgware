@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny, fail-open, opt-in Codex hook adapter for AOI."""
+"""Tiny opt-in AOI adapter: mutation fail-closed, lifecycle fail-open."""
 
 from __future__ import annotations
 
@@ -18,6 +18,17 @@ from .harnesslib import get_paths, is_semantic_v2_task
 
 
 SUPPORTED_HOOK_VERSION = "6"
+SUPPORTED_HOOK_EVENTS = frozenset(
+    {
+        "SessionStart",
+        "UserPromptSubmit",
+        "SubagentStart",
+        "SubagentStop",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+    }
+)
 SAFE_DISPLAY_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HOOK_INPUT_MAX_BYTES = 64 * 1024
@@ -955,22 +966,177 @@ def dispatch(payload: dict[str, Any], *, project_root: Path | None = None) -> No
         allow()
 
 
+def _argv_option_count(argv: list[str], option: str) -> int:
+    return sum(token == option or token.startswith(f"{option}=") for token in argv)
+
+
+def _argv_option_values(argv: list[str], option: str) -> list[str | None]:
+    """Extract exact option values without granting argparse parser authority."""
+
+    values: list[str | None] = []
+    for index, token in enumerate(argv):
+        if token.startswith(f"{option}="):
+            values.append(token[len(option) + 1 :])
+        elif token == option:
+            value_index = index + 1
+            values.append(
+                argv[value_index]
+                if value_index < len(argv) and not argv[value_index].startswith("--")
+                else None
+            )
+    return values
+
+
+def _current_v6ish_definition(argv: list[str]) -> bool:
+    """Recognize a current hook signal without trusting its full definition."""
+
+    return (
+        SUPPORTED_HOOK_VERSION in _argv_option_values(argv, "--hook-version")
+        # Event binding was introduced with the current hook contract.  Its
+        # presence therefore prevents a malformed mixed-version command from
+        # claiming historical non-mutation compatibility.
+        or bool(_argv_option_values(argv, "--expected-event"))
+        # A provenance binding similarly identifies the current trusted-hook
+        # route even when the version option itself has been lost.
+        or bool(_argv_option_values(argv, "--provenance-sha256"))
+    )
+
+
+def _exact_current_v6_provenance_identity(
+    argv: list[str],
+) -> tuple[str, str] | None:
+    """Return only a single, exact current identity usable for verification."""
+
+    versions = _argv_option_values(argv, "--hook-version")
+    roots = _argv_option_values(argv, "--project-root")
+    provenances = _argv_option_values(argv, "--provenance-sha256")
+    if (
+        versions != [SUPPORTED_HOOK_VERSION]
+        or len(roots) != 1
+        or not roots[0]
+        or len(provenances) != 1
+        or not provenances[0]
+    ):
+        return None
+    assert roots[0] is not None
+    assert provenances[0] is not None
+    return roots[0], provenances[0]
+
+
+def _current_v6ish_is_observed_nonmutation(argv: list[str]) -> bool:
+    """Boundedly observe current-definition drift before deciding fail-open.
+
+    A current-v6-ish handler can be routed to PreToolUse even when its command
+    definition is malformed.  It therefore never inherits historical fail-open
+    behaviour without observing an exact supported non-mutation event.  Where a
+    complete root/provenance identity remains available, that observation also
+    requires its runtime verification.
+    """
+
+    identity = _exact_current_v6_provenance_identity(argv)
+    verified_identity = identity is None
+    if identity is not None:
+        project_root_text, provenance_sha256 = identity
+        try:
+            from .codex_install_provenance import verify_runtime_hook_provenance
+
+            verify_runtime_hook_provenance(
+                Path(project_root_text),
+                provenance_sha256,
+                Path(sys.argv[0]),
+                runtime_python=Path(sys.executable),
+                runtime_module_path=Path(__file__),
+                runtime_argv_prefix=(
+                    "-I",
+                    "-B",
+                    "-m",
+                    "aoi_orgware.codex_hook",
+                ),
+            )
+            verified_identity = True
+        except Exception:
+            # Still consume the bounded payload once: this keeps the mutation
+            # boundary observable even though verification prevents fail-open.
+            verified_identity = False
+    try:
+        observed_event = exact_payload_string(read_input(), "hook_event_name")
+    except Exception:
+        return False
+    return verified_identity and observed_event in SUPPORTED_HOOK_EVENTS - {
+        "PreToolUse"
+    }
+
+
+def _fail_open_or_deny_current_v6ish(argv: list[str]) -> None:
+    """Fence malformed current hooks while retaining true historical fallback."""
+
+    if not _current_v6ish_definition(argv):
+        allow()
+    elif _current_v6ish_is_observed_nonmutation(argv):
+        allow()
+    else:
+        _deny_pretool_fail_closed()
+
+
+def _allow_valid_nonmutation_after_provenance_failure() -> None:
+    """Fail-open only after proving the failed route is non-mutation."""
+
+    try:
+        observed_event = exact_payload_string(read_input(), "hook_event_name")
+    except Exception:
+        _deny_pretool_fail_closed()
+        return
+    if observed_event in SUPPORTED_HOOK_EVENTS - {"PreToolUse"}:
+        allow()
+    else:
+        _deny_pretool_fail_closed()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Optional fail-open Codex lifecycle adapter for AOI"
+        description=(
+            "Optional AOI Codex adapter: PreToolUse fails closed after AOI "
+            "main starts; non-mutation lifecycle events fail open"
+        ),
+        allow_abbrev=False,
+        exit_on_error=False,
     )
-    parser.add_argument("--hook-version", required=True)
+    parser.add_argument("--hook-version")
     parser.add_argument("--project-root")
     parser.add_argument("--provenance-sha256")
-    args = parser.parse_args()
+    # Each current handler binds its expected event in the immutable command
+    # definition.  Keep this optional only so historical non-mutation handlers
+    # remain fail-open while onboarding replaces them; an unbound definition is
+    # never trusted to process a mutation event.
+    parser.add_argument("--expected-event")
+    raw_argv = list(sys.argv[1:])
+    try:
+        args, unknown = parser.parse_known_args(raw_argv)
+    except (argparse.ArgumentError, SystemExit):
+        # Parser-level faults are untrusted current-definition drift when the
+        # command still identifies v6; probe the actual event before deciding.
+        _fail_open_or_deny_current_v6ish(raw_argv)
+        return 0
+    expected_event = args.expected_event if type(args.expected_event) is str else ""
+    expected_pretool = expected_event == "PreToolUse"
+    definition_invalid = bool(unknown) or any(
+        _argv_option_count(raw_argv, option) != 1
+        for option in (
+            "--hook-version",
+            "--project-root",
+            "--provenance-sha256",
+            "--expected-event",
+        )
+    )
     if (
+        definition_invalid
+        or
         args.hook_version != SUPPORTED_HOOK_VERSION
         or not args.project_root
         or not args.provenance_sha256
+        or expected_event not in SUPPORTED_HOOK_EVENTS
     ):
-        # Legacy/unbound hook definitions must not become an argparse failure
-        # that strands Codex.  They also must not process the event as trusted.
-        allow()
+        _fail_open_or_deny_current_v6ish(raw_argv)
         return 0
     try:
         from .codex_install_provenance import verify_runtime_hook_provenance
@@ -980,16 +1146,56 @@ def main() -> int:
             project_root,
             args.provenance_sha256,
             Path(sys.argv[0]),
+            runtime_python=Path(sys.executable),
+            runtime_module_path=Path(__file__),
+            runtime_argv_prefix=(
+                "-I",
+                "-B",
+                "-m",
+                "aoi_orgware.codex_hook",
+            ),
         )
-        # Provenance is checked before reading stdin so a stale or shadowed
-        # launcher cannot process a payload under a trusted project identity.
+    except Exception:
+        if expected_pretool:
+            _deny_pretool_fail_closed()
+        else:
+            _allow_valid_nonmutation_after_provenance_failure()
+        return 0
+    try:
+        # Once this exact module has entered AOI main, provenance is checked
+        # before stdin. This is cooperative post-import drift detection, not
+        # isolation from a replaced interpreter, site startup, or local user.
         payload = read_input()
     except Exception:
-        # Hooks must never strand a task because the local harness is missing or
-        # malformed. Doctor/status expose the defect on the next normal turn.
-        allow()
+        # A trusted PreToolUse definition is the sole mutation boundary. Other
+        # valid lifecycle handlers retain their historical fail-open behaviour.
+        if expected_pretool:
+            _deny_pretool_fail_closed()
+        else:
+            allow()
         return 0
-    if exact_payload_string(payload, "hook_event_name") == "PreToolUse":
+    try:
+        observed_event = exact_payload_string(payload, "hook_event_name")
+    except Exception:
+        # A syntactically valid JSON object can still omit or mistype the
+        # authority-bearing event field.  Keep that payload fault inside the
+        # same mutation fence as read/parse failures.
+        if expected_pretool:
+            _deny_pretool_fail_closed()
+        else:
+            allow()
+        return 0
+    if observed_event != expected_event:
+        # Do not let a mutation payload be accepted by a non-mutation handler,
+        # and never process a mismatched payload through the expected
+        # PreToolUse boundary.  Other mismatches have no mutation authority and
+        # remain fail-open for compatibility.
+        if expected_pretool or observed_event == "PreToolUse":
+            _deny_pretool_fail_closed()
+        else:
+            allow()
+        return 0
+    if expected_pretool:
         try:
             dispatch(payload, project_root=project_root)
         except Exception:

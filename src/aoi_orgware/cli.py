@@ -2129,6 +2129,7 @@ def _enable_codex_hook_policy(
 
 _CODEX_PROVENANCE_HISTORY_DIRECTORY = "codex-install-provenance-history-v1"
 _CODEX_PROVENANCE_HISTORY_MAX = 16
+_CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES = 64 * 1024
 
 
 def _codex_provenance_bytes(receipt: dict[str, Any]) -> bytes:
@@ -2138,6 +2139,90 @@ def _codex_provenance_bytes(receipt: dict[str, Any]) -> bytes:
         )
     )
     return canonical_json_bytes(validated, max_bytes=64 * 1024)
+
+
+def _read_codex_provenance_history_entry(path: Path) -> bytes:
+    """Read one immutable private receipt archive without following links."""
+
+    label = f"Codex install provenance history archive {path.name}"
+    try:
+        if canonicalize_no_link_traversal(path, label) != path:
+            raise HarnessError(f"{label} is not canonical")
+        before = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect {label}: {exc}") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or path.is_symlink()
+        or int(before.st_nlink) != 1
+    ):
+        raise HarnessError(f"{label} must be a private regular non-linked file")
+    if before.st_size > _CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES:
+        raise HarnessError(f"{label} exceeds the bounded receipt size")
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            raw = stream.read(_CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES + 1)
+            finished = os.fstat(stream.fileno())
+        after = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot read {label}: {exc}") from exc
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_nlink",
+    )
+    if (
+        any(
+            getattr(before, field) != getattr(opened, field)
+            or getattr(opened, field) != getattr(finished, field)
+            or getattr(finished, field) != getattr(after, field)
+            for field in identity_fields
+        )
+        or not stat.S_ISREG(opened.st_mode)
+        or int(opened.st_nlink) != 1
+        or len(raw) != before.st_size
+        or len(raw) > _CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES
+    ):
+        raise HarnessError(f"{label} changed while being read")
+    if canonicalize_no_link_traversal(path, label) != path:
+        raise HarnessError(f"{label} changed path identity while being read")
+    return raw
+
+
+def _codex_provenance_history_inventory(history: Path) -> dict[str, bytes]:
+    """Validate the bounded history directory and return exact archive bytes."""
+
+    if canonicalize_no_link_traversal(
+        history, "Codex install provenance history"
+    ) != history:
+        raise HarnessError("Codex install provenance history is not canonical")
+    metadata = history.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or history.is_symlink():
+        raise HarnessError(
+            "Codex install provenance history must be a non-linked directory"
+        )
+    entries: list[Path] = []
+    for item in history.iterdir():
+        if len(entries) >= _CODEX_PROVENANCE_HISTORY_MAX:
+            raise HarnessError(
+                "Codex install provenance history exceeds its bounded entry cap"
+            )
+        entries.append(item)
+    entries.sort(key=lambda item: item.name)
+    if any(
+        not re.fullmatch(r"[0-9a-f]{64}\.json", item.name)
+        for item in entries
+    ):
+        raise HarnessError(
+            "Codex install provenance history has an unexpected entry"
+        )
+    return {
+        item.name: _read_codex_provenance_history_entry(item)
+        for item in entries
+    }
 
 
 def _codex_provenance_preflight(
@@ -2173,32 +2258,14 @@ def _codex_provenance_preflight(
 
     history = paths.harness / _CODEX_PROVENANCE_HISTORY_DIRECTORY
     if history.exists() or history.is_symlink():
-        if canonicalize_no_link_traversal(
-            history, "Codex install provenance history"
-        ) != history:
-            raise HarnessError("Codex install provenance history is not canonical")
-        metadata = history.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or history.is_symlink():
-            raise HarnessError(
-                "Codex install provenance history must be a non-linked directory"
-            )
-        entries = sorted(history.iterdir(), key=lambda item: item.name)
-        if any(
-            not re.fullmatch(r"[0-9a-f]{64}\.json", item.name)
-            for item in entries
-        ):
-            raise HarnessError(
-                "Codex install provenance history has an unexpected entry"
-            )
-        old_archive = history / (
-            f"{existing['provenance_receipt_sha256']}.json"
-        )
-        if old_archive.exists():
-            if old_archive.read_bytes() != existing_bytes:
+        inventory = _codex_provenance_history_inventory(history)
+        old_archive_name = f"{existing['provenance_receipt_sha256']}.json"
+        if old_archive_name in inventory:
+            if inventory[old_archive_name] != existing_bytes:
                 raise HarnessError(
                     "Codex install provenance history conflicts with current receipt"
                 )
-        elif len(entries) >= _CODEX_PROVENANCE_HISTORY_MAX:
+        elif len(inventory) >= _CODEX_PROVENANCE_HISTORY_MAX:
             raise HarnessError(
                 "Codex install provenance history reached its bounded entry cap"
             )
@@ -2234,24 +2301,27 @@ def _install_codex_provenance_receipt(
         )
         existing_bytes = _codex_provenance_bytes(existing)
         history = paths.harness / _CODEX_PROVENANCE_HISTORY_DIRECTORY
-        if not history.exists():
+        if not history.exists() and not history.is_symlink():
             history.mkdir(mode=0o700)
             if os.name != "nt":
                 history.chmod(0o700)
-        if canonicalize_no_link_traversal(
-            history, "Codex install provenance history"
-        ) != history or not stat.S_ISDIR(history.lstat().st_mode):
-            raise HarnessError(
-                "Codex install provenance history is not a safe directory"
-            )
+        inventory = _codex_provenance_history_inventory(history)
         history_path = history / f"{existing['provenance_receipt_sha256']}.json"
-        if history_path.exists():
-            if history_path.read_bytes() != existing_bytes:
+        if history_path.name in inventory:
+            if inventory[history_path.name] != existing_bytes:
                 raise HarnessError(
                     "Codex install provenance history archive is divergent"
                 )
         else:
+            if len(inventory) >= _CODEX_PROVENANCE_HISTORY_MAX:
+                raise HarnessError(
+                    "Codex install provenance history reached its bounded entry cap"
+                )
             atomic_create_bytes(history_path, existing_bytes)
+            if _read_codex_provenance_history_entry(history_path) != existing_bytes:
+                raise HarnessError(
+                    "Codex install provenance history archive did not persist exactly"
+                )
         atomic_write_bytes(receipt_path, candidate_bytes)
     else:
         atomic_create_bytes(receipt_path, candidate_bytes)
@@ -2265,6 +2335,46 @@ def _install_codex_provenance_receipt(
         "provenance_receipt_sha256": candidate["provenance_receipt_sha256"],
         "history_path": str(history_path) if history_path is not None else None,
     }
+
+
+def _codex_hook_commands_for_receipt(
+    receipt: Mapping[str, Any],
+    project_root: str | os.PathLike[str],
+) -> tuple[str, str]:
+    """Render the exact hook pair for one persisted receipt generation.
+
+    Schema-v3 makes the recorded Python/module runtime the active bootstrap.
+    Raw schema-v1/v2 receipts retain their pip launcher grammar only so an
+    interrupted upgrade can recognize and replace the historical pair.
+    """
+
+    validated = (
+        codex_install_provenance_impl.validate_codex_install_provenance_receipt(
+            receipt
+        )
+    )
+    digest = cast(str, validated["provenance_receipt_sha256"])
+    if validated.get("schema_version") == (
+        codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+    ):
+        if validated.get("install_provenance_schema_version") != 2:
+            raise HarnessError(
+                "current schema-v3 Codex hook command requires "
+                "local-v2 exact-wheel proof"
+            )
+        runtime = cast(Mapping[str, Any], validated["codex_hook_runtime"])
+        return codex_onboarding_impl.build_codex_python_hook_commands(
+            cast(str, runtime["python_invocation"]),
+            project_root,
+            digest,
+        )
+    hook = cast(Mapping[str, Any], validated["codex_hook_entry_point"])
+    return codex_onboarding_impl.build_codex_hook_commands(
+        cast(str, hook["path"]),
+        project_root,
+        digest,
+    )
+
 
 def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """Initialize AOI, wire project hooks, and install the user AOI skill."""
@@ -2311,6 +2421,11 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "Codex install provenance preflight failed before mutation: supply "
             "exactly one complete proof pair: promoted release or reviewed local install"
         )
+    user_skills_root = (
+        Path(args.user_skills_root).expanduser()
+        if args.user_skills_root
+        else Path.home() / ".agents" / "skills"
+    )
     try:
         if public_complete:
             if (
@@ -2318,7 +2433,7 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or expected_promotion_bundle_sha256 is None
             ):
                 raise AssertionError("complete public proof pair was not present")
-            provenance_receipt = (
+            install_provenance_receipt = (
                 codex_install_provenance_impl.validate_codex_install_provenance(
                     promotion_bundle_file,
                     expected_promotion_bundle_sha256,
@@ -2331,19 +2446,32 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or expected_local_artifact_bundle_sha256 is None
             ):
                 raise AssertionError("complete local proof pair was not present")
-            provenance_receipt = (
+            install_provenance_receipt = (
                 codex_install_provenance_impl.validate_codex_local_install_provenance(
                     local_artifact_bundle_file,
                     expected_local_artifact_bundle_sha256,
                     Path(sys.argv[0]).resolve(),
                 )
             )
-        hook_command, hook_command_windows = (
-            codex_onboarding_impl.build_codex_hook_commands(
-                provenance_receipt["codex_hook_entry_point"]["path"],
-                paths.root,
-                provenance_receipt["provenance_receipt_sha256"],
+        codex_skill_text = (
+            codex_install_provenance_impl.read_recorded_codex_client_skill(
+                install_provenance_receipt
             )
+        )
+        skill_preflight = codex_onboarding_impl.preflight_codex_user_skill(
+            user_skills_root,
+            codex_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+        provenance_receipt = (
+            codex_install_provenance_impl.bind_codex_client_skill(
+                install_provenance_receipt,
+                skill_preflight["skill_path"],
+            )
+        )
+        hook_command, hook_command_windows = _codex_hook_commands_for_receipt(
+            provenance_receipt,
+            paths.root,
         )
         provenance_preflight = _codex_provenance_preflight(
             paths, provenance_receipt
@@ -2359,12 +2487,10 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     paths.root
                 )
             )
-            previous_hook = previous_receipt["codex_hook_entry_point"]
             previous_hook_command, previous_hook_command_windows = (
-                codex_onboarding_impl.build_codex_hook_commands(
-                    previous_hook["path"],
+                _codex_hook_commands_for_receipt(
+                    previous_receipt,
                     paths.root,
-                    previous_receipt["provenance_receipt_sha256"],
                 )
             )
     except (
@@ -2387,18 +2513,7 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "cannot enable hooks.codex while active AOI tasks bind the current "
                 f"configuration digest: {sorted(active_tasks)}"
             )
-    user_skills_root = (
-        Path(args.user_skills_root).expanduser()
-        if args.user_skills_root
-        else Path.home() / ".agents" / "skills"
-    )
     try:
-        codex_skill_text = _resource_text("codex/SKILL.md")
-        skill_preflight = codex_onboarding_impl.preflight_codex_user_skill(
-            user_skills_root,
-            codex_skill_text,
-            replace_sha256=args.replace_user_skill_sha256,
-        )
         preflight = codex_onboarding_impl.preflight_codex_onboarding(
             paths.root,
             command=hook_command,
@@ -2510,9 +2625,11 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "hooks": hooks_result,
         "skill": skill_result,
         "next_steps": [
-            "Keep the promoted AOI installation and exact recorded hook launcher available.",
-            "The generic AOI skill is installed once at user scope; keep "
-            "project-specific instructions in the repository AGENTS.md.",
+            "Keep the reviewed AOI installation and its recorded Python/module "
+            "runtime available.",
+            "The exact same-distribution/version-bound AOI client adapter is "
+            "installed at user scope as a transitional compatibility surface; "
+            "keep project-specific instructions in the repository AGENTS.md.",
             "Start a new Codex session in this trusted repo, open /hooks, and "
             "review/trust the exact absolute AOI hook definition and provenance digest.",
             "Run aoi doctor --json after hook trust; structural PASS does not prove "
@@ -7505,28 +7622,140 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     codex_provenance_report: dict[str, Any] | None = None
     codex_hook_receipt_report: dict[str, Any] | None = None
     codex_hook_delivery = "not_configured"
-    if paths.project.codex_hooks_enabled:
-        config_path = paths.root / ".codex" / "config.toml"
-        hook_path = paths.root / ".codex" / "hooks.json"
-        expected_hook_commands: dict[str, str] | None = None
+    codex_client_skill_report: dict[str, Any] = {
+        "status": "not_configured",
+        "provider": "codex",
+        "client_contract_version": None,
+        "role": None,
+        "package_version": None,
+        "package_resource_path": None,
+        "installed_path": None,
+        "expected_sha256": None,
+        "actual_sha256": None,
+        "reason": "no_persisted_codex_install_provenance",
+    }
+    codex_provenance_path = (
+        paths.root
+        / codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_RECEIPT
+    )
+    if codex_provenance_path.exists() or codex_provenance_path.is_symlink():
         try:
             codex_provenance_report = (
                 codex_install_provenance_impl.load_codex_install_provenance_receipt(
                     paths.root
                 )
             )
-            hook_entry = codex_provenance_report["codex_hook_entry_point"]
-            codex_install_provenance_impl.verify_runtime_hook_provenance(
-                paths.root,
-                codex_provenance_report["provenance_receipt_sha256"],
-                hook_entry["path"],
+            codex_client_skill_report = (
+                codex_install_provenance_impl.inspect_codex_client_skill(
+                    codex_provenance_report
+                )
             )
-            expected_native, expected_windows = (
-                codex_onboarding_impl.build_codex_hook_commands(
-                    hook_entry["path"],
+        except (
+            OSError,
+            codex_install_provenance_impl.CodexInstallProvenanceError,
+        ) as exc:
+            codex_client_skill_report = {
+                **codex_client_skill_report,
+                "status": "uninspectable",
+                "reason": (
+                    "codex_install_provenance_or_client_binding_invalid:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+            errors.append(f"Codex client skill binding is uninspectable: {exc}")
+    client_skill_status = codex_client_skill_report["status"]
+    client_skill_reason = str(codex_client_skill_report.get("reason") or "")
+    client_package_provenance_invalid = (
+        client_skill_status == "uninspectable"
+        and client_skill_reason.startswith(
+            "packaged_skill_provenance_uninspectable:"
+        )
+    )
+    client_user_adapter_invalid = (
+        client_skill_status in {"missing", "drifted", "uninspectable"}
+        and not client_package_provenance_invalid
+    )
+    client_binding_configured = (
+        codex_provenance_report is not None
+        or codex_provenance_path.exists()
+        or codex_provenance_path.is_symlink()
+    )
+    if client_binding_configured and (
+        client_package_provenance_invalid
+        or (
+            paths.project.codex_hooks_enabled
+            and client_user_adapter_invalid
+        )
+    ):
+        errors.append(
+            "Codex client skill binding is not exact: "
+            f"{client_skill_status} "
+            f"(expected={codex_client_skill_report['expected_sha256']}, "
+            f"actual={codex_client_skill_report['actual_sha256']})"
+        )
+    elif client_binding_configured and client_user_adapter_invalid:
+        warnings.append(
+            "Codex client adapter is not exact while Codex hooks are disabled: "
+            f"{client_skill_status} ({client_skill_reason or 'reason unavailable'})"
+        )
+    if (
+        paths.project.codex_hooks_enabled
+        and client_skill_status in {"legacy_unbound", "not_configured"}
+    ):
+        if client_skill_status == "legacy_unbound":
+            errors.append(
+                "Codex hooks are enabled but the installed client skill is "
+                "legacy_unbound; rerun provenance-qualified `aoi codex-init`"
+            )
+        else:
+            errors.append(
+                "Codex hooks are enabled but no Codex install provenance or "
+                "client-skill binding is configured; rerun provenance-qualified "
+                "`aoi codex-init`"
+            )
+    if paths.project.codex_hooks_enabled:
+        config_path = paths.root / ".codex" / "config.toml"
+        hook_path = paths.root / ".codex" / "hooks.json"
+        expected_hook_commands: dict[str, str] | None = None
+        try:
+            if codex_provenance_report is None:
+                codex_provenance_report = (
+                    codex_install_provenance_impl.load_codex_install_provenance_receipt(
+                        paths.root
+                    )
+                )
+            receipt_schema = codex_provenance_report.get("schema_version")
+            if receipt_schema == (
+                codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+            ):
+                hook_runtime = cast(
+                    Mapping[str, Any],
+                    codex_provenance_report["codex_hook_runtime"],
+                )
+                codex_install_provenance_impl.verify_runtime_hook_provenance(
                     paths.root,
                     codex_provenance_report["provenance_receipt_sha256"],
+                    None,
+                    runtime_python=Path(sys.executable),
+                    runtime_module_path=hook_runtime["module_path"],
+                    runtime_argv_prefix=(
+                        codex_install_provenance_impl
+                        .CODEX_HOOK_RUNTIME_ARGV_PREFIX
+                    ),
                 )
+            else:
+                hook_entry = cast(
+                    Mapping[str, Any],
+                    codex_provenance_report["codex_hook_entry_point"],
+                )
+                codex_install_provenance_impl.verify_runtime_hook_provenance(
+                    paths.root,
+                    codex_provenance_report["provenance_receipt_sha256"],
+                    hook_entry["path"],
+                )
+            expected_native, expected_windows = _codex_hook_commands_for_receipt(
+                codex_provenance_report,
+                paths.root,
             )
             expected_hook_commands = {
                 "command": expected_native,
@@ -7640,19 +7869,45 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                         current = False
                         if expected_hook_commands is not None:
                             assert codex_provenance_report is not None
-                            hook_entry = codex_provenance_report[
-                                "codex_hook_entry_point"
-                            ]
+                            current_identity: dict[str, Any]
+                            if codex_provenance_report.get("schema_version") == (
+                                codex_install_provenance_impl
+                                .CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+                            ):
+                                runtime = cast(
+                                    Mapping[str, Any],
+                                    codex_provenance_report[
+                                        "codex_hook_runtime"
+                                    ],
+                                )
+                                current_identity = {
+                                    "expected_python": runtime[
+                                        "python_invocation"
+                                    ],
+                                }
+                            else:
+                                hook_entry = cast(
+                                    Mapping[str, Any],
+                                    codex_provenance_report[
+                                        "codex_hook_entry_point"
+                                    ],
+                                )
+                                current_identity = {
+                                    "expected_launcher": hook_entry["path"],
+                                }
                             current = (
                                 codex_onboarding_impl.is_aoi_codex_hook_command(
                                     command,
-                                    expected_launcher=hook_entry["path"],
+                                    **current_identity,
                                     expected_project_root=paths.root,
                                     expected_provenance_sha256=codex_provenance_report[
                                         "provenance_receipt_sha256"
                                     ],
                                 )
-                                and command == expected_hook_commands[key]
+                                and command
+                                == codex_onboarding_impl.bind_codex_hook_event(
+                                    expected_hook_commands[key], event
+                                )
                             )
                         if not current:
                             errors.append(
@@ -7762,6 +8017,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "context_provider_benchmarks": benchmark_reports,
         "release_promotions": release_reports,
         "codex_install_provenance": codex_provenance_report,
+        "codex_client_skill": codex_client_skill_report,
         "codex_hook_receipts": codex_hook_receipt_report,
         "codex_hook_delivery": codex_hook_delivery,
         "confidentiality": confidentiality_report,

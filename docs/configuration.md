@@ -93,21 +93,33 @@ enabled = false
 - `external_lock_namespace`: prefix for external file/tree locks.
 - `hooks.codex.enabled`: opt-in declaration. Plain `aoi init` does not install
   or trust hooks. Explicit `aoi codex-init` enables the declaration, merges
-  protocol-v6 project hooks, enables Codex's stable hook feature, and installs
-  the generic AOI skill at Codex user scope (`$HOME/.agents/skills`); the user
-  must still review the exact commands through Codex `/hooks`. Project-specific
-  instructions remain in the repository. Without hook trust, arm the exact
-  packet first and
+  event-bound protocol-v6 project hooks, enables Codex's stable hook feature,
+  and installs the AOI-distribution Codex client adapter at user scope
+  (`$HOME/.agents/skills/aoi/SKILL.md`). The adapter is bound by the installed
+  package `RECORD`, package version, and schema-v3 install provenance; it is a
+  transitional discovery/CLI client, never Chief, claim, mutation, or evidence
+  authority. That authority remains in the installed CLI/runtime/ledger and
+  the repository's `aoi.toml`, managed `POLICY.md`, and instructions. The user
+  must still review the exact commands through Codex `/hooks`.
+  Project-specific instructions remain in the repository. With Codex hooks
+  enabled, `doctor` reports the adapter as `not_configured`, `exact`, `missing`,
+  `drifted`, `uninspectable`, or `legacy_unbound`; only `exact` is current.
+  With hooks disabled, missing, drifted, and user-path-uninspectable adapter
+  states are warning/status only and do not block `doctor`; receipt/schema,
+  package, or wheel-provenance corruption remains blocking.
+  Without hook
+  trust, arm the exact packet first and
   then use explicit manual-unverified packet dispatch before that short-lived
   arm expires. AOI revalidates the same authority snapshot at consumption.
   Installer command ownership requires a direct current AOI entry point or the
-  documented structured WSL launcher; substring matches are never sufficient.
+  documented structured WSL Python wrapper; substring matches are never sufficient.
 - `aoi claude-init`: merges Claude lifecycle hooks into the repository's
-  `.claude/settings.json`, but installs the generic AOI skill only at Claude
-  user scope (`$HOME/.claude/skills`). It never creates the generic skill under
-  the project. A differing user skill is replaced only after its exact reviewed
-  SHA-256 is supplied. The pre-spawn gate validates the full live arm authority,
-  not only the parent-session and agent-type slot.
+  `.claude/settings.json`, but the Codex schema-v3 client-adapter binding and
+  doctor states above do not apply to it. This version makes no Codex/Claude
+  parity or all-provider coverage claim. It never creates the generic skill
+  under the project. A differing user skill is replaced only after its exact
+  reviewed SHA-256 is supplied. Any documented Claude gate remains a
+  cooperative provider-specific integration, not AOI governance authority.
 - `legacy.enabled`: enables compatibility-ledger import and reporting.
 
 The full default file is available at `examples/aoi.toml`.
@@ -222,22 +234,26 @@ remote route, `home_remote_only` allows its exact home repository after
 preflight, and `local_only` subjects stay out of all external promotion
 artifacts absent their separate exact export permits.
 
-## Codex v0.4 adapter boundary
+## ARISE Operational Alpha Codex adapter boundary
 
-`codex-init` records the exact resolved AOI hook launcher and installed-package
-provenance before it wires repository-local hooks. It accepts exactly one
-complete source-proof pair: the public release-promotion pair
-(`--promotion-bundle-file` / `--expected-promotion-bundle-sha256`) or the
-separate local pair (`--local-artifact-bundle-file` /
-`--expected-local-artifact-bundle-sha256`). Half a pair, both pairs, or neither
-fails before mutation.
+This unpublished candidate is not a complete v0.5 release. Current schema-v3
+hooks are created only from a reviewed local-v2 exact-wheel proof
+(`--local-artifact-bundle-file` /
+`--expected-local-artifact-bundle-sha256`). Public schema-v1 receipts remain
+readable and retain their historical migration path, but cannot newly enable
+current hooks; the public current-hook route is deferred. `codex-init` first
+publishes the exact repository-local hook pair, then atomically archives the
+old receipt and replaces it with the v3 Python/module and installed-package
+provenance. This pair-first order makes an interrupted rotation resumable from
+the still-current old receipt; it does not grant an unbound pair authority.
 
-The installed hook is one exact platform pair. Native Windows and non-WSL
-POSIX use the same direct provenance-bound command in both fields. Canonical
-WSL onboarding instead emits a direct Linux `command` and a fixed
+The installed v3 hook is one exact platform pair. Native Windows and non-WSL
+POSIX use the recorded absolute venv Python, not the pip launcher, in both
+fields: `"<absolute-python>" -I -B -m aoi_orgware.codex_hook ...`. Canonical
+WSL onboarding instead emits that direct Linux Python-module `command` and a fixed
 `commandWindows` wrapper:
 
-`wsl.exe --distribution "<distro>" --user "<user>" --cd "<project-root>" --exec "<absolute-linux-hook>" --hook-version 6 --project-root "<same-project-root>" --provenance-sha256 "<digest>"`
+`wsl.exe --distribution "<distro>" --user "<user>" --cd "<project-root>" --exec "<absolute-linux-python>" -I -B -m aoi_orgware.codex_hook --hook-version 6 --project-root "<same-project-root>" --provenance-sha256 "<digest>" --expected-event "<event>"`
 
 AOI derives distro from `WSL_DISTRO_NAME`, user from the current passwd entry,
 and requires Microsoft-kernel plus absolute `WSL_INTEROP` evidence. It offers
@@ -263,8 +279,7 @@ hook signature, or a CMD caret-normalized AOI executable signature, is treated
 as AOI-shaped drift and fails closed. This cooperative detector is not a
 general shell-equivalence engine, DLP, or a same-user process boundary.
 
-A public promotion receipt keeps its tag/release/PyPI semantics. A local
-`reviewed_local_install_bundle` instead has
+A local `reviewed_local_install_bundle` has
 `proof_scope=exact_local_wheel_install_only`: it is not a promotion or release.
 Its v2 receipt/runtime binds caller-supplied bundle SHA, canonical external
 store, clean commit/tree and complete tracked-source manifest, inventory and
@@ -278,15 +293,26 @@ identity is reviewed context: the local bundle does not independently attest
 source-to-wheel derivation, builder-toolchain execution, or execution of its
 caller-supplied test summary.
 
-Both routes bind package version, installed metadata, generated console/hook
-scripts, and a bounded non-cache runtime-package manifest checked against
-wheel `RECORD`. Pip-generated, hashless `__pycache__/*.pyc` files are excluded;
-other files under `__pycache__` are rejected. At hook execution, AOI's
-provenance validator revalidates the persisted receipt, invoked launcher, and
-covered installed package bytes, and `doctor` reports drift. Any internal
-`PreToolUse` failure produces the fixed deny response (fail-closed); only
-non-`PreToolUse` lifecycle adapters are fail-open. This cooperative hook is not
-a pre-import or OS security boundary.
+The local-v2 proof is the required input for schema-v3, not active-hook
+authority by itself. It records console/bridge and legacy launcher details for
+their own historical or diagnostic boundaries; the Bridge has its own
+launch/receipt contract. A v3 receipt binds the actual Python invocation,
+resolved executable SHA-256, venv prefix, cache tag, exact wheel-bound
+`aoi_orgware.codex_hook` module and `RECORD` hash, plus argv prefix
+`-I -B -m aoi_orgware.codex_hook`. Pip-generated, hashless `__pycache__/*.pyc`
+files are excluded; other files under `__pycache__` are rejected. Once AOI
+`main` has entered, its provenance validator revalidates those facts. The hook
+argument/event matcher and `doctor`
+separately validate the handler's immutable `--expected-event` binding and
+report or fence adapter/route drift. A
+protocol-v6 handler without that binding is an upgradeable legacy definition,
+not a trusted current handler, and must not process a mutation event. For a
+trusted event-bound `PreToolUse` handler, bootstrap, provenance, payload,
+event-mismatch, dispatch, or receipt faults produce the one fixed deny response
+(fail-closed). Non-mutation lifecycle adapters remain fail-open. This
+cooperative hook is post-import drift detection, not a boundary against
+interpreter, site/import, same-user, or pre-import tampering. The pip
+`aoi-codex-hook` launcher remains v1/v2 historical or diagnostic only.
 `RECORD` verifies covered installed payloads; it proves the original wheel
 archive only when the stronger matching archive-digest evidence is available.
 
@@ -375,9 +401,11 @@ On an existing project, `aoi codex-init` is Chief-fenced and changes only the
 false-to-true Codex hook flag. It refuses the change while any active or blocked
 task binds the current digest. It does not rewrite model, reasoning, approval,
 sandbox, provider, notification, MCP, plugin, or global Codex settings.
-The separate user-scope skill write is preflighted before project mutation and
-refuses a differing existing skill without its reviewed SHA-256. After a
-successful fresh init or strict existing-NUL Chief acquisition, onboarding
+The separate user-scope Codex client-adapter write is preflighted before project
+mutation, bound into schema-v3 install provenance, and refuses a differing
+existing adapter without its reviewed SHA-256. It cannot authorize governance;
+the CLI/runtime and repository policy remain authoritative. After a successful
+fresh init or strict existing-NUL Chief acquisition, onboarding
 reacquires the project state lock, rechecks that no competing Chief or task
 appeared, and retains the lock across the remaining policy and client-file
 writes.
