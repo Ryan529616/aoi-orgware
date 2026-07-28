@@ -9,7 +9,7 @@ adapter supplies the already-scrubbed wire digests to :func:`record_milestone`.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -117,7 +117,7 @@ def _event_for(
             raise CodexTransportRuntimeError("request milestone needs exact request id and bytes digest")
     method = contracts.previous_event_method(event_type)
     status = {"item_completed": "completed", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "unknown", "runtime_unknown": "unknown"}.get(event_type, "observed")
-    state = {"reserved": "reserved", "process_start_pending": "reserved", "process_started": "reserved", "initialize_send_pending": "reserved", "initialized": "reserved", "thread_start_send_pending": "reserved", "thread_started": "thread_started", "turn_start_send_pending": "thread_started", "turn_started": "turn_started", "interrupt_send_pending": "turn_started", "interrupt_observed": "turn_started", "item_started": "turn_started", "item_completed": "turn_started", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "launch_unknown", "runtime_unknown": "runtime_unknown"}[event_type]
+    state = {"reserved": "reserved", "version_probe_pending": "reserved", "version_probe_observed": "reserved", "process_start_pending": "reserved", "process_started": "reserved", "initialize_send_pending": "reserved", "initialized": "reserved", "thread_start_send_pending": "reserved", "thread_started": "thread_started", "turn_start_send_pending": "thread_started", "turn_started": "turn_started", "interrupt_send_pending": "turn_started", "interrupt_observed": "turn_started", "item_started": "turn_started", "item_completed": "turn_started", "completed": "completed", "failed": "failed", "interrupted": "interrupted", "launch_unknown": "launch_unknown", "runtime_unknown": "runtime_unknown"}[event_type]
     try:
         return contracts.seal_journal_event({
             "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
@@ -1221,12 +1221,26 @@ def require_codex_process_start_authority(
     event_chain: Iterable[Mapping[str, Any]],
     *,
     current_time: datetime,
+    effect_event_type: str = "process_start_pending",
+    journal: Sequence[Mapping[str, Any]] | None = None,
 ) -> None:
-    """Revalidate exclusive packet ownership at the durable Popen boundary."""
+    """Revalidate ownership at one exact child-process effect boundary.
+
+    Legacy callers omit ``journal`` and retain the original fresh-reserved
+    process/start check.  The v0.5 controller supplies the exact current
+    journal for both the version-probe and long-lived App Server boundaries.
+    """
 
     h._require_chief_lock(paths)
     require_codex_process_start_window(launch, current_time=current_time)
     try:
+        if effect_event_type not in {
+            "version_probe_pending",
+            "process_start_pending",
+        }:
+            raise CodexTransportRuntimeError(
+                "Codex child effect type is not authorized"
+            )
         task_id = h.validate_id(launch["task_id"], "task id")
         launch_id = _launch_id(launch["launch_id"])
         records, state, _head = _live_records(paths, task_id, event_chain)
@@ -1240,6 +1254,38 @@ def require_codex_process_start_authority(
             launch["launch_permit"]
         )
         reservation = contracts.validate_reservation(launch["reservation"])
+        expected_sequence = 1
+        expected_head_sha256: str | None = None
+        if journal is not None:
+            normalized_journal = [
+                contracts.validate_journal_event(event) for event in journal
+            ]
+            journal_state = contracts.validate_transport_journal(
+                normalized_journal
+            )
+            expected_previous = {
+                "version_probe_pending": "reserved",
+                "process_start_pending": "version_probe_observed",
+            }[effect_event_type]
+            if journal_state.last_event_type != expected_previous:
+                raise CodexTransportRuntimeError(
+                    "Codex child effect does not follow its exact journal boundary"
+                )
+            first = normalized_journal[0]
+            if (
+                first["launch_intent_sha256"] != intent["intent_sha256"]
+                or first["reservation_sha256"]
+                != reservation["reservation_sha256"]
+            ):
+                raise CodexTransportRuntimeError(
+                    "Codex child effect journal differs from the launch"
+                )
+            expected_sequence = len(normalized_journal)
+            expected_head_sha256 = journal_state.head_sha256
+        elif effect_event_type != "process_start_pending":
+            raise CodexTransportRuntimeError(
+                "Codex version probe authority requires the exact current journal"
+            )
         marker = _read_marker(paths, task_id, launch_permit["permit_sha256"])
         if (
             marker["task_id"] != task_id
@@ -1261,11 +1307,19 @@ def require_codex_process_start_authority(
             or row.get("state") != "reserved"
             or row.get("intent_sha256") != intent["intent_sha256"]
             or row.get("reservation_sha256") != reservation["reservation_sha256"]
-            or row.get("journal_sequence") != 1
+            or row.get("journal_sequence") != expected_sequence
+            or (
+                expected_head_sha256 is not None
+                and row.get("journal_head_sha256") != expected_head_sha256
+            )
             or row.get("terminal_receipt_sha256") is not None
         ):
+            if journal is None:
+                raise CodexTransportRuntimeError(
+                    "Codex process start requires one fresh reserved launch"
+                )
             raise CodexTransportRuntimeError(
-                "Codex process start requires one fresh reserved launch"
+                "Codex child effect authority differs from the exact journal"
             )
         packet = state_lookup._packet_by_id(state, intent["packet_id"])
         if (

@@ -480,7 +480,10 @@ def _run_controller(
         nonlocal journal
         try:
             with h.state_lock(paths, create_layout=False):
-                if event.get("event_type") == "process_start_pending":
+                if event.get("event_type") in {
+                    "version_probe_pending",
+                    "process_start_pending",
+                }:
                     _confidentiality_preflight(paths, intent)
                     _require_fresh_pre_git_endpoint(
                         paths,
@@ -495,6 +498,8 @@ def _run_controller(
                         launch,
                         store.load_semantic_events(paths, launch["task_id"]),
                         current_time=_now(),
+                        effect_event_type=str(event["event_type"]),
+                        journal=journal,
                     )
                 result = runtime.record_milestone(
                     paths,

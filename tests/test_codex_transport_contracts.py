@@ -108,6 +108,7 @@ def event(
         "interrupt_observed",
     } or (event_type == "failed" and method not in {"process/exited", "turn/completed"})
     wire_observed = response_observed or event_type in {
+        "version_probe_observed",
         "process_started",
         "item_started",
         "item_completed",
@@ -759,6 +760,97 @@ def terminal(reservation_sha: str, head_sha: str, **changes: object) -> dict[str
     }
     value.update(changes)
     return value
+
+
+def test_version_probe_effect_is_exact_and_crash_safe_without_new_terminal_state() -> None:
+    sealed_intent = contracts.seal_launch_intent(intent())
+    sealed_reservation = contracts.seal_reservation(
+        reservation(sealed_intent["intent_sha256"])
+    )
+    intent_sha = cast(str, sealed_intent["intent_sha256"])
+    reservation_sha = cast(str, sealed_reservation["reservation_sha256"])
+    records: list[dict[str, object]] = []
+    records = append(
+        records,
+        intent_sha,
+        reservation_sha,
+        "reserved",
+        "reserved",
+        correlation(),
+    )
+    records = append(
+        records,
+        intent_sha,
+        reservation_sha,
+        "version_probe_pending",
+        "reserved",
+        correlation(),
+    )
+    pending = records[-1]
+    assert pending["wire_method"] == "process/version-probe"
+    assert pending["request_id"] is not None
+    assert pending["request_bytes_sha256"] is not None
+    assert pending["wire_event_sha256"] is None
+
+    unknown = append(
+        records,
+        intent_sha,
+        reservation_sha,
+        "launch_unknown",
+        "launch_unknown",
+        correlation(),
+        wire_method="process/version-probe",
+        request_id=pending["request_id"],
+        request_bytes_sha256=pending["request_bytes_sha256"],
+    )
+    receipt = contracts.seal_terminal_receipt(
+        terminal(
+            reservation_sha,
+            cast(str, unknown[-1]["event_sha256"]),
+            terminal_state="launch_unknown",
+            correlation=correlation(),
+        )
+    )
+    assert contracts.validate_terminal_receipt_against_journal(
+        receipt, unknown
+    )["terminal_state"] == "launch_unknown"
+
+    observed = append(
+        records,
+        intent_sha,
+        reservation_sha,
+        "version_probe_observed",
+        "reserved",
+        correlation(),
+    )
+    assert observed[-1]["wire_event_sha256"] == SHA_A
+    assert observed[-1]["response_sha256"] is None
+    current = append(
+        observed,
+        intent_sha,
+        reservation_sha,
+        "process_start_pending",
+        "reserved",
+        correlation(),
+    )
+    assert contracts.validate_transport_journal(current).last_event_type == (
+        "process_start_pending"
+    )
+    failed = append(
+        observed,
+        intent_sha,
+        reservation_sha,
+        "failed",
+        "failed",
+        correlation(),
+        wire_method="process/version-probe",
+        wire_event_sha256=None,
+        response_sha256=None,
+        fault_kind="AppServerError",
+        fault_evidence_sha256=SHA_D,
+        fault_evidence_size_bytes=42,
+    )
+    assert contracts.validate_transport_journal(failed).state == "failed"
 
 
 def test_terminal_and_mutation_evidence_are_structural_not_promotion() -> None:

@@ -29,6 +29,7 @@ from .codex_app_server_stdio import (
     RuntimeEvent,
     SealedLaunchIntent,
     TurnObservation,
+    VersionProbeJournalEntry,
 )
 
 
@@ -52,6 +53,8 @@ class ControllerResult:
 
 
 _EVENT_STATE = {
+    "version_probe_pending": "reserved",
+    "version_probe_observed": "reserved",
     "process_start_pending": "reserved",
     "process_started": "reserved",
     "initialize_send_pending": "reserved",
@@ -208,6 +211,13 @@ class CodexTransportController:
         self._publish_terminal = publish_terminal
         self._persist_fault_evidence = persist_fault_evidence
         self._terminal_receipt: dict[str, Any] | None = None
+        self._version_probe_argv: tuple[str, ...] | None = None
+        # A pre-effect callback that fails before its milestone is accepted
+        # proves that the corresponding child/request was not started.  Keep
+        # this transient source separate from the last durable event so a
+        # process/start authorization failure after a successful version probe
+        # is not mislabeled as a version mismatch.
+        self._callback_attempt_method: str | None = None
 
     @property
     def state(self) -> contracts.JournalState:
@@ -282,6 +292,14 @@ class CodexTransportController:
             ) from exc
 
     def _on_process_start_pending(self, entry: ProcessJournalEntry) -> None:
+        if self.state.last_event_type not in {
+            "reserved",
+            "version_probe_observed",
+        }:
+            raise CodexTransportControllerError(
+                "process pending callback is out of sequence"
+            )
+        self._callback_attempt_method = "process/start"
         if entry.phase != "process_start_pending" or entry.pid is not None:
             raise CodexTransportControllerError(
                 "process pending callback has invalid phase/PID"
@@ -294,6 +312,104 @@ class CodexTransportController:
                 payload_size_bytes=len(entry.payload_bytes),
                 request_id=f"process:{self.launch_id}",
                 request_bytes_sha256=entry.sha256,
+            )
+        )
+        self._callback_attempt_method = None
+
+    @staticmethod
+    def _validate_version_probe_entry(
+        entry: VersionProbeJournalEntry, *, phase: str
+    ) -> None:
+        if (
+            entry.phase != phase
+            or not isinstance(entry.argv, tuple)
+            or not entry.argv
+            or any(not isinstance(part, str) or not part for part in entry.argv)
+        ):
+            raise CodexTransportControllerError(
+                "version probe callback has invalid phase/argv"
+            )
+        if phase == "version_probe_pending":
+            if (
+                entry.stdout_bytes is not None
+                or entry.stderr_bytes is not None
+                or entry.returncode is not None
+            ):
+                raise CodexTransportControllerError(
+                    "version probe pending callback carries observed evidence"
+                )
+            payload: dict[str, Any] = {
+                "phase": phase,
+                "argv": list(entry.argv),
+            }
+        else:
+            if (
+                not isinstance(entry.stdout_bytes, bytes)
+                or not isinstance(entry.stderr_bytes, bytes)
+                or not isinstance(entry.returncode, int)
+                or isinstance(entry.returncode, bool)
+            ):
+                raise CodexTransportControllerError(
+                    "version probe observed callback lacks exact process evidence"
+                )
+            payload = {
+                "phase": phase,
+                "argv": list(entry.argv),
+                "stdout_hex": entry.stdout_bytes.hex(),
+                "stderr_hex": entry.stderr_bytes.hex(),
+                "returncode": entry.returncode,
+            }
+        expected = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        if (
+            entry.payload_bytes != expected
+            or hashlib.sha256(expected).hexdigest() != entry.sha256
+        ):
+            raise CodexTransportControllerError(
+                "version probe callback differs from its canonical payload"
+            )
+
+    def _on_version_probe_pending(self, entry: VersionProbeJournalEntry) -> None:
+        if (
+            self.state.last_event_type != "reserved"
+            or self._version_probe_argv is not None
+        ):
+            raise CodexTransportControllerError(
+                "version probe pending callback is out of sequence"
+            )
+        self._callback_attempt_method = "process/version-probe"
+        self._validate_version_probe_entry(
+            entry, phase="version_probe_pending"
+        )
+        self._persist(
+            self._event(
+                "version_probe_pending",
+                wire_method="process/version-probe",
+                correlation=_correlation(),
+                payload_size_bytes=len(entry.payload_bytes),
+                request_id=f"version-probe:{self.launch_id}",
+                request_bytes_sha256=entry.sha256,
+            )
+        )
+        self._version_probe_argv = entry.argv
+        self._callback_attempt_method = None
+
+    def _on_version_probe_observed(self, entry: VersionProbeJournalEntry) -> None:
+        self._validate_version_probe_entry(
+            entry, phase="version_probe_observed"
+        )
+        if entry.argv != self._version_probe_argv:
+            raise CodexTransportControllerError(
+                "version probe observed argv differs from its pending effect"
+            )
+        self._persist(
+            self._event(
+                "version_probe_observed",
+                wire_method="process/version-probe",
+                correlation=_correlation(),
+                payload_size_bytes=len(entry.payload_bytes),
+                wire_event_sha256=entry.sha256,
             )
         )
 
@@ -566,11 +682,27 @@ class CodexTransportController:
                 )
             )
             return
+        if self._callback_attempt_method is not None:
+            method = self._callback_attempt_method
+            self._callback_attempt_method = None
+            self._persist(
+                self._event(
+                    "failed",
+                    wire_method=method,
+                    correlation=state.correlation,
+                    payload_size_bytes=size,
+                    fault_kind=fault_kind,
+                    fault_evidence_sha256=digest,
+                    fault_evidence_size_bytes=size,
+                )
+            )
+            return
         known_rejected_start = isinstance(exc, AppServerResponseError) and (
             state.last_event_type
             in {"thread_start_send_pending", "turn_start_send_pending"}
         )
         if state.last_event_type in {
+            "version_probe_pending",
             "process_start_pending",
             "thread_start_send_pending",
             "turn_start_send_pending",
@@ -592,6 +724,9 @@ class CodexTransportController:
         if state.state == "turn_started" or state.last_event_type == "interrupt_send_pending":
             event_type = "runtime_unknown"
             method = "runtime/disconnected"
+        elif state.last_event_type == "version_probe_observed":
+            event_type = "failed"
+            method = "process/version-probe"
         else:
             event_type = "failed"
             method = last["wire_method"] if state.last_event_type.endswith("_pending") else "process/exited"
@@ -655,6 +790,8 @@ class CodexTransportController:
                 "controller run is not fresh; reconcile persisted state without launching"
             )
         callbacks = (
+            adapter.on_version_probe_pending,
+            adapter.on_version_probe_observed,
             adapter.on_process_start_pending,
             adapter.on_process_started,
             adapter.on_send_pending,
@@ -667,6 +804,8 @@ class CodexTransportController:
                 "adapter callbacks are already owned by another controller"
             )
         intent_view = SealedLaunchIntent.from_sealed_mapping(self.intent)
+        adapter.on_version_probe_pending = self._on_version_probe_pending
+        adapter.on_version_probe_observed = self._on_version_probe_observed
         adapter.on_process_start_pending = self._on_process_start_pending
         adapter.on_process_started = self._on_process_started
         adapter.on_send_pending = self._on_send_pending
@@ -708,10 +847,11 @@ class CodexTransportController:
     def reconcile_after_crash(self) -> ControllerResult:
         """Terminalize persisted state without starting a process or resending.
 
-        A start-pending journal becomes ``launch_unknown``.  A known active turn
-        becomes ``runtime_unknown``.  Other pre-turn phases become a known
-        controller failure.  An already-terminal journal only republishes its
-        receipt, which makes publication-after-crash recovery explicit.
+        A version/process/request start-pending journal becomes
+        ``launch_unknown``.  A known active turn becomes ``runtime_unknown``.
+        Other pre-turn phases become a known controller failure.  An
+        already-terminal journal only republishes its receipt, which makes
+        publication-after-crash recovery explicit.
         """
 
         if self.state.state not in _TERMINAL_STATES:

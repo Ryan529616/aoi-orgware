@@ -32,6 +32,14 @@ DEFAULT_MAX_LINE_BYTES: Final = 1_048_576
 DEFAULT_MAX_EVENTS: Final = 10_000
 DEFAULT_MAX_STDERR_BYTES: Final = 1_048_576
 DEFAULT_MAX_QUEUE_MESSAGES: Final = 1_024
+_VERSION_PROBE_TIMEOUT_SECONDS: Final = 10.0
+_VERSION_PROBE_CLEANUP_TIMEOUT_SECONDS: Final = 2.0
+_VERSION_PROBE_READ_CHUNK_BYTES: Final = 65_536
+_VERSION_PROBE_POLL_SECONDS: Final = 0.02
+# POSIX wait status and the Windows DWORD exit code both fit within this
+# conservative decimal width.  Reserving it before the child effect ensures
+# every admitted raw capture can enter the canonical observed journal.
+_VERSION_PROBE_WORST_CASE_RETURNCODE: Final = -2_147_483_648
 
 
 def _require_positive_finite_timeout(timeout_seconds: float, *, operation: str) -> float:
@@ -486,6 +494,15 @@ class VersionProbeJournalEntry:
 
 
 @dataclass(frozen=True)
+class _VersionProbePlan:
+    """Immutable effect plan shared by every phase of one version probe."""
+
+    argv: tuple[str, ...]
+    max_journal_bytes: int
+    raw_capture_budget: int
+
+
+@dataclass(frozen=True)
 class RuntimePin:
     codex_cli_version: str
     executable_sha256: str
@@ -791,6 +808,8 @@ class CodexAppServerStdio:
         self._version_args = _test_version_args or ("--version",)
         self._local_files_policy_binding: dict[str, Any] | None = None
         self._version_probe_effect_phase = _VersionProbeEffectPhase.NOT_STARTED
+        self._version_probe_process: subprocess.Popen[bytes] | None = None
+        self._version_probe_threads: tuple[threading.Thread, ...] = ()
         self._process: subprocess.Popen[bytes] | None = None
         self._incoming: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=max_queue_messages)
         self._notifications: list[RuntimeEvent] = []
@@ -957,8 +976,15 @@ class CodexAppServerStdio:
     def close(self) -> None:
         """Best-effort bounded cleanup; never confers a clean terminal seal."""
 
+        version_probe_process = self._version_probe_process
         process = self._process
         cleanup_failed = False
+        if version_probe_process is not None and not self._cleanup_version_probe_process(
+            version_probe_process,
+            self._version_probe_threads,
+            timeout_seconds=_VERSION_PROBE_CLEANUP_TIMEOUT_SECONDS,
+        ):
+            cleanup_failed = True
         if process is not None:
             if process.stdin is not None:
                 try:
@@ -2349,15 +2375,15 @@ class CodexAppServerStdio:
             pid=pid,
         )
 
-    def _version_probe_journal_entry(
-        self,
+    @staticmethod
+    def _version_probe_payload_bytes(
         phase: str,
         *,
+        argv: tuple[str, ...],
         stdout_bytes: bytes | None = None,
         stderr_bytes: bytes | None = None,
         returncode: int | None = None,
-    ) -> VersionProbeJournalEntry:
-        argv = (str(self.executable), *self._version_args)
+    ) -> bytes:
         if phase == "version_probe_pending":
             if stdout_bytes is not None or stderr_bytes is not None or returncode is not None:
                 raise ValueError("version probe pending entry must not carry observed evidence")
@@ -2381,17 +2407,274 @@ class CodexAppServerStdio:
         raw = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
-        if len(raw) > self.max_line_bytes:
+        return raw
+
+    def _version_probe_plan(self) -> _VersionProbePlan:
+        """Snapshot all mutable inputs that define one probe effect."""
+
+        argv = (str(self.executable), *self._version_args)
+        max_journal_bytes = self.max_line_bytes
+        empty_observed = self._version_probe_payload_bytes(
+            "version_probe_observed",
+            argv=argv,
+            stdout_bytes=b"",
+            stderr_bytes=b"",
+            returncode=_VERSION_PROBE_WORST_CASE_RETURNCODE,
+        )
+        if len(empty_observed) > max_journal_bytes:
+            raise AppServerError("version probe journal entry exceeds configured byte bound")
+        # stdout/stderr are hex encoded without escaping, so every admitted raw
+        # byte adds exactly two ASCII bytes to the otherwise exact payload.
+        raw_capture_budget = (max_journal_bytes - len(empty_observed)) // 2
+        return _VersionProbePlan(
+            argv=argv,
+            max_journal_bytes=max_journal_bytes,
+            raw_capture_budget=raw_capture_budget,
+        )
+
+    def _version_probe_journal_entry(
+        self,
+        phase: str,
+        *,
+        stdout_bytes: bytes | None = None,
+        stderr_bytes: bytes | None = None,
+        returncode: int | None = None,
+        plan: _VersionProbePlan | None = None,
+    ) -> VersionProbeJournalEntry:
+        active_plan = self._version_probe_plan() if plan is None else plan
+        raw = self._version_probe_payload_bytes(
+            phase,
+            argv=active_plan.argv,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            returncode=returncode,
+        )
+        if len(raw) > active_plan.max_journal_bytes:
             raise AppServerError("version probe journal entry exceeds configured byte bound")
         return VersionProbeJournalEntry(
             phase=phase,
-            argv=argv,
+            argv=active_plan.argv,
             stdout_bytes=stdout_bytes,
             stderr_bytes=stderr_bytes,
             returncode=returncode,
             payload_bytes=raw,
             sha256=hashlib.sha256(raw).hexdigest(),
         )
+
+    def _version_probe_raw_capture_budget(self) -> int:
+        """Return the raw evidence bound guaranteed to fit its journal entry."""
+
+        return self._version_probe_plan().raw_capture_budget
+
+    @staticmethod
+    def _close_version_probe_streams(
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except BaseException:
+                pass
+
+    def _cleanup_version_probe_process(
+        self,
+        process: subprocess.Popen[bytes],
+        threads: tuple[threading.Thread, ...],
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        """Best-effort direct-child cleanup without claiming process-tree exit."""
+
+        deadline = time.monotonic() + timeout_seconds
+        exit_confirmed = False
+        try:
+            exit_confirmed = process.poll() is not None
+        except BaseException:
+            pass
+        if not exit_confirmed:
+            try:
+                process.kill()
+            except BaseException:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    process.wait(timeout=remaining)
+                except BaseException:
+                    pass
+                else:
+                    exit_confirmed = True
+
+        # Do not close a buffered pipe underneath a blocked reader: CPython's
+        # stream lock can make that close itself unbounded.  Join against the
+        # one shared deadline and retain live reader/stream ownership if an
+        # inherited descendant handle prevents EOF.
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                thread.join(timeout=remaining)
+            except BaseException:
+                pass
+        readers_quiesced = True
+        for thread in threads:
+            try:
+                if thread.is_alive():
+                    readers_quiesced = False
+            except BaseException:
+                readers_quiesced = False
+        if readers_quiesced:
+            self._close_version_probe_streams(process)
+        if readers_quiesced and self._version_probe_process is process:
+            self._version_probe_threads = ()
+        if (
+            exit_confirmed
+            and readers_quiesced
+            and self._version_probe_process is process
+        ):
+            self._version_probe_process = None
+        return exit_confirmed and readers_quiesced
+
+    def _capture_version_probe_output(
+        self, *, plan: _VersionProbePlan | None = None
+    ) -> tuple[bytes, bytes, int]:
+        """Run one probe with an aggregate raw-byte bound and dual readers."""
+
+        active_plan = self._version_probe_plan() if plan is None else plan
+        raw_budget = active_plan.raw_capture_budget
+        capture_lock = threading.Lock()
+        wake = threading.Event()
+        overflow = threading.Event()
+        reader_failed = threading.Event()
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        total_bytes = 0
+        process: subprocess.Popen[bytes] | None = None
+        threads: list[threading.Thread] = []
+        completed = False
+        deadline = time.monotonic() + _VERSION_PROBE_TIMEOUT_SECONDS
+
+        def read_stream(name: str, stream: Any) -> None:
+            nonlocal total_bytes
+            try:
+                while True:
+                    chunk = stream.read(_VERSION_PROBE_READ_CHUNK_BYTES)
+                    if not chunk:
+                        return
+                    with capture_lock:
+                        if overflow.is_set():
+                            continue
+                        if len(chunk) > raw_budget - total_bytes:
+                            overflow.set()
+                            wake.set()
+                            continue
+                        buffers[name].extend(chunk)
+                        total_bytes += len(chunk)
+            except BaseException:
+                reader_failed.set()
+                wake.set()
+
+        try:
+            process = subprocess.Popen(
+                list(active_plan.argv),
+                cwd=self.cwd,
+                env=self.environment,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._version_probe_process = process
+            if process.stdout is None or process.stderr is None:
+                raise AppServerError(
+                    "version probe did not expose both output streams"
+                )
+            for name, stream in (
+                ("stdout", process.stdout),
+                ("stderr", process.stderr),
+            ):
+                thread = threading.Thread(
+                    target=read_stream,
+                    args=(name, stream),
+                    daemon=True,
+                    name=f"aoi-version-probe-{name}",
+                )
+                threads.append(thread)
+                self._version_probe_threads = tuple(threads)
+                thread.start()
+
+            returncode: int | None = None
+            while returncode is None:
+                if overflow.is_set():
+                    raise AppServerError(
+                        "version probe output exceeds the aggregate byte bound"
+                    )
+                if reader_failed.is_set():
+                    raise AppServerError("version probe output reader failed")
+                try:
+                    returncode = process.poll()
+                except BaseException as exc:
+                    if not isinstance(exc, Exception):
+                        raise
+                    raise AppServerError(
+                        "version probe process status could not be observed"
+                    ) from None
+                if returncode is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AppServerError("version probe timed out")
+                wake.wait(min(_VERSION_PROBE_POLL_SECONDS, remaining))
+                wake.clear()
+
+            for thread in threads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AppServerError(
+                        "version probe output readers did not quiesce"
+                    )
+                thread.join(timeout=remaining)
+            if any(thread.is_alive() for thread in threads):
+                raise AppServerError(
+                    "version probe output readers did not quiesce"
+                )
+            if overflow.is_set():
+                raise AppServerError(
+                    "version probe output exceeds the aggregate byte bound"
+                )
+            if reader_failed.is_set():
+                raise AppServerError("version probe output reader failed")
+            self._close_version_probe_streams(process)
+            self._version_probe_process = None
+            self._version_probe_threads = ()
+            with capture_lock:
+                stdout_bytes = bytes(buffers["stdout"])
+                stderr_bytes = bytes(buffers["stderr"])
+            completed = True
+            return stdout_bytes, stderr_bytes, returncode
+        except BaseException as exc:
+            cleanup_confirmed = True
+            if process is not None:
+                cleanup_confirmed = self._cleanup_version_probe_process(
+                    process,
+                    tuple(threads),
+                    timeout_seconds=_VERSION_PROBE_CLEANUP_TIMEOUT_SECONDS,
+                )
+            if not isinstance(exc, Exception):
+                raise
+            suffix = (
+                ""
+                if cleanup_confirmed
+                else "; direct-child or reader cleanup is unconfirmed"
+            )
+            raise AppServerError(
+                f"bounded version probe capture failed{suffix}"
+            ) from None
+        finally:
+            if completed:
+                self._version_probe_threads = ()
 
     def _verify_runtime_pin(self) -> None:
         if self.executable.is_symlink() or not self.executable.is_file():
@@ -2408,7 +2691,13 @@ class CodexAppServerStdio:
             raise AppServerError("App Server executable SHA-256 does not match packaged runtime pin")
 
     def _verify_runtime_version(self) -> None:
-        pending_entry = self._version_probe_journal_entry("version_probe_pending")
+        # Snapshot and validate the complete effect plan before the pending
+        # receipt.  Every later phase uses this same immutable plan even if a
+        # callback or another thread mutates the reusable client's settings.
+        plan = self._version_probe_plan()
+        pending_entry = self._version_probe_journal_entry(
+            "version_probe_pending", plan=plan
+        )
         if self.on_version_probe_pending is not None:
             try:
                 self.on_version_probe_pending(pending_entry)
@@ -2421,27 +2710,23 @@ class CodexAppServerStdio:
         # reports a local failure.
         self._version_probe_effect_phase = _VersionProbeEffectPhase.EFFECT_PENDING
         try:
-            completed = subprocess.run(
-                [str(self.executable), *self._version_args],
-                cwd=self.cwd,
-                env=self.environment,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=10,
+            stdout_bytes, stderr_bytes, returncode = (
+                self._capture_version_probe_output(plan=plan)
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise AppServerError("could not execute pinned App Server --version") from exc
+        except (AppServerError, OSError, subprocess.SubprocessError) as exc:
+            detail = f": {exc}" if isinstance(exc, AppServerError) else ""
+            raise AppServerError(
+                f"could not execute pinned App Server --version{detail}"
+            ) from None
         # The process has returned exact evidence, but a callback failure or a
         # later launch failure must not re-send this already-observed effect.
         self._version_probe_effect_phase = _VersionProbeEffectPhase.EFFECT_UNKNOWN
         observed_entry = self._version_probe_journal_entry(
             "version_probe_observed",
-            stdout_bytes=completed.stdout,
-            stderr_bytes=completed.stderr,
-            returncode=completed.returncode,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            returncode=returncode,
+            plan=plan,
         )
         if self.on_version_probe_observed is not None:
             try:
@@ -2452,10 +2737,10 @@ class CodexAppServerStdio:
                 ) from None
         self._version_probe_effect_phase = _VersionProbeEffectPhase.OBSERVED
         try:
-            version = completed.stdout.decode("utf-8", errors="strict").strip()
+            version = stdout_bytes.decode("utf-8", errors="strict").strip()
         except UnicodeDecodeError as exc:
             raise AppServerError("pinned App Server --version is not strict UTF-8") from exc
-        if completed.returncode != 0 or version != self.runtime_pin.app_server_version:
+        if returncode != 0 or version != self.runtime_pin.app_server_version:
             raise AppServerError("App Server --version does not match packaged runtime pin")
 
 

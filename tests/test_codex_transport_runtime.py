@@ -730,6 +730,154 @@ def test_process_start_authority_requires_exact_released_issuing_chief() -> None
         temp.cleanup()
 
 
+def test_child_effect_authority_binds_probe_and_process_journal_boundaries() -> None:
+    temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
+    try:
+        _tx, events, launch = _reserve_and_load_launch(
+            paths, chief, credential_path
+        )
+        _release_issuing_chief(paths, chief, credential_path)
+        journal = list(launch["journal"])
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="requires the exact current journal",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths,
+                    launch,
+                    events,
+                    current_time=NOW,
+                    effect_event_type="version_probe_pending",
+                )
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="does not follow its exact journal boundary",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths,
+                    launch,
+                    events,
+                    current_time=NOW,
+                    effect_event_type="process_start_pending",
+                    journal=journal,
+                )
+            runtime.require_codex_process_start_authority(
+                paths,
+                launch,
+                events,
+                current_time=NOW,
+                effect_event_type="version_probe_pending",
+                journal=journal,
+            )
+            pending = runtime._event_for(
+                launch["intent"],
+                launch["reservation"],
+                event_id="launch-1:2:version-probe-pending",
+                sequence=2,
+                previous=journal[-1]["event_sha256"],
+                event_type="version_probe_pending",
+                correlation={
+                    "thread_id": None,
+                    "turn_id": None,
+                    "item_id": None,
+                },
+                request_id="version-probe:launch-1",
+                request_bytes_sha256=SHA_A,
+                payload_size_bytes=42,
+            )
+            pending_result = runtime.record_milestone(
+                paths,
+                task_id="task-1",
+                launch_id="launch-1",
+                intent=launch["intent"],
+                reservation=launch["reservation"],
+                journal=journal,
+                milestone=pending,
+                event_chain=store.load_semantic_events(paths, "task-1"),
+            )
+        journal = list(pending_result["journal"])
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="does not follow its exact journal boundary",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths,
+                    launch,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=NOW,
+                    effect_event_type="version_probe_pending",
+                    journal=journal,
+                )
+        observed = runtime._event_for(
+            launch["intent"],
+            launch["reservation"],
+            event_id="launch-1:3:version-probe-observed",
+            sequence=3,
+            previous=journal[-1]["event_sha256"],
+            event_type="version_probe_observed",
+            correlation={
+                "thread_id": None,
+                "turn_id": None,
+                "item_id": None,
+            },
+            wire_event_sha256=SHA_B,
+            payload_size_bytes=42,
+        )
+        unpublished_observed = contracts.append_transport_journal_event(
+            journal, observed
+        )
+        with h.state_lock(paths, create_layout=False):
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="differs from the exact journal",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths,
+                    launch,
+                    store.load_semantic_events(paths, "task-1"),
+                    current_time=NOW,
+                    effect_event_type="process_start_pending",
+                    journal=unpublished_observed,
+                )
+        with h.state_lock(paths, create_layout=False):
+            observed_result = runtime.record_milestone(
+                paths,
+                task_id="task-1",
+                launch_id="launch-1",
+                intent=launch["intent"],
+                reservation=launch["reservation"],
+                journal=journal,
+                milestone=observed,
+                event_chain=store.load_semantic_events(paths, "task-1"),
+            )
+        journal = list(observed_result["journal"])
+        events = store.load_semantic_events(paths, "task-1")
+        with h.state_lock(paths, create_layout=False):
+            runtime.require_codex_process_start_authority(
+                paths,
+                launch,
+                events,
+                current_time=NOW,
+                effect_event_type="process_start_pending",
+                journal=journal,
+            )
+            with pytest.raises(
+                runtime.CodexTransportRuntimeError,
+                match="fresh reserved launch",
+            ):
+                runtime.require_codex_process_start_authority(
+                    paths,
+                    launch,
+                    events,
+                    current_time=NOW,
+                )
+    finally:
+        credential_temp.cleanup()
+        temp.cleanup()
+
+
 def test_process_start_authority_rejects_later_active_and_released_chief() -> None:
     temp, credential_temp, paths, chief, credential_path = _filesystem_runtime()
     try:

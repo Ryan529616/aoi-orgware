@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn, cast
+from typing import Any, Mapping, NoReturn, cast
 
 import pytest
 
@@ -44,6 +44,7 @@ from aoi_orgware.codex_app_server_stdio import (
     VersionProbeJournalEntry,
     scrub_aoi_secret_env,
 )
+from aoi_orgware.codex_transport_controller import CodexTransportController
 
 
 SHA_A = "a" * 64
@@ -328,6 +329,13 @@ def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwarg
         _fake_runtime_pin(),
     )
     max_line_bytes = int(kwargs.pop("max_line_bytes", 1024))
+    version_args = cast(
+        tuple[str, ...],
+        kwargs.pop(
+            "_test_version_args",
+            ("-c", "print('fake-app-server 0.145.0')"),
+        ),
+    )
     return CodexAppServerStdio(
         Path(sys.executable).resolve(),
         cwd=tmp_path,
@@ -335,7 +343,7 @@ def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwarg
         max_line_bytes=max_line_bytes,
         runtime_pin=runtime_pin,  # type: ignore[arg-type]
         _test_launch_args=("-u", str(fake_server)),
-        _test_version_args=("-c", "print('fake-app-server 0.145.0')"),
+        _test_version_args=version_args,
         **kwargs,
     )
 
@@ -426,6 +434,74 @@ def _intent(
     return SealedLaunchIntent.from_sealed_mapping(
         sealed, expected_sha256=str(sealed["intent_sha256"])
     )
+
+
+def _version_probe_controller(
+    tmp_path: Path,
+) -> tuple[CodexTransportController, list[dict[str, Any]]]:
+    intent = contracts.seal_launch_intent(_intent_payload(tmp_path))
+    reservation = contracts.seal_reservation(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1,
+            "reservation_id": "version-probe-boundary",
+            "launch_intent_sha256": intent["intent_sha256"],
+            "permit_sha256": SHA_C,
+            "runtime_pin": intent["runtime_pin"],
+            "state": "reserved",
+            "correlation": {
+                "thread_id": None,
+                "turn_id": None,
+                "item_id": None,
+            },
+        }
+    )
+    reserved = contracts.seal_journal_event(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+            "event_id": "version-probe-boundary:1:reserved",
+            "sequence": 1,
+            "prev_event_sha256": contracts.ZERO_SHA256,
+            "launch_intent_sha256": intent["intent_sha256"],
+            "reservation_sha256": reservation["reservation_sha256"],
+            "event_type": "reserved",
+            "state": "reserved",
+            "wire_method": "aoi/reservation",
+            "wire_event_sha256": None,
+            "payload_size_bytes": 0,
+            "item_type": None,
+            "status": "observed",
+            "request_id": None,
+            "request_bytes_sha256": None,
+            "response_sha256": None,
+            "fault_kind": None,
+            "fault_evidence_sha256": None,
+            "fault_evidence_size_bytes": None,
+            "correlation": {
+                "thread_id": None,
+                "turn_id": None,
+                "item_id": None,
+            },
+        }
+    )
+    durable = [reserved]
+
+    def persist(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+        durable[:] = contracts.append_transport_journal_event(durable, event)
+        return list(durable)
+
+    controller = CodexTransportController(
+        intent=intent,
+        reservation=reservation,
+        journal=durable,
+        persist_milestone=persist,
+        publish_terminal=lambda receipt: dict(receipt),
+        persist_fault_evidence=lambda data, _label: {
+            "path": "local-cas",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+        },
+    )
+    return controller, durable
 
 
 def _initialized_client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwargs: Any) -> CodexAppServerStdio:
@@ -2879,19 +2955,12 @@ def test_initialize_first_attempt_consumption_is_atomic_without_deadlock(
 
 
 def test_version_probe_and_process_callbacks_are_separate_exact_effects(
-    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_server: Path, tmp_path: Path
 ) -> None:
     order: list[str] = []
     probes: list[VersionProbeJournalEntry] = []
     processes: list[ProcessJournalEntry] = []
     version_probe_called = False
-
-    original_run = stdio.subprocess.run
-
-    def observed_run(*args: Any, **kwargs: Any) -> Any:
-        nonlocal version_probe_called
-        version_probe_called = True
-        return original_run(*args, **kwargs)
 
     def record_probe(entry: VersionProbeJournalEntry) -> None:
         order.append(entry.phase)
@@ -2901,7 +2970,6 @@ def test_version_probe_and_process_callbacks_are_separate_exact_effects(
         order.append(entry.phase)
         processes.append(entry)
 
-    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
     client = _client(
         fake_server,
         tmp_path,
@@ -2910,6 +2978,14 @@ def test_version_probe_and_process_callbacks_are_separate_exact_effects(
         on_process_start_pending=record_process,
         on_process_started=record_process,
     )
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal version_probe_called
+        version_probe_called = True
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
     client.start()
     try:
         assert version_probe_called is True
@@ -2955,18 +3031,447 @@ def test_version_probe_and_process_callbacks_are_separate_exact_effects(
         client.close()
 
 
+def test_version_probe_capture_drains_both_pipes_with_exact_aggregate_bound(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    stdout_size = 70_000
+    stderr_size = 70_000
+    script = (
+        "import sys\n"
+        f"sys.stdout.buffer.write(b'a' * {stdout_size})\n"
+        "sys.stdout.buffer.flush()\n"
+        f"sys.stderr.buffer.write(b'b' * {stderr_size})\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=300_000,
+        _test_version_args=("-u", "-c", script),
+    )
+
+    stdout_bytes, stderr_bytes, returncode = (
+        client._capture_version_probe_output()
+    )
+
+    assert stdout_bytes == b"a" * stdout_size
+    assert stderr_bytes == b"b" * stderr_size
+    assert returncode == 0
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+@pytest.mark.parametrize("distribution", ["stdout", "stderr", "split"])
+@pytest.mark.parametrize("over_budget", [False, True])
+def test_version_probe_capture_uses_one_combined_raw_byte_budget(
+    fake_server: Path,
+    tmp_path: Path,
+    distribution: str,
+    over_budget: bool,
+) -> None:
+    script = (
+        "import os,sys\n"
+        "stdout_size=int(os.environ['SAFE_STDOUT_SIZE'])\n"
+        "stderr_size=int(os.environ['SAFE_STDERR_SIZE'])\n"
+        "sys.stdout.buffer.write(b'v' + b'a' * (stdout_size - 1))\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stderr.buffer.write(b'b' * stderr_size)\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    planner = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        environment={"SAFE_STDOUT_SIZE": "1", "SAFE_STDERR_SIZE": "0"},
+        _test_version_args=("-u", "-c", script),
+    )
+    raw_budget = planner._version_probe_raw_capture_budget()
+    planner.close()
+    total_size = raw_budget + int(over_budget)
+    if distribution == "stdout":
+        stdout_size, stderr_size = total_size, 0
+    elif distribution == "stderr":
+        stdout_size, stderr_size = 1, total_size - 1
+    else:
+        stdout_size = 1 + ((total_size - 1) // 2)
+        stderr_size = total_size - stdout_size
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        environment={
+            "SAFE_STDOUT_SIZE": str(stdout_size),
+            "SAFE_STDERR_SIZE": str(stderr_size),
+        },
+        _test_version_args=("-u", "-c", script),
+    )
+    assert client._version_probe_raw_capture_budget() == raw_budget
+    if not over_budget:
+        stdout_bytes, stderr_bytes, returncode = (
+            client._capture_version_probe_output()
+        )
+        assert (len(stdout_bytes), len(stderr_bytes), returncode) == (
+            stdout_size,
+            stderr_size,
+            0,
+        )
+    else:
+        with pytest.raises(AppServerError, match="bounded version probe"):
+            client._capture_version_probe_output()
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_overflow_after_pending_ack_is_not_retried(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    script = (
+        "import sys\n"
+        "sys.stdout.write('fake-app-server 0.145.0\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.buffer.write(b'x' * 8192)\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        _test_version_args=("-u", "-c", script),
+    )
+
+    with pytest.raises(AppServerError, match="could not execute"):
+        client.start()
+
+    assert client._version_probe_effect_phase.value == "effect_pending"
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+
+
+@pytest.mark.parametrize("distribution", ["stdout", "stderr", "split"])
+def test_version_probe_capture_budget_closes_controller_observed_journal(
+    fake_server: Path,
+    tmp_path: Path,
+    distribution: str,
+) -> None:
+    script = (
+        "import os,sys\n"
+        "stdout_size=int(os.environ['SAFE_STDOUT_SIZE'])\n"
+        "stderr_size=int(os.environ['SAFE_STDERR_SIZE'])\n"
+        "sys.stdout.buffer.write(b'v' + b'a' * (stdout_size - 1))\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stderr.buffer.write(b'b' * stderr_size)\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    planner = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        environment={"SAFE_STDOUT_SIZE": "1", "SAFE_STDERR_SIZE": "0"},
+        _test_version_args=("-u", "-c", script),
+    )
+    raw_budget = planner._version_probe_raw_capture_budget()
+    planner.close()
+
+    for over_budget in (False, True):
+        total_size = raw_budget + int(over_budget)
+        if distribution == "stdout":
+            stdout_size, stderr_size = total_size, 0
+        elif distribution == "stderr":
+            stdout_size, stderr_size = 1, total_size - 1
+        else:
+            stdout_size = 1 + ((total_size - 1) // 2)
+            stderr_size = total_size - stdout_size
+        expected_version = "v" + ("a" * (stdout_size - 1))
+        controller, durable = _version_probe_controller(tmp_path)
+        client = _client(
+            fake_server,
+            tmp_path,
+            max_line_bytes=1024,
+            environment={
+                "SAFE_STDOUT_SIZE": str(stdout_size),
+                "SAFE_STDERR_SIZE": str(stderr_size),
+            },
+            runtime_pin=_fake_runtime_pin(app_server_version=expected_version),
+            _test_version_args=("-u", "-c", script),
+            on_version_probe_pending=controller._on_version_probe_pending,
+            on_version_probe_observed=controller._on_version_probe_observed,
+        )
+        try:
+            if over_budget:
+                with pytest.raises(AppServerError, match="bounded version probe"):
+                    client._verify_runtime_version()
+                assert client._version_probe_effect_phase.value == "effect_pending"
+                assert [row["event_type"] for row in durable] == [
+                    "reserved",
+                    "version_probe_pending",
+                ]
+            else:
+                client._verify_runtime_version()
+                assert client._version_probe_effect_phase.value == "observed"
+                assert [row["event_type"] for row in durable] == [
+                    "reserved",
+                    "version_probe_pending",
+                    "version_probe_observed",
+                ]
+                observed_size = int(durable[-1]["payload_size_bytes"])
+                assert observed_size <= client.max_line_bytes
+        finally:
+            client.close()
+
+
+def test_version_probe_capture_budget_reserves_worst_case_returncode_and_argv(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        _test_version_args=("--version", "--long-argument"),
+    )
+    raw_budget = client._version_probe_raw_capture_budget()
+    for returncode in (-2_147_483_648, 4_294_967_295):
+        accepted = client._version_probe_journal_entry(
+            "version_probe_observed",
+            stdout_bytes=b"a" * raw_budget,
+            stderr_bytes=b"",
+            returncode=returncode,
+        )
+        assert len(accepted.payload_bytes) <= client.max_line_bytes
+    with pytest.raises(AppServerError, match="journal entry exceeds"):
+        client._version_probe_journal_entry(
+            "version_probe_observed",
+            stdout_bytes=b"a" * (raw_budget + 1),
+            stderr_bytes=b"",
+            returncode=-2_147_483_648,
+        )
+
+
+def test_version_probe_pending_callback_cannot_mutate_frozen_effect_plan(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    controller, durable = _version_probe_controller(tmp_path)
+    pending_entries: list[VersionProbeJournalEntry] = []
+    observed_entries: list[VersionProbeJournalEntry] = []
+    client: CodexAppServerStdio
+
+    def persist_then_mutate(entry: VersionProbeJournalEntry) -> None:
+        controller._on_version_probe_pending(entry)
+        pending_entries.append(entry)
+        client.max_line_bytes = 128
+        client._version_args = ("-c", "raise SystemExit(37)")
+
+    def persist_observed(entry: VersionProbeJournalEntry) -> None:
+        controller._on_version_probe_observed(entry)
+        observed_entries.append(entry)
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        on_version_probe_pending=persist_then_mutate,
+        on_version_probe_observed=persist_observed,
+    )
+
+    client._verify_runtime_version()
+
+    assert [row["event_type"] for row in durable] == [
+        "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
+    ]
+    assert len(pending_entries) == len(observed_entries) == 1
+    assert pending_entries[0].argv == observed_entries[0].argv
+    assert pending_entries[0].argv != (
+        str(client.executable),
+        *client._version_args,
+    )
+    assert len(observed_entries[0].payload_bytes) > client.max_line_bytes
+    assert len(observed_entries[0].payload_bytes) <= 1024
+    assert client._version_probe_effect_phase.value == "observed"
+
+
+def test_version_probe_observed_journal_reuses_plan_after_capture_mutation(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    controller, durable = _version_probe_controller(tmp_path)
+    entries: list[VersionProbeJournalEntry] = []
+
+    def persist(entry: VersionProbeJournalEntry) -> None:
+        entries.append(entry)
+        if entry.phase == "version_probe_pending":
+            controller._on_version_probe_pending(entry)
+        else:
+            controller._on_version_probe_observed(entry)
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        on_version_probe_pending=persist,
+        on_version_probe_observed=persist,
+    )
+    original_capture = client._capture_version_probe_output
+
+    def capture_then_mutate(
+        *args: Any, **kwargs: Any
+    ) -> tuple[bytes, bytes, int]:
+        result = original_capture(*args, **kwargs)
+        client.max_line_bytes = 128
+        client._version_args = ("-c", "raise SystemExit(38)")
+        return result
+
+    client._capture_version_probe_output = capture_then_mutate  # type: ignore[method-assign]
+
+    client._verify_runtime_version()
+
+    assert [entry.phase for entry in entries] == [
+        "version_probe_pending",
+        "version_probe_observed",
+    ]
+    assert entries[0].argv == entries[1].argv
+    assert len(entries[1].payload_bytes) > client.max_line_bytes
+    assert [row["event_type"] for row in durable] == [
+        "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
+    ]
+    assert client._version_probe_effect_phase.value == "observed"
+
+
+def test_version_probe_timeout_kills_and_reaps_owned_direct_child(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stdio, "_VERSION_PROBE_TIMEOUT_SECONDS", 0.2)
+    script = "import time; time.sleep(30)\n"
+    client = _client(
+        fake_server,
+        tmp_path,
+        _test_version_args=("-u", "-c", script),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(AppServerError, match="could not execute"):
+        client.start()
+
+    assert time.monotonic() - started < 3
+    assert client._version_probe_effect_phase.value == "effect_pending"
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+
+
+def test_version_probe_second_reader_start_failure_cleans_first_reader_and_child(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(
+        fake_server,
+        tmp_path,
+        _test_version_args=("-u", "-c", "import time; time.sleep(30)\n"),
+    )
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_second_start(thread: threading.Thread) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            raise RuntimeError("synthetic second reader start failure")
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    with pytest.raises(AppServerError, match="bounded version probe"):
+        client._capture_version_probe_output()
+
+    assert starts == 2
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_baseexception_during_poll_still_cleans_owned_child(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    child: subprocess.Popen[bytes] | None = None
+
+    class InterruptingPoll:
+        def __init__(self, process: subprocess.Popen[bytes]) -> None:
+            self._process = process
+            self.stdout = process.stdout
+            self.stderr = process.stderr
+
+        def poll(self) -> int | None:
+            raise KeyboardInterrupt("synthetic poll interrupt")
+
+        def kill(self) -> None:
+            self._process.kill()
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self._process.wait(timeout=timeout)
+
+    def interrupting_popen(*args: Any, **kwargs: Any) -> InterruptingPoll:
+        nonlocal child
+        child = real_popen(*args, **kwargs)
+        return InterruptingPoll(child)
+
+    monkeypatch.setattr(stdio.subprocess, "Popen", interrupting_popen)
+    client = _client(
+        fake_server,
+        tmp_path,
+        _test_version_args=("-u", "-c", "import time; time.sleep(30)\n"),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic poll interrupt"):
+        client._capture_version_probe_output()
+
+    assert child is not None
+    assert child.poll() is not None
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_unconfirmed_cleanup_retains_separate_process_handle(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnconfirmableProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+
+        def poll(self) -> int | None:
+            raise OSError("synthetic poll failure")
+
+        def kill(self) -> None:
+            raise OSError("synthetic kill failure")
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise OSError("synthetic wait failure")
+
+    process = UnconfirmableProcess()
+    monkeypatch.setattr(stdio.subprocess, "Popen", lambda *args, **kwargs: process)
+    client = _client(fake_server, tmp_path)
+
+    with pytest.raises(AppServerError, match="cleanup is unconfirmed"):
+        client._capture_version_probe_output()
+
+    assert client._version_probe_process is process
+    assert client._version_probe_threads == ()
+
+
 def test_version_probe_pending_callback_prevents_the_probe_without_consuming_start(
-    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_server: Path, tmp_path: Path
 ) -> None:
     called = False
-    original_run = stdio.subprocess.run
-
-    def observed_run(*args: Any, **kwargs: Any) -> Any:
-        nonlocal called
-        called = True
-        return original_run(*args, **kwargs)
-
-    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
     entries: list[VersionProbeJournalEntry] = []
 
     def reject_pending(entry: VersionProbeJournalEntry) -> None:
@@ -2978,6 +3483,14 @@ def test_version_probe_pending_callback_prevents_the_probe_without_consuming_sta
         tmp_path,
         on_version_probe_pending=reject_pending,
     )
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal called
+        called = True
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
     with pytest.raises(AppServerError, match="probe was not executed") as caught:
         client.start()
     assert "pending-callback-secret" not in str(caught.value)
@@ -2991,17 +3504,9 @@ def test_version_probe_pending_callback_prevents_the_probe_without_consuming_sta
 
 
 def test_version_probe_observed_callback_preserves_unknown_effect_without_retry(
-    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_server: Path, tmp_path: Path
 ) -> None:
     calls = 0
-    original_run = stdio.subprocess.run
-
-    def observed_run(*args: Any, **kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        return original_run(*args, **kwargs)
-
-    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
     entries: list[VersionProbeJournalEntry] = []
 
     def reject_observed(entry: VersionProbeJournalEntry) -> None:
@@ -3013,6 +3518,14 @@ def test_version_probe_observed_callback_preserves_unknown_effect_without_retry(
         tmp_path,
         on_version_probe_observed=reject_observed,
     )
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal calls
+        calls += 1
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
     with pytest.raises(AppServerError, match="effect is unknown") as caught:
         client.start()
     assert "observed-callback-secret" not in str(caught.value)
@@ -3035,18 +3548,17 @@ def test_version_probe_observed_callback_preserves_unknown_effect_without_retry(
 def test_version_probe_run_failure_is_non_retryable_after_pending_ack(
     fake_server: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     raised: BaseException,
 ) -> None:
     calls = 0
 
-    def fail_run(*_args: Any, **_kwargs: Any) -> NoReturn:
+    def fail_capture(*_args: Any, **_kwargs: Any) -> NoReturn:
         nonlocal calls
         calls += 1
         raise raised
 
-    monkeypatch.setattr(stdio.subprocess, "run", fail_run)
     client = _client(fake_server, tmp_path)
+    client._capture_version_probe_output = fail_capture  # type: ignore[method-assign]
     with pytest.raises(AppServerError, match="could not execute"):
         client.start()
     assert calls == 1
@@ -3063,14 +3575,6 @@ def test_observed_version_probe_is_not_resent_after_later_start_failure(
     later_failure: str,
 ) -> None:
     calls = 0
-    original_run = stdio.subprocess.run
-
-    def observed_run(*args: Any, **kwargs: Any) -> Any:
-        nonlocal calls
-        calls += 1
-        return original_run(*args, **kwargs)
-
-    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
     kwargs: dict[str, Any] = {}
     if later_failure == "process_pending":
         def reject_process_pending(_entry: ProcessJournalEntry) -> None:
@@ -3086,6 +3590,14 @@ def test_observed_version_probe_is_not_resent_after_later_start_failure(
 
         kwargs["on_version_probe_observed"] = install_popen_failure
     client = _client(fake_server, tmp_path, **kwargs)
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal calls
+        calls += 1
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
     with pytest.raises(AppServerError, match="process was not started|could not start"):
         client.start()
     assert calls == 1
