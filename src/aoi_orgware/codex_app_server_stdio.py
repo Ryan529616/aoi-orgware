@@ -414,6 +414,15 @@ class _TerminalStreamPhase(str, Enum):
     ABORTED = "aborted"
 
 
+class _VersionProbeEffectPhase(str, Enum):
+    """One-way crash markers for the bounded ``codex --version`` effect."""
+
+    NOT_STARTED = "not_started"
+    EFFECT_PENDING = "effect_pending"
+    EFFECT_UNKNOWN = "effect_unknown"
+    OBSERVED = "observed"
+
+
 @dataclass(frozen=True)
 class RequestReceipt:
     request_id: int
@@ -456,6 +465,24 @@ class ProcessJournalEntry:
     payload_bytes: bytes
     sha256: str
     pid: int | None
+
+
+@dataclass(frozen=True)
+class VersionProbeJournalEntry:
+    """Exact bounded evidence for one ``codex --version`` process effect.
+
+    The pending form carries only the exact probe argv.  The observed form
+    additionally carries the unmodified stdout/stderr bytes and return code;
+    ``payload_bytes`` binds those bytes through their hexadecimal encoding.
+    """
+
+    phase: str
+    argv: tuple[str, ...]
+    stdout_bytes: bytes | None
+    stderr_bytes: bytes | None
+    returncode: int | None
+    payload_bytes: bytes
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -698,6 +725,8 @@ class CodexAppServerStdio:
         max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
         max_queue_messages: int = DEFAULT_MAX_QUEUE_MESSAGES,
         runtime_pin: RuntimePin | None = None,
+        on_version_probe_pending: Callable[[VersionProbeJournalEntry], None] | None = None,
+        on_version_probe_observed: Callable[[VersionProbeJournalEntry], None] | None = None,
         on_process_start_pending: Callable[[ProcessJournalEntry], None] | None = None,
         on_process_started: Callable[[ProcessJournalEntry], None] | None = None,
         on_send_pending: Callable[[RequestJournalEntry], None] | None = None,
@@ -743,6 +772,8 @@ class CodexAppServerStdio:
         self.max_stderr_bytes = max_stderr_bytes
         self.max_queue_messages = max_queue_messages
         self.runtime_pin = runtime_pin or _load_packaged_runtime_pin()
+        self.on_version_probe_pending = on_version_probe_pending
+        self.on_version_probe_observed = on_version_probe_observed
         self.on_process_start_pending = on_process_start_pending
         self.on_process_started = on_process_started
         self.on_send_pending = on_send_pending
@@ -759,6 +790,7 @@ class CodexAppServerStdio:
         self._launch_args = _test_launch_args or _PRODUCTION_LAUNCH_ARGS
         self._version_args = _test_version_args or ("--version",)
         self._local_files_policy_binding: dict[str, Any] | None = None
+        self._version_probe_effect_phase = _VersionProbeEffectPhase.NOT_STARTED
         self._process: subprocess.Popen[bytes] | None = None
         self._incoming: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=max_queue_messages)
         self._notifications: list[RuntimeEvent] = []
@@ -844,6 +876,10 @@ class CodexAppServerStdio:
     def start(self) -> None:
         if self._process is not None:
             raise AppServerError("App Server process already started")
+        if self._version_probe_effect_phase is not _VersionProbeEffectPhase.NOT_STARTED:
+            raise AppServerError(
+                "previous App Server --version probe may already have executed; retry is forbidden"
+            )
         if not self.executable.is_file():
             raise AppServerError(f"App Server executable does not exist: {self.executable}")
         if not self.cwd.is_dir():
@@ -853,18 +889,6 @@ class CodexAppServerStdio:
                 self.environment
             )
         self._verify_runtime_pin()
-        # This durable boundary authorizes every process execution that follows
-        # in the exact pinned-runtime start sequence: the bounded ``--version``
-        # probe and then the long-lived App Server Popen.  No child process may
-        # execute before the callback succeeds.
-        pending_entry = self._process_journal_entry("process_start_pending")
-        if self.on_process_start_pending is not None:
-            try:
-                self.on_process_start_pending(pending_entry)
-            except Exception as exc:
-                raise AppServerError(
-                    "process_start_pending journal callback failed; process was not started"
-                ) from exc
         self._verify_runtime_version()
         # Rehash after version probing and immediately before App Server exec
         # to narrow the executable replacement window.  The process image is
@@ -876,6 +900,17 @@ class CodexAppServerStdio:
                 raise AppServerError(
                     "local_files CODEX_HOME policy changed after process authorization"
                 )
+        # This durable boundary authorizes only the following long-lived
+        # App Server Popen.  The bounded ``--version`` probe has its own
+        # independently journaled effect boundary above.
+        pending_entry = self._process_journal_entry("process_start_pending")
+        if self.on_process_start_pending is not None:
+            try:
+                self.on_process_start_pending(pending_entry)
+            except BaseException:
+                raise AppServerError(
+                    "process_start_pending journal callback failed; process was not started"
+                ) from None
         self._stderr = b""
         self._stderr_total_bytes = 0
         self._stderr_truncated = False
@@ -906,11 +941,18 @@ class CodexAppServerStdio:
         if self.on_process_started is not None:
             try:
                 self.on_process_started(started_entry)
-            except Exception as exc:
-                self.close()
+            except BaseException:
+                try:
+                    self.close()
+                except BaseException:
+                    pass
+                if self._process is None:
+                    cleanup_outcome = "process exited during cleanup"
+                else:
+                    cleanup_outcome = "process cleanup was attempted; exit is unconfirmed"
                 raise AppServerError(
-                    "process_started journal callback failed; process was terminated"
-                ) from exc
+                    f"process_started journal callback failed; {cleanup_outcome}"
+                ) from None
 
     def close(self) -> None:
         """Best-effort bounded cleanup; never confers a clean terminal seal."""
@@ -2307,6 +2349,50 @@ class CodexAppServerStdio:
             pid=pid,
         )
 
+    def _version_probe_journal_entry(
+        self,
+        phase: str,
+        *,
+        stdout_bytes: bytes | None = None,
+        stderr_bytes: bytes | None = None,
+        returncode: int | None = None,
+    ) -> VersionProbeJournalEntry:
+        argv = (str(self.executable), *self._version_args)
+        if phase == "version_probe_pending":
+            if stdout_bytes is not None or stderr_bytes is not None or returncode is not None:
+                raise ValueError("version probe pending entry must not carry observed evidence")
+            payload: dict[str, Any] = {"phase": phase, "argv": list(argv)}
+        elif phase == "version_probe_observed":
+            if (
+                stdout_bytes is None
+                or stderr_bytes is None
+                or returncode is None
+            ):
+                raise ValueError("version probe observed entry requires raw process evidence")
+            payload = {
+                "phase": phase,
+                "argv": list(argv),
+                "stdout_hex": stdout_bytes.hex(),
+                "stderr_hex": stderr_bytes.hex(),
+                "returncode": returncode,
+            }
+        else:
+            raise ValueError("unsupported version probe journal phase")
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        if len(raw) > self.max_line_bytes:
+            raise AppServerError("version probe journal entry exceeds configured byte bound")
+        return VersionProbeJournalEntry(
+            phase=phase,
+            argv=argv,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            returncode=returncode,
+            payload_bytes=raw,
+            sha256=hashlib.sha256(raw).hexdigest(),
+        )
+
     def _verify_runtime_pin(self) -> None:
         if self.executable.is_symlink() or not self.executable.is_file():
             raise AppServerError("pinned App Server executable is missing or is a symlink")
@@ -2322,6 +2408,18 @@ class CodexAppServerStdio:
             raise AppServerError("App Server executable SHA-256 does not match packaged runtime pin")
 
     def _verify_runtime_version(self) -> None:
+        pending_entry = self._version_probe_journal_entry("version_probe_pending")
+        if self.on_version_probe_pending is not None:
+            try:
+                self.on_version_probe_pending(pending_entry)
+            except BaseException:
+                raise AppServerError(
+                    "version_probe_pending journal callback failed; version probe was not executed"
+                ) from None
+        # Once the pending callback has committed, spawning the probe is an
+        # ambiguous non-retryable effect even if ``subprocess.run`` later
+        # reports a local failure.
+        self._version_probe_effect_phase = _VersionProbeEffectPhase.EFFECT_PENDING
         try:
             completed = subprocess.run(
                 [str(self.executable), *self._version_args],
@@ -2336,6 +2434,23 @@ class CodexAppServerStdio:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise AppServerError("could not execute pinned App Server --version") from exc
+        # The process has returned exact evidence, but a callback failure or a
+        # later launch failure must not re-send this already-observed effect.
+        self._version_probe_effect_phase = _VersionProbeEffectPhase.EFFECT_UNKNOWN
+        observed_entry = self._version_probe_journal_entry(
+            "version_probe_observed",
+            stdout_bytes=completed.stdout,
+            stderr_bytes=completed.stderr,
+            returncode=completed.returncode,
+        )
+        if self.on_version_probe_observed is not None:
+            try:
+                self.on_version_probe_observed(observed_entry)
+            except BaseException:
+                raise AppServerError(
+                    "version_probe_observed journal callback failed; version probe effect is unknown"
+                ) from None
+        self._version_probe_effect_phase = _VersionProbeEffectPhase.OBSERVED
         try:
             version = completed.stdout.decode("utf-8", errors="strict").strip()
         except UnicodeDecodeError as exc:

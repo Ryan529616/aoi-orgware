@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import pytest
 
@@ -41,6 +41,7 @@ from aoi_orgware.codex_app_server_stdio import (
     RuntimePin,
     SealedLaunchIntent,
     ServerRequestDenied,
+    VersionProbeJournalEntry,
     scrub_aoi_secret_env,
 )
 
@@ -546,8 +547,7 @@ def test_local_files_policy_is_rechecked_after_version_probe_before_popen(
     monkeypatch.setattr(client, "_verify_runtime_version", mutate_after_pending)
     with pytest.raises(AppServerError, match="local_files"):
         client.start()
-    assert len(pending) == 1
-    assert pending[0].phase == "process_start_pending"
+    assert pending == []
 
 
 def test_constructor_rejects_symlinked_executable(tmp_path: Path) -> None:
@@ -2878,10 +2878,12 @@ def test_initialize_first_attempt_consumption_is_atomic_without_deadlock(
         client.close()
 
 
-def test_process_callbacks_bracket_every_child_process_and_fail_closed(
+def test_version_probe_and_process_callbacks_are_separate_exact_effects(
     fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pending: list[ProcessJournalEntry] = []
+    order: list[str] = []
+    probes: list[VersionProbeJournalEntry] = []
+    processes: list[ProcessJournalEntry] = []
     version_probe_called = False
 
     original_run = stdio.subprocess.run
@@ -2891,41 +2893,257 @@ def test_process_callbacks_bracket_every_child_process_and_fail_closed(
         version_probe_called = True
         return original_run(*args, **kwargs)
 
+    def record_probe(entry: VersionProbeJournalEntry) -> None:
+        order.append(entry.phase)
+        probes.append(entry)
+
+    def record_process(entry: ProcessJournalEntry) -> None:
+        order.append(entry.phase)
+        processes.append(entry)
+
     monkeypatch.setattr(stdio.subprocess, "run", observed_run)
-
-    def reject_before_popen(entry: ProcessJournalEntry) -> None:
-        pending.append(entry)
-        raise RuntimeError("journal unavailable")
-
-    before = _client(
+    client = _client(
         fake_server,
         tmp_path,
-        on_process_start_pending=reject_before_popen,
+        on_version_probe_pending=record_probe,
+        on_version_probe_observed=record_probe,
+        on_process_start_pending=record_process,
+        on_process_started=record_process,
     )
-    with pytest.raises(AppServerError, match="process was not started"):
-        before.start()
-    assert len(pending) == 1
-    assert pending[0].phase == "process_start_pending"
-    assert pending[0].pid is None
-    assert version_probe_called is False
+    client.start()
+    try:
+        assert version_probe_called is True
+        assert order == [
+            "version_probe_pending",
+            "version_probe_observed",
+            "process_start_pending",
+            "process_started",
+        ]
+        assert len(probes) == 2
+        pending, observed = probes
+        assert pending.argv == observed.argv == (
+            str(Path(sys.executable).resolve()),
+            "-c",
+            "print('fake-app-server 0.145.0')",
+        )
+        assert json.loads(pending.payload_bytes) == {
+            "argv": list(pending.argv),
+            "phase": "version_probe_pending",
+        }
+        assert pending.stdout_bytes is None
+        assert pending.stderr_bytes is None
+        assert pending.returncode is None
+        assert observed.stdout_bytes is not None
+        assert observed.stdout_bytes.rstrip(b"\r\n") == b"fake-app-server 0.145.0"
+        assert observed.stderr_bytes == b""
+        assert observed.returncode == 0
+        assert json.loads(observed.payload_bytes) == {
+            "argv": list(observed.argv),
+            "phase": "version_probe_observed",
+            "returncode": 0,
+            "stderr_hex": "",
+            "stdout_hex": observed.stdout_bytes.hex(),
+        }
+        assert [entry.phase for entry in processes] == [
+            "process_start_pending",
+            "process_started",
+        ]
+        assert json.loads(processes[0].payload_bytes)["argv"] == list(client.argv)
+        assert processes[0].pid is None
+        assert isinstance(processes[1].pid, int)
+    finally:
+        client.close()
 
-    started: list[ProcessJournalEntry] = []
 
-    def reject_after_popen(entry: ProcessJournalEntry) -> None:
-        started.append(entry)
-        raise RuntimeError("journal unavailable")
+def test_version_probe_pending_callback_prevents_the_probe_without_consuming_start(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+    original_run = stdio.subprocess.run
 
-    after = _client(
+    def observed_run(*args: Any, **kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
+    entries: list[VersionProbeJournalEntry] = []
+
+    def reject_pending(entry: VersionProbeJournalEntry) -> None:
+        entries.append(entry)
+        raise KeyboardInterrupt("pending-callback-secret")
+
+    client = _client(
         fake_server,
         tmp_path,
-        on_process_started=reject_after_popen,
+        on_version_probe_pending=reject_pending,
     )
-    with pytest.raises(AppServerError, match="process was terminated"):
-        after.start()
-    assert len(started) == 1
-    assert started[0].phase == "process_started"
-    assert isinstance(started[0].pid, int)
-    after.close()
+    with pytest.raises(AppServerError, match="probe was not executed") as caught:
+        client.start()
+    assert "pending-callback-secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert called is False
+    assert client._process is None
+    assert [entry.phase for entry in entries] == ["version_probe_pending"]
+    client.on_version_probe_pending = None
+    client.start()
+    client.close()
+
+
+def test_version_probe_observed_callback_preserves_unknown_effect_without_retry(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    original_run = stdio.subprocess.run
+
+    def observed_run(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
+    entries: list[VersionProbeJournalEntry] = []
+
+    def reject_observed(entry: VersionProbeJournalEntry) -> None:
+        entries.append(entry)
+        raise SystemExit("observed-callback-secret")
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_version_probe_observed=reject_observed,
+    )
+    with pytest.raises(AppServerError, match="effect is unknown") as caught:
+        client.start()
+    assert "observed-callback-secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert calls == 1
+    assert client._process is None
+    assert [entry.phase for entry in entries] == ["version_probe_observed"]
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        OSError("injected version probe launch failure"),
+        subprocess.TimeoutExpired(["codex", "--version"], timeout=10),
+    ],
+)
+def test_version_probe_run_failure_is_non_retryable_after_pending_ack(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: BaseException,
+) -> None:
+    calls = 0
+
+    def fail_run(*_args: Any, **_kwargs: Any) -> NoReturn:
+        nonlocal calls
+        calls += 1
+        raise raised
+
+    monkeypatch.setattr(stdio.subprocess, "run", fail_run)
+    client = _client(fake_server, tmp_path)
+    with pytest.raises(AppServerError, match="could not execute"):
+        client.start()
+    assert calls == 1
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+    assert calls == 1
+
+
+@pytest.mark.parametrize("later_failure", ["process_pending", "popen"])
+def test_observed_version_probe_is_not_resent_after_later_start_failure(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    later_failure: str,
+) -> None:
+    calls = 0
+    original_run = stdio.subprocess.run
+
+    def observed_run(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
+    kwargs: dict[str, Any] = {}
+    if later_failure == "process_pending":
+        def reject_process_pending(_entry: ProcessJournalEntry) -> None:
+            raise RuntimeError("process pending journal unavailable")
+
+        kwargs["on_process_start_pending"] = reject_process_pending
+    else:
+        def reject_popen(*_args: Any, **_kwargs: Any) -> NoReturn:
+            raise OSError("injected Popen failure")
+
+        def install_popen_failure(_entry: VersionProbeJournalEntry) -> None:
+            monkeypatch.setattr(stdio.subprocess, "Popen", reject_popen)
+
+        kwargs["on_version_probe_observed"] = install_popen_failure
+    client = _client(fake_server, tmp_path, **kwargs)
+    with pytest.raises(AppServerError, match="process was not started|could not start"):
+        client.start()
+    assert calls == 1
+    assert client._process is None
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+    assert calls == 1
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_process_started_baseexception_runs_cleanup_without_claiming_clean_exit(
+    fake_server: Path, tmp_path: Path, failure_type: type[BaseException]
+) -> None:
+    def interrupt_after_popen(_entry: ProcessJournalEntry) -> None:
+        raise failure_type("process-callback-secret")
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_process_started=interrupt_after_popen,
+    )
+    with pytest.raises(AppServerError, match="process exited during cleanup") as caught:
+        client.start()
+    assert "process-callback-secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert client._process is None
+
+
+def test_process_started_callback_preserves_unconfirmed_exit_when_cleanup_cannot_prove_it(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process: subprocess.Popen[bytes] | None = None
+
+    def refuse_cleanup(_entry: ProcessJournalEntry) -> None:
+        nonlocal process
+        process = client._process
+        assert process is not None
+
+        def fail_cleanup(*_args: Any, **_kwargs: Any) -> NoReturn:
+            raise OSError("injected cleanup failure")
+
+        monkeypatch.setattr(process, "poll", fail_cleanup)
+        monkeypatch.setattr(process, "terminate", fail_cleanup)
+        monkeypatch.setattr(process, "kill", fail_cleanup)
+        monkeypatch.setattr(process, "wait", fail_cleanup)
+        raise KeyboardInterrupt("process-callback-secret")
+
+    client = _client(fake_server, tmp_path, on_process_started=refuse_cleanup)
+    try:
+        with pytest.raises(AppServerError, match="exit is unconfirmed") as caught:
+            client.start()
+        assert "process-callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert process is not None
+        assert client._process is process
+    finally:
+        monkeypatch.undo()
+        client.close()
 
 
 def test_runtime_pin_version_and_intent_validation_fail_closed(fake_server: Path, tmp_path: Path) -> None:
@@ -2949,6 +3167,8 @@ def test_runtime_pin_version_and_intent_validation_fail_closed(fake_server: Path
         runtime_pin=_fake_runtime_pin(app_server_version="different"),
     )
     with pytest.raises(AppServerError, match="--version"):
+        bad_version.start()
+    with pytest.raises(AppServerError, match="retry is forbidden"):
         bad_version.start()
     tampered = contracts.seal_launch_intent(_intent_payload(tmp_path))
     tampered["prompt_size_bytes"] = 1
