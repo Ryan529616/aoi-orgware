@@ -56,6 +56,10 @@ CoverageGapReason = Literal[
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 _NAMESPACE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{6})?Z"
+)
 _WINDOWS_SEMANTICS = frozenset(
     {"windows-win32-v1", "wsl-windows-drive-mount-v1"}
 )
@@ -191,14 +195,24 @@ def _namespace(value: Any, label: str) -> str:
     return value
 
 
-def _plain_int(value: Any, label: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+def _plain_int(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 0,
+    maximum: int = 999_999_999,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
         raise WriteAdmissionError(f"{label} is invalid")
     return value
 
 
 def _timestamp(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.endswith("Z") or len(value) > 64:
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
         raise WriteAdmissionError(f"{label} must use bounded UTC Z form")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
@@ -206,6 +220,11 @@ def _timestamp(value: Any, label: str) -> str:
         raise WriteAdmissionError(f"{label} is invalid") from exc
     if parsed.tzinfo != timezone.utc:
         raise WriteAdmissionError(f"{label} must use UTC")
+    canonical = parsed.isoformat(
+        timespec="microseconds" if parsed.microsecond else "seconds",
+    ).replace("+00:00", "Z")
+    if value != canonical:
+        raise WriteAdmissionError(f"{label} is not canonically spelled")
     return value
 
 
@@ -425,8 +444,8 @@ def validate_write_domain_binding(value: Any) -> dict[str, Any]:
         "contract_type": WRITE_DOMAIN_BINDING_V1,
         "schema_version": WRITE_ADMISSION_SCHEMA_VERSION,
         "company_id": _identifier(item["company_id"], "company_id"),
-        "company_incarnation": _identifier(
-            item["company_incarnation"], "company_incarnation"
+        "company_incarnation": _plain_int(
+            item["company_incarnation"], "company_incarnation", minimum=1
         ),
         "lock_domain_generation": _plain_int(
             item["lock_domain_generation"], "lock_domain_generation", minimum=1
@@ -487,8 +506,8 @@ def validate_work_write_intent(value: Any) -> dict[str, Any]:
         "contract_type": WORK_WRITE_INTENT_V1,
         "schema_version": WRITE_ADMISSION_SCHEMA_VERSION,
         "company_id": _identifier(item["company_id"], "company_id"),
-        "company_incarnation": _identifier(
-            item["company_incarnation"], "company_incarnation"
+        "company_incarnation": _plain_int(
+            item["company_incarnation"], "company_incarnation", minimum=1
         ),
         "lock_domain_generation": _plain_int(
             item["lock_domain_generation"], "lock_domain_generation", minimum=1

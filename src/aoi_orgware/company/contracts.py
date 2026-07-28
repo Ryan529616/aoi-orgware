@@ -5188,76 +5188,27 @@ def validate_provider_turn_result_receipt(value: Any) -> dict[str, Any]:
     return result
 
 
-_VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
-    COMPANY_MANIFEST_V1: validate_company_manifest, ACTOR_AUTHORITY_V1: validate_actor_authority,
-    AUTHORITY_GRANT_V1: validate_authority_grant, CONTROL_INTENT_V1: validate_control_intent,
-    TASK_REVISION_V1: validate_task_revision, WORK_PACKET_V1: validate_work_packet,
-    WORK_RESULT_RECEIPT_V1: validate_work_result_receipt,
-    WORK_DISPATCH_BINDING_V1: validate_work_dispatch_binding,
-    WORK_DEFINITION_ENFORCEMENT_V1: validate_work_definition_enforcement,
-    PROVIDER_CODEX_HOME_V1: validate_provider_codex_home,
-    PROVIDER_LAUNCH_BINDING_V1: validate_provider_launch_binding,
-    PROVIDER_WORKER_IO_RECEIPT_V1: validate_provider_worker_io_receipt,
-    PROVIDER_WORKER_OPERATION_V1: validate_provider_worker_operation,
-    PROVIDER_TURN_RESULT_RECEIPT_V1: validate_provider_turn_result_receipt,
-    EXPECTED_HEAD_V1: validate_expected_head, EXPECTED_TRANSACTION_HEAD_V1: validate_expected_transaction_head, BLOB_REF_V1: validate_blob_ref,
-    TAKEOVER_CAPABILITY_V1: validate_takeover_capability, TAKEOVER_CONSUMPTION_RECEIPT_V1: validate_takeover_consumption_receipt, COMPANY_EVENT_V1: validate_company_event,
-    COMPANY_TRANSACTION_REQUEST_V1: validate_company_transaction_request, COMPANY_TRANSACTION_RECEIPT_V1: validate_company_transaction_receipt,
-    ORGANIZATION_NODE_V1: validate_organization_node, DEPARTMENT_IDENTITY_V1: validate_department_identity,
-    DEPARTMENT_SNAPSHOT_V1: validate_department_snapshot, CHIEF_TERM_V1: validate_chief_term,
-    CARRIER_BINDING_V1: validate_carrier_binding, EXECUTION_NODE_V1: validate_execution_node,
-    EXECUTION_EVENT_V1: validate_execution_event, MUTATION_INTENT_V1: validate_mutation_intent,
-    EXTERNAL_JOB_V1: validate_external_job, DISPATCH_REQUEST_V1: validate_dispatch_request,
-    PROVIDER_LIFECYCLE_RECEIPT_V1: validate_provider_lifecycle_receipt,
-    EXECUTION_RUNTIME_OBSERVATION_RECEIPT_V1:
-        validate_execution_runtime_observation_receipt,
-    ENGINEERING_DISPOSITION_RECEIPT_V1:
-        validate_engineering_disposition_receipt,
-    PROVIDER_TELEMETRY_RECEIPT_V1: validate_provider_telemetry_receipt,
-    PROVIDER_COVERAGE_REVISION_V1: validate_provider_coverage_revision,
-    USAGE_COUNTER_SAMPLE_V1: validate_usage_counter_sample,
-    EXTERNAL_JOB_EFFECT_RECEIPT_V1: validate_external_job_effect_receipt,
-    EVIDENCE_RECORD_V1: validate_evidence_record,
-    ARTIFACT_EDGE_V1: validate_artifact_edge, USAGE_EVENT_V1: validate_usage_event, USAGE_BURN_REVISION_V1: validate_usage_burn_revision,
-    RATE_CARD_V1: validate_rate_card, ALERT_V1: validate_alert, NEEDS_USER_V1: validate_needs_user,
-    NEEDS_USER_REVISION_V1: validate_needs_user_revision,
-    ROUTE_POLICY_V1: validate_route_policy, OPTIMIZER_PROPOSAL_V1: validate_optimizer_proposal,
-    CANARY_V1: validate_canary, BACKUP_ENVELOPE_V1: validate_backup_envelope, CRYPTO_VERIFICATION_RECEIPT_V1: validate_crypto_verification_receipt,
-}
-
-_SOURCE_VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
-    PROVIDER_LIFECYCLE_SOURCE_V1: validate_provider_lifecycle_source,
-    EXECUTION_RUNTIME_OBSERVATION_SOURCE_V1:
-        validate_execution_runtime_observation_source,
-    ENGINEERING_DISPOSITION_SOURCE_V1:
-        validate_engineering_disposition_source,
-    EXTERNAL_JOB_EFFECT_SOURCE_V1: validate_external_job_effect_source,
-}
-
-_DOCUMENT_VALIDATORS: dict[str, Callable[[Any], dict[str, Any]]] = {
-    WORK_CONTEXT_MANIFEST_V1: validate_work_context_manifest,
-    PROVIDER_TURN_RESULT_V1: validate_provider_turn_result,
-}
-
-
 def validate_company_contract(value: Any) -> dict[str, Any]:
     """Validate one known v0.5 contract and return a detached canonical value."""
     if not isinstance(value, Mapping):
         _fail("company contract type is missing")
+    from .contract_registry import contract_validator_for
+
     contract_type = value.get("contract_type")
     source_type = value.get("source_type")
     document_type = value.get("document_type")
-    validator = (
-        _VALIDATORS.get(contract_type)
-        if isinstance(contract_type, str)
-        else _SOURCE_VALIDATORS.get(source_type)
-        if isinstance(source_type, str)
-        else _DOCUMENT_VALIDATORS.get(document_type)
-        if isinstance(document_type, str)
-        else None
+    validator = contract_validator_for(
+        contract_type,
+        source_type,
+        document_type,
     )
     if validator is None:
         _fail("company contract type is unsupported")
-    result = validator(value)
+    try:
+        result = validator(value)
+    except CompanyContractError:
+        raise
+    except ValueError as exc:
+        _fail(str(exc))
     _canonical(result, "company contract")
     return result

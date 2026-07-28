@@ -71,6 +71,7 @@ from .contracts import (
     validate_company_transaction_request,
 )
 from .ledger import LedgerHeadsSnapshot
+from .projection_registry import PROJECTABLE_STREAM as _PROJECTABLE_STREAM
 
 
 class CompanyTransactionBuildError(ValueError):
@@ -89,53 +90,6 @@ class CompanyEventDraft:
 
 
 _STREAM_ORDER = ("org", "execution", "evidence", "usage", "alert")
-_PROJECTABLE_STREAM = {
-    COMPANY_MANIFEST_V1: "org",
-    AUTHORITY_GRANT_V1: "org",
-    TAKEOVER_CAPABILITY_V1: "org",
-    TAKEOVER_CONSUMPTION_RECEIPT_V1: "org",
-    ORGANIZATION_NODE_V1: "org",
-    DEPARTMENT_IDENTITY_V1: "org",
-    DEPARTMENT_SNAPSHOT_V1: "org",
-    CHIEF_TERM_V1: "org",
-    CARRIER_BINDING_V1: "org",
-    ROUTE_POLICY_V1: "org",
-    TASK_REVISION_V1: "org",
-    WORK_DEFINITION_ENFORCEMENT_V1: "org",
-    EXECUTION_NODE_V1: "execution",
-    EXECUTION_EVENT_V1: "execution",
-    CONTROL_INTENT_V1: "execution",
-    MUTATION_INTENT_V1: "execution",
-    EXTERNAL_JOB_V1: "execution",
-    DISPATCH_REQUEST_V1: "execution",
-    WORK_PACKET_V1: "execution",
-    WORK_DISPATCH_BINDING_V1: "execution",
-    PROVIDER_CODEX_HOME_V1: "execution",
-    PROVIDER_LAUNCH_BINDING_V1: "execution",
-    PROVIDER_WORKER_OPERATION_V1: "execution",
-    PROVIDER_WORKER_IO_RECEIPT_V1: "evidence",
-    PROVIDER_TURN_RESULT_RECEIPT_V1: "evidence",
-    EXTERNAL_JOB_EFFECT_RECEIPT_V1: "evidence",
-    WORK_RESULT_RECEIPT_V1: "evidence",
-    PROVIDER_LIFECYCLE_RECEIPT_V1: "evidence",
-    ENGINEERING_DISPOSITION_RECEIPT_V1: "evidence",
-    EXECUTION_RUNTIME_OBSERVATION_RECEIPT_V1: "evidence",
-    EVIDENCE_RECORD_V1: "evidence",
-    ARTIFACT_EDGE_V1: "evidence",
-    OPTIMIZER_PROPOSAL_V1: "evidence",
-    CANARY_V1: "evidence",
-    BACKUP_ENVELOPE_V1: "evidence",
-    CRYPTO_VERIFICATION_RECEIPT_V1: "evidence",
-    USAGE_EVENT_V1: "usage",
-    USAGE_BURN_REVISION_V1: "usage",
-    RATE_CARD_V1: "usage",
-    ALERT_V1: "alert",
-    NEEDS_USER_V1: "alert",
-    NEEDS_USER_REVISION_V1: "alert",
-    PROVIDER_TELEMETRY_RECEIPT_V1: "evidence",
-    PROVIDER_COVERAGE_REVISION_V1: "evidence",
-    USAGE_COUNTER_SAMPLE_V1: "usage",
-}
 
 
 def _binding(value: Mapping[str, Any]) -> tuple[str, int, int]:

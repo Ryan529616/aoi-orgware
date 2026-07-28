@@ -84,6 +84,11 @@ from .invariants import (
     UncertainDispatch,
     reduce_company_invariants,
 )
+from .projection_registry import (
+    APPEND_ONCE_WRITE_ADMISSION_TYPES as _APPEND_ONCE_WRITE_ADMISSION_TYPES,
+    PROJECTION_SPECS as _PROJECTION_SPECS,
+    ProjectionSpec as _ProjectionSpec,
+)
 
 
 READMODEL_SCHEMA_VERSION = 2
@@ -141,130 +146,6 @@ class DispatchRevisionRecord:
     command_id: str
     receipt_state: str
     payload_sha256: str
-
-
-@dataclass(frozen=True)
-class _ProjectionSpec:
-    stream: str
-    object_key_field: str
-    record_id_field: str
-
-
-_PROJECTION_SPECS = {
-    COMPANY_MANIFEST_V1: _ProjectionSpec("org", "company_id", "company_id"),
-    AUTHORITY_GRANT_V1: _ProjectionSpec("org", "grant_id", "grant_id"),
-    TAKEOVER_CAPABILITY_V1: _ProjectionSpec(
-        "org", "capability_id", "capability_id",
-    ),
-    TAKEOVER_CONSUMPTION_RECEIPT_V1: _ProjectionSpec(
-        "org", "consumption_id", "consumption_id",
-    ),
-    ORGANIZATION_NODE_V1: _ProjectionSpec("org", "node_id", "node_id"),
-    DEPARTMENT_IDENTITY_V1: _ProjectionSpec(
-        "org", "department_id", "department_id",
-    ),
-    DEPARTMENT_SNAPSHOT_V1: _ProjectionSpec(
-        "org", "department_id", "snapshot_id",
-    ),
-    CHIEF_TERM_V1: _ProjectionSpec("org", "chief_id", "chief_id"),
-    CARRIER_BINDING_V1: _ProjectionSpec(
-        "org", "carrier_id", "carrier_id",
-    ),
-    ROUTE_POLICY_V1: _ProjectionSpec("org", "policy_id", "policy_id"),
-    TASK_REVISION_V1: _ProjectionSpec(
-        "org", "task_revision_id", "task_revision_id",
-    ),
-    WORK_DEFINITION_ENFORCEMENT_V1: _ProjectionSpec(
-        "org", "gate_id", "gate_id",
-    ),
-    PROVIDER_CODEX_HOME_V1: _ProjectionSpec(
-        "execution", "home_id", "home_id",
-    ),
-    EXECUTION_NODE_V1: _ProjectionSpec(
-        "execution", "execution_id", "execution_id",
-    ),
-    DISPATCH_REQUEST_V1: _ProjectionSpec(
-        "execution", "dispatch_request_id", "dispatch_revision_id",
-    ),
-    WORK_PACKET_V1: _ProjectionSpec(
-        "execution", "packet_id", "packet_id",
-    ),
-    WORK_DISPATCH_BINDING_V1: _ProjectionSpec(
-        "execution", "dispatch_request_id", "binding_id",
-    ),
-    PROVIDER_LAUNCH_BINDING_V1: _ProjectionSpec(
-        "execution", "launch_binding_id", "launch_binding_id",
-    ),
-    PROVIDER_WORKER_OPERATION_V1: _ProjectionSpec(
-        "execution", "operation_id", "operation_id",
-    ),
-    EXECUTION_EVENT_V1: _ProjectionSpec(
-        "execution", "event_id", "event_id",
-    ),
-    CONTROL_INTENT_V1: _ProjectionSpec(
-        "execution", "control_intent_id", "control_intent_id",
-    ),
-    MUTATION_INTENT_V1: _ProjectionSpec(
-        "execution", "intent_id", "intent_id",
-    ),
-    EXTERNAL_JOB_V1: _ProjectionSpec("execution", "job_id", "job_id"),
-    EXTERNAL_JOB_EFFECT_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    WORK_RESULT_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "result_receipt_id", "result_receipt_id",
-    ),
-    EVIDENCE_RECORD_V1: _ProjectionSpec(
-        "evidence", "evidence_id", "evidence_id",
-    ),
-    PROVIDER_LIFECYCLE_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    EXECUTION_RUNTIME_OBSERVATION_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    ENGINEERING_DISPOSITION_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    PROVIDER_TELEMETRY_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    PROVIDER_WORKER_IO_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    PROVIDER_TURN_RESULT_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "result_receipt_id", "result_receipt_id",
-    ),
-    PROVIDER_COVERAGE_REVISION_V1: _ProjectionSpec(
-        "evidence", "coverage_scope_id", "revision_id",
-    ),
-    ARTIFACT_EDGE_V1: _ProjectionSpec(
-        "evidence", "edge_id", "edge_id",
-    ),
-    OPTIMIZER_PROPOSAL_V1: _ProjectionSpec(
-        "evidence", "proposal_id", "proposal_id",
-    ),
-    CANARY_V1: _ProjectionSpec("evidence", "canary_id", "canary_id"),
-    BACKUP_ENVELOPE_V1: _ProjectionSpec(
-        "evidence", "backup_id", "backup_id",
-    ),
-    CRYPTO_VERIFICATION_RECEIPT_V1: _ProjectionSpec(
-        "evidence", "receipt_id", "receipt_id",
-    ),
-    USAGE_EVENT_V1: _ProjectionSpec("usage", "usage_id", "usage_id"),
-    USAGE_COUNTER_SAMPLE_V1: _ProjectionSpec("usage", "sample_id", "sample_id"),
-    USAGE_BURN_REVISION_V1: _ProjectionSpec(
-        "usage", "burn_id", "burn_id",
-    ),
-    RATE_CARD_V1: _ProjectionSpec(
-        "usage", "rate_card_id", "rate_card_id",
-    ),
-    ALERT_V1: _ProjectionSpec("alert", "alert_id", "alert_id"),
-    NEEDS_USER_V1: _ProjectionSpec("alert", "item_id", "item_id"),
-    NEEDS_USER_REVISION_V1: _ProjectionSpec(
-        "alert", "item_id", "revision_id",
-    ),
-}
 
 
 _SCHEMA_OBJECTS = {
@@ -1337,8 +1218,10 @@ class CompanyReadModel:
             PROVIDER_WORKER_OPERATION_V1,
             PROVIDER_TURN_RESULT_RECEIPT_V1,
             EXTERNAL_JOB_V1,
+            MUTATION_INTENT_V1,
             WORK_RESULT_RECEIPT_V1,
         }
+        reducer_types.update(_APPEND_ONCE_WRITE_ADMISSION_TYPES)
         expected = {
             key: value for key, value in expected_current.items()
             if key[0] in reducer_types

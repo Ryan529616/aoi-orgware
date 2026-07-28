@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from aoi_orgware.company.contracts import company_contract_sha256
+import aoi_orgware.company.service as service_module
 from aoi_orgware.company.service import (
     CompanyServiceOperationError,
     activate_service_work_definition_enforcement,
@@ -32,6 +34,20 @@ from tests.company_v05.test_work_definition_registration import (
     _initialize,
     _work_bundle,
 )
+
+
+FIXED_SERVICE_NOW = datetime(2026, 7, 27, 0, 10, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_service_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep resident-generated events inside the deterministic grant window."""
+
+    monkeypatch.setattr(
+        service_module,
+        "_trusted_utc_now",
+        lambda: FIXED_SERVICE_NOW,
+    )
 
 
 def _chief_and_bundle(

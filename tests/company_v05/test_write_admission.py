@@ -63,7 +63,7 @@ def domain(
     binding_id: str = "write-domain-1",
     family: str = "posix-v1",
     root_namespace: str = "repo-root",
-    company_incarnation: str = "incarnation-1",
+    company_incarnation: int = 1,
     lock_domain_generation: int = 1,
     opaque: tuple[tuple[str, str], ...] = (
         ("output_namespace", "outputs"),
@@ -169,11 +169,15 @@ def test_empty_intent_is_rejected_and_cannot_authorize_write_launch() -> None:
     [
         ("domain", "contract_type", "Other"),
         ("domain", "schema_version", True),
+        ("domain", "company_incarnation", "1"),
+        ("domain", "company_incarnation", True),
         ("domain", "filesystem_family", "unknown"),
         ("domain", "provenance", "agent_reported"),
         ("domain", "observation", {"state": "unknown", "reason": "missing"}),
         ("intent", "contract_type", "Other"),
         ("intent", "schema_version", True),
+        ("intent", "company_incarnation", "1"),
+        ("intent", "company_incarnation", True),
         ("intent", "owner_kind", "worker"),
         ("intent", "task_id", None),
         ("intent", "packet_id", None),
@@ -520,7 +524,7 @@ def test_same_id_wrong_domain_is_divergence_not_coverage_unknown() -> None:
     current_domain = domain()
     stale_domain = domain(
         binding_id="write-domain-stale",
-        company_incarnation="incarnation-stale",
+        company_incarnation=2,
         lock_domain_generation=2,
     )
     candidate = intent(
@@ -614,7 +618,7 @@ def test_unreconciled_company_generation_is_coverage_unknown() -> None:
     current_domain = domain()
     old_domain = domain(
         binding_id="write-domain-old",
-        company_incarnation="incarnation-old",
+        company_incarnation=2,
         lock_domain_generation=2,
     )
     candidate = intent("candidate", write_domain=current_domain)

@@ -16,9 +16,11 @@ from aoi_orgware.company.supervisor import CompanySupervisor
 from tests.company_v05.test_company_service_chief import (
     _carrier,
     _consume,
+    _now,
     _prepare,
     _resident,
     _slot,
+    _utc,
 )
 
 
@@ -170,6 +172,7 @@ def test_department_dispatch_resumes_from_enqueue_only_after_service_restart(
     chief, departments = _chief_and_departments(slot)
     department = departments[0]
     with CompanySupervisor.open(slot) as supervisor:
+        recorded_at = _utc(_now())
         enqueue = supervisor.enqueue_department_dispatch_fenced(
             str(department["department_id"]),
             chief_id=str(chief["chief_id"]),
@@ -186,8 +189,8 @@ def test_department_dispatch_resumes_from_enqueue_only_after_service_restart(
             route_policy_id="restart-window-route",
             requested_role=f"{department['name'].lower()}_lead",
             requested_capability_tier="standard",
-            requested_at="2026-07-27T00:00:00Z",
-            recorded_at="2026-07-27T00:00:00Z",
+            requested_at=recorded_at,
+            recorded_at=recorded_at,
         )
         assert enqueue.dispatch_state == "queued"
         assert supervisor.record_by_transaction_id(

@@ -69,6 +69,17 @@ from .telemetry_policy import (
     telemetry_id,
     unknown_drop,
 )
+from .projection_registry import (
+    APPEND_ONCE_AUTHORITY_TYPES as _APPEND_ONCE_AUTHORITY_TYPES,
+    APPEND_ONCE_PROVIDER_PROJECTION_TYPES as _APPEND_ONCE_PROVIDER_PROJECTION_TYPES,
+    APPEND_ONCE_WRITE_ADMISSION_TYPES as _APPEND_ONCE_WRITE_ADMISSION_TYPES,
+    APPEND_ONCE_WORK_DEFINITION_TYPES as _APPEND_ONCE_WORK_DEFINITION_TYPES,
+    LOGICAL_ID_FIELDS as _LOGICAL_ID_FIELDS,
+)
+from .write_admission_invariants import (
+    WriteAdmissionInvariantError,
+    validate_relevant_write_admission_invariants,
+)
 
 
 MAX_ACTIVE_CARRIERS = 16
@@ -92,61 +103,6 @@ _TRANSITIONS = {
     "effect_unknown": frozenset({"dispatched", "failed_known"}),
     "dispatched": frozenset(), "failed_known": frozenset(), "cancelled": frozenset(),
 }
-_LOGICAL_ID_FIELDS = {
-    ALERT_V1: "alert_id",
-    AUTHORITY_GRANT_V1: "grant_id",
-    TAKEOVER_CAPABILITY_V1: "capability_id",
-    TAKEOVER_CONSUMPTION_RECEIPT_V1: "consumption_id",
-    ORGANIZATION_NODE_V1: "node_id",
-    DEPARTMENT_IDENTITY_V1: "department_id",
-    DEPARTMENT_SNAPSHOT_V1: "department_id",
-    CHIEF_TERM_V1: "chief_id",
-    CARRIER_BINDING_V1: "carrier_id",
-    EXECUTION_NODE_V1: "execution_id",
-    DISPATCH_REQUEST_V1: "dispatch_request_id",
-    EXTERNAL_JOB_EFFECT_RECEIPT_V1: "receipt_id",
-    EXTERNAL_JOB_V1: "job_id",
-    MUTATION_INTENT_V1: "intent_id",
-    PROVIDER_LIFECYCLE_RECEIPT_V1: "receipt_id",
-    ENGINEERING_DISPOSITION_RECEIPT_V1: "receipt_id",
-    EXECUTION_RUNTIME_OBSERVATION_RECEIPT_V1: "receipt_id",
-    PROVIDER_TELEMETRY_RECEIPT_V1: "receipt_id",
-    PROVIDER_COVERAGE_REVISION_V1: "coverage_scope_id",
-    USAGE_COUNTER_SAMPLE_V1: "sample_id",
-    NEEDS_USER_REVISION_V1: "item_id",
-    EVIDENCE_RECORD_V1: "evidence_id",
-    EXECUTION_EVENT_V1: "event_id",
-    CONTROL_INTENT_V1: "control_intent_id",
-    TASK_REVISION_V1: "task_revision_id",
-    WORK_PACKET_V1: "packet_id",
-    WORK_DISPATCH_BINDING_V1: "dispatch_request_id",
-    WORK_RESULT_RECEIPT_V1: "result_receipt_id",
-    WORK_DEFINITION_ENFORCEMENT_V1: "gate_id",
-    PROVIDER_CODEX_HOME_V1: "home_id",
-    PROVIDER_LAUNCH_BINDING_V1: "launch_binding_id",
-    PROVIDER_WORKER_IO_RECEIPT_V1: "receipt_id",
-    PROVIDER_WORKER_OPERATION_V1: "operation_id",
-    PROVIDER_TURN_RESULT_RECEIPT_V1: "result_receipt_id",
-}
-
-# These work-definition records are immutable facts, not revision streams.
-# Exact replay belongs to the ledger transaction identity; a later generic
-# transaction must not reinterpret their logical ID as an upsert key.
-_APPEND_ONCE_WORK_DEFINITION_TYPES = frozenset({
-    TASK_REVISION_V1,
-    WORK_PACKET_V1,
-    WORK_RESULT_RECEIPT_V1,
-    WORK_DISPATCH_BINDING_V1,
-    WORK_DEFINITION_ENFORCEMENT_V1,
-})
-
-_APPEND_ONCE_PROVIDER_PROJECTION_TYPES = frozenset({
-    PROVIDER_LAUNCH_BINDING_V1,
-    PROVIDER_WORKER_IO_RECEIPT_V1,
-    PROVIDER_TURN_RESULT_RECEIPT_V1,
-})
-
-
 class CompanyInvariantError(ValueError):
     """A cross-record company invariant is not satisfied."""
 
@@ -451,8 +407,17 @@ def _validate_transaction_authority(
     ]
     if len(matches) != 1:
         _error("transaction authority lacks one exact durable grant")
+    grant = matches[0].payload
+    issued_at = _parsed_time(str(grant["issued_at"]))
+    expires_at = grant.get("expires_at")
+    if expires_at is None or any(
+        not issued_at <= _parsed_time(str(event["recorded_at"]))
+        < _parsed_time(str(expires_at))
+        for event in request["events"]
+    ):
+        _error("transaction authority grant is unavailable at event fence")
     try:
-        derived = authority_from_grant(matches[0].payload)
+        derived = authority_from_grant(grant)
     except CompanyContractError as exc:
         raise CompanyInvariantError(
             f"transaction authority grant is invalid: {exc}",
@@ -5857,18 +5822,24 @@ def _validate_resolution(
     return tuple(remaining)
 
 
-def _validate_append_once_work_definition_ids(
+def _validate_append_once_projection_ids(
     old_objects: Mapping[tuple[str, str], InvariantObject],
     batch: Sequence[InvariantObject],
 ) -> None:
-    """Reject generic commits that would overwrite immutable work facts."""
+    """Reject generic commits that would overwrite immutable projected facts."""
 
     for item in batch:
-        if item.contract_type not in _APPEND_ONCE_WORK_DEFINITION_TYPES:
+        if item.contract_type in _APPEND_ONCE_AUTHORITY_TYPES:
+            error = "immutable authority grant logical ID is already durable"
+        elif item.contract_type in _APPEND_ONCE_WORK_DEFINITION_TYPES:
+            error = "immutable work definition logical ID is already durable"
+        elif item.contract_type in _APPEND_ONCE_WRITE_ADMISSION_TYPES:
+            error = "immutable write-admission logical ID is already durable"
+        else:
             continue
         key = (item.contract_type, _logical_key(item))
         if key in old_objects:
-            _error("immutable work definition logical ID is already durable")
+            _error(error)
 
 
 def _validate_work_definitions(
@@ -7071,7 +7042,7 @@ def reduce_company_invariants(
             if key in seen_batch:
                 _error("transaction has duplicate invariant object revisions")
             seen_batch.add(key)
-        _validate_append_once_work_definition_ids(objects_by_key, batch)
+        _validate_append_once_projection_ids(objects_by_key, batch)
         _validate_work_definitions(objects_by_key, batch, request)
         _validate_provider_worker_projection(
             objects_by_key, batch, request, receipt_state,
@@ -7148,6 +7119,18 @@ def reduce_company_invariants(
             batch,
             request,
         )
+        try:
+            validate_relevant_write_admission_invariants(
+                old_objects,
+                batch,
+                shadows,
+                request,
+                receipt_state,
+            )
+        except WriteAdmissionInvariantError as exc:
+            raise CompanyInvariantError(
+                f"write admission invariant is invalid: {exc}",
+            ) from exc
         if receipt_state == "committed":
             for item in batch:
                 objects_by_key[(item.contract_type, _logical_key(item))] = item
@@ -7163,6 +7146,18 @@ def reduce_company_invariants(
     if transition is None:
         _validate_work_definitions(objects_by_key, (), None)
         _validate_provider_worker_projection(objects_by_key, (), None, None)
+        try:
+            validate_relevant_write_admission_invariants(
+                old_objects,
+                (),
+                shadows,
+                None,
+                None,
+            )
+        except WriteAdmissionInvariantError as exc:
+            raise CompanyInvariantError(
+                f"write admission invariant is invalid: {exc}",
+            ) from exc
 
     final_objects = tuple(objects_by_key.values())
     _validate_chief_graph(objects_by_key)
