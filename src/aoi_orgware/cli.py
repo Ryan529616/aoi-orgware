@@ -118,6 +118,15 @@ from .commands.context_memory import (
     cmd_context_receipt_record,
     register_context_memory_commands,
 )
+from .commands.company_runtime import (
+    CompanyRuntimeCommandError,
+    cmd_dashboard_open,
+    cmd_dashboard_url,
+    cmd_supervisor_ensure,
+    cmd_supervisor_status,
+    cmd_supervisor_stop,
+    register_company_runtime_commands,
+)
 from .commands.coordination import (
     CoordinationCmdServices,
     cmd_baseline_freeze,
@@ -754,8 +763,14 @@ CHIEF_STANDALONE_WRITER_COMMANDS = {
     "pilot-init",
     "pilot-summary",
 }
+CHIEF_STANDALONE_RUNTIME_COMMANDS = {
+    "dashboard",
+    "supervisor",
+}
 CHIEF_STANDALONE_COMMANDS = (
-    CHIEF_STANDALONE_READ_ONLY_COMMANDS | CHIEF_STANDALONE_WRITER_COMMANDS
+    CHIEF_STANDALONE_READ_ONLY_COMMANDS
+    | CHIEF_STANDALONE_WRITER_COMMANDS
+    | CHIEF_STANDALONE_RUNTIME_COMMANDS
 )
 KNOWN_MANAGED_POLICY_SHA256 = {
     # AOI v0.1.3 packaged policy; safe one-way replacement during authenticated init.
@@ -783,6 +798,7 @@ def command_requires_chief(command: str, *, initialized: bool) -> bool:
         | CHIEF_PROJECT_READ_ONLY_COMMANDS
         | CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS
         | CHIEF_STANDALONE_READ_ONLY_COMMANDS
+        | CHIEF_STANDALONE_RUNTIME_COMMANDS
     )
 
 
@@ -8188,6 +8204,18 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
+    register_company_runtime_commands(
+        sub,
+        handlers={
+            "supervisor_ensure": cmd_supervisor_ensure,
+            "supervisor_status": cmd_supervisor_status,
+            "supervisor_stop": cmd_supervisor_stop,
+            "dashboard_url": cmd_dashboard_url,
+            "dashboard_open": cmd_dashboard_open,
+        },
+        add_json_argument=add_json_argument,
+    )
+
     mini_completion_services = _mini_completion_services(task_lifecycle_services)
     register_task_lifecycle_commands(
         sub,
@@ -8891,7 +8919,7 @@ def main(argv: list[str] | None = None) -> int:
         if args._aoi_command != command:
             raise HarnessError("parsed command differs from normalized command routing")
         return _execute_project_command(args, paths, initialized=initialized)
-    except (HarnessError, PilotError) as exc:
+    except (HarnessError, PilotError, CompanyRuntimeCommandError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

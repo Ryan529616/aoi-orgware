@@ -3,20 +3,29 @@ from __future__ import annotations
 import io
 import json
 import hashlib
+import math
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from aoi_orgware import codex_app_server_stdio as stdio
 from aoi_orgware import codex_transport_contracts as contracts
+from aoi_orgware.company.codex_adapter import (
+    ThreadTokenUsageUpdated,
+    parse_codex_notification,
+)
 from aoi_orgware.codex_app_server_stdio import (
     AppServerError,
+    AppServerLaunchSpec,
     AppServerResponseError,
+    ClientNotificationJournalEntry,
+    ClientNotificationPhase,
     CodexAppServerStdio,
     ProcessJournalEntry,
     ProtocolViolation,
@@ -232,7 +241,8 @@ if scenario == "model_rerouted_live":
     raise SystemExit(0)
 if scenario == "auxiliary_notifications":
     send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"not persisted by AOI"}})
-    send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","tokenUsage":{"totalTokens":1}}})
+    token_vector = {"inputTokens":1,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":3}
+    send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":token_vector,"last":token_vector}}})
 if scenario == "interrupt_active":
     interrupt = read()
     assert "jsonrpc" not in interrupt
@@ -701,7 +711,714 @@ def test_lifecycle_buffers_event_before_response_and_records_aggregate(fake_serv
         client.close()
 
 
+def test_transport_neutral_launch_spec_uses_the_legacy_adapter_flow(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    prompt = "hello"
+    spec = AppServerLaunchSpec(
+        cwd=tmp_path.resolve().as_posix(),
+        model="gpt-5.6-terra",
+        effort="medium",
+        sandbox="readOnly",
+        prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        prompt_size_bytes=len(prompt.encode("utf-8")),
+        executable_path=Path(sys.executable).resolve().as_posix(),
+    )
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        thread_id = client.start_thread_from_intent(intent=spec)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt=prompt, intent=spec
+        )
+        assert client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        ).terminal_status == "completed"
+    finally:
+        client.close()
+
+
+def test_observe_turn_event_callback_receives_accepted_exact_wire_bytes(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    accepted: list[RuntimeEvent] = []
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        observation = client.observe_turn(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            timeout_seconds=3,
+            on_event=accepted.append,
+        )
+        assert accepted == list(observation.events)
+        assert [event.wire_bytes for event in accepted] == [
+            event.wire_bytes for event in observation.events
+        ]
+        assert all(
+            hashlib.sha256(event.wire_bytes).hexdigest() == event.sha256
+            for event in accepted
+        )
+    finally:
+        client.close()
+
+
+def test_observe_turn_rejects_before_event_callback() -> None:
+    invalid_events = (
+        RuntimeEvent(
+            "turn/started",
+            {"threadId": "other", "turn": {"id": "turn-1", "items": [], "status": "inProgress"}},
+            "a" * 64,
+            b'{"method":"turn/started"}\n',
+        ),
+        RuntimeEvent(
+            "item/started",
+            {"threadId": "thread-1", "turnId": "turn-1", "item": {"id": "item-1", "type": "agentMessage", "text": "ok"}},
+            "b" * 64,
+            b'{"method":"item/started"}\n',
+        ),
+    )
+    for event in invalid_events:
+        client = object.__new__(CodexAppServerStdio)
+        client._notifications = [event]
+        accepted: list[RuntimeEvent] = []
+        with pytest.raises(ProtocolViolation):
+            client.observe_turn(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                timeout_seconds=1,
+                on_event=accepted.append,
+            )
+        assert accepted == []
+
+
+def test_observe_turn_event_callback_failure_fails_closed(fake_server: Path, tmp_path: Path) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def fail_callback(_event: RuntimeEvent) -> None:
+            raise RuntimeError("callback-secret")
+
+        with pytest.raises(AppServerError, match="event callback failed") as caught:
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=3,
+                on_event=fail_callback,
+            )
+        assert "callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert client._turn_terminal is False
+        assert client._terminal_stream_phase.value == "aborted"
+        assert type(client._reader_error) is AppServerError
+        assert str(client._reader_error) == "observe_turn event callback failed"
+        with pytest.raises(AppServerError, match="event callback failed"):
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=3,
+            )
+        with pytest.raises(RuntimeDisconnected, match="not eligible for a clean seal"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+    finally:
+        client.close()
+
+
+def test_observe_turn_base_exception_callback_failure_fails_closed(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def interrupt_callback(_event: RuntimeEvent) -> None:
+            raise KeyboardInterrupt("callback-secret")
+
+        with pytest.raises(AppServerError, match="event callback failed") as caught:
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=3,
+                on_event=interrupt_callback,
+            )
+        assert "callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert client._turn_terminal is False
+        assert client._terminal_stream_phase.value == "aborted"
+        with pytest.raises(AppServerError, match="event callback failed"):
+            client.observe_turn(
+                thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+            )
+        with pytest.raises(RuntimeDisconnected, match="not eligible for a clean seal"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("late_method", ["turn/started", "turn/completed"])
+def test_observe_turn_late_callback_aborts_terminal_eligibility(
+    fake_server: Path, tmp_path: Path, late_method: str
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callbacks: list[str] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def late_callback(event: RuntimeEvent) -> None:
+            callbacks.append(event.method)
+            if event.method == late_method:
+                time.sleep(0.08)
+
+        with pytest.raises(
+            RuntimeDisconnected, match="turn observation deadline expired"
+        ):
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=0.02,
+                on_event=late_callback,
+            )
+
+        assert late_method in callbacks
+        assert client._turn_terminal is False
+        assert client._terminal_stream_phase.value == "aborted"
+        with pytest.raises(RuntimeDisconnected, match="not eligible for a clean seal"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+    finally:
+        client.close()
+
+
+def test_observe_and_terminal_seal_serialize_callback_abort(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observer_errors: list[BaseException] = []
+    seal_errors: list[BaseException] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def fail_after_barrier(_event: RuntimeEvent) -> None:
+            callback_entered.set()
+            assert release_callback.wait(timeout=3)
+            raise RuntimeError("callback-secret")
+
+        def observe() -> None:
+            try:
+                client.observe_turn(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    timeout_seconds=3,
+                    on_event=fail_after_barrier,
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        def seal() -> None:
+            try:
+                client.seal_reader_for_terminal_commit(timeout_seconds=3)
+            except BaseException as exc:
+                seal_errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert callback_entered.wait(timeout=2)
+        sealer = threading.Thread(target=seal)
+        sealer.start()
+        time.sleep(0.1)
+        assert client._terminal_stream_phase.value == "open"
+        assert sealer.is_alive()
+
+        release_callback.set()
+        observer.join(timeout=3)
+        sealer.join(timeout=3)
+
+        assert not observer.is_alive()
+        assert not sealer.is_alive()
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], AppServerError)
+        assert len(seal_errors) == 1
+        assert isinstance(seal_errors[0], RuntimeDisconnected)
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def test_lifecycle_serialization_timeout_aborts_stalled_callback(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observer_errors: list[BaseException] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def stall_callback(_event: RuntimeEvent) -> None:
+            callback_entered.set()
+            assert release_callback.wait(timeout=3)
+
+        def observe() -> None:
+            try:
+                client.observe_turn(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    timeout_seconds=3,
+                    on_event=stall_callback,
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert callback_entered.wait(timeout=2)
+
+        started = time.monotonic()
+        with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+            client.observe_turn(
+                thread_id=thread_id, turn_id=turn_id, timeout_seconds=0.1
+            )
+        assert time.monotonic() - started < 0.5
+
+        started = time.monotonic()
+        with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=0.1)
+        assert time.monotonic() - started < 0.5
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
+
+        release_callback.set()
+        observer.join(timeout=3)
+        assert not observer.is_alive()
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], RuntimeDisconnected)
+        assert client._terminal_stream_phase.value == "aborted"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("abort_mode", ["contender", "reentrant"])
+def test_global_abort_preserves_later_buffered_events_after_callback(
+    abort_mode: str,
+) -> None:
+    client = object.__new__(CodexAppServerStdio)
+    first = RuntimeEvent(
+        "item/started",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "startedAtMs": 1,
+            "item": {"id": "item-1", "type": "agentMessage", "text": "first"},
+        },
+        "a" * 64,
+        b"first\n",
+    )
+    later = RuntimeEvent(
+        "item/started",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "startedAtMs": 2,
+            "item": {"id": "item-2", "type": "agentMessage", "text": "later"},
+        },
+        "b" * 64,
+        b"later\n",
+    )
+    client._notifications = [first, later]
+    client._turn_lifecycle_lock = threading.Lock()
+    client._reader_condition = threading.Condition()
+    client._terminal_stream_phase = stdio._TerminalStreamPhase.OPEN
+    client._turn_terminal = False
+    client._reader_error = None
+    client._event_callback_failed = False
+    callbacks: list[RuntimeEvent] = []
+
+    if abort_mode == "reentrant":
+
+        def callback(event: RuntimeEvent) -> None:
+            callbacks.append(event)
+            with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+                client.observe_turn(
+                    thread_id="thread-1", turn_id="turn-1", timeout_seconds=0.01
+                )
+
+        with pytest.raises(RuntimeDisconnected, match="not eligible after terminal stream transition"):
+            client.observe_turn(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                timeout_seconds=1,
+                on_event=callback,
+            )
+    else:
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        observer_errors: list[BaseException] = []
+
+        def callback(event: RuntimeEvent) -> None:
+            callbacks.append(event)
+            callback_entered.set()
+            assert release_callback.wait(timeout=3)
+
+        def observe() -> None:
+            try:
+                client.observe_turn(
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                    timeout_seconds=1,
+                    on_event=callback,
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert callback_entered.wait(timeout=1)
+        with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+            client.observe_turn(thread_id="thread-1", turn_id="turn-1", timeout_seconds=0.01)
+        release_callback.set()
+        observer.join(timeout=1)
+        assert not observer.is_alive()
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], RuntimeDisconnected)
+
+    assert callbacks == [first]
+    assert client._notifications == [later]
+    assert client._terminal_stream_phase.value == "aborted"
+
+
+def test_global_abort_preserves_live_event_waiting_in_next_incoming() -> None:
+    entered_get = threading.Event()
+    release_event = threading.Event()
+    params: dict[str, Any] = {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "startedAtMs": 1,
+        "item": {"id": "item-1", "type": "agentMessage", "text": "live"},
+    }
+    message = {
+        "method": "item/started",
+        "params": params,
+    }
+    raw = b'{"method":"item/started"}\n'
+
+    class IncomingAfterAbort:
+        def get(self, *, timeout: float) -> tuple[str, object]:
+            entered_get.set()
+            assert release_event.wait(timeout=3)
+            return ("notification", (message, raw))
+
+    client = object.__new__(CodexAppServerStdio)
+    client._notifications = []
+    client._turn_lifecycle_lock = threading.Lock()
+    client._reader_condition = threading.Condition()
+    client._terminal_stream_phase = stdio._TerminalStreamPhase.OPEN
+    client._turn_terminal = False
+    client._reader_error = None
+    client._event_callback_failed = False
+    client._reroute_persistence_inflight = 0
+    client._incoming = IncomingAfterAbort()  # type: ignore[assignment]
+    client._seen_events = {}
+    client.max_events = 8
+    callbacks: list[RuntimeEvent] = []
+    observer_errors: list[BaseException] = []
+
+    def observe() -> None:
+        try:
+            client.observe_turn(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                timeout_seconds=1,
+                on_event=callbacks.append,
+            )
+        except BaseException as exc:
+            observer_errors.append(exc)
+
+    observer = threading.Thread(target=observe)
+    observer.start()
+    assert entered_get.wait(timeout=1)
+    with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+        client.observe_turn(thread_id="thread-1", turn_id="turn-1", timeout_seconds=0.01)
+    release_event.set()
+    observer.join(timeout=1)
+
+    assert not observer.is_alive()
+    assert len(observer_errors) == 1
+    assert isinstance(observer_errors[0], RuntimeDisconnected)
+    assert callbacks == []
+    assert client._notifications == [
+        RuntimeEvent("item/started", params, hashlib.sha256(raw).hexdigest(), raw)
+    ]
+    assert client._terminal_stream_phase.value == "aborted"
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [math.nan, math.inf, -math.inf, 0.0, -1.0, True, "1", threading.TIMEOUT_MAX * 2, 10**10000],
+    ids=[
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "zero",
+        "negative",
+        "bool",
+        "non-numeric",
+        "over-timeout-max",
+        "conversion-overflow",
+    ],
+)
+@pytest.mark.parametrize("operation", ["observe", "seal"])
+def test_public_lifecycle_timeouts_reject_invalid_or_unwaitable_before_lock(
+    timeout_seconds: object, operation: str
+) -> None:
+    class LockMustNotRun:
+        def acquire(self, *args: object, **kwargs: object) -> bool:
+            raise AssertionError("platform lifecycle lock was called")
+
+        def release(self) -> None:
+            raise AssertionError("platform lifecycle lock was released")
+
+    client = object.__new__(CodexAppServerStdio)
+    client._turn_lifecycle_lock = LockMustNotRun()  # type: ignore[assignment]
+    client._terminal_stream_phase = stdio._TerminalStreamPhase.OPEN
+    client._turn_terminal = False
+    client._reader_error = None
+    with pytest.raises(ValueError, match="finite positive number"):
+        if operation == "observe":
+            client.observe_turn(
+                thread_id="thread-1", turn_id="turn-1", timeout_seconds=timeout_seconds  # type: ignore[arg-type]
+            )
+        else:
+            client.seal_reader_for_terminal_commit(timeout_seconds=timeout_seconds)  # type: ignore[arg-type]
+    assert client._terminal_stream_phase is stdio._TerminalStreamPhase.OPEN
+    assert client._turn_terminal is False
+    assert client._reader_error is None
+
+
+def test_concurrent_observers_cannot_accept_after_terminal_observation(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observations: list[object] = []
+    observer_errors: list[BaseException] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def pause_first_callback(_event: RuntimeEvent) -> None:
+            if not callback_entered.is_set():
+                callback_entered.set()
+                assert release_callback.wait(timeout=3)
+
+        def first_observer() -> None:
+            observations.append(
+                client.observe_turn(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    timeout_seconds=3,
+                    on_event=pause_first_callback,
+                )
+            )
+
+        def second_observer() -> None:
+            try:
+                client.observe_turn(
+                    thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        first = threading.Thread(target=first_observer)
+        first.start()
+        assert callback_entered.wait(timeout=2)
+        second = threading.Thread(target=second_observer)
+        second.start()
+        time.sleep(0.1)
+        assert second.is_alive()
+
+        release_callback.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(observations) == 1
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], AppServerError)
+        assert "after terminal completion" in str(observer_errors[0])
+        assert client._turn_terminal is True
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("reroute_first", [False, True])
+def test_callback_abort_preserves_reroute_evidence_precedence(
+    fake_server: Path, tmp_path: Path, reroute_first: bool
+) -> None:
+    client = _client(fake_server, tmp_path)
+    client._model_intent = _intent(tmp_path)
+    persisted: list[bytes] = []
+    def persist_rejected(
+        observed: RuntimeEvent | RejectedNotificationWire,
+    ) -> dict[str, object]:
+        persisted.append(observed.wire_bytes)
+        return {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+
+    def fail_callback(_event: RuntimeEvent) -> None:
+        raise RuntimeError("callback-secret")
+
+    client.on_rejected_notification = persist_rejected
+    raw = (
+        b'{"method":"item/started","params":{"threadId":"thread-1",'
+        b'"turnId":"turn-1","startedAtMs":2,"item":{"id":"item-1",'
+        b'"type":"agentMessage","text":"ok"}}}\n'
+    )
+    client._notifications.append(
+        RuntimeEvent(
+            "item/started",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 2,
+                "item": {"id": "item-1", "type": "agentMessage", "text": "ok"},
+            },
+            hashlib.sha256(raw).hexdigest(),
+            raw,
+        )
+    )
+    reroute, reroute_raw = _reroute_wire()
+
+    if reroute_first:
+        client._classify_incoming(reroute, reroute_raw)
+
+    with pytest.raises(AppServerError, match="event callback failed"):
+        client.observe_turn(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            timeout_seconds=1,
+            on_event=fail_callback,
+        )
+
+    if not reroute_first:
+        client._classify_incoming(reroute, reroute_raw)
+
+    assert persisted == [reroute_raw]
+    assert isinstance(client._reader_error, ModelReroutedViolation)
+    assert client._reader_error.evidence_sha256 == hashlib.sha256(reroute_raw).hexdigest()
+    assert client._reader_error.evidence_size_bytes == len(reroute_raw)
+    assert client._event_callback_failed is True
+    assert client._terminal_stream_phase.value == "aborted"
+    with pytest.raises(ModelReroutedViolation) as caught:
+        client.observe_turn(thread_id="thread-1", turn_id="turn-1", timeout_seconds=1)
+    assert caught.value.evidence_sha256 == hashlib.sha256(reroute_raw).hexdigest()
+    assert caught.value.evidence_size_bytes == len(reroute_raw)
+
+
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_runtime_event_json_payload_bytes_is_company_parser_outer_framing_equivalent(
+    line_ending: bytes,
+) -> None:
+    payload = (
+        b'{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1",'
+        b'"turnId":"turn-1","tokenUsage":{"total":{"inputTokens":1,'
+        b'"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,'
+        b'"totalTokens":3},"last":{"inputTokens":1,"cachedInputTokens":0,'
+        b'"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":3}}}}'
+    )
+    wire = payload + line_ending
+    event = RuntimeEvent(
+        "thread/tokenUsage/updated",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+                "last": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+            },
+        },
+        hashlib.sha256(wire).hexdigest(),
+        wire,
+    )
+    assert event.json_payload_bytes == payload
+    parsed = parse_codex_notification(event.json_payload_bytes)
+    assert isinstance(parsed, ThreadTokenUsageUpdated)
+    assert parsed.total.total_tokens == 3
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b' {"method":"warning","params":{}}',
+        b'{"method":"warning","params":{}} ',
+        b'{"method":"warning","params":{},"extra":true}',
+        b'{"method":"warning","method":"warning","params":{}}',
+    ],
+    ids=("leading-whitespace", "trailing-whitespace", "extra-envelope", "duplicate-key"),
+)
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_runtime_event_json_payload_bytes_rejects_non_parser_equivalent_outer_framing(
+    payload: bytes, line_ending: bytes
+) -> None:
+    wire = payload + line_ending
+    event = RuntimeEvent(
+        "warning",
+        {},
+        hashlib.sha256(wire).hexdigest(),
+        wire,
+    )
+    with pytest.raises(ProtocolViolation):
+        _ = event.json_payload_bytes
+
+
 def test_pinned_auxiliary_notifications_do_not_break_lifecycle(fake_server: Path, tmp_path: Path) -> None:
+    accepted: list[RuntimeEvent] = []
     client = _initialized_client(fake_server, tmp_path, "auxiliary_notifications")
     try:
         intent = _intent(tmp_path)
@@ -710,7 +1427,10 @@ def test_pinned_auxiliary_notifications_do_not_break_lifecycle(fake_server: Path
             thread_id=thread_id, prompt="hello", intent=intent
         )
         observation = client.observe_turn(
-            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+            thread_id=thread_id,
+            turn_id=turn_id,
+            timeout_seconds=3,
+            on_event=accepted.append,
         )
         assert observation.terminal_status == "completed"
         assert "item/agentMessage/delta" in {
@@ -719,6 +1439,45 @@ def test_pinned_auxiliary_notifications_do_not_break_lifecycle(fake_server: Path
         assert "thread/tokenUsage/updated" in {
             event.method for event in observation.events
         }
+        token_events = [
+            event for event in accepted if event.method == "thread/tokenUsage/updated"
+        ]
+        assert len(token_events) == 1
+        assert token_events[0].wire_bytes == next(
+            event.wire_bytes
+            for event in observation.events
+            if event.method == "thread/tokenUsage/updated"
+        )
+        assert json.loads(token_events[0].wire_bytes)["params"] == {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+                "last": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+            },
+        }
+        token_event = token_events[0]
+        assert token_event.wire_bytes.endswith(b"\n")
+        assert hashlib.sha256(token_event.wire_bytes).hexdigest() == token_event.sha256
+        expected_payload = token_event.wire_bytes.removesuffix(b"\n").removesuffix(b"\r")
+        assert token_event.json_payload_bytes == expected_payload
+        assert hashlib.sha256(token_event.json_payload_bytes).hexdigest() != token_event.sha256
+        parsed = parse_codex_notification(token_event.json_payload_bytes)
+        assert isinstance(parsed, ThreadTokenUsageUpdated)
+        assert parsed.total.total_tokens == 3
+        assert parsed.last.total_tokens == 3
     finally:
         client.close()
 
@@ -986,6 +1745,94 @@ def test_terminal_stream_seal_drains_reroute_emitted_after_stdin_eof(
         assert client._terminal_stream_phase.value == "aborted"
         assert client._stdout_reader_done is True
         assert client._process is None
+    finally:
+        client.close()
+
+
+_TERMINAL_SEAL_LATE_QUEUE_CASES: list[tuple[str, Any]] = [
+    (
+        "notification",
+        (
+            {"method": "warning", "params": {"message": "late"}},
+            b'{"method":"warning","params":{"message":"late"}}\n',
+        ),
+    ),
+    (
+        "notification",
+        (
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "items": [], "status": "failed"},
+                },
+            },
+            b'{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"failed"}}}\n',
+        ),
+    ),
+    ("response", ({"id": 99, "result": {}}, b'{"id":99,"result":{}}\n')),
+    ("server_request", {"id": 99, "method": "tool/requestUserInput", "params": {}}),
+    ("eof", None),
+]
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    _TERMINAL_SEAL_LATE_QUEUE_CASES,
+    ids=("late-notification", "conflicting-terminal", "late-response", "late-request", "duplicate-eof"),
+)
+def test_terminal_stream_seal_rejects_every_late_or_duplicate_queue_entry(
+    fake_server: Path, tmp_path: Path, kind: str, payload: Any
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        assert client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        ).terminal_status == "completed"
+        client._incoming.put_nowait((kind, payload))
+
+        with pytest.raises(RuntimeDisconnected, match="late protocol data or invalid EOF"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def test_terminal_stream_seal_rejects_buffered_ordinary_notification(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        assert client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        ).terminal_status == "completed"
+        raw = b'{"method":"warning","params":{"message":"buffered"}}\n'
+        client._notifications.append(
+            RuntimeEvent(
+                "warning",
+                {"message": "buffered"},
+                hashlib.sha256(raw).hexdigest(),
+                raw,
+            )
+        )
+
+        with pytest.raises(RuntimeDisconnected, match="late protocol data or invalid EOF"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
     finally:
         client.close()
 
@@ -1682,6 +2529,8 @@ def test_send_pending_precedes_write_and_error_response_uses_rejected_sink(
     try:
         with pytest.raises(AppServerError, match="request was not written"):
             client.initialize()
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
         assert len(pending) == 1
         assert client.last_receipt is not None and client.last_receipt.phase is RequestPhase.BEFORE_SEND
     finally:
@@ -1711,6 +2560,322 @@ def test_send_pending_precedes_write_and_error_response_uses_rejected_sink(
         assert "no" not in str(caught.value)
     finally:
         error_client.close()
+
+
+def test_initialized_notification_is_journaled_before_and_after_the_exact_write(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    order: list[tuple[str, object]] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_send_pending=lambda entry: order.append(("request", entry)),
+        on_client_notification_send_pending=lambda entry: order.append(
+            ("notification_pending", entry)
+        ),
+        on_client_notification_written=lambda entry: order.append(
+            ("notification_written", entry)
+        ),
+    )
+    client.start()
+    try:
+        client.initialize()
+        assert [kind for kind, _entry in order] == [
+            "request",
+            "notification_pending",
+            "notification_written",
+        ]
+        pending = order[1][1]
+        written = order[2][1]
+        assert isinstance(pending, ClientNotificationJournalEntry)
+        assert isinstance(written, ClientNotificationJournalEntry)
+        assert pending.phase is ClientNotificationPhase.SEND_PENDING
+        assert written.phase is ClientNotificationPhase.WRITE_COMPLETED
+        assert pending.method == written.method == "initialized"
+        assert pending.wire_bytes == written.wire_bytes == b'{"method":"initialized"}\n'
+        assert pending.sha256 == written.sha256 == hashlib.sha256(
+            pending.wire_bytes
+        ).hexdigest()
+    finally:
+        client.close()
+
+
+def test_initialized_notification_pre_callback_failure_writes_no_notification_bytes(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    class RecordingStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.flushes = 0
+
+        def write(self, payload: bytes) -> None:
+            self.writes.append(payload)
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    entries: list[ClientNotificationJournalEntry] = []
+    failure = KeyboardInterrupt("pending-callback-secret")
+
+    def reject_pending(entry: ClientNotificationJournalEntry) -> None:
+        entries.append(entry)
+        raise failure
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_client_notification_send_pending=reject_pending,
+    )
+    client.start()
+    actual_process = client._process
+    assert actual_process is not None
+    recording_stdin = RecordingStdin()
+    client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=recording_stdin))
+    try:
+        with pytest.raises(AppServerError, match="notification was not written") as caught:
+            client._send_notification("initialized")
+        assert "pending-callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert len(entries) == 1
+        assert entries[0].phase is ClientNotificationPhase.SEND_PENDING
+        assert recording_stdin.writes == []
+        assert recording_stdin.flushes == 0
+    finally:
+        client._process = actual_process
+        client.close()
+
+
+def test_initialize_post_write_callback_failure_is_one_shot_and_never_resends(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    requests: list[RequestJournalEntry] = []
+    notifications: list[ClientNotificationJournalEntry] = []
+    failure = ValueError("written-callback-secret")
+
+    def reject_written(entry: ClientNotificationJournalEntry) -> None:
+        notifications.append(entry)
+        raise failure
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_send_pending=requests.append,
+        on_client_notification_send_pending=notifications.append,
+        on_client_notification_written=reject_written,
+    )
+    client.start()
+    try:
+        with pytest.raises(AppServerError, match="notification may have been written") as caught:
+            client.initialize()
+        assert "written-callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
+        assert [entry.method for entry in requests] == ["initialize"]
+        assert [entry.phase for entry in notifications] == [
+            ClientNotificationPhase.SEND_PENDING,
+            ClientNotificationPhase.WRITE_COMPLETED,
+        ]
+        assert notifications[0].wire_bytes == notifications[1].wire_bytes
+        assert notifications[0].sha256 == notifications[1].sha256
+    finally:
+        client.close()
+
+
+def test_initialize_write_failure_is_one_shot_and_never_resends(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.flushes = 0
+
+        def write(self, payload: bytes) -> None:
+            self.writes.append(payload)
+            raise OSError("injected notification write failure")
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    request_methods: list[str] = []
+
+    def successful_initialize_request(
+        method: str, params: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        request_methods.append(method)
+        assert params["clientInfo"] == {"name": "aoi-orgware", "version": "0.4"}
+        assert "validate_result" in kwargs
+        return {"model": "gpt-5.6"}
+
+    client = _client(fake_server, tmp_path)
+    failing_stdin = FailingStdin()
+    client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=failing_stdin))
+    monkeypatch.setattr(client, "request", successful_initialize_request)
+
+    with pytest.raises(RuntimeDisconnected, match="notification may have been written") as caught:
+        client.initialize()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    with pytest.raises(AppServerError, match="initialize may be called only once"):
+        client.initialize()
+
+    assert request_methods == ["initialize"]
+    assert failing_stdin.writes == [b'{"method":"initialized"}\n']
+    assert failing_stdin.flushes == 0
+
+
+def test_initialize_short_or_invalid_notification_write_is_ambiguous_and_never_resends(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ShortWritingStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.flushes = 0
+
+        def write(self, payload: bytes) -> object:
+            self.writes.append(payload)
+            return write_result
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    for write_result in (0, 5, 24, None, "write-result-secret"):
+        request_methods: list[str] = []
+
+        def successful_initialize_request(
+            method: str, _params: dict[str, Any], **_kwargs: Any
+        ) -> dict[str, Any]:
+            request_methods.append(method)
+            return {"model": "gpt-5.6"}
+
+        notifications: list[ClientNotificationJournalEntry] = []
+        client = _client(
+            fake_server,
+            tmp_path,
+            on_client_notification_send_pending=notifications.append,
+            on_client_notification_written=notifications.append,
+        )
+        stdin = ShortWritingStdin()
+        client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=stdin))
+        monkeypatch.setattr(client, "request", successful_initialize_request)
+
+        with pytest.raises(RuntimeDisconnected, match="notification may have been written") as caught:
+            client.initialize()
+        assert "write-result-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
+        assert request_methods == ["initialize"]
+        assert stdin.writes == [b'{"method":"initialized"}\n']
+        assert stdin.flushes == 0
+        assert [entry.phase for entry in notifications] == [ClientNotificationPhase.SEND_PENDING]
+
+
+def test_initialize_notification_io_value_error_is_redacted_and_never_resends(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for operation in ("write", "flush"):
+        class ValueErrorStdin:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.flushes = 0
+
+            def write(self, payload: bytes) -> int:
+                self.writes.append(payload)
+                if operation == "write":
+                    raise ValueError("write-io-secret")
+                return len(payload)
+
+            def flush(self) -> None:
+                self.flushes += 1
+                if operation == "flush":
+                    raise ValueError("flush-io-secret")
+
+        request_methods: list[str] = []
+
+        def successful_initialize_request(
+            method: str, _params: dict[str, Any], **_kwargs: Any
+        ) -> dict[str, Any]:
+            request_methods.append(method)
+            return {"model": "gpt-5.6"}
+
+        notifications: list[ClientNotificationJournalEntry] = []
+        client = _client(
+            fake_server,
+            tmp_path,
+            on_client_notification_send_pending=notifications.append,
+            on_client_notification_written=notifications.append,
+        )
+        stdin = ValueErrorStdin()
+        client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=stdin))
+        monkeypatch.setattr(client, "request", successful_initialize_request)
+
+        with pytest.raises(RuntimeDisconnected, match="notification may have been written") as caught:
+            client.initialize()
+        assert "io-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
+        assert request_methods == ["initialize"]
+        assert stdin.writes == [b'{"method":"initialized"}\n']
+        assert stdin.flushes == (0 if operation == "write" else 1)
+        assert [entry.phase for entry in notifications] == [ClientNotificationPhase.SEND_PENDING]
+
+
+def test_initialize_first_attempt_consumption_is_atomic_without_deadlock(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    requests: list[RequestJournalEntry] = []
+    notifications: list[ClientNotificationJournalEntry] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_send_pending=requests.append,
+        on_client_notification_send_pending=notifications.append,
+        on_client_notification_written=notifications.append,
+    )
+    client.start()
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def call_initialize() -> None:
+        barrier.wait(timeout=2)
+        try:
+            client.initialize()
+        except AppServerError as exc:
+            outcome = str(exc)
+        else:
+            outcome = "success"
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    first = threading.Thread(target=call_initialize)
+    second = threading.Thread(target=call_initialize)
+    first.start()
+    second.start()
+    try:
+        barrier.wait(timeout=2)
+        first.join(timeout=3)
+        second.join(timeout=3)
+        assert first.is_alive() is False
+        assert second.is_alive() is False
+        assert sorted(outcomes) == ["initialize may be called only once", "success"]
+        assert [entry.method for entry in requests] == ["initialize"]
+        assert [entry.phase for entry in notifications] == [
+            ClientNotificationPhase.SEND_PENDING,
+            ClientNotificationPhase.WRITE_COMPLETED,
+        ]
+    finally:
+        client.close()
 
 
 def test_process_callbacks_bracket_every_child_process_and_fail_closed(

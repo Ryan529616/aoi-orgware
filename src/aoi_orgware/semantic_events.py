@@ -246,7 +246,7 @@ def _domain_state(value: Mapping[str, Any], *, allow_envelope: bool) -> dict[str
                 f"domain state reserves top-level key {SEMANTIC_ENVELOPE_KEY!r}"
             )
         del cloned[SEMANTIC_ENVELOPE_KEY]
-    return cloned
+    return cast(dict[str, Any], cloned)
 
 
 def projection_domain(projection: Mapping[str, Any]) -> dict[str, Any]:
@@ -274,7 +274,7 @@ def _json_equal(left: Any, right: Any) -> bool:
         )
     if isinstance(left, float):
         return json.dumps(left, allow_nan=False) == json.dumps(right, allow_nan=False)
-    return left == right
+    return bool(left == right)
 
 
 def _append_delta_operations(
@@ -519,7 +519,7 @@ def _validate_event_record(event: Mapping[str, Any]) -> dict[str, Any]:
     if _event_digest(event) != event["event_sha256"]:
         raise SemanticEventError("semantic event hash mismatch")
     canonical_json_bytes(event, max_bytes=MAX_EVENT_BYTES)
-    return _json_clone(event)
+    return cast(dict[str, Any], _json_clone(event))
 
 
 def _build_event(
@@ -737,7 +737,7 @@ def _projection_envelope(projection: Mapping[str, Any]) -> dict[str, Any]:
     for field in ("head_event_sha256", "domain_sha256"):
         if not isinstance(envelope.get(field), str) or not _SHA256_RE.fullmatch(envelope[field]):
             raise SemanticEventError(f"semantic projection {field} is invalid")
-    return _json_clone(envelope)
+    return cast(dict[str, Any], _json_clone(envelope))
 
 
 def validate_projection(
@@ -805,7 +805,7 @@ def resolve_command_retry(
         command_semantics(matches[0])
     ) != canonical_json_bytes(command_semantics(proposed)):
         raise SemanticEventError("command id was reused for different semantics")
-    return _json_clone(matches[0])
+    return cast(dict[str, Any], _json_clone(matches[0]))
 
 
 def event_filename(sequence: int) -> str:

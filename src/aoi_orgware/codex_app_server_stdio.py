@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import subprocess
@@ -31,6 +32,24 @@ DEFAULT_MAX_LINE_BYTES: Final = 1_048_576
 DEFAULT_MAX_EVENTS: Final = 10_000
 DEFAULT_MAX_STDERR_BYTES: Final = 1_048_576
 DEFAULT_MAX_QUEUE_MESSAGES: Final = 1_024
+
+
+def _require_positive_finite_timeout(timeout_seconds: float, *, operation: str) -> float:
+    """Normalize public lifecycle deadlines before any platform wait primitive."""
+
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise ValueError(f"{operation} timeout must be a finite positive number")
+    try:
+        normalized = float(timeout_seconds)
+    except OverflowError:
+        raise ValueError(f"{operation} timeout must be a finite positive number") from None
+    if (
+        not math.isfinite(normalized)
+        or normalized <= 0
+        or normalized > threading.TIMEOUT_MAX
+    ):
+        raise ValueError(f"{operation} timeout must be a finite positive number")
+    return normalized
 
 _REQUEST_METHODS: Final = frozenset(
     {"initialize", "model/list", "thread/start", "turn/start", "turn/interrupt"}
@@ -379,6 +398,13 @@ class RequestPhase(str, Enum):
     RESPONSE_RECEIVED = "response_received"
 
 
+class ClientNotificationPhase(str, Enum):
+    """Durable crash markers for one non-idempotent client notification."""
+
+    SEND_PENDING = "send_pending"
+    WRITE_COMPLETED = "write_completed"
+
+
 class _TerminalStreamPhase(str, Enum):
     """One-way ownership state for the MVP stdout terminal cut."""
 
@@ -413,6 +439,16 @@ class RequestJournalEntry:
 
 
 @dataclass(frozen=True)
+class ClientNotificationJournalEntry:
+    """Exact client notification bytes offered before and after their write."""
+
+    method: str
+    phase: ClientNotificationPhase
+    wire_bytes: bytes
+    sha256: str
+
+
+@dataclass(frozen=True)
 class ProcessJournalEntry:
     """Exact bounded process-start observation offered to the controller."""
 
@@ -433,6 +469,51 @@ class RuntimePin:
 
 
 @dataclass(frozen=True)
+class AppServerLaunchSpec:
+    """Validated, transport-neutral inputs required for one App Server turn.
+
+    This value intentionally carries only the fields consumed by the stdio
+    adapter.  It does not assert packet, company, or transport-contract
+    authority; callers that need the legacy sealed transport contract can keep
+    using :class:`SealedLaunchIntent`.
+    """
+
+    cwd: str
+    model: str
+    effort: str
+    sandbox: str
+    prompt_sha256: str
+    prompt_size_bytes: int
+    executable_path: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.cwd, "cwd"),
+            (self.model, "model"),
+            (self.effort, "effort"),
+            (self.executable_path, "executable_path"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"App Server launch spec {label} must be a non-empty string")
+        if not Path(self.cwd).is_absolute() or not Path(self.executable_path).is_absolute():
+            raise ValueError("App Server launch spec cwd and executable_path must be absolute")
+        if self.sandbox not in {"readOnly", "workspaceWrite"}:
+            raise ValueError("App Server launch spec sandbox is unsupported")
+        if (
+            not isinstance(self.prompt_sha256, str)
+            or len(self.prompt_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.prompt_sha256)
+        ):
+            raise ValueError("App Server launch spec prompt_sha256 must be a lowercase SHA-256")
+        if (
+            not isinstance(self.prompt_size_bytes, int)
+            or isinstance(self.prompt_size_bytes, bool)
+            or self.prompt_size_bytes < 0
+        ):
+            raise ValueError("App Server launch spec prompt_size_bytes must be a non-negative integer")
+
+
+@dataclass(frozen=True)
 class SealedLaunchIntent:
     """Validated view of the canonical transport launch-intent contract."""
 
@@ -444,6 +525,19 @@ class SealedLaunchIntent:
     prompt_sha256: str
     prompt_size_bytes: int
     executable_path: str
+
+    def as_app_server_launch_spec(self) -> AppServerLaunchSpec:
+        """Drop legacy transport authority while retaining adapter inputs."""
+
+        return AppServerLaunchSpec(
+            cwd=self.cwd,
+            model=self.model,
+            effort=self.effort,
+            sandbox=self.sandbox,
+            prompt_sha256=self.prompt_sha256,
+            prompt_size_bytes=self.prompt_size_bytes,
+            executable_path=self.executable_path,
+        )
 
     @classmethod
     def from_sealed_mapping(
@@ -478,6 +572,49 @@ class RuntimeEvent:
     params: dict[str, Any]
     sha256: str
     wire_bytes: bytes
+
+    @property
+    def json_payload_bytes(self) -> bytes:
+        """Return a parser-compatible JSON payload without terminal line framing.
+
+        ``wire_bytes`` and ``sha256`` deliberately remain the complete
+        line-delimited transport receipt.  Consumers needing one standalone
+        JSON value must opt into this checked unframed view rather than
+        silently altering the receipt bytes.
+        """
+
+        if not self.wire_bytes.endswith(b"\n"):
+            raise ProtocolViolation("RuntimeEvent wire bytes are not exactly LF-framed")
+        if hashlib.sha256(self.wire_bytes).hexdigest() != self.sha256:
+            raise ProtocolViolation("RuntimeEvent wire digest does not match exact bytes")
+        payload = self.wire_bytes[:-1]
+        # Windows text peers may emit CRLF.  Treat that CR as part of the line
+        # framing while keeping the stored wire receipt and digest untouched.
+        if payload.endswith(b"\r"):
+            payload = payload[:-1]
+        if payload.endswith(b"\n") or payload.endswith(b"\r"):
+            raise ProtocolViolation("RuntimeEvent wire bytes contain extra line framing")
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ProtocolViolation("RuntimeEvent wire payload is not strict UTF-8") from exc
+        try:
+            decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_keys)
+            value, end = decoder.raw_decode(text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ProtocolViolation("RuntimeEvent wire payload is not strict JSON") from exc
+        # ``raw_decode`` deliberately does not skip leading whitespace.  Requiring
+        # a full consume rejects both leading and trailing bytes exactly as the
+        # company parser does, without normalizing the retained wire receipt.
+        if end != len(text) or not isinstance(value, dict):
+            raise ProtocolViolation("RuntimeEvent wire payload is not one JSON object")
+        if set(value) != {"method", "params"}:
+            raise ProtocolViolation("RuntimeEvent wire payload envelope fields are invalid")
+        if not isinstance(value["method"], str) or not isinstance(value["params"], dict):
+            raise ProtocolViolation("RuntimeEvent wire payload envelope types are invalid")
+        if value["method"] != self.method or value["params"] != self.params:
+            raise ProtocolViolation("RuntimeEvent wire payload differs from event fields")
+        return payload
 
 
 @dataclass(frozen=True)
@@ -565,6 +702,14 @@ class CodexAppServerStdio:
         on_process_started: Callable[[ProcessJournalEntry], None] | None = None,
         on_send_pending: Callable[[RequestJournalEntry], None] | None = None,
         on_response: Callable[[RequestJournalEntry], None] | None = None,
+        on_client_notification_send_pending: Callable[
+            [ClientNotificationJournalEntry], None
+        ]
+        | None = None,
+        on_client_notification_written: Callable[
+            [ClientNotificationJournalEntry], None
+        ]
+        | None = None,
         on_rejected_response: Callable[
             [RequestJournalEntry], Mapping[str, Any]
         ]
@@ -602,6 +747,10 @@ class CodexAppServerStdio:
         self.on_process_started = on_process_started
         self.on_send_pending = on_send_pending
         self.on_response = on_response
+        self.on_client_notification_send_pending = (
+            on_client_notification_send_pending
+        )
+        self.on_client_notification_written = on_client_notification_written
         self.on_rejected_response = on_rejected_response
         self.on_rejected_notification = on_rejected_notification
         self.require_local_files_policy = require_local_files_policy
@@ -615,16 +764,24 @@ class CodexAppServerStdio:
         self._notifications: list[RuntimeEvent] = []
         self._seen_events: dict[tuple[str, str], str] = {}
         self._request_lock = threading.Lock()
+        self._initialize_attempt_lock = threading.Lock()
+        # A lifecycle callback runs after its notification has been removed
+        # from the stream.  Hold this mutex until that callback either commits
+        # or aborts, so another observer or the terminal seal cannot make the
+        # popped notification disappear from the durable decision boundary.
+        self._turn_lifecycle_lock = threading.Lock()
         self._next_request_id = 1
         self.last_receipt: RequestReceipt | None = None
+        self._initialize_attempted = False
         self._initialized = False
-        self._model_intent: SealedLaunchIntent | None = None
+        self._model_intent: AppServerLaunchSpec | SealedLaunchIntent | None = None
         self._model_catalog_response: dict[str, Any] | None = None
         self._thread_id: str | None = None
         self._turn_id: str | None = None
         self._turn_terminal = False
-        self._intent: SealedLaunchIntent | None = None
+        self._intent: AppServerLaunchSpec | SealedLaunchIntent | None = None
         self._reader_error: AppServerError | None = None
+        self._event_callback_failed = False
         self._reader_condition = threading.Condition()
         self._reroute_persistence_inflight = 0
         self._terminal_stream_phase = _TerminalStreamPhase.OPEN
@@ -785,6 +942,25 @@ class CodexAppServerStdio:
         self._join_readers_for_cleanup(timeout_seconds=2)
 
     def seal_reader_for_terminal_commit(self, *, timeout_seconds: float) -> None:
+        """Serialize the permanent terminal cut with lifecycle observation."""
+
+        timeout_seconds = _require_positive_finite_timeout(
+            timeout_seconds, operation="terminal stream seal"
+        )
+        deadline = time.monotonic() + timeout_seconds
+        self._acquire_turn_lifecycle_lock(deadline=deadline)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._abort_terminal_stream()
+                raise RuntimeDisconnected(
+                    "timed out waiting for App Server lifecycle serialization"
+                )
+            self._seal_reader_for_terminal_commit(timeout_seconds=remaining)
+        finally:
+            self._turn_lifecycle_lock.release()
+
+    def _seal_reader_for_terminal_commit(self, *, timeout_seconds: float) -> None:
         """Create the permanent stdout cut required before terminal journaling.
 
         ``turn/completed`` is only a candidate until the one-shot App Server
@@ -793,12 +969,9 @@ class CodexAppServerStdio:
         instantaneous barrier check can authorize ``completed``.
         """
 
-        if timeout_seconds <= 0:
-            raise ValueError("terminal stream seal timeout must be positive")
-        if not self._turn_terminal:
-            raise AppServerError(
-                "terminal stream seal requires an observed terminal turn"
-            )
+        timeout_seconds = _require_positive_finite_timeout(
+            timeout_seconds, operation="terminal stream seal"
+        )
         deadline = time.monotonic() + timeout_seconds
         with self._reader_condition:
             if self._terminal_stream_phase is _TerminalStreamPhase.SEALED:
@@ -806,6 +979,10 @@ class CodexAppServerStdio:
             if self._terminal_stream_phase is not _TerminalStreamPhase.OPEN:
                 raise RuntimeDisconnected(
                     "App Server terminal stream is not eligible for a clean seal"
+                )
+            if not self._turn_terminal:
+                raise AppServerError(
+                    "terminal stream seal requires an observed terminal turn"
                 )
             self._terminal_stream_phase = _TerminalStreamPhase.DRAINING
             self._reader_condition.notify_all()
@@ -876,6 +1053,11 @@ class CodexAppServerStdio:
         except AppServerError:
             self._abort_terminal_stream()
             raise
+        try:
+            self._require_single_terminal_eof()
+        except AppServerError:
+            self._abort_terminal_stream()
+            raise
         with self._reader_condition:
             if (
                 not self._stdout_reader_done
@@ -941,9 +1123,36 @@ class CodexAppServerStdio:
         with self._reader_condition:
             if self._terminal_stream_phase is not _TerminalStreamPhase.SEALED:
                 self._terminal_stream_phase = _TerminalStreamPhase.ABORTED
+                # A terminal notification is only a candidate until the
+                # irreversible stream seal succeeds.
+                self._turn_terminal = False
             if forced:
                 self._forced_shutdown = True
             self._reader_condition.notify_all()
+
+    def _require_single_terminal_eof(self) -> None:
+        """Consume and validate the fully drained reader suffix for terminal seal.
+
+        Reader threads have already joined at this point, so the queue is a
+        stable complete stream suffix.  EOF is the only expected remainder:
+        any buffered/late notification, response, request, reader error, or a
+        missing/duplicate EOF means the terminal candidate cannot be sealed.
+        """
+
+        if self._notifications:
+            raise RuntimeDisconnected(
+                "App Server terminal stream has late protocol data or invalid EOF"
+            )
+        pending: list[tuple[str, Any]] = []
+        while True:
+            try:
+                pending.append(self._incoming.get_nowait())
+            except queue.Empty:
+                break
+        if len(pending) != 1 or pending[0][0] != "eof" or pending[0][1] is not None:
+            raise RuntimeDisconnected(
+                "App Server terminal stream has late protocol data or invalid EOF"
+            )
 
     def _raise_terminal_stream_failure(
         self,
@@ -1031,8 +1240,13 @@ class CodexAppServerStdio:
         self.close()
 
     def initialize(self, *, client_name: str = "aoi-orgware", client_version: str = "0.4") -> dict[str, Any]:
-        if self._initialized:
-            raise AppServerError("initialize may be called only once")
+        # Do not make retry eligibility depend on the successful completion
+        # marker.  Once any caller has been admitted, the initialize request or
+        # initialized notification may already have affected the peer.
+        with self._initialize_attempt_lock:
+            if self._initialize_attempted:
+                raise AppServerError("initialize may be called only once")
+            self._initialize_attempted = True
         response = self.request(
             "initialize",
             {
@@ -1052,7 +1266,9 @@ class CodexAppServerStdio:
         self._initialized = True
         return response
 
-    def verify_model_from_intent(self, *, intent: SealedLaunchIntent) -> dict[str, Any]:
+    def verify_model_from_intent(
+        self, *, intent: AppServerLaunchSpec | SealedLaunchIntent
+    ) -> dict[str, Any]:
         """Bind the sealed model/effort to the live visible App Server catalog."""
 
         self._require_initialized()
@@ -1079,7 +1295,7 @@ class CodexAppServerStdio:
     def start_thread_from_intent(
         self,
         *,
-        intent: SealedLaunchIntent,
+        intent: AppServerLaunchSpec | SealedLaunchIntent,
     ) -> str:
         self._require_initialized()
         if self._thread_id is not None:
@@ -1117,7 +1333,7 @@ class CodexAppServerStdio:
         *,
         thread_id: str,
         prompt: str,
-        intent: SealedLaunchIntent,
+        intent: AppServerLaunchSpec | SealedLaunchIntent,
     ) -> str:
         self._require_initialized()
         if self._thread_id != thread_id or self._intent != intent:
@@ -1175,14 +1391,86 @@ class CodexAppServerStdio:
             validate_result=_validate_turn_interrupt_response,
         )
 
-    def observe_turn(self, *, thread_id: str, turn_id: str, timeout_seconds: float = 60.0) -> TurnObservation:
+    def observe_turn(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        timeout_seconds: float = 60.0,
+        on_event: Callable[[RuntimeEvent], None] | None = None,
+    ) -> TurnObservation:
         """Consume buffered/live lifecycle notifications through ``turn/completed``."""
 
+        timeout_seconds = _require_positive_finite_timeout(
+            timeout_seconds, operation="observe_turn"
+        )
+        if on_event is not None and not callable(on_event):
+            raise ValueError("observe_turn on_event must be callable")
+        # A small number of unit tests deliberately use a bare object to prove
+        # validation precedes callback delivery.  Production instances always
+        # receive the mutex in __init__.
+        lifecycle_lock = getattr(self, "_turn_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            return self._observe_turn_locked(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=timeout_seconds,
+                on_event=on_event,
+            )
+        deadline = time.monotonic() + timeout_seconds
+        self._acquire_turn_lifecycle_lock(deadline=deadline)
+        try:
+            return self._observe_turn_locked(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=max(deadline - time.monotonic(), 0.0),
+                on_event=on_event,
+            )
+        finally:
+            lifecycle_lock.release()
+
+    def _observe_turn_locked(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        timeout_seconds: float,
+        on_event: Callable[[RuntimeEvent], None] | None,
+    ) -> TurnObservation:
+        """Observe one turn while holding the lifecycle serialization mutex."""
+
+        self._raise_if_event_callback_failed()
+        reader_condition = getattr(self, "_reader_condition", None)
+        if reader_condition is not None:
+            with reader_condition:
+                if self._terminal_stream_phase is not _TerminalStreamPhase.OPEN:
+                    raise RuntimeDisconnected(
+                        "App Server turn observation is not eligible after terminal stream transition"
+                    )
+                if self._turn_terminal:
+                    raise AppServerError(
+                        "App Server turn observation is not eligible after terminal completion"
+                    )
         deadline = time.monotonic() + timeout_seconds
         observed: list[RuntimeEvent] = []
         while True:
             event = self._next_notification(deadline)
             self._validate_event(event, thread_id=thread_id, turn_id=turn_id)
+            if on_event is not None:
+                self._require_observation_event_eligibility(event)
+                try:
+                    on_event(event)
+                except BaseException:
+                    callback_failed = True
+                else:
+                    callback_failed = False
+                if callback_failed:
+                    # Abort after leaving the callback exception handler so
+                    # untrusted callback text is absent from exception context.
+                    # The just-popped event must never be bypassed by a retry.
+                    self._abort_event_callback_failure()
+                self._require_observation_stream_eligibility()
+                self._require_observation_deadline(deadline)
             observed.append(event)
             if event.method == "turn/completed":
                 turn = _require_object(event.params.get("turn"), "turn/completed turn")
@@ -1190,7 +1478,17 @@ class CodexAppServerStdio:
                 if status not in {"completed", "failed", "interrupted"}:
                     raise ProtocolViolation(f"turn/completed has non-terminal status: {status!r}")
                 self._wait_rejected_notification_barrier(deadline)
-                self._turn_terminal = True
+                self._raise_if_event_callback_failed()
+                self._require_observation_deadline(deadline)
+                with self._reader_condition:
+                    if self._terminal_stream_phase is not _TerminalStreamPhase.OPEN:
+                        raise RuntimeDisconnected(
+                            "App Server turn observation lost terminal stream eligibility"
+                        )
+                    if self._reader_error is not None:
+                        raise self._reader_error
+                    self._turn_terminal = True
+                    self._reader_condition.notify_all()
                 return TurnObservation(thread_id, turn_id, status, tuple(observed))
 
     def synchronize_reader_boundary(self, *, timeout_seconds: float) -> None:
@@ -1201,8 +1499,9 @@ class CodexAppServerStdio:
         :meth:`seal_reader_for_terminal_commit` for that boundary.
         """
 
-        if timeout_seconds <= 0:
-            raise ValueError("reader boundary timeout must be positive")
+        timeout_seconds = _require_positive_finite_timeout(
+            timeout_seconds, operation="reader boundary"
+        )
         self._wait_rejected_notification_barrier(
             time.monotonic() + timeout_seconds
         )
@@ -1271,11 +1570,45 @@ class CodexAppServerStdio:
         ) + b"\n"
         if len(payload) > self.max_line_bytes:
             raise ValueError("outgoing App Server notification exceeds line limit")
+        digest = hashlib.sha256(payload).hexdigest()
+        pending_entry = ClientNotificationJournalEntry(
+            method, ClientNotificationPhase.SEND_PENDING, payload, digest
+        )
+        if self.on_client_notification_send_pending is not None:
+            pending_callback_failed = False
+            try:
+                self.on_client_notification_send_pending(pending_entry)
+            except BaseException:
+                pending_callback_failed = True
+            if pending_callback_failed:
+                raise AppServerError(
+                    "client notification send_pending journal callback failed; notification was not written"
+                )
+        write_completed = False
         try:
-            process.stdin.write(payload)
-            process.stdin.flush()
-        except OSError as exc:
-            raise RuntimeDisconnected(f"App Server write failed during {method}") from exc
+            bytes_written = process.stdin.write(payload)
+            if type(bytes_written) is int and bytes_written == len(payload):
+                process.stdin.flush()
+                write_completed = True
+        except BaseException:
+            pass
+        if not write_completed:
+            raise RuntimeDisconnected(
+                "App Server initialized notification may have been written"
+            )
+        written_entry = ClientNotificationJournalEntry(
+            method, ClientNotificationPhase.WRITE_COMPLETED, payload, digest
+        )
+        if self.on_client_notification_written is not None:
+            written_callback_failed = False
+            try:
+                self.on_client_notification_written(written_entry)
+            except BaseException:
+                written_callback_failed = True
+            if written_callback_failed:
+                raise AppServerError(
+                    "client notification written journal callback failed; notification may have been written"
+                )
 
     def _wait_response(
         self,
@@ -1460,7 +1793,14 @@ class CodexAppServerStdio:
         )
 
     def _next_notification(self, deadline: float) -> RuntimeEvent:
-        if self._notifications:
+        self._require_observation_deadline(deadline)
+        reader_condition = getattr(self, "_reader_condition", None)
+        if reader_condition is not None:
+            with reader_condition:
+                self._require_observation_stream_eligibility_locked()
+                if self._notifications:
+                    return self._notifications.pop(0)
+        elif self._notifications:
             return self._notifications.pop(0)
         while True:
             kind, payload = self._next_incoming(deadline)
@@ -1470,6 +1810,15 @@ class CodexAppServerStdio:
                 message, raw = payload
                 event = self._record_notification(message, raw, buffer=False)
                 if event is not None:
+                    if reader_condition is not None:
+                        with reader_condition:
+                            if self._terminal_stream_phase is not _TerminalStreamPhase.OPEN:
+                                # A contender may have aborted while this observer
+                                # waited on the incoming queue.  Retain the decoded
+                                # event rather than silently consuming it after the
+                                # stream became ineligible.
+                                self._notifications.append(event)
+                                self._require_observation_stream_eligibility_locked()
                     return event
                 continue
             if kind == "server_request":
@@ -1578,6 +1927,88 @@ class CodexAppServerStdio:
             assert retained is not None
             self._reader_condition.notify_all()
             return retained
+
+    def _acquire_turn_lifecycle_lock(self, *, deadline: float) -> None:
+        """Acquire lifecycle ownership within the caller's public deadline.
+
+        A callback may be stalled indefinitely.  A later observer or terminal
+        seal must not inherit that unbounded wait, and must invalidate the
+        terminal candidate rather than leave an eventual late seal possible.
+        """
+
+        remaining = max(deadline - time.monotonic(), 0.0)
+        if self._turn_lifecycle_lock.acquire(timeout=remaining):
+            return
+        self._abort_terminal_stream()
+        raise RuntimeDisconnected(
+            "timed out waiting for App Server lifecycle serialization"
+        )
+
+    def _require_observation_deadline(self, deadline: float) -> None:
+        """Fail closed when lifecycle work outlives its public deadline."""
+
+        if time.monotonic() < deadline:
+            return
+        self._abort_terminal_stream()
+        raise RuntimeDisconnected("App Server turn observation deadline expired")
+
+    def _require_observation_stream_eligibility(self) -> None:
+        """Reject lifecycle work immediately after any global stream abort."""
+
+        reader_condition = getattr(self, "_reader_condition", None)
+        if reader_condition is None:
+            return
+        with reader_condition:
+            self._require_observation_stream_eligibility_locked()
+
+    def _require_observation_stream_eligibility_locked(self) -> None:
+        """Require an open stream while ``_reader_condition`` is held."""
+
+        if self._terminal_stream_phase is not _TerminalStreamPhase.OPEN:
+            raise RuntimeDisconnected(
+                "App Server turn observation is not eligible after terminal stream transition"
+            )
+
+    def _require_observation_event_eligibility(self, event: RuntimeEvent) -> None:
+        """Prevent a popped event from being lost if a global abort races its callback."""
+
+        reader_condition = getattr(self, "_reader_condition", None)
+        if reader_condition is None:
+            return
+        with reader_condition:
+            if self._terminal_stream_phase is _TerminalStreamPhase.OPEN:
+                return
+            self._notifications.insert(0, event)
+            self._require_observation_stream_eligibility_locked()
+
+    def _raise_if_event_callback_failed(self) -> None:
+        """Reject every retry after a lifecycle callback rejected a popped event."""
+
+        if not getattr(self, "_event_callback_failed", False):
+            return
+        with self._reader_condition:
+            if self._event_callback_failed:
+                retained = self._reader_error
+                assert retained is not None
+                raise retained
+
+    def _abort_event_callback_failure(self) -> NoReturn:
+        """Make a failed lifecycle callback terminal without retaining its details."""
+
+        failure = AppServerError("observe_turn event callback failed")
+        with self._reader_condition:
+            self._event_callback_failed = True
+            # A model reroute is independently persisted evidence.  It must
+            # remain the retained fault whether it arrived before or after the
+            # callback failure; the separate callback flag still makes every
+            # lifecycle retry permanently terminal.
+            if not isinstance(self._reader_error, ModelReroutedViolation):
+                self._reader_error = failure
+            if self._terminal_stream_phase is not _TerminalStreamPhase.SEALED:
+                self._terminal_stream_phase = _TerminalStreamPhase.ABORTED
+                self._turn_terminal = False
+            self._reader_condition.notify_all()
+        raise failure
 
     def _begin_rejected_notification_persistence(self) -> None:
         with self._reader_condition:
@@ -1839,7 +2270,9 @@ class CodexAppServerStdio:
         if not self._initialized:
             raise AppServerError("initialize/initialized handshake has not completed")
 
-    def _validate_intent_context(self, intent: SealedLaunchIntent) -> None:
+    def _validate_intent_context(
+        self, intent: AppServerLaunchSpec | SealedLaunchIntent
+    ) -> None:
         try:
             executable = self.executable.resolve(strict=True).as_posix()
             cwd = self.cwd.resolve(strict=True).as_posix()
@@ -2362,7 +2795,7 @@ def _validate_initialize_response(
 
 
 def _validate_model_list_response(
-    value: dict[str, Any], *, intent: SealedLaunchIntent
+    value: dict[str, Any], *, intent: AppServerLaunchSpec | SealedLaunchIntent
 ) -> dict[str, Any]:
     _require_fields(value, _MODEL_LIST_RESPONSE_REQUIRED, "model/list response")
     if value.get("nextCursor") is not None:
@@ -2416,7 +2849,7 @@ def _validate_model_list_response(
 
 
 def _validate_thread_start_response(
-    value: dict[str, Any], *, intent: SealedLaunchIntent
+    value: dict[str, Any], *, intent: AppServerLaunchSpec | SealedLaunchIntent
 ) -> dict[str, Any]:
     _require_fields(
         value, _THREAD_START_RESPONSE_REQUIRED, "thread/start response"

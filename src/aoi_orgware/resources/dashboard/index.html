@@ -1,0 +1,1719 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>AOI Command Center</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090d12;
+      --panel: #111821;
+      --panel2: #151f2b;
+      --line: #243243;
+      --text: #e7edf5;
+      --muted: #8493a6;
+      --cyan: #56d7e5;
+      --green: #64d98b;
+      --amber: #f0bd54;
+      --red: #ff6b72;
+      --blue: #72a7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.4 Inter, ui-sans-serif, system-ui, sans-serif;
+      min-width: 900px;
+    }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      background: #0d131b;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .brand { font-weight: 720; letter-spacing: .08em; }
+    .brand span { color: var(--cyan); }
+    .metric { color: var(--muted); }
+    .metric strong { color: var(--text); font-weight: 620; margin-left: 6px; }
+    .spacer { flex: 1; }
+    #search {
+      width: clamp(150px, 15vw, 240px);
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0a1017;
+      color: var(--text);
+      padding: 8px 10px;
+      outline: none;
+    }
+    #search:focus { border-color: var(--cyan); }
+    .view-controls { display: flex; align-items: center; gap: 7px; }
+    .view-label { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .view-indicator {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--green);
+      font-size: 10px;
+      font-weight: 650;
+      letter-spacing: .05em;
+      white-space: nowrap;
+    }
+    .view-indicator.historical { color: var(--amber); border-color: #5a4721; }
+    #history-cursor {
+      width: 86px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #0a1017;
+      color: var(--text);
+      padding: 6px 7px;
+      outline: none;
+      font: 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    #history-cursor:focus { border-color: var(--cyan); }
+    button.control {
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #111a25;
+      color: var(--text);
+      cursor: pointer;
+      padding: 6px 8px;
+      font: 11px/1.2 inherit;
+      white-space: nowrap;
+    }
+    button.control:hover { border-color: var(--cyan); color: var(--cyan); }
+    button.control:disabled { cursor: default; color: var(--muted); opacity: .55; }
+    main {
+      display: grid;
+      grid-template-columns: 270px minmax(430px, 1fr) 330px;
+      min-height: calc(100vh - 56px);
+    }
+    aside, section { min-width: 0; }
+    .left, .center { border-right: 1px solid var(--line); }
+    .pane { padding: 16px; }
+    h2 {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    h3 { margin: 0; font-size: 13px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 11px;
+      margin-bottom: 9px;
+    }
+    .card.active { border-left: 3px solid var(--green); }
+    .card.unknown { border-left: 3px solid var(--amber); }
+    .card.blocked { border-left: 3px solid var(--red); }
+    .row { display: flex; align-items: center; gap: 8px; }
+    .row .grow { flex: 1; min-width: 0; }
+    .sub {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
+    .mono {
+      font: 11px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace;
+      color: #9fb1c8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .pill {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      color: var(--muted);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .pill.running, .pill.active, .pill.ready, .pill.admitted { color: var(--green); }
+    .pill.in_flight { color: var(--blue); }
+    .pill.unknown, .pill.waiting, .pill.queued, .pill.effect_unknown,
+    .pill.reconcile_required, .pill.fenced, .pill.non_current { color: var(--amber); }
+    .pill.telemetry_silent { color: var(--amber); }
+    .pill.blocked, .pill.failed, .pill.lost, .pill.confirmed_lost { color: var(--red); }
+    .pill.current, .pill.not_applicable { color: var(--green); }
+    .status-pair { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+    .tree-node { margin-left: calc(var(--depth, 0) * 18px); position: relative; }
+    .tree-node.current-department-execution {
+      border-color: var(--cyan);
+      box-shadow: 0 0 0 1px #1e6470;
+    }
+    .execution-link { color: var(--cyan); text-decoration: none; }
+    .execution-link:hover { text-decoration: underline; }
+    .tree-node::before {
+      content: "";
+      position: absolute;
+      left: -10px;
+      top: 0;
+      bottom: -10px;
+      border-left: 1px solid #253449;
+    }
+    .empty {
+      color: var(--muted);
+      padding: 20px;
+      border: 1px dashed var(--line);
+      border-radius: 7px;
+      text-align: center;
+    }
+    .alert { border-left: 3px solid var(--amber); }
+    .alert.critical { border-left-color: var(--red); }
+    .coverage {
+      background: #241e11;
+      border-color: #4d3d19;
+      color: #f1c76b;
+    }
+    .capacity {
+      margin-top: 8px;
+      padding-top: 7px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .capacity strong { color: var(--text); font-weight: 620; }
+    .capacity.degraded strong { color: var(--amber); }
+    .queue-card { border-left: 3px solid var(--blue); }
+    .queue-card.effect_unknown, .queue-card.reconcile_required {
+      border-left-color: var(--amber);
+      background: #1d1a13;
+    }
+    .queue-card.queued { border-left-color: var(--amber); }
+    .queue-card.in_flight { border-left-color: var(--blue); }
+    .queue-card.admitted { border-left-color: var(--green); }
+    .handoff-history { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+    .handoff-history h3 { color: var(--muted); font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
+    .handoff-entry { margin-top: 7px; padding-top: 7px; border-top: 1px solid #1d2938; }
+    .handoff-entry:first-of-type { border-top: 0; }
+    .queue-banner {
+      margin: -2px 0 9px;
+      color: var(--amber);
+      font-size: 11px;
+    }
+    .section-gap { margin-top: 22px; }
+    button.copy {
+      border: 0;
+      padding: 0;
+      color: var(--blue);
+      background: none;
+      cursor: pointer;
+      font: inherit;
+    }
+    #fatal {
+      display: none;
+      margin: 12px 18px;
+      padding: 10px;
+      color: #ffd7d9;
+      background: #35171a;
+      border: 1px solid #693136;
+      border-radius: 6px;
+    }
+    #warnings {
+      display: none;
+      margin: 12px 18px;
+      padding: 10px 12px;
+      color: #ffe1a3;
+      background: #2c2312;
+      border: 1px solid #6a5120;
+      border-radius: 6px;
+    }
+    #environment-banner {
+      margin: 12px 18px 0;
+      padding: 11px 13px;
+      border: 1px solid #6a5120;
+      border-left: 4px solid var(--amber);
+      border-radius: 6px;
+      background: #231d12;
+      color: #ffe1a3;
+    }
+    #environment-banner.verified {
+      border-color: #265d3a;
+      border-left-color: var(--green);
+      background: #122019;
+      color: #b9efc9;
+    }
+    .environment-title {
+      font-size: 11px;
+      font-weight: 720;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .environment-detail {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .work-summary {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .work-count {
+      padding: 7px;
+      border: 1px solid #1d2938;
+      border-radius: 5px;
+      background: #0d141d;
+      color: var(--muted);
+      font-size: 10px;
+    }
+    .work-count strong {
+      display: block;
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 680;
+    }
+    details.work-group {
+      border-top: 1px solid #1d2938;
+      margin-top: 8px;
+      padding-top: 7px;
+    }
+    details.work-group summary {
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 10px;
+      font-weight: 650;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+    }
+    .work-entry {
+      margin-top: 7px;
+      padding-top: 7px;
+      border-top: 1px solid #1d2938;
+    }
+    .work-entry:first-of-type { border-top: 0; }
+    .eligibility-true { color: var(--green); }
+    .eligibility-false { color: var(--red); }
+    .eligibility-unknown { color: var(--amber); }
+    .execution-card { cursor: pointer; }
+    .execution-card:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 2px;
+    }
+    #execution-drawer[hidden] { display: none; }
+    #execution-drawer {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .drawer-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, .64);
+    }
+    .drawer-panel {
+      position: relative;
+      z-index: 1;
+      width: min(620px, 92vw);
+      height: 100%;
+      overflow: auto;
+      padding: 18px;
+      border-left: 1px solid var(--line);
+      background: #0d141d;
+      box-shadow: -12px 0 32px rgba(0, 0, 0, .38);
+    }
+    .drawer-header { display: flex; align-items: flex-start; gap: 10px; }
+    .drawer-header h2 { flex: 1; color: var(--text); margin-bottom: 4px; }
+    .drawer-source { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .drawer-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 12px; }
+    .drawer-tab {
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 5px 7px;
+      background: #111a25;
+      color: var(--muted);
+      cursor: pointer;
+      font: 11px/1.2 inherit;
+    }
+    .drawer-tab[aria-selected="true"] { border-color: var(--cyan); color: var(--cyan); }
+    .drawer-content pre {
+      margin: 0;
+      padding: 10px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #090d12;
+      color: #b8c8db;
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .drawer-unavailable { color: var(--amber); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><span>AOI</span> COMMAND CENTER</div>
+    <div class="metric">Supervisor<strong id="supervisor">unknown</strong></div>
+    <div class="metric">Ledger<strong id="cursor">—</strong></div>
+    <div class="metric">Checkpoint<strong id="checkpoint">unavailable</strong></div>
+    <div class="metric">Export<strong id="export-status">unavailable</strong></div>
+    <div class="metric">Coverage<strong id="coverage">unknown</strong></div>
+    <div class="metric">Dashboard<strong id="connection">connecting</strong></div>
+    <div class="spacer"></div>
+    <div class="view-controls" aria-label="歷史投影檢視">
+      <span id="view-indicator" class="view-indicator" aria-live="polite">LIVE</span>
+      <label class="view-label" for="history-cursor">Past cursor</label>
+      <input id="history-cursor" type="number" min="0" step="1" inputmode="numeric" placeholder="cursor" aria-label="過去 cursor">
+      <button id="history-load" class="control" type="button">View</button>
+      <button id="return-live" class="control" type="button" disabled>Return to Live</button>
+    </div>
+    <input id="search" type="search" placeholder="搜尋名稱、ID、狀態…" aria-label="搜尋">
+    <div class="metric">更新<strong id="updated">—</strong></div>
+  </header>
+  <div id="fatal" role="alert"></div>
+  <div id="warnings" role="alert" aria-live="polite"></div>
+  <div id="environment-banner" role="status" aria-live="polite"></div>
+  <div id="execution-drawer" hidden>
+    <div class="drawer-backdrop" data-execution-close="backdrop"></div>
+    <aside id="execution-drawer-panel" class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="execution-drawer-title" tabindex="-1">
+      <div class="drawer-header">
+        <div><h2 id="execution-drawer-title">Execution detail</h2><div id="execution-drawer-source" class="drawer-source"></div></div>
+        <button id="execution-drawer-close" class="control" type="button" aria-label="Close execution detail">Close</button>
+      </div>
+      <div id="execution-drawer-tabs" class="drawer-tabs" role="tablist" aria-label="Execution detail sections"></div>
+      <div id="execution-drawer-content" class="drawer-content" role="tabpanel"></div>
+    </aside>
+  </div>
+  <main>
+    <aside class="left pane">
+      <h2>Company</h2>
+      <div id="company"></div>
+      <h2 class="section-gap">Departments</h2>
+      <div id="departments"></div>
+      <h2 class="section-gap">Work definitions</h2>
+      <div id="work-definitions"></div>
+      <h2 class="section-gap">Dispatch queue</h2>
+      <div id="dispatch-queue" aria-live="polite"></div>
+    </aside>
+    <section class="center pane">
+      <h2>Execution tree</h2>
+      <div id="execution"></div>
+      <h2 id="orphan-heading" class="section-gap">Orphan / Unattributed (0)</h2>
+      <div id="execution-orphans" aria-live="polite"></div>
+      <h2 class="section-gap">External jobs</h2>
+      <div id="jobs"></div>
+    </section>
+    <aside class="right pane">
+      <h2>Coverage</h2>
+      <div id="coverage-card"></div>
+      <h2 class="section-gap">Telemetry receipts</h2>
+      <div id="telemetry-receipts"></div>
+      <h2 class="section-gap">Provider lifecycle receipts</h2>
+      <div id="provider-lifecycle-receipts"></div>
+      <h2 class="section-gap">Raw usage</h2>
+      <div id="usage-samples"></div>
+      <h2 class="section-gap">Checkpoint / Export</h2>
+      <div id="checkpoint-export"></div>
+      <h2 class="section-gap">Job effect receipts</h2>
+      <div id="job-receipts"></div>
+      <h2 class="section-gap">Needs user</h2>
+      <div id="needs-user"></div>
+      <h2 class="section-gap">Alerts</h2>
+      <div id="alerts"></div>
+      <h2 class="section-gap">Recent events</h2>
+      <div id="recent"></div>
+    </aside>
+  </main>
+  <script>
+    "use strict";
+    let snapshot = null;
+    let recent = [];
+    let lastSeenEventCursor = null;
+    let lastAcceptedTransactionData = null;
+    let historyGap = null;
+    let liveSnapshot = null;
+    let historicalCursor = null;
+    let historicalNotice = null;
+    let refreshGeneration = 0;
+    let appliedRefreshGeneration = 0;
+    let connectionGeneration = 0;
+    const RECENT_LIMIT = 64;
+    const DRAWER_RECORD_LIMIT = 32;
+    const DRAWER_RAW_LIMIT = 16384;
+    const DRAWER_TABS = ["Overview", "Activity", "Usage", "Artifacts", "Evidence", "Raw"];
+    let drawer = null;
+    let drawerGeneration = 0;
+    const el = id => document.getElementById(id);
+    const safe = value => String(value ?? "unknown")
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+    const empty = text => `<div class="empty">${safe(text)}</div>`;
+    const pill = (label, value) =>
+      `<span class="pill ${safe(value)}">${safe(label)} ${safe(value)}</span>`;
+    const copy = value =>
+      `<button class="copy" data-copy="${safe(value)}" title="複製 immutable ID">${safe(value)}</button>`;
+    const isHistoricalView = () => historicalCursor !== null;
+    function updateViewIndicator() {
+      const indicator = el("view-indicator");
+      const returnLive = el("return-live");
+      if (isHistoricalView()) {
+        indicator.textContent = `HISTORICAL #${historicalCursor}`;
+        indicator.classList.add("historical");
+        returnLive.disabled = false;
+      } else {
+        indicator.textContent = "LIVE";
+        indicator.classList.remove("historical");
+        returnLive.disabled = true;
+      }
+    }
+    function match(value) {
+      const query = el("search").value.trim().toLowerCase();
+      return !query || JSON.stringify(value).toLowerCase().includes(query);
+    }
+    function orderedExecution(projection) {
+      const nodes = projection?.nodes || [];
+      const byId = new Map(nodes.map(node => [node.execution_id, node]));
+      const children = projection?.children || {};
+      const rows = [];
+      const visited = new Set();
+      function visit(id, depth) {
+        if (visited.has(id) || !byId.has(id)) return;
+        visited.add(id);
+        rows.push({node: byId.get(id), depth, invalid: false, reason: ""});
+        for (const childId of children[id] || []) visit(childId, depth + 1);
+      }
+      for (const rootId of projection?.roots || []) visit(rootId, 0);
+      const invalid = new Map(
+        (projection?.invalid_nodes || [])
+          .map(item => [item.execution_id, item.reason])
+      );
+      for (const node of nodes) {
+        if (visited.has(node.execution_id)) continue;
+        rows.push({
+          node,
+          depth: Number(node.execution_depth ?? 0),
+          invalid: true,
+          reason: invalid.get(node.execution_id) || "unreachable_from_roots"
+        });
+      }
+      return rows;
+    }
+    function capacityLine(label, capacity) {
+      const occupied = Number.isInteger(capacity?.occupied)
+        ? capacity.occupied : null;
+      const limit = Number.isInteger(capacity?.limit) ? capacity.limit : null;
+      const available = Number.isInteger(capacity?.available)
+        ? capacity.available : null;
+      const incomplete = occupied === null || limit === null || available === null;
+      const lowerBound = capacity?.occupied_semantics === "lower_bound";
+      const detail = capacity?.reason ? ` · ${safe(capacity.reason)}` : "";
+      return `<div class="capacity ${incomplete ? "degraded" : ""}">
+        ${safe(label)} <strong>${occupied === null || limit === null
+          ? "UNKNOWN" : `${lowerBound ? "known ≥" : ""}${occupied}/${limit}`}</strong>
+        · available <strong>${available === null ? "UNKNOWN" : available}</strong>${detail}
+      </div>`;
+    }
+    function queueDisplayState(item) {
+      if (item?.reconcile_required || item?.receipt_state === "reconcile_required") {
+        return "reconcile_required";
+      }
+      return String(item?.state ?? item?.receipt_state ?? "unknown");
+    }
+    function dispatchQueue(projection) {
+      const raw = Array.isArray(projection?.dispatch_queue)
+        ? projection.dispatch_queue.slice(0, 256) : [];
+      const barrierReservations = new Set(raw.filter(item =>
+        item?.reservation_id && (
+          item?.source === "uncertain_receipt"
+          || item?.state === "effect_unknown"
+          || item?.receipt_state === "reconcile_required"
+          || item?.reconcile_required
+        )
+      ).map(item => item.reservation_id));
+      const visible = raw.filter(item => !(
+        item?.reservation_id
+        && barrierReservations.has(item.reservation_id)
+        && item?.source !== "uncertain_receipt"
+        && item?.state !== "effect_unknown"
+        && item?.receipt_state !== "reconcile_required"
+        && !item?.reconcile_required
+      ));
+      return visible.sort((left, right) => {
+        const rank = item => {
+          const state = queueDisplayState(item);
+          return state === "effect_unknown" || state === "reconcile_required" ? 0 : 1;
+        };
+        return rank(left) - rank(right)
+          || String(left?.created_at ?? "").localeCompare(String(right?.created_at ?? ""))
+          || String(left?.dispatch_revision_id ?? "").localeCompare(String(right?.dispatch_revision_id ?? ""));
+      });
+    }
+    function executionAnchor(executionId) {
+      return `execution-${encodeURIComponent(String(executionId))}`;
+    }
+    function isRecord(value) {
+      return value !== null && typeof value === "object" && !Array.isArray(value);
+    }
+    function containsExecutionId(record, executionId) {
+      return isRecord(record) && [
+        record.execution_id,
+        record.origin_execution_id,
+        record.owner_execution_id,
+        record.producer_execution_id,
+        record.dispatch_join?.execution_id
+      ].some(value => value === executionId);
+    }
+    function drawerRecords(data, executionId) {
+      const evidence = isRecord(data?.evidence) ? data.evidence : {};
+      const usage = isRecord(data?.usage) ? data.usage : {};
+      const alerts = isRecord(data?.alerts) ? data.alerts : {};
+      const collect = value => (Array.isArray(value) ? value : [])
+        .filter(item => containsExecutionId(item, executionId))
+        .slice(0, DRAWER_RECORD_LIMIT);
+      const jobs = collect(data?.jobs);
+      const jobIds = new Set(jobs.map(job => job.job_id).filter(id =>
+        typeof id === "string" && id
+      ));
+      const jobReceipts = (Array.isArray(evidence.external_job_effect_receipts)
+        ? evidence.external_job_effect_receipts : [])
+        .filter(item => containsExecutionId(item, executionId) || jobIds.has(item?.job_id))
+        .slice(0, DRAWER_RECORD_LIMIT);
+      const artifactEvidence = [
+        ...collect(evidence.provider_telemetry_receipts),
+        ...collect(evidence.provider_lifecycle_receipts)
+      ].filter(item => isRecord(item.raw_artifact));
+      const telemetryReceiptIds = new Set((Array.isArray(evidence.provider_telemetry_receipts)
+        ? evidence.provider_telemetry_receipts : [])
+        .filter(item => isRecord(item)
+          && item.dispatch_join?.execution_id === executionId
+          && typeof item.receipt_id === "string" && item.receipt_id)
+        .map(item => item.receipt_id));
+      // Counter samples never carry execution_id.  Attribute them only through
+      // their immutable telemetry receipt, never by timing or a guessed turn.
+      const usageSamples = (Array.isArray(usage.counter_samples)
+        ? usage.counter_samples : [])
+        .filter(item => isRecord(item)
+          && telemetryReceiptIds.has(item.telemetry_receipt_id))
+        .slice(0, DRAWER_RECORD_LIMIT);
+      const execution = isRecord(data?.execution) ? data.execution : {};
+      const matchingNodes = [
+        ...(Array.isArray(execution.nodes) ? execution.nodes : []),
+        ...(Array.isArray(execution.orphans) ? execution.orphans : [])
+      ].filter(node => isRecord(node) && node.execution_id === executionId);
+      // A duplicate normal/orphan identity is ambiguous.  Do not attach its
+      // node evidence IDs; the detail endpoint itself fails closed for it.
+      const uniqueNodeEvidenceIds = matchingNodes.length === 1
+        ? (Array.isArray(matchingNodes[0].evidence_ids)
+          ? matchingNodes[0].evidence_ids : [])
+        : [];
+      const matchingEventEvidenceIds = (Array.isArray(execution.events)
+        ? execution.events : [])
+        .filter(event => isRecord(event) && event.execution_id === executionId)
+        .flatMap(event => Array.isArray(event.evidence_ids) ? event.evidence_ids : []);
+      const allEdges = Array.isArray(evidence.edges) ? evidence.edges : [];
+      const edgeReferences = (edge, kind, ids) => isRecord(edge) && (
+        (edge.source_kind === kind && ids.has(edge.source_id))
+        || (edge.target_kind === kind && ids.has(edge.target_id))
+      );
+      const directExecutionEdges = allEdges.filter(edge =>
+        edgeReferences(edge, "execution", new Set([executionId]))
+      );
+      const directEdgeEvidenceIds = directExecutionEdges.flatMap(edge => [
+        edge.source_kind === "evidence" ? edge.source_id : null,
+        edge.target_kind === "evidence" ? edge.target_id : null
+      ]);
+      const directRecordEvidenceIds = (Array.isArray(evidence.records)
+        ? evidence.records : [])
+        .filter(record => isRecord(record) && record.execution_id === executionId)
+        .map(record => record.evidence_id);
+      // Association is deliberately ID-only: unique node IDs, exact execution
+      // event IDs, direct record IDs, or the evidence endpoint of a direct
+      // execution edge.  Never infer an association from time or adjacency.
+      const evidenceIds = new Set([
+        ...uniqueNodeEvidenceIds,
+        ...matchingEventEvidenceIds,
+        ...directRecordEvidenceIds,
+        ...directEdgeEvidenceIds
+      ].filter(id => typeof id === "string" && id));
+      const executionEvidence = (Array.isArray(evidence.records)
+        ? evidence.records : [])
+        .filter(record => isRecord(record) && evidenceIds.has(record.evidence_id))
+        .slice(0, DRAWER_RECORD_LIMIT);
+      const visibleEvidenceIds = new Set(executionEvidence.map(record => record.evidence_id)
+        .filter(id => typeof id === "string" && id));
+      const artifactSha256s = new Set(executionEvidence.map(record => record.artifact?.sha256)
+        .filter(sha256 => typeof sha256 === "string" && sha256));
+      // This is one-hop identity linkage only.  Do not recursively infer an
+      // execution relation from a graph path or an incidental time window.
+      const relatedEdges = allEdges
+        .filter(edge => edgeReferences(edge, "execution", new Set([executionId]))
+          || edgeReferences(edge, "evidence", visibleEvidenceIds)
+          || edgeReferences(edge, "blob", artifactSha256s))
+        .slice(0, DRAWER_RECORD_LIMIT);
+      return {
+        activity: collect(data?.execution?.events),
+        usage: usageSamples,
+        artifacts: [...jobs, ...jobReceipts, ...artifactEvidence, ...executionEvidence, ...relatedEdges]
+          .slice(0, DRAWER_RECORD_LIMIT),
+        evidence: [
+          ...collect(evidence.provider_telemetry_receipts),
+          ...collect(evidence.provider_lifecycle_receipts),
+          ...collect(alerts.alerts),
+          ...executionEvidence,
+          ...relatedEdges
+        ].slice(0, DRAWER_RECORD_LIMIT)
+      };
+    }
+    function truncateRaw(value) {
+      const serialized = JSON.stringify(value, null, 2);
+      if (serialized.length <= DRAWER_RAW_LIMIT) return serialized;
+      return `${serialized.slice(0, DRAWER_RAW_LIMIT)}\n… truncated at ${DRAWER_RAW_LIMIT} characters`;
+    }
+    function drawerRows(records, unavailable) {
+      return records.length
+        ? records.map(record => `<pre>${safe(truncateRaw(record))}</pre>`).join("")
+        : `<div class="empty drawer-unavailable">${safe(unavailable)}</div>`;
+    }
+    function renderDrawer() {
+      const root = el("execution-drawer");
+      if (!drawer) {
+        root.hidden = true;
+        setDrawerBackgroundInert(false);
+        return;
+      }
+      root.hidden = false;
+      setDrawerBackgroundInert(true);
+      el("execution-drawer-title").textContent = `Execution detail · ${drawer.executionId}`;
+      el("execution-drawer-source").textContent =
+        `${drawer.mode === "historical" ? "HISTORICAL" : "LIVE"} · company ${drawer.companyId} · cursor ${drawer.cursor}`;
+      const tabs = el("execution-drawer-tabs");
+      tabs.innerHTML = DRAWER_TABS.map(tab => `<button id="${drawerTabId(tab)}" class="drawer-tab" type="button" role="tab" data-drawer-tab="${tab}" aria-selected="${drawer.tab === tab}" aria-controls="execution-drawer-content" tabindex="${drawer.tab === tab ? "0" : "-1"}">${tab}</button>`).join("");
+      tabs.querySelectorAll("[data-drawer-tab]").forEach(button => {
+        button.onclick = () => activateDrawerTab(button.dataset.drawerTab, false);
+        button.onkeydown = event => handleDrawerTabKey(event, button.dataset.drawerTab);
+      });
+      const content = el("execution-drawer-content");
+      content.setAttribute("aria-labelledby", drawerTabId(drawer.tab));
+      if (drawer.error) {
+        content.innerHTML = `<div class="empty drawer-unavailable">${safe(drawer.error)}</div>`;
+        return;
+      }
+      if (!drawer.detail) {
+        content.innerHTML = `<div class="empty">Loading read-only execution detail…</div>`;
+        return;
+      }
+      const detail = drawer.detail;
+      if (drawer.tab === "Overview") {
+        content.innerHTML = `<div class="card"><h3>${safe(detail.display_name || detail.execution_id)}</h3>
+          <div class="mono">${safe(detail.execution_id)}</div>
+          <div class="status-pair">${pill("engineering", detail.engineering_status)}${pill("runtime", detail.runtime_status)}${pill("carrier", detail.carrier_state ?? "unknown")}</div>
+          <div class="sub">${safe(detail.objective || detail.phase || "No projected objective or phase.")}</div>
+          <div class="sub">Read-only projection; no mutation controls are available.</div></div>`;
+      } else if (drawer.tab === "Activity") {
+        content.innerHTML = `<div class="card"><h3>Projected activity</h3><div class="sub">${safe(detail.phase || detail.objective || "Activity unavailable in this projection.")}</div></div>${drawerRows(drawer.records.activity, "No bounded activity records are available in this projection.")}`;
+      } else if (drawer.tab === "Usage") {
+        content.innerHTML = drawerRows(drawer.records.usage, "Usage unavailable for this execution in this read-only projection.");
+      } else if (drawer.tab === "Artifacts") {
+        content.innerHTML = drawerRows(drawer.records.artifacts, "Artifact metadata unavailable for this execution in this read-only projection.");
+      } else if (drawer.tab === "Evidence") {
+        content.innerHTML = drawerRows(drawer.records.evidence, "Evidence metadata unavailable for this execution in this read-only projection.");
+      } else {
+        content.innerHTML = `<pre>${safe(truncateRaw({
+          source: {mode: drawer.mode, company_id: drawer.companyId, cursor: drawer.cursor},
+          data: drawer.detail
+        }))}</pre>`;
+      }
+    }
+    function currentExecutionCard(executionId) {
+      return [...document.querySelectorAll("[data-execution-card]")].find(card =>
+        card instanceof HTMLElement && card.dataset.executionCard === executionId
+      ) ?? null;
+    }
+    function closeDrawer() {
+      if (!drawer) return;
+      const restoreFocus = drawer.trigger;
+      const restoreExecutionId = drawer.triggerExecutionId;
+      drawer = null;
+      drawerGeneration += 1;
+      renderDrawer();
+      const currentCard = currentExecutionCard(restoreExecutionId);
+      if (currentCard) {
+        currentCard.focus();
+        return;
+      }
+      if (restoreFocus instanceof HTMLElement && document.contains(restoreFocus)) restoreFocus.focus();
+    }
+    function drawerTabId(tab) {
+      return `execution-drawer-tab-${String(tab).toLowerCase()}`;
+    }
+    function activateDrawerTab(tab, focus) {
+      if (!drawer || !DRAWER_TABS.includes(tab)) return;
+      drawer.tab = tab;
+      renderDrawer();
+      if (focus) el(drawerTabId(tab))?.focus();
+    }
+    function handleDrawerTabKey(event, tab) {
+      const current = DRAWER_TABS.indexOf(tab);
+      if (current < 0) return;
+      let next = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (current + 1) % DRAWER_TABS.length;
+      if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (current - 1 + DRAWER_TABS.length) % DRAWER_TABS.length;
+      if (event.key === "Home") next = 0;
+      if (event.key === "End") next = DRAWER_TABS.length - 1;
+      if (next === null) return;
+      event.preventDefault();
+      activateDrawerTab(DRAWER_TABS[next], true);
+    }
+    function setDrawerBackgroundInert(open) {
+      document.querySelectorAll("body > header, body > main, body > #fatal, body > #warnings, body > #environment-banner")
+        .forEach(background => { background.inert = open; });
+    }
+    function trapDrawerFocus(event) {
+      if (!drawer || event.key !== "Tab") return;
+      const panel = el("execution-drawer-panel");
+      const focusable = [...panel.querySelectorAll("button:not([disabled]), [tabindex]:not([tabindex='-1'])")]
+        .filter(item => item instanceof HTMLElement && !item.hidden);
+      if (!focusable.length) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    function historicalExecution(snapshotValue, executionId) {
+      const execution = snapshotValue?.data?.execution;
+      const nodes = Array.isArray(execution?.nodes) ? execution.nodes : [];
+      const orphans = Array.isArray(execution?.orphans) ? execution.orphans : [];
+      const matches = [...nodes, ...orphans].filter(node =>
+        isRecord(node) && node.execution_id === executionId
+      );
+      return matches.length === 1 ? matches[0] : null;
+    }
+    async function openExecutionDrawer(executionId, trigger) {
+      const source = snapshot;
+      if (!source || typeof executionId !== "string" || !executionId) return;
+      const companyId = source.company_id;
+      const cursor = source.cursor;
+      if (typeof companyId !== "string" || !companyId || !Number.isSafeInteger(cursor) || cursor < 0) return;
+      const requestGeneration = ++drawerGeneration;
+      drawer = {
+        executionId, companyId, cursor, mode: isHistoricalView() ? "historical" : "live",
+        tab: "Overview", detail: null, error: null, records: drawerRecords(source.data, executionId),
+        trigger, triggerExecutionId: executionId, requestGeneration
+      };
+      renderDrawer();
+      el("execution-drawer-close").focus();
+      if (drawer.mode === "historical") {
+        const detail = historicalExecution(source, executionId);
+        if (!detail || snapshot !== source || !isHistoricalView() || historicalCursor !== cursor) {
+          drawer.error = "Historical execution detail is unavailable or no longer matches the selected snapshot.";
+        } else {
+          drawer.detail = detail;
+        }
+        renderDrawer();
+        return;
+      }
+      try {
+        const response = await fetch(`/api/v1/execution/${encodeURIComponent(executionId)}`, {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const envelope = await response.json();
+        if (
+          drawer?.requestGeneration !== requestGeneration
+          || snapshot !== source
+          || isHistoricalView()
+          || envelope?.company_id !== companyId
+          || envelope?.cursor !== cursor
+          || !isRecord(envelope?.data)
+          || envelope.data.execution_id !== executionId
+        ) {
+          throw new Error("execution detail identity mismatch or stale response");
+        }
+        drawer.detail = envelope.data;
+      } catch (error) {
+        if (drawer?.requestGeneration !== requestGeneration) return;
+        drawer.error = `Read-only execution detail unavailable: ${error}`;
+      }
+      if (drawer?.requestGeneration === requestGeneration) renderDrawer();
+    }
+    function installExecutionCardInteractions() {
+      document.querySelectorAll("[data-execution-card]").forEach(card => {
+        const open = event => {
+          if (event.target.closest("[data-copy]")) return;
+          void openExecutionDrawer(card.dataset.executionCard, card);
+        };
+        card.onclick = open;
+        card.onkeydown = event => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            open(event);
+          }
+        };
+      });
+    }
+    function render() {
+      if (!snapshot) return;
+      const data = snapshot.data;
+      const meta = data.meta || {};
+      el("supervisor").textContent = meta.supervisor?.status ?? "unknown";
+      el("cursor").textContent = snapshot.cursor;
+      const delivery = data.export || {};
+      const checkpoint = delivery.checkpoint || {};
+      el("checkpoint").textContent =
+        checkpoint.state === "verified"
+          ? `#${checkpoint.cursor ?? "unknown"}`
+          : (checkpoint.state ?? "unavailable");
+      el("export-status").textContent =
+        delivery.state === "available"
+          ? `#${delivery.cursor ?? "unknown"}`
+          : (delivery.state ?? "unavailable");
+      el("coverage").textContent = meta.coverage?.state ?? "unknown";
+      el("updated").textContent = new Date(snapshot.generated_at).toLocaleTimeString();
+      const warnings = Array.isArray(snapshot.warnings)
+        ? snapshot.warnings : [];
+      const warningBanner = el("warnings");
+      const warningMessages = [
+        ...(snapshot.completeness !== "complete"
+          ? [warnings.length ? warnings.join(" · ") : "partial"] : warnings),
+        ...(historicalNotice ? [historicalNotice] : [])
+      ];
+      if (warningMessages.length) {
+        warningBanner.textContent =
+          `${isHistoricalView()
+            ? "歷史投影"
+            : historicalNotice ? "Dashboard notice" : "觀測不完整"}：${warningMessages.join(" · ")}`;
+        warningBanner.style.display = "block";
+      } else {
+        warningBanner.textContent = "";
+        warningBanner.style.display = "none";
+      }
+
+      const work = data.work || {};
+      const environment = work.environment || {};
+      const providerWorker = work.provider_worker || {};
+      const environmentKind = environment.environment_kind || "unverified";
+      const providerLiveVerified = environment.provider_live_verified === true;
+      const environmentBanner = el("environment-banner");
+      environmentBanner.classList.toggle("verified", providerLiveVerified);
+      environmentBanner.innerHTML = `
+        <div class="environment-title">${safe(
+          `Environment: ${environmentKind} · provider-live ${
+            providerLiveVerified ? "verified" : "NOT VERIFIED"
+          } · provider worker ${providerWorker.state || "unavailable"}`
+        )}</div>
+        <div class="environment-detail">${safe(
+          `source: ${environment.source || "unavailable"} · ${
+            environment.reason || "environment verification unavailable"
+          } · ${providerWorker.reason || "provider worker state unavailable"}`
+        )}</div>`;
+
+      const company = data.company || {};
+      const manifest = company.manifest || {};
+      const chief = company.chief || {};
+      const selectedChief = chief.term || (company.chief_terms || []).find(x => x.state === "active")
+        || (company.chief_terms || [])[0];
+      const chiefCardClass = selectedChief?.state === "active"
+        ? "active" : "unknown";
+      const chiefCarrier = chief.carrier || {};
+      const authorities = Array.isArray(chief.authority_grants)
+        ? chief.authority_grants : [];
+      const currentAuthority = authorities.find(item => item.effective_state === "active")
+        || authorities[0];
+      const handoffs = Array.isArray(chief.takeover_attempts)
+        ? chief.takeover_attempts.slice(0, 3) : [];
+      el("company").innerHTML = `
+        <div class="card ${chiefCardClass}">
+          <h3>${safe(manifest.display_name || "Local company")}</h3>
+          <div class="mono">${copy(snapshot.company_id)}</div>
+          <div class="status-pair">
+            ${pill("Chief", selectedChief?.state ?? "unknown")}
+            ${currentAuthority ? pill("authority", currentAuthority.effective_state) : ""}
+          </div>
+          <div class="sub">${safe(selectedChief
+            ? `logical ${selectedChief.chief_id ?? "unknown"} · term ${selectedChief.term ?? "unknown"} / epoch ${selectedChief.epoch ?? "unknown"}`
+            : "Chief term unavailable")}</div>
+          <div class="sub">${safe(chiefCarrier.carrier_id
+            ? `${chiefCarrier.provider ?? "unknown"} · current carrier ${chiefCarrier.carrier_id}`
+            : "current carrier unavailable")}</div>
+          ${handoffs.length ? `<div class="handoff-history"><h3>Chief handoff history</h3>${handoffs.map(item => {
+            const resulting = item.resulting_chief_term || {};
+            const contender = item.contender_carrier_id;
+            const resultingCarrier = resulting.carrier_id;
+            return `<div class="handoff-entry">
+              <div class="status-pair">${pill("takeover", item.outcome ?? "unknown")}</div>
+              <div class="sub">${safe(`contender carrier: ${contender || "unavailable"}`)}</div>
+              ${typeof contender === "string" ? `<div class="mono">${copy(contender)}</div>` : ""}
+              <div class="sub">${safe(`result: chief ${resulting.chief_id ?? "unknown"} · term ${resulting.term ?? "unknown"} / epoch ${resulting.epoch ?? "unknown"}`)}</div>
+              <div class="sub">${safe(`resulting carrier: ${resultingCarrier || "unavailable"} · consumed: ${item.consumed_at ?? "unknown"}`)}</div>
+              ${typeof resultingCarrier === "string" ? `<div class="mono">${copy(resultingCarrier)}</div>` : ""}
+            </div>`;
+          }).join("")}</div>` : `<div class="sub">Chief handoff history unavailable.</div>`}
+          ${capacityLine("active capacity", company.capacity)}
+        </div>`;
+
+      const departments = (data.departments || []).filter(match);
+      el("departments").innerHTML = departments.length ? departments.map(dep => `
+        <div class="card ${safe(dep.lifecycle_state || dep.state || "unknown")}">
+          <div class="row"><h3 class="grow">${safe(dep.name || dep.display_name || dep.department_id)}</h3>
+          ${pill("lifecycle", dep.lifecycle_state || "unknown")}</div>
+          <div class="mono">${copy(dep.department_id)}</div>
+          <div class="status-pair">
+            ${pill("org", dep.lead?.organization_status || "unknown")}
+            ${dep.current_execution
+              ? pill("engineering", dep.current_execution.engineering_status || "unknown")
+              : pill("execution", "not_running")}
+            ${dep.current_execution
+              ? pill("runtime", dep.current_execution.runtime_status || "unknown")
+              : ""}
+            ${dep.carrier ? pill("carrier", dep.carrier.state || "unknown") : ""}
+            ${dep.wake_dispatch ? pill("wake", dep.wake_dispatch.state || "unknown") : ""}
+          </div>
+          <div class="sub">${safe(`reason: ${dep.lifecycle_reason || "unknown"} · lead: ${dep.lead?.node_id || "unavailable"}`)}</div>
+          <div class="sub">${safe(dep.snapshot?.availability === "available"
+            ? `snapshot ${dep.snapshot.snapshot_id || "unknown"} · r${dep.snapshot.revision ?? "unknown"} · cursor ${dep.snapshot.cursor ?? "unknown"}`
+            : "snapshot unavailable")}</div>
+          <div class="sub">${safe(dep.carrier
+            ? `carrier ${dep.carrier.carrier_id || "unknown"} · ${dep.carrier.provider || "unknown"} / ${dep.carrier.model || "unknown"} · session ${dep.carrier.session_availability || "unknown"}`
+            : "carrier unavailable")}</div>
+          <div class="sub">${safe(dep.wake_dispatch
+            ? `wake dispatch ${dep.wake_dispatch.dispatch_request_id || "unknown"} · revision ${dep.wake_dispatch.revision ?? "unknown"} · ${dep.wake_dispatch.state || "unknown"}${dep.wake_dispatch.state === "queued" ? " · queued, no runtime execution" : ""}`
+            : "wake dispatch unavailable")}</div>
+          ${dep.current_execution ? `<div class="sub">current execution: <a class="execution-link" href="#${safe(executionAnchor(dep.current_execution.execution_id))}">${copy(dep.current_execution.execution_id)}</a> · descendants: ${safe(dep.current_execution.descendant_count ?? "unknown")}</div>` : ""}
+          ${capacityLine("lead fanout", dep.manager_capacity)}
+        </div>`).join("") : empty("沒有符合條件的部門");
+
+      const workTasks = Array.isArray(work.tasks) ? work.tasks : [];
+      const workPackets = Array.isArray(work.packets) ? work.packets : [];
+      const workBindings = Array.isArray(work.bindings) ? work.bindings : [];
+      const workResults = Array.isArray(work.results) ? work.results : [];
+      const workCollectionSummary = work.collection_summary || {};
+      const workGate = work.gate || {};
+      const workGateState = workGate.active === true
+        ? "active" : workGate.active === false ? "blocked" : "unknown";
+      const boundedEntries = values => values.slice(-12).reverse();
+      const workVisible = (name, values) =>
+        Number.isInteger(workCollectionSummary[name]?.visible)
+          ? workCollectionSummary[name].visible : values.length;
+      const workGroup = (label, name, values, row) => `
+        <details class="work-group"${values.length ? " open" : ""}>
+          <summary>${safe(label)} (${workVisible(name, values)})</summary>
+          ${values.length
+            ? boundedEntries(values).map(row).join("")
+            : `<div class="sub">none recorded</div>`}
+          ${workCollectionSummary[name]?.truncated === true
+            ? `<div class="sub">${safe(
+              `API 顯示最新 ${workCollectionSummary[name].returned ?? values.length} / ${
+                workCollectionSummary[name].visible ?? "unknown"
+              } 筆 metadata；完整資料請用 History / Export。`
+            )}</div>`
+            : ""}
+          ${values.length > 12
+            ? `<div class="sub">顯示最新 12 筆 metadata；其餘請用 History / Export。</div>`
+            : ""}
+        </details>`;
+      el("work-definitions").innerHTML = `
+        <div class="card ${safe(workGateState)}">
+          <div class="row"><h3 class="grow">Registered-work gate</h3>
+          ${pill("", workGateState)}</div>
+          <div class="sub">${safe(workGate.reason || "gate state unavailable")}</div>
+          <div class="sub">此 gate 只表示 durable contract admission；不代表 provider worker 已啟動。</div>
+          <div class="work-summary">
+            <div class="work-count"><strong>${workVisible("tasks", workTasks)}</strong>task revisions</div>
+            <div class="work-count"><strong>${workVisible("packets", workPackets)}</strong>packets</div>
+            <div class="work-count"><strong>${workVisible("bindings", workBindings)}</strong>bindings</div>
+            <div class="work-count"><strong>${workVisible("results", workResults)}</strong>results</div>
+          </div>
+          ${workGroup("Task revisions", "tasks", workTasks, item => `
+            <div class="work-entry">
+              <div class="row"><h3 class="grow">${safe(item.display_name || item.task_id)}</h3>
+              <span class="sub">r${safe(item.revision ?? "unknown")}</span></div>
+              <div class="mono">${item.task_revision_id
+                ? copy(item.task_revision_id) : "revision ID unavailable"}</div>
+              <div class="sub">${safe(item.objective || "objective unavailable")}</div>
+              <div class="sub">${safe(`task: ${item.task_id || "unknown"} · digest: ${item.task_sha256 || "unavailable"}`)}</div>
+            </div>`)}
+          ${workGroup("Packets", "packets", workPackets, item => `
+            <div class="work-entry">
+              <div class="row"><h3 class="grow">${safe(item.display_name || item.packet_id)}</h3>
+              ${pill("depth", item.delegation_depth ?? "unknown")}</div>
+              <div class="mono">${item.packet_id ? copy(item.packet_id) : "packet ID unavailable"}</div>
+              <div class="sub">${safe(item.objective || "objective unavailable")}</div>
+              <div class="sub">${safe(`department: ${item.department_id || "unattributed"} · target: ${item.target_node_id || "unknown"} · expires: ${item.expires_at || "unknown"}`)}</div>
+            </div>`)}
+          ${workGroup("Dispatch bindings", "bindings", workBindings, item => `
+            <div class="work-entry">
+              <div class="mono">${item.binding_id ? copy(item.binding_id) : "binding ID unavailable"}</div>
+              <div class="sub">${safe(`dispatch: ${item.dispatch_request_id || "unknown"} · packet: ${item.packet_id || "unknown"}`)}</div>
+              <div class="sub">${safe(`department: ${item.department_id || "unattributed"} · target: ${item.target_node_id || "unknown"} · expires: ${item.expires_at || "unknown"}`)}</div>
+            </div>`)}
+          ${workGroup("Result receipts", "results", workResults, item => `
+            <div class="work-entry">
+              <div class="mono">${item.result_receipt_id
+                ? copy(item.result_receipt_id) : "result receipt ID unavailable"}</div>
+              <div class="sub">${safe(`packet: ${item.packet_id || "unknown"} · execution: ${item.producer_execution_id || "unknown"}`)}</div>
+              <div class="sub">${safe(`recorded: ${item.recorded_at || "unknown"} · digest: ${item.receipt_sha256 || "unavailable"}`)}</div>
+            </div>`)}
+        </div>`;
+
+      const execution = data.execution || {};
+      const queueSummary = execution.queue_summary || {};
+      const queue = dispatchQueue(execution).filter(match);
+      const queueLimited = queueSummary.truncated === true
+        || Number(queueSummary.returned) > 256;
+      const queueReason = queueSummary.reason
+        || (queueSummary.completeness === "partial" ? "coverage degraded" : "");
+      const queueBanner = queueLimited
+        ? "只顯示前 256 筆 dispatch summary；完整歷史請用唯讀 History/Export。"
+        : (queueReason ? `Queue ${queueReason}` : "");
+      el("dispatch-queue").innerHTML = `${queueBanner
+        ? `<div class="queue-banner">${safe(queueBanner)}</div>` : ""}${queue.length
+        ? queue.map(item => {
+          const state = queueDisplayState(item);
+          const frozen = state === "effect_unknown" || state === "reconcile_required";
+          const title = frozen ? "FROZEN — reconcile required"
+            : (item.requested_role || item.requested_capability_tier || "dispatch request");
+          const requestId = item.dispatch_revision_id || item.dispatch_request_id || item.reservation_id;
+          const eligibility = item.launch_eligible === true
+            ? "true" : item.launch_eligible === false ? "false" : "unknown";
+          const eligibilityLabel = eligibility === "true"
+            ? "contract gate eligible"
+            : eligibility === "false" ? "contract gate blocked" : "eligibility unknown";
+          return `<div class="card queue-card ${safe(state)}">
+            <div class="row"><h3 class="grow">${safe(title)}</h3>${pill("", state)}</div>
+            <div class="mono">${requestId ? copy(requestId) : "immutable ID unavailable"}</div>
+            <div class="sub eligibility-${safe(eligibility)}">${safe(
+              `${eligibilityLabel} · ${
+                item.launch_eligibility_reason || "reason unavailable"
+              }`
+            )}</div>
+            <div class="sub">${safe(
+              item.launch_eligible === true
+                ? "Durable contract admitted; provider worker remains unavailable."
+                : "No provider launch is claimed."
+            )}</div>
+            <div class="sub">${safe(frozen
+              ? "freeze / reconcile before retry"
+              : `depth ${item.delegation_depth ?? "unknown"} · attempt ${item.attempt ?? "unknown"}`)}</div>
+            <div class="sub">${safe(`department: ${item.department_id ?? "unattributed"} · manager: ${item.manager_node_id ?? "unknown"} · target: ${item.target_node_id ?? "unknown"}`)}</div>
+          </div>`;
+        }).join("") : empty("目前沒有等待 dispatch 的工作")}`;
+
+      const orphans = Array.isArray(execution.orphans)
+        ? execution.orphans.filter(match) : [];
+      const orphanIds = new Set(orphans.map(node => node.execution_id));
+      const nodes = orderedExecution(execution)
+        .filter(row => !orphanIds.has(row.node.execution_id))
+        .filter(row => match(row.node));
+      const currentDepartmentExecutions = new Set((data.departments || [])
+        .map(dep => dep.current_execution?.execution_id)
+        .filter(executionId => typeof executionId === "string"));
+      el("execution").innerHTML = nodes.length ? nodes.map(row => {
+        const node = row.node;
+        const depth = Math.min(Number(row.depth), 12);
+        const highlighted = currentDepartmentExecutions.has(node.execution_id);
+        return `<div id="${safe(executionAnchor(node.execution_id))}" class="card tree-node execution-card ${highlighted ? "current-department-execution" : ""} ${row.invalid ? "blocked" : safe(node.engineering_status)}"
+          style="--depth:${depth}" data-execution-card="${safe(node.execution_id)}" role="button" tabindex="0" aria-label="Open read-only execution detail for ${safe(node.display_name || node.execution_id)}">
+          <div class="row"><h3 class="grow">${safe(node.display_name || node.execution_id)}</h3>
+          <span class="sub">${safe(node.role || node.execution_kind)}</span></div>
+          <div class="mono">${copy(node.execution_id)}</div>
+          <div class="status-pair">
+            ${pill("engineering", node.engineering_status)}
+            ${pill("runtime", node.runtime_status)}
+            ${pill("carrier", node.carrier_state ?? "unknown")}
+            ${row.invalid ? pill("ancestry", row.reason) : ""}
+          </div>
+          <div class="sub">${safe(node.objective || node.phase || "")}</div>
+        </div>`;
+      }).join("") : empty("目前沒有 execution node");
+      el("orphan-heading").textContent = `Orphan / Unattributed (${orphans.length})`;
+      el("execution-orphans").innerHTML = orphans.length ? orphans.map(node => `
+        <div class="card blocked execution-card" data-execution-card="${safe(node.execution_id)}" role="button" tabindex="0" aria-label="Open read-only execution detail for ${safe(node.display_name || node.execution_id)}">
+          <div class="row"><h3 class="grow">${safe(node.display_name || node.execution_id)}</h3>
+          <span class="sub">${safe(node.role || node.execution_kind)}</span></div>
+          <div class="mono">${copy(node.execution_id)}</div>
+          <div class="status-pair">
+            ${pill("orphan", node.orphan_reason || "unattributed")}
+            ${pill("engineering", node.engineering_status)}
+            ${pill("runtime", node.runtime_status)}
+          </div>
+          <div class="sub">${safe(`source: ${node.projection_source || "unknown"}`)}</div>
+          <div class="sub">${safe(node.objective || node.phase || "")}</div>
+        </div>`).join("") : empty("沒有 orphan / unattributed execution");
+
+      const allJobReceipts =
+        data.evidence?.external_job_effect_receipts || [];
+      const receiptsByJob = new Map();
+      allJobReceipts.forEach(receipt => {
+        const rows = receiptsByJob.get(receipt.job_id) || [];
+        rows.push(receipt);
+        receiptsByJob.set(receipt.job_id, rows);
+      });
+      const jobs = (data.jobs || []).filter(match);
+      el("jobs").innerHTML = jobs.length ? jobs.map(job => `
+        <div class="card ${safe(job.state)}">
+          <div class="row"><h3 class="grow">External job</h3>
+          ${pill("", job.state)}</div>
+          <div class="mono">${copy(job.job_id)}</div>
+          <div class="sub">${safe(`owner execution: ${job.owner_execution_id}`)}</div>
+          <div class="sub">${safe(`mutation intent: ${job.mutation_intent_id} · command: ${job.command_id}`)}</div>
+          <div class="sub">${safe(`scope digest: ${job.scope_sha256}`)}</div>
+          <div class="sub">${safe(job.external_handle?.availability === "available"
+            ? `external handle available · ${job.external_handle.provider} / ${job.external_handle.namespace} / ${job.external_handle.resolver} · host digest: ${job.external_handle.host_fingerprint_sha256}`
+            : "external handle unavailable")}</div>
+          <div class="sub">${safe(`process observation: ${job.process_observation?.state ?? "unknown"} · ${job.process_observation?.reason ?? "unavailable"} · effect evidence: ${(job.effect_evidence || []).length}`)}</div>
+          <div class="sub">${safe(`typed effect receipts: ${(receiptsByJob.get(job.job_id) || []).length}`)}</div>
+          <div class="sub">${safe(`job observation: ${job.observation?.state ?? "unknown"} · ${job.observation?.reason ?? "unavailable"}`)}</div>
+        </div>`).join("") : empty("目前沒有外部 job");
+
+      const coverage = meta.coverage || {state: "unknown", reason: "unavailable"};
+      const coverageRows = Array.isArray(coverage.revisions) ? coverage.revisions : [];
+      el("coverage-card").innerHTML = `<div class="card coverage">
+        <div class="row"><h3 class="grow">${safe(coverage.state)}</h3></div>
+        <div class="sub">${safe(coverage.reason)}</div>
+        ${coverage.source ? `<div class="sub">${safe(`source: ${coverage.source} · quality: ${coverage.quality ?? "unknown"}`)}</div>` : ""}
+        ${coverageRows.length ? coverageRows.map(item =>
+          `<div class="sub">${safe(`${item.provider ?? "unknown"} / ${item.surface ?? "unknown"}: ${item.state ?? "unknown"} · ${item.reason ?? "unavailable"} · dropped ${item.dropped_event_count?.quality ?? "unknown"}`)}</div>`
+        ).join("") : `<div class="sub">provider/surface coverage not reported</div>`}
+        ${coverage.blob_health_warning
+          ? `<div class="sub">${safe(`independent blob warning: ${coverage.blob_health_warning.state} · ${coverage.blob_health_warning.reason}`)}</div>`
+          : ""}
+      </div>`;
+      const telemetryReceipts = (data.evidence?.provider_telemetry_receipts || [])
+        .filter(match);
+      el("telemetry-receipts").innerHTML = telemetryReceipts.length
+        ? telemetryReceipts.slice().reverse().map(receipt => `
+          <div class="card">
+            <div class="row"><h3 class="grow">${safe(
+              `${receipt.provider ?? "unknown"} · ${receipt.normalized_kind ?? "unavailable"}`
+            )}</h3>${pill("", receipt.parse_outcome ?? "unknown")}</div>
+            <div class="mono">${copy(receipt.receipt_id)}</div>
+            <div class="sub">${safe(`join: ${receipt.dispatch_join?.state ?? "none"} / ${receipt.dispatch_join?.binding_kind ?? "none"} · ${receipt.dispatch_join?.reason ?? "unavailable"}`)}</div>
+            <div class="sub">${safe(`received: ${receipt.received_at ?? "unknown"} · raw digest: ${receipt.raw_artifact?.sha256 ?? "unavailable"}`)}</div>
+            <div class="sub">${safe(`native provider relation only (not AOI lineage): ${receipt.provider_native_relation?.kind ?? "none"} · ${receipt.provider_native_relation?.reason ?? "unavailable"}`)}</div>
+            <div class="sub">${safe(`provenance: ${receipt.provenance ?? "unknown"} · observation: ${receipt.observation?.state ?? "unknown"}`)}</div>
+          </div>`).join("")
+        : empty("目前沒有 provider telemetry receipt");
+      const lifecycleReceipts = (data.evidence?.provider_lifecycle_receipts || [])
+        .filter(match);
+      const lifecycleSummary = data.evidence?.provider_lifecycle_receipt_summary || {};
+      const lifecycleBanner = lifecycleSummary.truncated === true
+        ? "只顯示最新 256 筆 provider lifecycle receipt summary。" : "";
+      el("provider-lifecycle-receipts").innerHTML = `${lifecycleBanner
+        ? `<div class="queue-banner">${safe(lifecycleBanner)}</div>` : ""}${lifecycleReceipts.length
+        ? lifecycleReceipts.map(receipt => `
+          <div class="card">
+            <div class="row"><h3 class="grow">${safe(
+              `${receipt.provider ?? "unknown"} · ${receipt.event_kind ?? "unknown"}`
+            )}</h3>${pill("", receipt.observation?.state ?? "unknown")}</div>
+            <div class="mono">${copy(receipt.receipt_id)}</div>
+            <div class="sub">${safe(`cursor: ${receipt.ledger_cursor ?? "unknown"} · event: ${receipt.source_event_id ?? "unknown"} · observed: ${receipt.observed_at ?? "unknown"}`)}</div>
+            <div class="sub">${safe(`dispatch: ${receipt.dispatch_request_id ?? "none"} · revision: ${receipt.dispatch_revision_id ?? "none"} / ${receipt.dispatch_revision ?? "unknown"}`)}</div>
+            <div class="sub">${safe(`execution: ${receipt.execution_id ?? "none"} · carrier: ${receipt.carrier_id ?? "none"} · provider dispatch: ${receipt.provider_dispatch_id ?? "none"}`)}</div>
+            <div class="sub">${safe(receipt.reconcile_ref ? `reconcile: ${receipt.reconcile_ref}` : "reconcile: none")}</div>
+            <div class="sub">${safe(`provenance: ${receipt.provenance ?? "unknown"} · observation: ${receipt.observation?.state ?? "unknown"} · ${receipt.observation?.reason ?? "unavailable"}`)}</div>
+            <div class="sub">${safe(`raw artifact: ${receipt.raw_artifact?.availability ?? "unavailable"} · digest: ${receipt.raw_artifact?.sha256 ?? "unavailable"}`)}</div>
+          </div>`).join("")
+        : empty("目前沒有 provider lifecycle receipt")}`;
+      const counterSamples = (data.usage?.counter_samples || []).filter(match);
+      el("usage-samples").innerHTML = `
+        <div class="card coverage"><h3>NON-ADDITIVE CUMULATIVE — no total / no cost</h3>
+          <div class="sub">${safe(`coverage: ${data.usage?.coverage?.state ?? "unknown"} · ${data.usage?.coverage?.reason ?? "unavailable"}`)}</div>
+        </div>
+        ${counterSamples.length ? counterSamples.slice().reverse().map(sample => `
+          <div class="card">
+            <div class="mono">${copy(sample.sample_id)}</div>
+            <div class="sub">${safe(`provider: ${sample.provider ?? "unknown"} · received: ${sample.received_at ?? "unknown"}`)}</div>
+            <div class="sub">${safe(`total vector: ${JSON.stringify(sample.total_token_vector ?? {})}`)}</div>
+            <div class="sub">${safe(`last vector: ${JSON.stringify(sample.last_token_vector ?? {})}`)}</div>
+            <div class="sub">${safe(`context: ${JSON.stringify(sample.model_context_window ?? {})} · raw digest: ${sample.raw_artifact?.sha256 ?? "unavailable"}`)}</div>
+          </div>`).join("") : empty("目前沒有 raw cumulative counter sample")}`;
+      const exportState = delivery.state ?? "unavailable";
+      const checkpointState = checkpoint.state ?? "unavailable";
+      el("checkpoint-export").innerHTML = `
+        <div class="card ${safe(checkpointState)}">
+          <div class="row"><h3 class="grow">Plain checkpoint</h3>
+          ${pill("", checkpointState)}</div>
+          <div class="sub">${safe(checkpointState === "verified"
+            ? `cursor ${checkpoint.cursor ?? "unknown"} · verified ${checkpoint.verified_at ?? "unknown"}`
+            : `reason: ${checkpoint.reason ?? "no_verified_checkpoint"}`)}</div>
+          ${checkpoint.manifest_sha256
+            ? `<div class="mono">${safe(checkpoint.manifest_sha256)}</div>`
+            : ""}
+        </div>
+        <div class="card ${safe(exportState)}">
+          <div class="row"><h3 class="grow">Sanitized export</h3>
+          ${pill("", exportState)}</div>
+          <div class="sub">${safe(exportState === "available"
+            ? `checkpoint cursor ${delivery.cursor ?? checkpoint.cursor ?? "unknown"} · generated ${delivery.generated_at ?? "unknown"}`
+            : `reason: ${delivery.reason ?? "sanitized_export_not_available"}`)}</div>
+          <div class="sub">${safe(
+            delivery.redaction?.security_boundary === false
+              ? "operational redaction · not a security boundary"
+              : "redaction boundary unavailable"
+          )}</div>
+          ${delivery.export_sha256
+            ? `<div class="mono">${safe(delivery.export_sha256)}</div>`
+            : ""}
+        </div>`;
+      const jobReceipts = allJobReceipts.filter(match);
+      el("job-receipts").innerHTML = jobReceipts.length
+        ? jobReceipts.slice().reverse().map(receipt => `
+          <div class="card">
+            <div class="row"><h3 class="grow">${safe(
+              `${receipt.previous_job_state} → ${receipt.observed_job_state}`
+            )}</h3>${pill("", receipt.provenance)}</div>
+            <div class="mono">${copy(receipt.receipt_id)}</div>
+            <div class="sub">${safe(`job: ${receipt.job_id} · source: ${receipt.source_event_id}`)}</div>
+            <div class="sub">${safe(`transition: ${receipt.transaction_id} / ${receipt.transition_command_id}`)}</div>
+            <div class="sub">${safe(`raw digest: ${receipt.raw_artifact?.sha256 ?? "unavailable"}`)}</div>
+            <div class="sub">${safe(receipt.reconciliation_id
+              ? `open reconciliation: ${receipt.reconciliation_id}`
+              : receipt.resolves_reconciliation_id
+                ? `resolved reconciliation: ${receipt.resolves_reconciliation_id}`
+                : "no reconciliation")}</div>
+          </div>`).join("")
+        : empty("目前沒有 typed external-job receipt");
+      const needs = (data.alerts?.needs_user || []).filter(match);
+      el("needs-user").innerHTML = needs.length ? needs.map(item => `
+        <div class="card alert"><h3>${safe(`Needs user · ${item.state}`)}</h3>
+        <div class="mono">${copy(item.item_id)}</div>
+        <div class="sub">${safe(`execution: ${item.origin_execution_id ?? item.execution_id ?? "none"} · opened chief term: ${item.opened_chief_term ?? item.chief_term ?? "unknown"}`)}</div>
+        <div class="sub">${safe(`revision: ${item.revision ?? "legacy"} · updated: ${item.updated_at ?? item.created_at ?? "unknown"}`)}</div>
+        <div class="sub">${safe(
+          typeof item.question_summary === "string" && item.question_summary.trim()
+            ? `question summary: ${item.question_summary}`
+            : "Question summary unavailable in this read-only projection."
+        )}</div>
+        <div class="sub">${safe(`question digest: ${item.question_sha256}`)}</div>
+        ${item.answer_sha256 ? `<div class="sub">${safe(`answer digest: ${item.answer_sha256} · answered term: ${item.answered_by_chief_term ?? "unknown"}`)}</div>` : ""}
+        <div class="sub">Question content unavailable in this read-only projection.</div>
+        <div class="sub">${safe(`observation: ${item.observation?.state ?? "unknown"} · ${item.observation?.reason ?? "unavailable"}`)}</div></div>
+      `).join("") : empty("沒有待使用者回答");
+      const alerts = (data.alerts?.alerts || []).filter(match);
+      el("alerts").innerHTML = alerts.length ? alerts.map(item => `
+        <div class="card alert ${safe(item.severity)}"><h3>${safe(`${item.category} · ${item.state}`)}</h3>
+        <div class="mono">${copy(item.alert_id)}</div>
+        <div class="sub">${safe(`severity: ${item.severity} · execution: ${item.execution_id ?? "none"}`)}</div>
+        <div class="sub">${safe(`detail digest: ${item.detail_sha256}`)}</div>
+        <div class="sub">Alert detail content unavailable in this read-only projection.</div>
+        <div class="sub">${safe(`observation: ${item.observation?.state ?? "unknown"} · ${item.observation?.reason ?? "unavailable"}`)}</div>
+        ${item.projection_source ? `<div class="sub">${safe(`source: ${item.projection_source}`)}</div>` : ""}</div>
+      `).join("") : empty("沒有 alert");
+      const recentRows = historyGap
+        ? [
+            ...recent.filter(item =>
+              item.cursor !== historyGap.cursor
+              || item.event_id !== historyGap.event_id
+            ),
+            historyGap
+          ]
+        : recent;
+      el("recent").innerHTML = recentRows.length ? recentRows.slice(-12).reverse().map(item => `
+        <div class="card ${item.event_type === "history_gap" ? "alert" : ""}">
+        <div class="row"><h3 class="grow">${safe(item.event_type)}</h3>
+        <span class="sub">#${safe(item.cursor)}</span></div>
+        <div class="mono">${safe(item.event_id)}</div></div>
+      `).join("") : empty("等待新事件");
+      document.querySelectorAll("[data-copy]").forEach(button => {
+        button.onclick = event => {
+          event.stopPropagation();
+          navigator.clipboard?.writeText(button.dataset.copy);
+        };
+      });
+      installExecutionCardInteractions();
+    }
+    async function refresh() {
+      if (isHistoricalView()) return true;
+      const generation = ++refreshGeneration;
+      try {
+        const response = await fetch("/api/v1/snapshot", {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const incoming = await response.json();
+        if (!Number.isSafeInteger(incoming.cursor) || incoming.cursor < 0) {
+          throw new Error("invalid snapshot cursor");
+        }
+        const identitySnapshot = liveSnapshot || snapshot;
+        if (identitySnapshot && incoming.company_id !== identitySnapshot.company_id) {
+          throw new Error("company identity changed");
+        }
+        if (
+          liveSnapshot
+          && (
+            incoming.cursor < liveSnapshot.cursor
+            || (
+              incoming.cursor === liveSnapshot.cursor
+              && generation < appliedRefreshGeneration
+            )
+          )
+        ) {
+          return true;
+        }
+        liveSnapshot = incoming;
+        appliedRefreshGeneration = generation;
+        if (!isHistoricalView()) {
+          if (drawer?.mode === "live" && drawer.cursor !== incoming.cursor) closeDrawer();
+          snapshot = incoming;
+          historicalNotice = null;
+          updateViewIndicator();
+          render();
+        }
+        el("fatal").style.display = "none";
+        return true;
+      } catch (error) {
+        el("fatal").textContent = `Dashboard 無法讀取 Supervisor：${error}`;
+        el("fatal").style.display = "block";
+        el("connection").textContent = "dashboard_unavailable";
+        return false;
+      }
+    }
+    el("search").addEventListener("input", () => { closeDrawer(); render(); });
+    async function loadHistoricalSnapshot() {
+      closeDrawer();
+      const rawCursor = el("history-cursor").value.trim();
+      if (!/^(0|[1-9]\d*)$/.test(rawCursor)) {
+        historicalNotice = "請輸入非負整數 cursor。";
+        render();
+        return;
+      }
+      const requested = Number(rawCursor);
+      if (!Number.isSafeInteger(requested)) {
+        historicalNotice = "cursor 超出安全整數範圍。";
+        render();
+        return;
+      }
+      try {
+        const response = await fetch(
+          `/api/v1/snapshot?cursor=${requested}`,
+          {cache: "no-store"}
+        );
+        let incoming = null;
+        try {
+          incoming = await response.json();
+        } catch (error) {
+          incoming = null;
+        }
+        if (!response.ok) {
+          const errorCode = incoming?.error || `HTTP ${response.status}`;
+          const detail = incoming?.detail || "historical projection unavailable";
+          historicalNotice = `${errorCode}: ${detail}`;
+          render();
+          return;
+        }
+        if (!Number.isSafeInteger(incoming?.cursor) || incoming.cursor !== requested) {
+          throw new Error("historical snapshot cursor identity mismatch");
+        }
+        if (liveSnapshot && incoming.company_id !== liveSnapshot.company_id) {
+          throw new Error("company identity changed");
+        }
+        if (liveSnapshot && incoming.cursor === liveSnapshot.cursor) {
+          historicalNotice = "指定 cursor 即為目前 live projection。";
+          returnToLive();
+          return;
+        }
+        historicalCursor = incoming.cursor;
+        historicalNotice = null;
+        snapshot = incoming;
+        connectionGeneration += 1;
+        closeStream();
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        el("connection").textContent = "historical_paused";
+        updateViewIndicator();
+        render();
+      } catch (error) {
+        historicalNotice = `歷史投影無法讀取：${error}`;
+        render();
+      }
+    }
+    function returnToLive() {
+      closeDrawer();
+      historicalCursor = null;
+      historicalNotice = null;
+      if (liveSnapshot) snapshot = liveSnapshot;
+      lastSeenEventCursor = liveSnapshot?.cursor ?? lastSeenEventCursor;
+      lastAcceptedTransactionData = null;
+      updateViewIndicator();
+      render();
+      void connectStream();
+    }
+    el("history-load").addEventListener("click", () => { void loadHistoricalSnapshot(); });
+    el("history-cursor").addEventListener("keydown", event => {
+      if (event.key === "Enter") void loadHistoricalSnapshot();
+    });
+    el("return-live").addEventListener("click", returnToLive);
+    el("execution-drawer-close").addEventListener("click", closeDrawer);
+    el("execution-drawer").addEventListener("click", event => {
+      if (event.target.dataset.executionClose === "backdrop") closeDrawer();
+    });
+    document.addEventListener("keydown", event => {
+      trapDrawerFocus(event);
+      if (event.key === "Escape" && drawer) {
+        event.preventDefault();
+        closeDrawer();
+      }
+    });
+    let stream = null;
+    let reconnectTimer = null;
+    function pushRecent(candidate) {
+      if (!recent.some(existing =>
+        existing.cursor === candidate.cursor
+        && existing.event_id === candidate.event_id
+      )) {
+        recent.push(candidate);
+      }
+      if (recent.length > RECENT_LIMIT) {
+        recent.splice(0, recent.length - RECENT_LIMIT);
+      }
+    }
+    function closeStream() {
+      if (stream) {
+        stream.close();
+        stream = null;
+      }
+    }
+    function scheduleReconnect(delay) {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connectStream, delay);
+    }
+    function reconnectFromLastSeen(nextStream, status, delay) {
+      if (stream !== nextStream) return;
+      el("connection").textContent = status;
+      nextStream.close();
+      stream = null;
+      scheduleReconnect(delay);
+    }
+    function failReplay(reason) {
+      el("fatal").textContent = `Dashboard replay contract failed: ${reason}`;
+      el("fatal").style.display = "block";
+      el("connection").textContent = "replay_invalid";
+    }
+    function rejectStream(nextStream, reason) {
+      if (stream !== nextStream) return;
+      connectionGeneration += 1;
+      nextStream.close();
+      stream = null;
+      failReplay(reason);
+    }
+    async function resetReplayCursor(reason, expectedGeneration) {
+      if (isHistoricalView()) return;
+      if (expectedGeneration !== connectionGeneration) return;
+      const resetGeneration = ++connectionGeneration;
+      closeStream();
+      el("connection").textContent = "reset_required";
+      const previous = lastSeenEventCursor;
+      if (!await refresh() || !snapshot) {
+        if (resetGeneration === connectionGeneration) scheduleReconnect(1000);
+        return;
+      }
+      if (resetGeneration !== connectionGeneration) return;
+      const current = snapshot.cursor;
+      if (previous !== null && current <= previous) {
+        el("fatal").textContent =
+          `Dashboard replay reset is inconsistent: ${previous} -> ${current}`;
+        el("fatal").style.display = "block";
+        el("connection").textContent = "reset_inconsistent";
+        scheduleReconnect(1000);
+        return;
+      }
+      if (previous !== null) {
+        historyGap = {
+          cursor: current,
+          event_id: `dashboard-local:missed-${previous + 1}-${current}:${reason}`,
+          event_type: "history_gap"
+        };
+        pushRecent(historyGap);
+      }
+      lastSeenEventCursor = current;
+      lastAcceptedTransactionData = null;
+      render();
+      scheduleReconnect(250);
+    }
+    async function connectStream() {
+      if (isHistoricalView()) {
+        el("connection").textContent = "historical_paused";
+        return;
+      }
+      const generation = ++connectionGeneration;
+      closeStream();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (!await refresh() || !snapshot) {
+        if (generation === connectionGeneration) scheduleReconnect(1000);
+        return;
+      }
+      if (generation !== connectionGeneration) return;
+      if (lastSeenEventCursor === null) {
+        lastSeenEventCursor = snapshot.cursor;
+      }
+      const replayCursor = lastSeenEventCursor;
+      let replayResponse;
+      try {
+        replayResponse = await fetch(
+          `/api/v1/history?cursor=${replayCursor}`,
+          {cache: "no-store"}
+        );
+      } catch (error) {
+        if (generation !== connectionGeneration) return;
+        el("connection").textContent = "dashboard_disconnected";
+        scheduleReconnect(1000);
+        return;
+      }
+      if (generation !== connectionGeneration) return;
+      if (replayResponse.status === 409) {
+        let replayError = {};
+        try {
+          replayError = await replayResponse.json();
+        } catch (error) {
+          replayError = {};
+        }
+        if (generation !== connectionGeneration) return;
+        if (replayError.error === "reset_required") {
+          await resetReplayCursor(
+            replayError.detail || "bounded_replay_expired",
+            generation
+          );
+          return;
+        }
+        failReplay(replayError.error || "unexpected HTTP 409");
+        return;
+      }
+      if (!replayResponse.ok) {
+        if (replayResponse.status < 500) {
+          failReplay(`unexpected HTTP ${replayResponse.status}`);
+          return;
+        }
+        el("connection").textContent = "dashboard_disconnected";
+        scheduleReconnect(1000);
+        return;
+      }
+      let replayEnvelope;
+      try {
+        replayEnvelope = await replayResponse.json();
+      } catch (error) {
+        failReplay("history response is not JSON");
+        return;
+      }
+      if (
+        generation !== connectionGeneration
+        || replayEnvelope?.data?.after_cursor !== replayCursor
+      ) {
+        if (generation === connectionGeneration) {
+          failReplay("history cursor identity mismatch");
+        }
+        return;
+      }
+      const nextStream = new EventSource(
+        `/api/v1/events?cursor=${replayCursor}`
+      );
+      stream = nextStream;
+      nextStream.onopen = () => {
+        if (stream !== nextStream || generation !== connectionGeneration) return;
+        el("connection").textContent = "live";
+      };
+      nextStream.addEventListener("company", event => {
+        if (stream !== nextStream || generation !== connectionGeneration) return;
+        let tx;
+        try {
+          tx = JSON.parse(event.data);
+        } catch (error) {
+          rejectStream(nextStream, "SSE transaction is not JSON");
+          return;
+        }
+        const lastEventId = event.lastEventId;
+        const eventCursor = /^(0|[1-9]\d*)$/.test(lastEventId)
+          ? Number(lastEventId)
+          : Number.NaN;
+        if (
+          !Number.isSafeInteger(tx.cursor)
+          || tx.cursor < 0
+          || !Number.isSafeInteger(eventCursor)
+          || eventCursor !== tx.cursor
+          || !Array.isArray(tx.events)
+          || typeof tx.transaction_id !== "string"
+          || !tx.transaction_id
+          || lastSeenEventCursor === null
+        ) {
+          rejectStream(nextStream, "SSE cursor or transaction shape is invalid");
+          return;
+        }
+        const candidates = [];
+        for (const item of tx.events) {
+          if (
+            !item
+            || typeof item !== "object"
+            || Array.isArray(item)
+            || typeof item.event_id !== "string"
+            || !item.event_id
+            || typeof item.event_type !== "string"
+            || !item.event_type
+          ) {
+            rejectStream(nextStream, "SSE event metadata is invalid");
+            return;
+          }
+          candidates.push({
+            cursor: tx.cursor,
+            event_id: item.event_id,
+            event_type: item.event_type
+          });
+        }
+        if (tx.cursor === lastSeenEventCursor) {
+          if (
+            lastAcceptedTransactionData !== null
+            && event.data === lastAcceptedTransactionData
+          ) {
+            return;
+          }
+          rejectStream(
+            nextStream,
+            "same cursor carried non-identical transaction bytes"
+          );
+          return;
+        }
+        if (tx.cursor !== lastSeenEventCursor + 1) {
+          reconnectFromLastSeen(nextStream, "history_gap_detected", 250);
+          return;
+        }
+        for (const candidate of candidates) pushRecent(candidate);
+        lastSeenEventCursor = tx.cursor;
+        lastAcceptedTransactionData = event.data;
+        refresh();
+      });
+      nextStream.addEventListener("reset_required", event => {
+        if (stream !== nextStream || generation !== connectionGeneration) return;
+        let reason = "bounded_replay_expired";
+        try {
+          reason = JSON.parse(event.data).reason || reason;
+        } catch (error) {
+          reason = "bounded_replay_expired";
+        }
+        void resetReplayCursor(reason, generation);
+      });
+      nextStream.onerror = () => {
+        if (generation !== connectionGeneration) return;
+        reconnectFromLastSeen(nextStream, "dashboard_disconnected", 1000);
+      };
+    }
+    connectStream();
+    setInterval(() => { void refresh(); }, 5000);
+  </script>
+</body>
+</html>
