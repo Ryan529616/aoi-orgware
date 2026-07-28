@@ -167,7 +167,7 @@ class FileGovernanceWaiverV1:
 
 @dataclass(frozen=True, slots=True)
 class ImportBoundaryRuleV1:
-    """Reserved contract only; no AST gate is claimed in this slice."""
+    """One deterministic AST import-boundary and cycle policy."""
 
     schema_version: Literal[1]
     rule_id: str

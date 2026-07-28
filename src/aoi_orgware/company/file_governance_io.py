@@ -23,7 +23,9 @@ from .file_governance import (
     FileGovernanceWaiverV1,
     GitBlob,
     GitScopeSnapshot,
+    GovernanceFinding,
     GovernanceReport,
+    ImportBoundaryRuleV1,
     _evaluate_verified_candidate,
     baseline_manifest_bytes,
     build_baseline_manifest,
@@ -34,6 +36,10 @@ from .file_governance import (
 from .file_governance_process import (
     quiesce_git_process,
     spawn_git_process,
+)
+from .import_governance import (
+    DEFAULT_COMPANY_IMPORT_BOUNDARY_RULES,
+    evaluate_import_governance,
 )
 
 
@@ -481,19 +487,49 @@ def evaluate_file_governance(
     current_files: Mapping[str, GitBlob],
     release: str,
     observed_at: datetime,
+    import_rules: Sequence[ImportBoundaryRuleV1],
     waivers: Sequence[FileGovernanceWaiverV1] = (),
     known_values: Sequence[tuple[str, bytes | str]] = (),
 ) -> GovernanceReport:
-    """Verify the immutable Git tree before invoking the pure evaluator."""
+    """Verify the immutable Git tree, then enforce file and import policy."""
 
     checked = verify_baseline_against_git(repo_root, baseline)
-    return _evaluate_verified_candidate(
+    report = _evaluate_verified_candidate(
         baseline=checked,
         current_files=current_files,
         release=release,
         observed_at=observed_at,
         waivers=waivers,
         known_values=known_values,
+    )
+    if not import_rules:
+        return report
+    return _merge_import_findings(
+        report,
+        evaluate_import_governance(current_files, import_rules),
+    )
+
+
+def _merge_import_findings(
+    report: GovernanceReport,
+    findings: Sequence[GovernanceFinding],
+) -> GovernanceReport:
+    errors = tuple(sorted(set((
+        *report.errors,
+        *(item for item in findings if item.severity == "error"),
+    ))))
+    warnings = tuple(sorted(set((
+        *report.warnings,
+        *(item for item in findings if item.severity == "warning"),
+    ))))
+    return GovernanceReport(
+        report.accepted and not errors,
+        report.baseline_commit_sha1,
+        report.baseline_tree_sha1,
+        report.scanned_file_count,
+        report.scanned_size_bytes,
+        errors,
+        warnings,
     )
 
 
@@ -515,6 +551,7 @@ def evaluate_packaged_file_governance(
         current_files=current_files,
         release=release,
         observed_at=observed_at,
+        import_rules=DEFAULT_COMPANY_IMPORT_BOUNDARY_RULES,
         waivers=waivers,
         known_values=known_values,
     )

@@ -504,8 +504,52 @@ def test_ls_tree_reader_ignores_export_ignore_and_verifies_exact_tree(
         current_files=_current(wire, {}),
         release="0.5.0a1",
         observed_at=OBSERVED_AT,
+        import_rules=(),
     )
     assert safe.accepted
+
+
+def test_public_gate_composes_exact_git_and_import_policy(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _init_repo(root)
+    source = root / "src/aoi_orgware/company/worker.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("import aoi_orgware.ledger\n", encoding="utf-8")
+    (root / "src/aoi_orgware/ledger.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "baseline")
+    commit = _git(root, "rev-parse", "HEAD")
+    snapshot = read_git_commit_scope(root, commit)
+    manifest = build_baseline_from_git(root, commit, exclusions=SELF_ONLY)
+    wire = baseline_manifest_bytes(manifest)
+    current = dict(snapshot.files)
+    current[BASELINE_RESOURCE_PATH] = GitBlob("100644", wire)
+    report = evaluate_file_governance(
+        root,
+        baseline=wire,
+        current_files=current,
+        release="0.5.0a1",
+        observed_at=OBSERVED_AT,
+        import_rules=(
+            ImportBoundaryRuleV1(
+                1,
+                "company-boundary-test",
+                "aoi_orgware.company",
+                ("aoi_orgware.company",),
+                True,
+            ),
+        ),
+    )
+    assert not report.accepted
+    assert {item.rule_id for item in report.errors} == {
+        "import_boundary:company-boundary-test"
+    }
 
 
 def test_ls_tree_rejects_tracked_symlink_mode(tmp_path: Path) -> None:
