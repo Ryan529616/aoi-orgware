@@ -722,13 +722,7 @@ class CompanyLedger:
 
     @staticmethod
     def _fsync_snapshot_parent(path: Path) -> None:
-        """Best-effort parent entry flush after an already-fsynced leaf.
-
-        POSIX receives a real directory ``fsync``.  Windows exposes no
-        portable successful directory-entry flush through this API; its
-        unsupported result is deliberately a documented best-effort boundary,
-        not a power-loss durability guarantee.
-        """
+        """Flush an already-fsynced leaf's parent; Windows remains best-effort."""
 
         if os.name != "nt":
             descriptor = os.open(
@@ -746,7 +740,7 @@ class CompanyLedger:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         handle = kernel32.CreateFileW(
             str(path),
             0x80000000,  # GENERIC_READ
@@ -758,10 +752,14 @@ class CompanyLedger:
         )
         invalid = ctypes.c_void_p(-1).value
         if handle == invalid:
-            raise OSError(ctypes.get_last_error(), "CreateFileW failed", str(path))
+            raise OSError(
+                ctypes.get_last_error(),  # type: ignore[attr-defined]
+                "CreateFileW failed",
+                str(path),
+            )
         try:
             if not kernel32.FlushFileBuffers(wintypes.HANDLE(handle)):
-                error = ctypes.get_last_error()
+                error = ctypes.get_last_error()  # type: ignore[attr-defined]
                 # Windows documents directory handles for metadata inspection,
                 # but NTFS/ReFS reject FlushFileBuffers on them with ACCESS_DENIED.
                 # The leaf is fsynced; this is a best-effort parent boundary,

@@ -126,7 +126,7 @@ def _spawn_windows(command: Sequence[str]) -> GitProcessTree:
             ("TotalTerminatedProcesses", wintypes.DWORD),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     kernel32.CreateJobObjectW.restype = wintypes.HANDLE
     kernel32.SetInformationJobObject.argtypes = (
@@ -153,14 +153,14 @@ def _spawn_windows(command: Sequence[str]) -> GitProcessTree:
 
     job = kernel32.CreateJobObjectW(None, None)
     if not job:
-        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")  # type: ignore[attr-defined]
     process: subprocess.Popen[bytes] | None = None
     assigned = False
     job_open = True
 
     def close_handle(handle: int) -> None:
         if handle and not kernel32.CloseHandle(handle):
-            raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            raise OSError(ctypes.get_last_error(), "CloseHandle failed")  # type: ignore[attr-defined]
 
     def close_job() -> None:
         nonlocal job_open
@@ -170,7 +170,7 @@ def _spawn_windows(command: Sequence[str]) -> GitProcessTree:
 
     def terminate_job() -> None:
         if not kernel32.TerminateJobObject(job, 1):
-            raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
+            raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")  # type: ignore[attr-defined]
 
     try:
         limits = ExtendedLimits()
@@ -182,7 +182,7 @@ def _spawn_windows(command: Sequence[str]) -> GitProcessTree:
             ctypes.sizeof(limits),
         ):
             raise OSError(
-                ctypes.get_last_error(),
+                ctypes.get_last_error(),  # type: ignore[attr-defined]
                 "SetInformationJobObject failed",
             )
         process = subprocess.Popen(
@@ -200,11 +200,11 @@ def _spawn_windows(command: Sequence[str]) -> GitProcessTree:
             process.pid,
         )
         if not process_handle:
-            raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+            raise OSError(ctypes.get_last_error(), "OpenProcess failed")  # type: ignore[attr-defined]
         try:
             if not kernel32.AssignProcessToJobObject(job, process_handle):
                 raise OSError(
-                    ctypes.get_last_error(),
+                    ctypes.get_last_error(),  # type: ignore[attr-defined]
                     "AssignProcessToJobObject failed",
                 )
             assigned = True
@@ -263,7 +263,7 @@ def _spawn_windows(command: Sequence[str]) -> GitProcessTree:
             None,
         ):
             raise OSError(
-                ctypes.get_last_error(),
+                ctypes.get_last_error(),  # type: ignore[attr-defined]
                 "QueryInformationJobObject failed",
             )
         return bool(accounting.ActiveProcesses)

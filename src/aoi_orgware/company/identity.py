@@ -615,14 +615,7 @@ def _run_git(
 
 
 def _windows_file_id_info(path: Path) -> tuple[int, bytes]:
-    """Read the native FileIdInfo tuple for one already-vetted directory.
-
-    This deliberately does not use ``stat_result``: CPython's Windows
-    ``st_dev``/``st_ino`` mapping is not the v0.5 binding contract.  Opening
-    the leaf with ``OPEN_REPARSE_POINT`` keeps a race-created reparse point
-    from being followed; the caller has already rejected all extant reparse
-    components before it reaches this native boundary.
-    """
+    """Read native FileIdInfo for one vetted directory without following its leaf."""
 
     if os.name != "nt":
         raise CompanyIdentityError("Windows FileIdInfo is unavailable on this host")
@@ -638,7 +631,7 @@ def _windows_file_id_info(path: Path) -> tuple[int, bytes]:
     class _FileIdInfo(ctypes.Structure):
         _fields_ = [("volume_serial_number", ctypes.c_ulonglong), ("file_id", _FileId128)]
 
-    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file = ctypes.windll.kernel32.CreateFileW  # type: ignore[attr-defined]
     create_file.argtypes = (
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -649,10 +642,10 @@ def _windows_file_id_info(path: Path) -> tuple[int, bytes]:
         wintypes.HANDLE,
     )
     create_file.restype = wintypes.HANDLE
-    get_information = ctypes.windll.kernel32.GetFileInformationByHandleEx
+    get_information = ctypes.windll.kernel32.GetFileInformationByHandleEx  # type: ignore[attr-defined]
     get_information.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
     get_information.restype = wintypes.BOOL
-    close_handle = ctypes.windll.kernel32.CloseHandle
+    close_handle = ctypes.windll.kernel32.CloseHandle  # type: ignore[attr-defined]
     close_handle.argtypes = (wintypes.HANDLE,)
     close_handle.restype = wintypes.BOOL
 
@@ -673,12 +666,12 @@ def _windows_file_id_info(path: Path) -> tuple[int, bytes]:
         None,
     )
     if handle == invalid_handle_value:
-        error = ctypes.get_last_error()
+        error = ctypes.get_last_error()  # type: ignore[attr-defined]
         raise CompanyIdentityError(f"cannot open Git common-dir for FileIdInfo: WinError {error}")
     try:
         info = _FileIdInfo()
         if not get_information(handle, file_id_info_class, ctypes.byref(info), ctypes.sizeof(info)):
-            error = ctypes.get_last_error()
+            error = ctypes.get_last_error()  # type: ignore[attr-defined]
             raise CompanyIdentityError(f"cannot read Git common-dir FileIdInfo: WinError {error}")
         return int(info.volume_serial_number), bytes(info.file_id.identifier)
     finally:
