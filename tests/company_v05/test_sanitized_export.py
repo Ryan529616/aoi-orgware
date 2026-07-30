@@ -120,6 +120,7 @@ def test_identical_collision_waits_for_link_window_and_fsyncs(
     linked = Event()
     settling = Event()
     release = Event()
+    unlinked = Event()
     fsyncs: list[Path] = []
     original_publish = sanitized_export_module._publish_no_replace
     original_fsync = sanitized_export_module._fsync_directory
@@ -130,12 +131,14 @@ def test_identical_collision_waits_for_link_window_and_fsyncs(
             linked.set()
             assert release.wait(5)
             stage.unlink()
+            unlinked.set()
             return
         original_publish(stage, target)
 
     def wait_for_release(_seconds: float) -> None:
         settling.set()
         assert release.wait(5)
+        assert unlinked.wait(5)
 
     def record_fsync(path: Path) -> None:
         fsyncs.append(path)
@@ -172,6 +175,7 @@ def test_divergent_collision_waits_then_rejects_without_overwrite(
     linked = Event()
     settling = Event()
     release = Event()
+    unlinked = Event()
     original_publish = sanitized_export_module._publish_no_replace
 
     def delayed_publish(stage: Path, target: Path) -> None:
@@ -180,12 +184,14 @@ def test_divergent_collision_waits_then_rejects_without_overwrite(
             linked.set()
             assert release.wait(5)
             stage.unlink()
+            unlinked.set()
             return
         original_publish(stage, target)
 
     def wait_for_release(_seconds: float) -> None:
         settling.set()
         assert release.wait(5)
+        assert unlinked.wait(5)
 
     def publish(generated_at: str) -> str:
         return write_sanitized_export(
