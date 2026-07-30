@@ -5,9 +5,11 @@ import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import shutil
+from threading import Event
 
 import pytest
 
+import aoi_orgware.company.sanitized_export as sanitized_export_module
 from aoi_orgware.company.checkpoint import verify_plain_checkpoint
 from aoi_orgware.company.contracts import canonical_company_json_bytes
 from aoi_orgware.company.sanitized_export import (
@@ -105,6 +107,207 @@ def test_replay_collision_and_concurrent_publication_are_fail_closed(tmp_path: P
         witness = _ConcurrentWitness(owner.resolved.slot.lock)
         results = list(pool.map(lambda _item: _write(owner, "race-1", lock=witness)[0], range(2)))
     assert results == [results[0], results[0]]
+    owner.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-replace uses a two-link window")
+def test_identical_collision_waits_for_link_window_and_fsyncs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = initialized(tmp_path)
+    write(owner)
+    linked = Event()
+    settling = Event()
+    release = Event()
+    fsyncs: list[Path] = []
+    original_publish = sanitized_export_module._publish_no_replace
+    original_fsync = sanitized_export_module._fsync_directory
+
+    def delayed_publish(stage: Path, target: Path) -> None:
+        if target.name == "race-window.json" and not linked.is_set():
+            os.link(stage, target)
+            linked.set()
+            assert release.wait(5)
+            stage.unlink()
+            return
+        original_publish(stage, target)
+
+    def wait_for_release(_seconds: float) -> None:
+        settling.set()
+        assert release.wait(5)
+
+    def record_fsync(path: Path) -> None:
+        fsyncs.append(path)
+        original_fsync(path)
+
+    monkeypatch.setattr(sanitized_export_module, "_publish_no_replace", delayed_publish)
+    monkeypatch.setattr(sanitized_export_module, "sleep", wait_for_release)
+    monkeypatch.setattr(sanitized_export_module, "_fsync_directory", record_fsync)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            winner = pool.submit(lambda: _write(owner, "race-window", lock=_ConcurrentWitness(owner.resolved.slot.lock))[0])
+            assert linked.wait(5)
+            loser = pool.submit(lambda: _write(owner, "race-window", lock=_ConcurrentWitness(owner.resolved.slot.lock))[0])
+            assert settling.wait(5)
+            release.set()
+            results = [winner.result(timeout=10), loser.result(timeout=10)]
+        target = owner.resolved.incarnation.exports / "race-window.json"
+        assert results == [results[0], results[0]]
+        assert target.stat().st_nlink == 1
+        assert fsyncs.count(target.parent) >= 2
+        assert not list(target.parent.glob(".s-*"))
+    finally:
+        release.set()
+        owner.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-replace uses a two-link window")
+def test_divergent_collision_waits_then_rejects_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = initialized(tmp_path)
+    write(owner)
+    linked = Event()
+    settling = Event()
+    release = Event()
+    original_publish = sanitized_export_module._publish_no_replace
+
+    def delayed_publish(stage: Path, target: Path) -> None:
+        if target.name == "divergent-race.json" and not linked.is_set():
+            os.link(stage, target)
+            linked.set()
+            assert release.wait(5)
+            stage.unlink()
+            return
+        original_publish(stage, target)
+
+    def wait_for_release(_seconds: float) -> None:
+        settling.set()
+        assert release.wait(5)
+
+    def publish(generated_at: str) -> str:
+        return write_sanitized_export(
+            lock=_ConcurrentWitness(owner.resolved.slot.lock),
+            resolved=owner.resolved,
+            checkpoint_path=_checkpoint(owner),
+            export_id="divergent-race",
+            generated_at=generated_at,
+        )
+
+    monkeypatch.setattr(sanitized_export_module, "_publish_no_replace", delayed_publish)
+    monkeypatch.setattr(sanitized_export_module, "sleep", wait_for_release)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            winner = pool.submit(publish, T)
+            assert linked.wait(5)
+            loser = pool.submit(publish, "2026-07-27T00:00:01Z")
+            assert settling.wait(5)
+            release.set()
+            winner_digest = winner.result(timeout=10)
+            with pytest.raises(CompanySanitizedExportError, match="divergent content"):
+                loser.result(timeout=10)
+        target = owner.resolved.incarnation.exports / "divergent-race.json"
+        verified = verify_sanitized_export(target)
+        assert verified.sha256 == winner_digest
+        assert verified.bundle["generated_at"] == T
+        assert target.stat().st_nlink == 1
+        assert not list(target.parent.glob(".s-*"))
+    finally:
+        release.set()
+        owner.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link settling is platform-specific")
+@pytest.mark.parametrize("alias_name", ["external-alias.json", f".s-{'a' * 32}.json"])
+def test_persistent_hardlink_never_becomes_an_idempotent_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alias_name: str,
+) -> None:
+    owner = initialized(tmp_path)
+    write(owner)
+    _digest, target = _write(owner, "stuck")
+    alias = target.with_name(alias_name)
+    try:
+        os.link(target, alias)
+    except OSError as exc:
+        owner.close()
+        pytest.skip(f"hardlink unavailable: {exc}")
+    monkeypatch.setattr(sanitized_export_module, "_EXISTING_EXPORT_RETRIES", 2)
+    monkeypatch.setattr(sanitized_export_module, "sleep", lambda _seconds: None)
+    try:
+        with pytest.raises(
+            CompanySanitizedExportError,
+            match="did not settle",
+        ):
+            _write(owner, "stuck")
+        with pytest.raises(CompanySanitizedExportError):
+            verify_sanitized_export(target)
+        assert alias.exists()
+        assert target.stat().st_nlink == 2
+    finally:
+        alias.unlink()
+        owner.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link settling is platform-specific")
+def test_settling_identity_drift_is_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = initialized(tmp_path)
+    write(owner)
+    _digest, target = _write(owner, "drift")
+    alias = target.with_name("drift-alias.json")
+    os.link(target, alias)
+    original_inode = target.stat().st_ino
+
+    def replace_target(_seconds: float) -> None:
+        raw = alias.read_bytes()
+        target.unlink()
+        target.write_bytes(raw)
+
+    monkeypatch.setattr(sanitized_export_module, "sleep", replace_target)
+    try:
+        with pytest.raises(
+            CompanySanitizedExportError,
+            match="changed while settling",
+        ):
+            _write(owner, "drift")
+        assert target.stat().st_ino != original_inode
+        assert alias.exists()
+    finally:
+        alias.unlink()
+        owner.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-replace unlinks its staging name")
+def test_post_link_cleanup_failure_is_typed_and_replayable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = initialized(tmp_path)
+    write(owner)
+    original_unlink = Path.unlink
+    failed = False
+
+    def fail_once(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if path.name.startswith(".s-") and not failed:
+            failed = True
+            raise OSError("synthetic cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+    with pytest.raises(
+        CompanySanitizedExportError,
+        match="published export temporary cleanup failed",
+    ):
+        _write(owner, "cleanup")
+    digest, target = _write(owner, "cleanup")
+    assert verify_sanitized_export(target).sha256 == digest
     owner.close()
 
 

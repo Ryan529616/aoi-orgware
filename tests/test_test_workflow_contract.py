@@ -36,6 +36,27 @@ def _step(job: str, name: str) -> str:
     return match.group("body")
 
 
+def _checkout_inputs(job: str) -> str:
+    match = re.search(
+        r"^      - uses: actions/checkout@[0-9a-f]{40}[^\n]*\n"
+        r"        with:\n(?P<body>(?:          [^\n]*\n)+)",
+        job,
+        flags=re.MULTILINE,
+    )
+    assert match, "actions/checkout inputs are absent"
+    return match.group("body")
+
+
+def test_full_suite_jobs_checkout_the_packaged_baseline_history() -> None:
+    workflow = _workflow()
+    for name in ("unit", "coverage"):
+        inputs = _checkout_inputs(_job(workflow, name))
+        assert re.search(
+            r"^\s*persist-credentials:\s*false\s*$", inputs, re.MULTILINE
+        )
+        assert re.search(r"^\s*fetch-depth:\s*0\s*$", inputs, re.MULTILINE)
+
+
 def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
     unit = _job(_workflow(), "unit")
 
@@ -69,6 +90,10 @@ def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
     tests = _step(unit, "Run unit tests")
     assert re.search(
         r"^\s*run:\s*python -m pytest -q tests\s*$", tests, re.MULTILINE
+    )
+    assert all(
+        f"{name}: ${{{{ runner.temp }}}}" in tests
+        for name in ("TMPDIR", "TEMP", "TMP")
     )
     assert "unittest discover" not in unit
     assert "PYTHONPATH" not in tests

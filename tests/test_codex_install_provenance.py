@@ -147,7 +147,7 @@ def _environment(
         ("aoi-codex-bridge", "aoi_orgware.codex_transport_cli:main"),
     ):
         _write_launcher(prefix, name, target, with_companion=with_companion)
-    rows = [_row(p, site) for p in [dist / "METADATA", *(package / x for x in ("__init__.py", "_version.py", "cli.py", "codex_hook.py", "codex_transport_cli.py", "helper.py")), skill, *sorted(scripts.iterdir())]]
+    rows = [_row(p, site) for p in [dist / "METADATA", *(package / x for x in ("__init__.py", "_version.py", "cli.py", "codex_hook.py", "codex_transport_cli.py", "helper.py")), skill, *sorted(scripts.glob("aoi*"))]]
     (dist / "RECORD").write_text("\n".join(",".join(row) for row in rows) + "\n" + str((dist / "RECORD").relative_to(site)).replace("\\", "/") + ",,\n", encoding="utf-8")
     entries = [SimpleNamespace(group="console_scripts", name="aoi", value="aoi_orgware.cli:main"), SimpleNamespace(group="console_scripts", name="aoi-codex-hook", value="aoi_orgware.codex_hook:main"), SimpleNamespace(group="console_scripts", name="aoi-codex-bridge", value="aoi_orgware.codex_transport_cli:main")]
     fake_dist = SimpleNamespace(_path=dist, metadata={"Name": "aoi-orgware"}, version="1.2.3", entry_points=entries)
@@ -182,8 +182,6 @@ def _local_v2_receipt(
     bundle_file: Path,
     invoked_console: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """Build the alpha-only exact-wheel v2 proof for a fixture install."""
-
     site = _site_packages(prefix)
     dist = next(site.glob("*.dist-info"))
     wheel = tmp_path / "store" / "aoi_orgware-1.2.3-py3-none-any.whl"
@@ -333,10 +331,9 @@ def test_posix_rejects_missing_extensionless_console_alias(
 ) -> None:
     prefix, bundle_file, _bundle = _environment(tmp_path, monkeypatch)
 
-    with pytest.raises(provenance.CodexInstallProvenanceError, match="does not exist"):
-        provenance.validate_codex_install_provenance(
-            bundle_file, "a" * 64, _launcher(prefix, "aoi").with_suffix(".missing")
-        )
+    with pytest.raises(provenance.CodexInstallProvenanceError, match="cannot inspect invoked") as error:
+        provenance.validate_codex_install_provenance(bundle_file, "a" * 64, _launcher(prefix, "aoi").with_suffix(".missing"))
+    assert isinstance(error.value.__cause__, FileNotFoundError)
 
 
 def test_validates_real_recorded_native_launchers_and_returns_deterministic_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

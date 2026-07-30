@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+from time import sleep
 from types import SimpleNamespace
 from typing import Any, cast
 import uuid
@@ -38,6 +39,8 @@ MAX_SANITIZED_EXPORT_BYTES = 32 * 1024 * 1024
 _EXPORT_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _STAGE_PREFIX = ".s-"
+_EXISTING_EXPORT_RETRIES = 128
+_EXISTING_EXPORT_RETRY_SECONDS = 0.001
 _SAFE_RAW_KEYS = frozenset({"raw_token_vector", "raw_artifact"})
 _OPERATIONAL_REDACTION_WARNING = (
     "operational_redaction_not_security_boundary"
@@ -518,7 +521,12 @@ def _publish_no_replace(stage: Path, target: Path) -> None:
         if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
             raise FileExistsError(exc.errno, os.strerror(exc.errno), os.fspath(target)) from exc
         raise CompanySanitizedExportError("atomic no-replace export publication is unavailable") from exc
-    stage.unlink()
+    try:
+        stage.unlink()
+    except OSError as exc:
+        raise CompanySanitizedExportError(
+            "published export temporary cleanup failed",
+        ) from exc
 
 
 def _fsync_directory(path: Path) -> None:
@@ -536,6 +544,61 @@ def _fsync_directory(path: Path) -> None:
         raise CompanySanitizedExportError("export root fsync failed") from exc
     finally:
         os.close(descriptor)
+
+
+def _existing_export_after_settling(
+    target: Path,
+    *,
+    checkpoint_path: Path,
+) -> VerifiedSanitizedExport:
+    """Wait only for a cooperative POSIX publisher's two-link window."""
+
+    if os.name == "nt":
+        return verify_sanitized_export(target, checkpoint_path=checkpoint_path)
+    identity: tuple[int, int, int, int, int] | None = None
+    for attempt in range(_EXISTING_EXPORT_RETRIES):
+        try:
+            metadata = target.lstat()
+        except OSError as exc:
+            raise CompanySanitizedExportError(
+                "existing export publication is unavailable",
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or _is_windows_reparse(metadata)
+        ):
+            raise CompanySanitizedExportError(
+                "existing export publication must be a regular non-link file",
+            )
+        current = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+        if identity is None:
+            identity = current
+        elif current != identity:
+            raise CompanySanitizedExportError(
+                "existing export publication changed while settling",
+            )
+        if metadata.st_nlink == 1:
+            _fsync_directory(target.parent)
+            return verify_sanitized_export(
+                target,
+                checkpoint_path=checkpoint_path,
+            )
+        if metadata.st_nlink != 2:
+            raise CompanySanitizedExportError(
+                "existing export publication has an invalid hard-link count",
+            )
+        if attempt + 1 < _EXISTING_EXPORT_RETRIES:
+            sleep(_EXISTING_EXPORT_RETRY_SECONDS)
+    raise CompanySanitizedExportError(
+        "existing export publication did not settle",
+    )
 
 
 def _remove_stage(stage: Path) -> None:
@@ -594,7 +657,10 @@ def write_sanitized_export(
         try:
             _publish_no_replace(stage, target)
         except FileExistsError:
-            existing = verify_sanitized_export(target, checkpoint_path=checkpoint)
+            existing = _existing_export_after_settling(
+                target,
+                checkpoint_path=checkpoint,
+            )
             if existing.sha256 == digest:
                 return digest
             raise CompanySanitizedExportError("export ID already has divergent content")
