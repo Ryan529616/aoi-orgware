@@ -664,8 +664,8 @@ def test_release_mutation_requires_exact_successful_main_push_test_and_docs() ->
 
 def test_full_ci_timeouts_cover_the_observed_long_matrix_runtime() -> None:
     text = _test_workflow()
-    assert "timeout-minutes: 90" in _job(text, "unit")
-    assert "timeout-minutes: 120" in _job(text, "coverage")
+    for j in ("unit", "coverage"):
+        assert re.search(r"^    timeout-minutes: 120$", _job(text, j), re.M)
 
 
 def test_complete_pypi_retry_emits_no_phantom_missing_filename() -> None:

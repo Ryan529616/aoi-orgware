@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   unit:
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
