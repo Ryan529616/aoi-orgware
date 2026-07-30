@@ -1,11 +1,4 @@
-"""Pure semantic-event contracts for AOI task state.
-
-The event ledger is the authority for a semantic-v2 task.  ``state.json`` is
-only a projection: its reserved top-level ``_semantic`` member identifies the
-ledger head and is deliberately excluded from the domain-state hash.  This
-module performs no filesystem I/O so the schema, canonical hashes, replay, and
-idempotency rules can be tested before a writer is enabled.
-"""
+"""Pure semantic-v2 event contracts."""
 
 from __future__ import annotations
 
@@ -19,6 +12,7 @@ from datetime import datetime
 from itertools import islice
 from typing import Any, Iterable, Literal, Mapping, Sequence, cast
 
+from .frozen_json import FrozenJsonError, FrozenJsonMapping as FrozenMap, FrozenJsonSequence as FrozenList, thaw_frozen_json as _thaw
 
 EVENT_SCHEMA_VERSION = 2
 DELTA_SCHEMA_VERSION = 1
@@ -102,7 +96,7 @@ def _validate_json_value(
         if not math.isfinite(value):
             raise SemanticEventError(f"non-finite JSON number at {path}")
         return
-    if not isinstance(value, (dict, list)):
+    if not isinstance(value, (dict, list)) and type(value) not in (FrozenMap, FrozenList):
         raise SemanticEventError(
             f"unsupported JSON value at {path}: {type(value).__name__}"
         )
@@ -113,11 +107,10 @@ def _validate_json_value(
     identity = id(value)
     if identity in containers:
         raise SemanticEventError(f"repeated or cyclic JSON container at {path}")
-    # JSON has tree semantics. Reject shared container aliases rather than
-    # allowing a tiny Python DAG to expand exponentially during serialization.
     containers.add(identity)
-    if isinstance(value, list):
-        for index, item in enumerate(value):
+    if isinstance(value, list) or type(value) is FrozenList:
+        array = value.frozen_values() if type(value) is FrozenList else value
+        for index, item in enumerate(array):
             _validate_json_value(
                 item,
                 path=f"{path}[{index}]",
@@ -126,7 +119,8 @@ def _validate_json_value(
                 budget=budget,
             )
         return
-    for key, item in value.items():
+    pairs = value.frozen_items() if type(value) is FrozenMap else value.items()
+    for key, item in pairs:
         if not isinstance(key, str):
             raise SemanticEventError(f"non-string JSON object key at {path}")
         _validate_json_value(
@@ -203,7 +197,11 @@ def _canonical_json_size(value: Any, *, limit: int) -> int:
 def canonical_json_bytes(value: Any, *, max_bytes: int = MAX_CANONICAL_JSON_BYTES) -> bytes:
     """Return AOI's project-defined canonical UTF-8 JSON representation."""
 
-    _validate_json_value(value)
+    try:
+        _validate_json_value(value)
+    except FrozenJsonError as exc:
+        raise SemanticEventError("invalid nominal frozen JSON value") from exc
+    value = _thaw(value)
     measured = _canonical_json_size(value, limit=max_bytes)
     if measured > max_bytes:
         raise SemanticEventError(

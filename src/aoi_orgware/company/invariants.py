@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-import copy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, NoReturn, TypeAlias
@@ -61,6 +60,17 @@ from .contracts import (
     validate_company_contract,
     validate_company_transaction_request,
 )
+from ..frozen_json import (
+    FrozenJsonError,
+    FrozenJsonMapping,
+    thaw_json_payload,
+)
+from .invariant_carriers import (
+    CompanyInvariantError as CompanyInvariantError,
+    InvariantObject as InvariantObject,
+    InvariantTransition as InvariantTransition,
+    UncertainDispatch as UncertainDispatch,
+)
 from .telemetry_policy import (
     TelemetryPolicyError,
     automatic_coverage_state,
@@ -103,102 +113,6 @@ _TRANSITIONS = {
     "effect_unknown": frozenset({"dispatched", "failed_known"}),
     "dispatched": frozenset(), "failed_known": frozenset(), "cancelled": frozenset(),
 }
-class CompanyInvariantError(ValueError):
-    """A cross-record company invariant is not satisfied."""
-
-
-class _FrozenDict(dict[str, Any]):
-    """JSON-compatible mapping which cannot be mutated after construction."""
-    def __init__(self, value: Mapping[str, Any]) -> None:
-        dict.__init__(self, value)
-
-    def _immutable(self, *_: Any, **__: Any) -> NoReturn:
-        raise TypeError("immutable invariant payload")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
-        return {copy.deepcopy(key, memo): copy.deepcopy(value, memo) for key, value in self.items()}
-
-
-class _FrozenList(list[Any]):
-    """JSON-compatible sequence which cannot be mutated after construction."""
-    def __init__(self, value: Sequence[Any]) -> None:
-        list.__init__(self, value)
-
-    def _immutable(self, *_: Any, **__: Any) -> NoReturn:
-        raise TypeError("immutable invariant payload")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
-        return [copy.deepcopy(value, memo) for value in self]
-
-
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return _FrozenDict({str(key): _freeze(member) for key, member in value.items()})
-    if isinstance(value, (list, tuple)):
-        return _FrozenList([_freeze(member) for member in value])
-    return value
-
-
-@dataclass(frozen=True)
-class InvariantObject:
-    contract_type: str
-    object_key: str
-    event_id: str
-    global_sequence: int
-    payload_sha256: str
-    payload: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "payload", _freeze(self.payload))
-
-
-@dataclass(frozen=True)
-class UncertainDispatch:
-    reservation_id: str
-    dispatch_request_id: str
-    source_event_id: str
-    source_global_sequence: int
-    source_transaction_id: str
-    source_command_id: str
-    receipt_state: str
-    requested_state: str
-    payload_sha256: str
-    payload: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "payload", _freeze(self.payload))
-
-
-@dataclass(frozen=True)
-class InvariantTransition:
-    request: Mapping[str, Any]
-    receipt_state: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "request", _freeze(self.request))
-
-
 QueueItem: TypeAlias = InvariantObject | UncertainDispatch
 
 
@@ -226,17 +140,35 @@ def _parsed_time(value: str) -> datetime:
 
 
 def _validate_object(value: InvariantObject) -> InvariantObject:
-    if not isinstance(value, InvariantObject) or not isinstance(value.payload, Mapping):
+    if type(value) is not InvariantObject:
         _error("current objects must be InvariantObject values")
-    if value.contract_type != value.payload.get("contract_type"):
-        _error("invariant object contract type differs from payload")
+    try:
+        valid_shape = (
+            type(value.payload) is FrozenJsonMapping
+            and all(
+                type(getattr(value, name)) is str
+                for name in (
+                    "contract_type",
+                    "object_key",
+                    "event_id",
+                    "payload_sha256",
+                )
+            )
+            and type(value.global_sequence) is int
+        )
+    except AttributeError:
+        valid_shape = False
+    if not valid_shape:
+        _error("current objects must be InvariantObject values")
     if value.global_sequence < 0:
         _error("invariant object global_sequence is invalid")
     try:
-        payload = validate_company_contract(value.payload)
+        payload = validate_company_contract(thaw_json_payload(value.payload))
         digest = company_contract_sha256(payload)
-    except CompanyContractError as exc:
+    except (CompanyContractError, FrozenJsonError) as exc:
         raise CompanyInvariantError(f"invariant object payload is invalid: {exc}") from exc
+    if value.contract_type != payload.get("contract_type"):
+        _error("invariant object contract type differs from payload")
     if digest != value.payload_sha256:
         _error("invariant object payload SHA-256 differs")
     return InvariantObject(value.contract_type, value.object_key, value.event_id,
@@ -244,12 +176,36 @@ def _validate_object(value: InvariantObject) -> InvariantObject:
 
 
 def _validate_shadow(value: UncertainDispatch) -> UncertainDispatch:
-    if not isinstance(value, UncertainDispatch) or value.receipt_state not in {"effect_unknown", "reconcile_required"}:
+    if type(value) is not UncertainDispatch:
         _error("uncertain dispatch is invalid")
     try:
-        payload = validate_company_contract(value.payload)
+        valid_shape = (
+            type(value.payload) is FrozenJsonMapping
+            and all(
+                type(getattr(value, name)) is str
+                for name in (
+                    "reservation_id",
+                    "dispatch_request_id",
+                    "source_event_id",
+                    "source_transaction_id",
+                    "source_command_id",
+                    "receipt_state",
+                    "requested_state",
+                    "payload_sha256",
+                )
+            )
+            and type(value.source_global_sequence) is int
+        )
+    except AttributeError:
+        valid_shape = False
+    if not valid_shape:
+        _error("uncertain dispatch is invalid")
+    if value.receipt_state not in {"effect_unknown", "reconcile_required"}:
+        _error("uncertain dispatch is invalid")
+    try:
+        payload = validate_company_contract(thaw_json_payload(value.payload))
         digest = company_contract_sha256(payload)
-    except CompanyContractError as exc:
+    except (CompanyContractError, FrozenJsonError) as exc:
         raise CompanyInvariantError(f"uncertain dispatch payload is invalid: {exc}") from exc
     if payload.get("contract_type") != DISPATCH_REQUEST_V1 or digest != value.payload_sha256:
         _error("uncertain dispatch payload differs")
@@ -7011,12 +6967,24 @@ def reduce_company_invariants(
     requested_dispatches: list[InvariantObject] = []
     batch: list[InvariantObject] = []
     if transition is not None:
-        if not isinstance(transition, InvariantTransition) or transition.receipt_state not in _RECEIPT_STATES:
+        if type(transition) is not InvariantTransition:
+            _error("invariant transition receipt state is invalid")
+        try:
+            valid_transition = (
+                type(transition.request) is FrozenJsonMapping
+                and type(transition.receipt_state) is str
+                and transition.receipt_state in _RECEIPT_STATES
+            )
+        except (AttributeError, FrozenJsonError):
+            valid_transition = False
+        if not valid_transition:
             _error("invariant transition receipt state is invalid")
         receipt_state = transition.receipt_state
         try:
-            request = validate_company_transaction_request(transition.request)
-        except CompanyContractError as exc:
+            request = validate_company_transaction_request(
+                thaw_json_payload(transition.request),
+            )
+        except (CompanyContractError, FrozenJsonError) as exc:
             raise CompanyInvariantError(f"transaction request is invalid: {exc}") from exc
         source_sequence = request["expected_transaction_head"]["global_sequence"] + 1
         for event in request["events"]:

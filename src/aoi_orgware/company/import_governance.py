@@ -45,7 +45,11 @@ DEFAULT_COMPANY_IMPORT_BOUNDARY_RULES = (
         1,
         "company-dogfood-v1",
         "aoi_orgware.company",
-        ("aoi_orgware.company", "aoi_orgware.semantic_events"),
+        (
+            "aoi_orgware.company",
+            "aoi_orgware.frozen_json",
+            "aoi_orgware.semantic_events",
+        ),
         True,
     ),
 )

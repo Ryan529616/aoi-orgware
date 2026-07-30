@@ -43,10 +43,36 @@ def test_default_company_dogfood_rule_is_frozen() -> None:
             1,
             "company-dogfood-v1",
             "aoi_orgware.company",
-            ("aoi_orgware.company", "aoi_orgware.semantic_events"),
+            (
+                "aoi_orgware.company",
+                "aoi_orgware.frozen_json",
+                "aoi_orgware.semantic_events",
+            ),
             True,
         ),
     )
+
+
+def test_default_rule_allows_only_the_named_low_level_json_dependencies() -> None:
+    files = _files(
+        **{
+            "aoi_orgware.company.worker": (
+                "import aoi_orgware.frozen_json\n"
+                "import aoi_orgware.semantic_events\n"
+                "import aoi_orgware.unrelated\n"
+            ),
+            "aoi_orgware.frozen_json": "VALUE = 1\n",
+            "aoi_orgware.semantic_events": "VALUE = 2\n",
+            "aoi_orgware.unrelated": "VALUE = 3\n",
+        }
+    )
+    findings = evaluate_import_governance(files)
+    assert [(item.rule_id, item.path) for item in findings] == [
+        (
+            "import_boundary:company-dogfood-v1",
+            "src/aoi_orgware/company/worker.py",
+        ),
+    ]
 
 
 def test_function_local_aoi_import_is_a_boundary_violation() -> None:

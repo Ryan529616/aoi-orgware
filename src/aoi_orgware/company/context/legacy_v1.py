@@ -98,20 +98,24 @@ def _fail(message: str) -> NoReturn:
 
 
 def _identity(item: InvariantObject) -> ContextEvidenceRef:
-    if (
-        type(item) is not InvariantObject
-        or type(item.contract_type) is not str
-        or type(item.object_key) is not str
-        or type(item.event_id) is not str
-        or type(item.global_sequence) is not int
-        or isinstance(item.global_sequence, bool)
-        or type(item.payload_sha256) is not str
-        or not _ID.fullmatch(item.contract_type)
-        or not _ID.fullmatch(item.object_key)
-        or not _ID.fullmatch(item.event_id)
-        or item.global_sequence < 0
-        or not _SHA256.fullmatch(item.payload_sha256)
-    ):
+    if type(item) is not InvariantObject:
+        _fail("legacy context invariant object metadata is invalid")
+    try:
+        valid = (
+            type(item.contract_type) is str
+            and type(item.object_key) is str
+            and type(item.event_id) is str
+            and type(item.global_sequence) is int
+            and type(item.payload_sha256) is str
+            and bool(_ID.fullmatch(item.contract_type))
+            and bool(_ID.fullmatch(item.object_key))
+            and bool(_ID.fullmatch(item.event_id))
+            and item.global_sequence >= 0
+            and bool(_SHA256.fullmatch(item.payload_sha256))
+        )
+    except AttributeError:
+        valid = False
+    if not valid:
         _fail("legacy context invariant object metadata is invalid")
     return ContextEvidenceRef(
         item.contract_type, item.object_key, item.event_id,
@@ -146,7 +150,15 @@ def _packet(projection: InvariantProjection, key: LegacyContextV1Key) -> tuple[I
             continue
         try:
             packet = validate_work_packet(item.payload)
-        except CompanyContractError as exc:
+        except (
+            AttributeError,
+            KeyError,
+            OverflowError,
+            RuntimeError,
+            StopIteration,
+            TypeError,
+            ValueError,
+        ) as exc:
             _fail(f"legacy context work packet is invalid: {exc}")
         if item.object_key != packet["packet_id"] or item.payload_sha256 != company_contract_sha256(packet):
             _fail("legacy context work packet object identity differs")

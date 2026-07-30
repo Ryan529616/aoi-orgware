@@ -24,6 +24,7 @@ from aoi_orgware.company.contracts import (
     validate_work_packet,
 )
 from aoi_orgware.company.invariants import InvariantObject, InvariantProjection
+from aoi_orgware.frozen_json import FrozenJsonMapping
 
 
 H = "a" * 64
@@ -191,6 +192,32 @@ def test_immutable_result_and_bad_metadata_fail_closed() -> None:
     bad = InvariantObject(item.contract_type, item.object_key, item.event_id, True, item.payload_sha256, item.payload)
     with pytest.raises(LegacyContextV1Error):
         observe_legacy_context_v1(_projection(bad), KEY, raw)
+    uninitialized = object.__new__(InvariantObject)
+    with pytest.raises(LegacyContextV1Error):
+        observe_legacy_context_v1(_projection(uninitialized), KEY, raw)
+    partial = object.__new__(InvariantObject)
+    object.__setattr__(partial, "contract_type", item.contract_type)
+    object.__setattr__(partial, "object_key", item.object_key)
+    object.__setattr__(partial, "event_id", item.event_id)
+    object.__setattr__(partial, "global_sequence", item.global_sequence)
+    object.__setattr__(partial, "payload_sha256", item.payload_sha256)
+    with pytest.raises(LegacyContextV1Error):
+        observe_legacy_context_v1(_projection(partial), KEY, raw)
+    malformed_payload = InvariantObject(
+        item.contract_type,
+        item.object_key,
+        item.event_id,
+        item.global_sequence,
+        item.payload_sha256,
+        item.payload,
+    )
+    object.__setattr__(
+        malformed_payload,
+        "payload",
+        object.__new__(FrozenJsonMapping),
+    )
+    with pytest.raises(LegacyContextV1Error):
+        observe_legacy_context_v1(_projection(malformed_payload), KEY, raw)
 
 
 def test_v2_fields_and_manifest_company_mismatch_are_rejected() -> None:

@@ -12,6 +12,8 @@ from aoi_orgware.company.contracts import (
     PROVIDER_TELEMETRY_RECEIPT_V1,
     USAGE_COUNTER_SAMPLE_V1,
     ZERO_SHA256,
+    CompanyContractError,
+    canonical_company_json_bytes,
     company_contract_sha256,
     validate_provider_coverage_revision,
     validate_provider_telemetry_receipt,
@@ -19,10 +21,13 @@ from aoi_orgware.company.contracts import (
 )
 from aoi_orgware.company.invariants import InvariantObject, InvariantProjection
 from aoi_orgware.company.telemetry_policy import coverage_event_kinds, telemetry_id
+from aoi_orgware.company.usage import high_water
 from aoi_orgware.company.usage.high_water import (
     UsageCounterScopeKey,
+    UsageHighWaterObservation,
     UsageHighWaterError,
     derive_usage_high_water,
+    validate_usage_high_water_observation,
 )
 
 
@@ -145,7 +150,7 @@ def _bundle(tag: str, total: int, *, adapter: str = "adapter-1", sequence: int =
     return result + ((_object(_coverage(receipt, key=key), sequence + 1),) if coverage else ())
 
 
-def _total(value: Any) -> int | None:
+def _total(value: UsageHighWaterObservation) -> int | None:
     return next(item.tokens for item in value.dimensions if item.dimension == "total")
 
 
@@ -216,9 +221,120 @@ def test_stale_coverage_and_distinct_sample_identity_reuse_cannot_qualify() -> N
     reused_event = InvariantObject(other[0].contract_type, other[0].object_key, sample.event_id, other[0].global_sequence, other[0].payload_sha256, other[0].payload)
     with pytest.raises(UsageHighWaterError, match="sample identity"):
         derive_usage_high_water(_projection(sample, receipt_object, reused_event, *other[1:]), KEY)
-    reused_sequence = InvariantObject(other[0].contract_type, other[0].object_key, other[0].event_id, sample.global_sequence, other[0].payload_sha256, other[0].payload)
-    with pytest.raises(UsageHighWaterError, match="sample identity"):
-        derive_usage_high_water(_projection(sample, receipt_object, reused_sequence, *other[1:]), KEY)
+
+
+def test_distinct_samples_and_receipts_can_share_one_transaction_sequence() -> None:
+    """A ledger transaction sequence is not a unique event or sample identity."""
+    first = _bundle("one", 20, adapter="adapter-1", sequence=10)
+    second = _bundle("two", 30, adapter="adapter-2", sequence=10)
+    left = derive_usage_high_water(_projection(*(first + second)), KEY)
+    right = derive_usage_high_water(_projection(*reversed(first + second)), KEY)
+    values = {item.dimension: item.tokens for item in left.dimensions}
+    bound = {
+        (item.contract_type, item.object_key, item.event_id, item.global_sequence)
+        for item in left.evidence
+    }
+    assert left == right and left.observation_digest == right.observation_digest
+    assert left.observation_state == "observed"
+    assert "reset_or_reorder_ambiguous" not in left.reason_codes
+    assert values == {
+        "input": 28,
+        "cache_read": 0,
+        "cache_creation": 0,
+        "output": 2,
+        "reasoning_output": 0,
+        "total": 30,
+    }
+    assert {(first[0].contract_type, first[0].object_key, first[0].event_id, 10),
+            (first[1].contract_type, first[1].object_key, first[1].event_id, 10),
+            (second[0].contract_type, second[0].object_key, second[0].event_id, 10),
+            (second[1].contract_type, second[1].object_key, second[1].event_id, 10)} <= bound
+
+
+def test_exact_duplicate_evidence_is_order_independent_and_rederives_identically() -> None:
+    bundle = _bundle("one", 20)
+    base = derive_usage_high_water(_projection(*bundle), KEY)
+    duplicated = derive_usage_high_water(_projection(*(bundle + tuple(reversed(bundle)))), KEY)
+    permuted = derive_usage_high_water(_projection(*reversed(bundle + tuple(reversed(bundle)))), KEY)
+    assert duplicated == base == permuted
+    assert duplicated.observation_digest == base.observation_digest == permuted.observation_digest
+
+
+@pytest.mark.parametrize("forged_first", (False, True))
+def test_duplicate_canonical_bytes_override_module_local_hash_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    forged_first: bool,
+) -> None:
+    bundle = _bundle("one", 20)
+    valid = bundle[0]
+    forged_payload = copy.deepcopy(dict(valid.payload))
+    forged_payload["total_token_vector"]["total"]["tokens"] = 99
+    forged = InvariantObject(
+        valid.contract_type, valid.object_key, valid.event_id, valid.global_sequence,
+        valid.payload_sha256, forged_payload,
+    )
+    valid_bytes = canonical_company_json_bytes(valid.payload)
+    forged_bytes = canonical_company_json_bytes(forged_payload)
+    original_hash = company_contract_sha256
+
+    def collision_hash(value: Any) -> str:
+        if canonical_company_json_bytes(value) in {valid_bytes, forged_bytes}:
+            return valid.payload_sha256
+        return original_hash(value)
+
+    monkeypatch.setattr(high_water, "company_contract_sha256", collision_hash)
+    base = derive_usage_high_water(_projection(*bundle), KEY)
+    duplicated = derive_usage_high_water(_projection(*(bundle + tuple(reversed(bundle)))), KEY)
+    assert duplicated == base
+    objects = (forged, valid) if forged_first else (valid, forged)
+    with pytest.raises(UsageHighWaterError, match="duplicate invariant object payload differs"):
+        derive_usage_high_water(_projection(*objects), KEY)
+
+
+@pytest.mark.parametrize("forged_first", (False, True))
+def test_duplicate_sample_metadata_with_divergent_payload_fails_independent_of_order(
+    forged_first: bool,
+) -> None:
+    receipt = _receipt("one")
+    valid = _object(_sample(receipt, 20), 10)
+    forged_payload = copy.deepcopy(dict(valid.payload))
+    forged_payload["total_token_vector"]["total"]["tokens"] = 99
+    forged = InvariantObject(
+        valid.contract_type, valid.object_key, valid.event_id, valid.global_sequence,
+        valid.payload_sha256, forged_payload,
+    )
+    objects = (forged, valid) if forged_first else (valid, forged)
+    with pytest.raises(UsageHighWaterError, match="duplicate invariant object payload differs"):
+        derive_usage_high_water(_projection(*objects), KEY)
+
+
+@pytest.mark.parametrize("forged_first", (False, True))
+def test_duplicate_receipt_metadata_with_divergent_payload_fails_independent_of_order(
+    forged_first: bool,
+) -> None:
+    valid = _object(_receipt("one"), 10)
+    forged_payload = copy.deepcopy(dict(valid.payload))
+    forged_payload["received_at"] = "2026-07-29T00:00:01Z"
+    forged = InvariantObject(
+        valid.contract_type, valid.object_key, valid.event_id, valid.global_sequence,
+        valid.payload_sha256, forged_payload,
+    )
+    objects = (forged, valid) if forged_first else (valid, forged)
+    with pytest.raises(UsageHighWaterError, match="duplicate invariant object payload differs"):
+        derive_usage_high_water(_projection(*objects), KEY)
+
+
+def test_later_sequence_decrease_remains_degraded_after_a_higher_lower_bound() -> None:
+    first = _bundle("one", 30, adapter="adapter-1", sequence=10)
+    lower = _bundle("two", 20, adapter="adapter-2", sequence=20)
+    higher = _bundle("three", 40, adapter="adapter-3", sequence=30)
+    observation = derive_usage_high_water(_projection(*first, *lower, *higher), KEY)
+    assert _total(observation) == 40
+    assert observation.observation_state == "degraded"
+    assert "reset_or_reorder_ambiguous" in observation.reason_codes
+    dimensions = {item.dimension: item for item in observation.dimensions}
+    assert "reset_or_reorder_ambiguous" in dimensions["input"].reason_codes
+    assert "reset_or_reorder_ambiguous" in dimensions["total"].reason_codes
 
 
 def test_non_usage_coverage_anchor_cannot_qualify() -> None:
@@ -284,7 +400,7 @@ def test_coverage_anchor_handles_offset_equivalence_and_missing_last_as_degraded
 def test_equal_maxima_are_deterministic_and_last_vector_is_ignored() -> None:
     first = list(_bundle("one", 20, adapter="adapter-1", sequence=10))
     second = list(_bundle("two", 20, adapter="adapter-2", sequence=20))
-    payload = copy.deepcopy(first[0].payload)
+    payload = copy.deepcopy(dict(first[0].payload))
     payload["last_token_vector"] = _vector(999_999_999)
     first[0] = _object(_rehash(payload, "sample_sha256"), 10)
     observation = derive_usage_high_water(_projection(*reversed(first + second)), KEY)
@@ -349,3 +465,126 @@ def test_bad_key_and_projection_metadata_are_typed_fail_closed() -> None:
     malformed = InvariantObject(USAGE_COUNTER_SAMPLE_V1, "sample-1", "event-1", True, H, {})
     with pytest.raises(UsageHighWaterError):
         derive_usage_high_water(_projection(malformed), KEY)
+    uninitialized = object.__new__(InvariantObject)
+    with pytest.raises(UsageHighWaterError):
+        derive_usage_high_water(_projection(uninitialized), KEY)
+
+
+@pytest.mark.parametrize("error_type", (AttributeError, StopIteration, CompanyContractError, RuntimeError, KeyError, TypeError, RecursionError))
+def test_hostile_payload_exceptions_are_typed_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    def hostile(_: InvariantProjection) -> InvariantProjection:
+        raise error_type("hostile payload")
+
+    monkeypatch.setattr(high_water, "_expect_projection", hostile)
+    with pytest.raises(UsageHighWaterError, match="payload processing failed"):
+        derive_usage_high_water(_projection(), KEY)
+
+
+@pytest.mark.parametrize("error_type", (KeyboardInterrupt, SystemExit, MemoryError))
+def test_critical_exceptions_are_not_converted(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+) -> None:
+    def interrupt(_: InvariantProjection) -> InvariantProjection:
+        raise error_type("do not swallow")
+
+    monkeypatch.setattr(high_water, "_expect_projection", interrupt)
+    with pytest.raises(error_type):
+        derive_usage_high_water(_projection(), KEY)
+
+
+def test_public_observation_validator_accepts_all_real_output_classes_and_is_company_typed() -> None:
+    observed = derive_usage_high_water(_projection(*_bundle("one", 20)), KEY)
+    degraded = derive_usage_high_water(_projection(*_bundle("one", 20), _object(_receipt("late"), 12)), KEY)
+    unavailable = derive_usage_high_water(_projection(), KEY)
+    for observation in (observed, degraded, unavailable):
+        assert validate_usage_high_water_observation(observation, KEY) is observation
+    with pytest.raises(CompanyContractError):
+        validate_usage_high_water_observation(observed, UsageCounterScopeKey("company-1", 1, 1, "codex", "other-thread"))
+
+
+def test_public_observation_validator_rejects_b164_carrier_counterexamples() -> None:
+    observation = derive_usage_high_water(_projection(*_bundle("one", 20)), KEY)
+    total_index = next(index for index, item in enumerate(observation.dimensions) if item.dimension == "total")
+    bad_dimensions = list(observation.dimensions)
+    bad_dimensions[total_index] = bad_dimensions[total_index]._replace(tokens=True)
+    cases: tuple[object, ...] = (
+        tuple(observation),
+        observation._replace(dimensions=observation.dimensions[:-1]),
+        observation._replace(dimensions=tuple(reversed(observation.dimensions))),
+        observation._replace(dimensions=tuple(bad_dimensions)),
+        observation._replace(selected_evidence_max_global_sequence=0),
+        observation._replace(coverage=observation.coverage + observation.coverage),
+        observation._replace(evidence=observation.evidence + observation.evidence[:1]),
+        observation._replace(reason_codes=observation.reason_codes + ("unknown_reason",)),
+        observation._replace(observation_digest="0" * 64),
+    )
+    for malformed in cases:
+        with pytest.raises(UsageHighWaterError):
+            validate_usage_high_water_observation(malformed, KEY)
+
+
+def _redigest(observation: UsageHighWaterObservation) -> UsageHighWaterObservation:
+    return observation._replace(observation_digest=company_contract_sha256(high_water._digest_payload(observation)))
+
+
+def test_public_observation_validator_rejects_b166_recomputed_digest_matrix_counterexamples() -> None:
+    observed = derive_usage_high_water(_projection(*_bundle("one", 20)), KEY)
+    optional_missing = derive_usage_high_water(_projection(
+        _object(_sample(_receipt("optional"), 20, cache_creation=None), 10),
+        _object(_receipt("optional"), 10), _object(_coverage(_receipt("optional")), 11),
+    ), KEY)
+    empty = derive_usage_high_water(_projection(), KEY)
+    coverage_reason_mismatch = observed.coverage[0]._replace(reason="adapter_gap")
+    optional = next(item for item in optional_missing.dimensions if item.dimension == "cache_creation")
+    bad_optional = tuple(
+        item._replace(reason_codes=("counter_scope_unobserved",)) if item.dimension == "cache_creation" else item
+        for item in optional_missing.dimensions
+    )
+    cases = (
+        observed._replace(observation_state="unavailable", quantity_classification="unavailable"),
+        observed._replace(observation_state="degraded"),
+        observed._replace(coverage=(coverage_reason_mismatch,)),
+        optional_missing._replace(dimensions=bad_optional),
+        empty._replace(reason_codes=tuple(reason for reason in empty.reason_codes if reason != "counter_scope_unobserved")),
+    )
+    assert optional.reason_codes == ("optional_dimension_partial_or_missing",)
+    for malformed in cases:
+        with pytest.raises(UsageHighWaterError):
+            validate_usage_high_water_observation(_redigest(malformed), KEY)
+
+
+def test_public_observation_validator_enforces_b168_coverage_evidence_and_empty_missingness() -> None:
+    observed = derive_usage_high_water(_projection(*_bundle("one", 20)), KEY)
+    partial = derive_usage_high_water(_projection(
+        *_bundle("one", 20, adapter="adapter-1", sequence=10),
+        *_bundle("two", 30, adapter="adapter-2", sequence=20, coverage=False),
+    ), KEY)
+    empty = derive_usage_high_water(_projection(), KEY)
+    for real_output in (observed, partial, empty):
+        assert validate_usage_high_water_observation(real_output, KEY) is real_output
+        assert real_output.projection_completeness == "unverified"
+    assert "usage_coverage_missing" in partial.reason_codes
+    no_coverage_summary = observed._replace(coverage=())
+    no_coverage_evidence = tuple(
+        item for item in observed.evidence if item.contract_type != PROVIDER_COVERAGE_REVISION_V1
+    )
+    summary_without_evidence = observed._replace(
+        evidence=no_coverage_evidence,
+        selected_evidence_max_global_sequence=max(item.global_sequence for item in no_coverage_evidence),
+    )
+    numeric_empty_without_reason = observed._replace(
+        coverage=(), evidence=no_coverage_evidence,
+        selected_evidence_max_global_sequence=max(item.global_sequence for item in no_coverage_evidence),
+    )
+    bogus_evidence = observed.evidence[:-1] + (
+        observed.evidence[-1]._replace(contract_type="ZZ_BOGUS_EVIDENCE_V1"),
+    )
+    cases = (no_coverage_summary, summary_without_evidence, numeric_empty_without_reason,
+             observed._replace(evidence=bogus_evidence))
+    for malformed in cases:
+        with pytest.raises(UsageHighWaterError):
+            validate_usage_high_water_observation(_redigest(malformed), KEY)
