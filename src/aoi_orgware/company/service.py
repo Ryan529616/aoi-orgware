@@ -829,7 +829,7 @@ def _verify_windows_private_directory(path: Path) -> None:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=10.0,
+            timeout=30.0,
             check=False,
             env=environment,
             **options,
