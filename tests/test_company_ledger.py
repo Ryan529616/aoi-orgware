@@ -1313,32 +1313,32 @@ def test_snapshot_to_is_verified_prefix_without_wal_and_source_stays_writable(
     ledger.verify_integrity()
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Win32 path-length regression")
 def test_snapshot_to_uses_a_bounded_staging_name_on_long_windows_path(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = tmp_path / "source.sqlite3"
-    ledger = CompanyLedger(source)
+    ledger = CompanyLedger(tmp_path / "source.sqlite3")
     ledger.append(request())
     parent = tmp_path / "checkpoints"
-    while len(str(parent)) < 220:
-        parent /= "long-path-segment"
+    pad = 229 - len(str(parent)) - 1
+    assert 1 <= pad <= 255
+    parent /= "p" * pad
+    assert len(str(parent)) == 229
     parent.mkdir(parents=True)
-    destination = parent / "plain.sqlite3"
-    legacy_staging = destination.with_name(
-        f".{destination.name}.aoi-staging-{'0' * 32}.sqlite3",
+    dst = parent / "plain.sqlite3"
+    old = dst.with_name(f".{dst.name}.aoi-staging-{'0' * 32}.sqlite3")
+    new = dst.with_name(f".aoi-{'0' * 11}.db")
+    assert len(str(dst)) < 260
+    assert len(str(old)) > 260
+    assert len(f"{new}-journal") < 260
+    monkeypatch.setattr(
+        "secrets.token_urlsafe",
+        lambda size: "0" * 11 if size == 8 else pytest.fail("nonce size"),
     )
-    bounded_staging = destination.with_name(f".aoi-{'0' * 16}.db")
-    assert len(str(destination)) < 260
-    assert len(str(legacy_staging)) > 260
-    assert len(f"{bounded_staging}-journal") < 260
-
-    copied_heads = ledger.snapshot_to(destination)
-
-    assert copied_heads == ledger.snapshot_heads()
-    copied = CompanyLedger(destination)
+    heads = ledger.snapshot_to(dst)
+    assert heads == ledger.snapshot_heads()
+    copied = CompanyLedger(dst)
     copied.verify_integrity()
-    assert copied.snapshot_heads() == copied_heads
+    assert copied.snapshot_heads() == heads
     copied.close()
     assert not list(parent.glob(".aoi-*.db"))
 

@@ -684,7 +684,7 @@ class CompanyLedger:
         )
         for _ in range(16):
             staging = candidate.with_name(
-                f".aoi-{secrets.token_hex(8)}.db",
+                f".aoi-{secrets.token_urlsafe(8)}.db",
             )
             descriptor: int | None = None
             guard: _SnapshotTargetGuard | None = None

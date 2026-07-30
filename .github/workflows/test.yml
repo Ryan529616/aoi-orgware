@@ -42,12 +42,61 @@ jobs:
         run: |
           aoi --version
           aoi --help
+      - name: Prepare POSIX test temp
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test -d "$RUNNER_TEMP"
+          {
+            printf 'TMPDIR=%s\n' "$RUNNER_TEMP"
+            printf 'TEMP=%s\n' "$RUNNER_TEMP"
+            printf 'TMP=%s\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+      - name: Prepare private Windows test temp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $drive = [IO.Path]::GetPathRoot($env:RUNNER_TEMP)
+          if ([string]::IsNullOrEmpty($drive)) {
+            throw "runner temp has no drive root"
+          }
+          $private = Join-Path $drive 't'
+          if (Test-Path -LiteralPath $private) {
+            throw "private test temp already exists"
+          }
+          New-Item -ItemType Directory -Path $private -ErrorAction Stop | Out-Null
+          $item = Get-Item -LiteralPath $private -Force -ErrorAction Stop
+          if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "private test temp is a reparse point"
+          }
+          $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          if ($null -eq $currentSid) {
+            throw "current Windows identity has no SID"
+          }
+          $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+          $arguments = @(
+            $private
+            '/inheritance:r'
+            '/grant:r'
+            "*$($currentSid.Value):(OI)(CI)F"
+            '*S-1-5-18:(OI)(CI)F'
+            '*S-1-5-32-544:(OI)(CI)F'
+          )
+          & $icacls @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to harden private test temp ACL"
+          }
+          $env:AOI_PRIVATE_TEST_TEMP = $private
+          python -c 'import os; from pathlib import Path; from aoi_orgware.company.service import _verify_windows_private_directory; _verify_windows_private_directory(Path(os.environ["AOI_PRIVATE_TEST_TEMP"]))'
+          if ($LASTEXITCODE -ne 0) {
+            throw "production ACL verification rejected private test temp"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TMPDIR=$private"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TEMP=$private"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TMP=$private"
       - name: Run unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-          TMPDIR: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
         run: python -m pytest -q tests
 
   package:
