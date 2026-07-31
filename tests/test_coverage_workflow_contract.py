@@ -19,7 +19,8 @@ CONFIG = ROOT / ".coveragerc"
 WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 VERIFIER = "python scripts/verify_coverage_path_mapping.py"
 FRAGMENT_COMBINER = f"{VERIFIER} --combine-fragments covdata"
-COVERAGE_JOB_SHA256 = "e744131e63fb71d1a3856ad6a61329f640712466fc8de5a11d98db658069a347"
+COVERAGE_TEMP_ROOT = "${{ runner.temp }}/aoi-coverage-tests"
+COVERAGE_JOB_SHA256 = "933e0877b79e5f01fd724e0a81ae1dc1f1f0ef85420dc7d094aa4c60f29c15f7"
 EXPECTED_CONFIG = """[run]
 source = aoi_orgware
 parallel = true
@@ -80,12 +81,18 @@ def _step_block(job: str, name: str) -> str:
 def _assert_coverage_contract(config: str, workflow: str) -> None:
     assert config == EXPECTED_CONFIG
     coverage = _job(workflow, "coverage")
-    assert hashlib.sha256(coverage.encode("utf-8")).hexdigest() == COVERAGE_JOB_SHA256
+    assert (
+        hashlib.sha256(coverage.encode("utf-8")).hexdigest()
+        == COVERAGE_JOB_SHA256
+    )
+    assert not re.search(r"^    env\s*:", coverage, flags=re.MULTILINE)
     assert re.findall(
-        r"^      AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
+        r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
         coverage,
         flags=re.MULTILINE,
-    ) == ["${{ runner.temp }}/aoi-coverage-tests"]
+    ) == [COVERAGE_TEMP_ROOT] * 3
+    assert coverage.count(COVERAGE_TEMP_ROOT) == 4
+    assert "${{ env.AOI_COVERAGE_TEMP_ROOT }}" not in coverage
     headers = _step_headers(coverage)
     assert headers == (
         "Install coverage tooling",
@@ -96,7 +103,9 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
     )
     assert _step(coverage, "Install coverage tooling").strip() == "run: python -m pip install pytest coverage"
     assert _step(coverage, "Verify coverage path mapping").strip() == (
-        "run: |\n"
+        "env:\n"
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
+        "        run: |\n"
         '          mkdir -p "$AOI_COVERAGE_TEMP_ROOT"\n'
         f"          {VERIFIER}"
     )
@@ -107,14 +116,24 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
     )
     run = _step(coverage, "Run suite under coverage")
     assert re.findall(
+        r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
+        run,
+        flags=re.MULTILINE,
+    ) == [COVERAGE_TEMP_ROOT]
+    assert re.findall(
         r"^          TMPDIR:\s*([^#\n]+?)\s*(?:#.*)?$",
         run,
         flags=re.MULTILINE,
-    ) == ["${{ env.AOI_COVERAGE_TEMP_ROOT }}"]
+    ) == [COVERAGE_TEMP_ROOT]
     assert "COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc" in run
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in run
     assert "python -m coverage run --parallel-mode -m pytest tests/ -q --tb=short" in run
     combine = _step(coverage, "Combine and enforce floor")
+    assert re.findall(
+        r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
+        combine,
+        flags=re.MULTILINE,
+    ) == [COVERAGE_TEMP_ROOT]
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in combine
     assert (
         "run: |\n"
@@ -157,19 +176,56 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         "test_standalone_gate_runs_from0/checkout/src/aoi_orgware\n",
         "",
     )
-    missing_job_root = workflow.replace(
-        "    env:\n"
-        "      AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/aoi-coverage-tests\n",
-        "",
+    invalid_job_root = workflow.replace(
+        "  coverage:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 120\n"
+        "    steps:\n",
+        "  coverage:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 120\n"
+        f"    env:\n      AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
+        "    steps:\n",
         1,
     )
-    wrong_job_root = workflow.replace(
-        "${{ runner.temp }}/aoi-coverage-tests",
-        "${{ github.workspace }}/aoi-coverage-tests",
+    missing_verify_root = workflow.replace(
+        f"        env:\n          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
+        "        run: |\n"
+        '          mkdir -p "$AOI_COVERAGE_TEMP_ROOT"\n',
+        "        run: |\n"
+        '          mkdir -p "$AOI_COVERAGE_TEMP_ROOT"\n',
+        1,
+    )
+    wrong_verify_root = workflow.replace(
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}",
+        "          AOI_COVERAGE_TEMP_ROOT: ${{ github.workspace }}/aoi-coverage-tests",
+        1,
+    )
+    missing_run_root = workflow.replace(
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
+        '          PYTHONDONTWRITEBYTECODE: "1"\n',
+        '          PYTHONDONTWRITEBYTECODE: "1"\n',
+        1,
+    )
+    missing_combine_root = workflow.replace(
+        "      - name: Combine and enforce floor\n"
+        "        env:\n"
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n",
+        "      - name: Combine and enforce floor\n"
+        "        env:\n",
+        1,
+    )
+    divergent_run_root = workflow.replace(
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
+        '          PYTHONDONTWRITEBYTECODE: "1"\n',
+        "          AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/other-coverage-tests\n"
+        '          PYTHONDONTWRITEBYTECODE: "1"\n',
         1,
     )
     missing_verifier = workflow.replace(
         "      - name: Verify coverage path mapping\n"
+        "        env:\n"
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
         "        run: |\n"
         '          mkdir -p "$AOI_COVERAGE_TEMP_ROOT"\n'
         f"          {VERIFIER}\n",
@@ -188,7 +244,7 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         1,
     )
     wrong_tmpdir = workflow.replace(
-        "          TMPDIR: ${{ env.AOI_COVERAGE_TEMP_ROOT }}",
+        f"          TMPDIR: {COVERAGE_TEMP_ROOT}",
         "          TMPDIR: ${{ runner.temp }}",
         1,
     )
@@ -216,8 +272,12 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         (broadened_node, workflow),
         (broadened_python, workflow),
         (omitted_alias, workflow),
-        (config, missing_job_root),
-        (config, wrong_job_root),
+        (config, invalid_job_root),
+        (config, missing_verify_root),
+        (config, wrong_verify_root),
+        (config, missing_run_root),
+        (config, missing_combine_root),
+        (config, divergent_run_root),
         (config, missing_verifier),
         (config, reordered_verifier),
         (config, missing_root_creation),
