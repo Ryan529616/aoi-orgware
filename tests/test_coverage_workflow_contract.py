@@ -544,7 +544,7 @@ def test_fragment_reader_rejects_stable_non_regular_fragment() -> None:
         )
 
 
-def test_fragment_reader_rejects_stably_invalid_coverage_data_after_delay() -> None:
+def test_fragment_reader_rejects_stably_invalid_coverage_data() -> None:
     stable = {Path(".coverage.truncated"): _identity()}
     clock = _FakeClock()
 
@@ -557,7 +557,7 @@ def test_fragment_reader_rejects_stably_invalid_coverage_data_after_delay() -> N
             monotonic=clock.monotonic,
             sleeper=clock.sleep,
         )
-    assert clock.sleep_calls == [0.125] * 8
+    assert clock.sleep_calls == [0.125] * 16
 
 
 def test_schema_preflight_rejects_missing_schema_without_mutating_bytes(tmp_path: Path) -> None:
@@ -572,7 +572,7 @@ def test_schema_preflight_rejects_missing_schema_without_mutating_bytes(tmp_path
     assert hashlib.sha256(fragment.read_bytes()).hexdigest() == before
 
 
-def test_fragment_reader_retries_transient_parse_or_identity_change() -> None:
+def test_fragment_reader_retries_transient_parse() -> None:
     fragment = Path(".coverage.retry")
     before = {fragment: _identity(1)}
     recovered = {fragment: _identity(2)}
@@ -601,7 +601,7 @@ def test_fragment_reader_retries_transient_parse_or_identity_change() -> None:
     assert measured == {fragment: ("/trusted.py",)}
     assert identities == recovered
     assert reader_calls == 2
-    assert clock.sleep_calls == [0.01, 0.01]
+    assert clock.sleep_calls == [0.01, 0.01, 0.01]
 
 
 def test_fragment_reader_retries_identity_change_after_read() -> None:

@@ -28,6 +28,16 @@ FRAGMENT_STABILITY_INTERVAL_SECONDS = 0.25
 FRAGMENT_IDENTITY_SEMANTICS = "cooperative_lstat_metadata_v1"
 _RESERVED_DESTINATION = ".coverage"
 _SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+_MAX_IDENTITY_INTEGER = (1 << 127) - 1
+_READER_ERROR_STAGES = frozenset(
+    {
+        "schema_preflight",
+        "coverage_data_read",
+        "coverage_data_close",
+        "measured_files",
+        "reader_unclassified",
+    }
+)
 
 
 class CoveragePathMappingError(RuntimeError):
@@ -36,6 +46,23 @@ class CoveragePathMappingError(RuntimeError):
 
 class _FragmentSetChanged(CoveragePathMappingError):
     """A cooperative coverage writer changed the frozen shard set."""
+
+
+class CoverageFragmentReadError(CoveragePathMappingError):
+    """A reader failed at a closed stage without disclosing provider detail."""
+
+    __slots__ = ("_stage",)
+
+    def __init__(self, stage: str) -> None:
+        if type(stage) is not str or stage not in _READER_ERROR_STAGES:
+            stage = "reader_unclassified"
+        self._stage = stage
+        super().__init__("coverage fragment reader failed")
+
+    @property
+    def stage(self) -> str:
+        stage = getattr(self, "_stage", None)
+        return stage if type(stage) is str and stage in _READER_ERROR_STAGES else "reader_unclassified"
 
 
 class FragmentIdentity(NamedTuple):
@@ -53,6 +80,24 @@ class _SnapshotProblem(NamedTuple):
     reason: str
     name_sha256: str
     identity: FragmentIdentity
+
+
+def _validate_snapshot_shape(snapshot: object) -> None:
+    if type(snapshot) is not dict:
+        raise CoveragePathMappingError("coverage fragment snapshot is invalid")
+    for fragment, identity in snapshot.items():
+        if not isinstance(fragment, Path) or type(identity) is not FragmentIdentity:
+            raise CoveragePathMappingError("coverage fragment snapshot is invalid")
+        if (
+            type(identity.file_type) is not int
+            or not 0 <= identity.file_type <= 0xFFFF
+            or stat.S_IFMT(identity.file_type) != identity.file_type
+            or any(
+                type(value) is not int or not 0 <= value <= _MAX_IDENTITY_INTEGER
+                for value in (identity.inode, identity.size, identity.mtime_ns)
+            )
+        ):
+            raise CoveragePathMappingError("coverage fragment snapshot is invalid")
 
 
 def _fragment_name_bytes(fragment: Path) -> bytes:
@@ -113,6 +158,7 @@ def _snapshot_fragments(fragment_directory: Path) -> dict[Path, FragmentIdentity
 
 
 def _snapshot_digest(snapshot: dict[Path, FragmentIdentity]) -> str:
+    _validate_snapshot_shape(snapshot)
     material = bytearray(b"aoi-coverage-fragment-snapshot-v1\0")
     for path, identity in sorted(
         snapshot.items(), key=lambda item: _fragment_name_bytes(item[0])
@@ -127,6 +173,15 @@ def _snapshot_digest(snapshot: dict[Path, FragmentIdentity]) -> str:
     return sha256(material).hexdigest()
 
 
+def _identity_digest(identity: FragmentIdentity) -> str:
+    material = bytearray(b"aoi-coverage-fragment-identity-v1\0")
+    for value in identity:
+        encoded = str(value).encode("ascii")
+        material.extend(len(encoded).to_bytes(2, "big"))
+        material.extend(encoded)
+    return sha256(material).hexdigest()
+
+
 def _snapshot_diagnostic(
     snapshot: dict[Path, FragmentIdentity],
     *,
@@ -138,6 +193,28 @@ def _snapshot_diagnostic(
         f"total_bytes={total_bytes}, "
         f"identity_semantics={FRAGMENT_IDENTITY_SEMANTICS}, "
         f"metadata_snapshot_sha256={_snapshot_digest(snapshot)}"
+    )
+
+
+def _reader_failure_diagnostic(
+    snapshot: dict[Path, FragmentIdentity],
+    fragment: Path,
+    *,
+    stage: str,
+) -> str:
+    """Return only fixed reader-stage and digest-bound failing-member evidence."""
+
+    identity = snapshot.get(fragment)
+    if identity is None:
+        raise CoveragePathMappingError(
+            "coverage fragment changed while recording reader failure"
+        )
+    return (
+        f"stage={stage}, "
+        "fragment_basename_sha256="
+        f"{sha256(_fragment_name_bytes(fragment)).hexdigest()}, "
+        f"fragment_identity_sha256={_identity_digest(identity)}, "
+        f"{_snapshot_diagnostic(snapshot, reason='coverage_data_incomplete_or_invalid')}"
     )
 
 
@@ -251,7 +328,20 @@ def _read_stable_fragment_set(
     last_time = start
     last_snapshot: dict[Path, FragmentIdentity] = {}
     last_reason = "writer_not_quiescent"
-    last_reader_error = False
+    last_reader_diagnostic: str | None = None
+    cached_snapshot: dict[Path, FragmentIdentity] | None = None
+    cached_measurements: dict[Path, tuple[str, ...]] = {}
+
+    def reset_reader_cache() -> None:
+        nonlocal cached_snapshot, cached_measurements
+        cached_snapshot = None
+        cached_measurements = {}
+
+    def note_writer_change() -> None:
+        nonlocal last_reason, last_reader_diagnostic
+        last_reason = "writer_not_quiescent"
+        last_reader_diagnostic = None
+        reset_reader_cache()
 
     def post_interval_snapshot() -> dict[Path, FragmentIdentity]:
         nonlocal last_time
@@ -271,45 +361,100 @@ def _read_stable_fragment_set(
                 "coverage fragment stability interval did not elapse"
             )
         last_time = after_sleep
-        return snapshot(fragment_directory)
+        captured = snapshot(fragment_directory)
+        _validate_snapshot_shape(captured)
+        return captured
 
     for _ in range(attempts):
-        before = snapshot(fragment_directory)
-        last_snapshot = before
-        before_problems = _snapshot_problems(before)
-        if _has_problem(before_problems, "reserved_destination_conflict"):
-            raise CoveragePathMappingError(
-                "combined coverage destination already exists "
-                f"({_snapshot_diagnostic(before, reason='reserved_destination_conflict')})"
-            )
-        stable = post_interval_snapshot()
+        try:
+            before = snapshot(fragment_directory)
+            _validate_snapshot_shape(before)
+            last_snapshot = before
+            before_problems = _snapshot_problems(before)
+            if _has_problem(before_problems, "reserved_destination_conflict"):
+                raise CoveragePathMappingError(
+                    "combined coverage destination already exists "
+                    f"({_snapshot_diagnostic(before, reason='reserved_destination_conflict')})"
+                )
+            stable = post_interval_snapshot()
+        except _FragmentSetChanged:
+            note_writer_change()
+            continue
         last_snapshot = stable
         if before != stable:
-            last_reason = "writer_not_quiescent"
+            note_writer_change()
             continue
         problems = _validate_fragment_snapshot(stable)
         if problems:
             last_reason = problems[0].reason
+            last_reader_diagnostic = None
+            reset_reader_cache()
             continue
-        measured_by_fragment: dict[Path, tuple[str, ...]] = {}
-        for fragment in stable:
+        if cached_snapshot != stable:
+            reset_reader_cache()
+            cached_snapshot = dict(stable)
+        measured_by_fragment = dict(cached_measurements)
+        ordered_fragments = tuple(sorted(stable, key=_fragment_name_bytes))
+        for fragment in ordered_fragments:
+            if fragment in measured_by_fragment:
+                continue
             try:
                 measured_by_fragment[fragment] = tuple(reader(fragment))
-            except Exception:
-                last_reader_error = True
+            except MemoryError:
+                raise
+            except Exception as exc:
+                candidate_stage = (
+                    exc.stage if type(exc) is CoverageFragmentReadError else None
+                )
+                stage = (
+                    candidate_stage
+                    if type(candidate_stage) is str
+                    and candidate_stage in _READER_ERROR_STAGES
+                    else "reader_unclassified"
+                )
+                try:
+                    immediate = snapshot(fragment_directory)
+                    _validate_snapshot_shape(immediate)
+                    after_reader_interval = post_interval_snapshot()
+                except _FragmentSetChanged:
+                    note_writer_change()
+                    break
+                last_snapshot = after_reader_interval
+                same_failing_identity = (
+                    immediate.get(fragment) == stable.get(fragment)
+                    and after_reader_interval.get(fragment) == stable.get(fragment)
+                )
+                same_full_snapshot = (
+                    immediate == stable and after_reader_interval == stable
+                )
+                if not same_failing_identity or not same_full_snapshot:
+                    note_writer_change()
+                    break
                 last_reason = "coverage_data_incomplete_or_invalid"
+                cached_measurements = measured_by_fragment
+                last_reader_diagnostic = _reader_failure_diagnostic(
+                    stable,
+                    fragment,
+                    stage=stage,
+                )
                 break
         else:
-            if snapshot(fragment_directory) == stable:
-                return tuple(stable), measured_by_fragment, stable
-            last_reason = "writer_not_quiescent"
+            try:
+                final_snapshot = snapshot(fragment_directory)
+                _validate_snapshot_shape(final_snapshot)
+            except _FragmentSetChanged:
+                note_writer_change()
+                continue
+            if final_snapshot == stable:
+                return ordered_fragments, measured_by_fragment, stable
+            note_writer_change()
             continue
 
     diagnostic = _snapshot_diagnostic(last_snapshot, reason=last_reason)
-    if last_reader_error and last_reason == "coverage_data_incomplete_or_invalid":
+    if last_reader_diagnostic is not None:
         raise CoveragePathMappingError(
             "coverage fragment is stably unreadable or invalid "
-            f"({diagnostic})"
+            f"({last_reader_diagnostic})"
         ) from None
     if last_reason in {
         "fragment_set_empty",

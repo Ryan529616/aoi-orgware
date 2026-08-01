@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,12 +13,15 @@ import pytest
 from scripts.coverage_fragment_quiescence import (
     MAX_FRAGMENT_FILES,
     MAX_FRAGMENT_SET_BYTES,
+    CoverageFragmentReadError,
     CoveragePathMappingError,
     FragmentIdentity,
+    _FragmentSetChanged,
     _read_stable_fragment_set,
     _snapshot_fragments,
     _snapshot_digest,
 )
+from scripts import verify_coverage_path_mapping as coverage_verifier
 
 
 def _identity(
@@ -141,7 +146,89 @@ def test_truncated_fragment_can_be_replaced_before_bounded_exhaustion() -> None:
     assert measured[fragment] == ("/trusted.py",)
     assert identities == valid
     assert calls == 2
-    assert clock.sleeps == [0.25, 0.25]
+    assert clock.sleeps == [0.25, 0.25, 0.25]
+
+
+def test_reader_failure_retries_when_the_full_set_changes_during_error_bracket() -> None:
+    fragment = Path(".coverage.raw")
+    first = {fragment: _identity(inode=1, mtime_ns=1)}
+    replaced = {fragment: _identity(inode=2, mtime_ns=2)}
+    calls = 0
+
+    def reader(_fragment: Path) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise CoverageFragmentReadError("coverage_data_read")
+        return ("/trusted.py",)
+
+    (fragments, measured, identities), clock = _read(
+        _sequence(first, first, replaced, replaced, replaced, replaced, replaced),
+        reader,
+        attempts=2,
+    )
+
+    assert fragments == (fragment,)
+    assert measured == {fragment: ("/trusted.py",)}
+    assert identities == replaced
+    assert calls == 2
+    assert clock.sleeps == [0.25, 0.25, 0.25]
+
+
+@pytest.mark.parametrize("failure_call,reader_fails_once", ((1, False), (2, False), (3, False), (3, True)))
+def test_snapshot_disappearance_retries(failure_call: int, reader_fails_once: bool) -> None:
+    fragment = Path(".coverage.raw")
+    stable = {fragment: _identity()}
+    snapshot_calls = 0
+    reader_calls = 0
+    clock = _Clock()
+
+    def snapshot(_directory: Path) -> dict[Path, FragmentIdentity]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == failure_call:
+            raise _FragmentSetChanged("observed disappearance")
+        return stable
+
+    def reader(_fragment: Path) -> tuple[str, ...]:
+        nonlocal reader_calls
+        reader_calls += 1
+        if reader_fails_once and reader_calls == 1:
+            raise CoverageFragmentReadError("coverage_data_read")
+        return ("/trusted.py",)
+
+    fragments, measured, identities = _read_stable_fragment_set(
+        Path("fragments"),
+        reader,
+        snapshot=snapshot,
+        attempts=2,
+        stability_interval=0.25,
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    )
+
+    assert fragments == (fragment,)
+    assert measured == {fragment: ("/trusted.py",)}
+    assert identities == stable
+    assert reader_calls == (2 if failure_call == 3 else 1)
+
+
+def test_later_writer_change_cannot_reuse_an_earlier_reader_failure_diagnostic() -> None:
+    fragment = Path(".coverage.raw")
+    stable = {fragment: _identity(inode=1, mtime_ns=1)}
+    changed = {fragment: _identity(inode=2, mtime_ns=2)}
+
+    with pytest.raises(CoveragePathMappingError) as caught:
+        _read(
+            _sequence(stable, stable, stable, stable, stable, changed),
+            lambda _fragment: (_ for _ in ()).throw(
+                CoverageFragmentReadError("coverage_data_read")
+            ),
+            attempts=2,
+        )
+
+    assert "did not stabilize" in str(caught.value)
+    assert "stably unreadable" not in str(caught.value)
 
 
 def test_persistent_reader_failure_is_bounded_and_redacted() -> None:
@@ -159,9 +246,237 @@ def test_persistent_reader_failure_is_bounded_and_redacted() -> None:
 
     message = str(caught.value)
     assert "reason=coverage_data_incomplete_or_invalid" in message
+    assert "stage=reader_unclassified" in message
+    assert "fragment_basename_sha256=" in message
+    assert "fragment_identity_sha256=" in message
     assert "secret-host" not in message
     assert "pid999" not in message
     assert "/private/path" not in message
+
+
+@pytest.mark.parametrize("corruption", ("mutated", "missing"))
+def test_corrupted_reader_stage_is_closed(corruption: str) -> None:
+    fragment = Path(".coverage.raw")
+    stable = {fragment: _identity()}
+    error = CoverageFragmentReadError("coverage_data_read")
+    if corruption == "mutated":
+        error._stage = "secret-stage"  # type: ignore[attr-defined]
+    else:
+        del error._stage  # type: ignore[attr-defined]
+
+    with pytest.raises(CoveragePathMappingError) as caught:
+        _read(
+            _sequence(stable),
+            lambda _fragment: (_ for _ in ()).throw(error),
+            attempts=1,
+        )
+
+    assert "stage=reader_unclassified" in str(caught.value)
+    assert "secret-stage" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("stage", "coverage_data_type"),
+    (
+        (
+            "coverage_data_read",
+            type(
+                "ReadFailure",
+                (),
+                {
+                    "__init__": lambda self, **_kwargs: None,
+                    "read": lambda self: (_ for _ in ()).throw(
+                        RuntimeError("secret read failure")
+                    ),
+                    "close": lambda self: None,
+                },
+            ),
+        ),
+        (
+            "measured_files",
+            type(
+                "MeasuredFailure",
+                (),
+                {
+                    "__init__": lambda self, **_kwargs: None,
+                    "read": lambda self: None,
+                    "measured_files": lambda self: (_ for _ in ()).throw(
+                        RuntimeError("secret measured failure")
+                    ),
+                    "close": lambda self: None,
+                },
+            ),
+        ),
+    ),
+)
+def test_workflow_reader_emits_only_closed_read_stages(
+    monkeypatch,
+    stage: str,
+    coverage_data_type: type[object],
+) -> None:
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_validate_coverage_fragment_schema",
+        lambda _fragment: None,
+    )
+    with pytest.raises(CoverageFragmentReadError) as caught:
+        coverage_verifier._read_fragment_measured_files(
+            Path(".coverage.secret"),
+            coverage_data_type,
+        )
+    assert caught.value.stage == stage
+    assert "secret" not in str(caught.value)
+
+
+def test_workflow_reader_classifies_schema_preflight_without_exception_text(
+    monkeypatch,
+) -> None:
+    def invalid_schema(_fragment: Path) -> None:
+        raise CoveragePathMappingError("secret raw schema diagnostic")
+
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_validate_coverage_fragment_schema",
+        invalid_schema,
+    )
+    with pytest.raises(CoverageFragmentReadError) as caught:
+        coverage_verifier._read_fragment_measured_files(
+            Path(".coverage.secret"),
+            object,
+        )
+    assert caught.value.stage == "schema_preflight"
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("stage", ("coverage_data_read", "measured_files"))
+def test_workflow_reader_does_not_convert_memory_exhaustion(stage: str, monkeypatch) -> None:
+    class MemoryFailure:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read(self) -> None:
+            if stage == "coverage_data_read":
+                raise MemoryError
+
+        def measured_files(self) -> tuple[str, ...]:
+            raise MemoryError
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_validate_coverage_fragment_schema",
+        lambda _fragment: None,
+    )
+    with pytest.raises(MemoryError):
+        coverage_verifier._read_fragment_measured_files(
+            Path(".coverage.memory"),
+            MemoryFailure,
+        )
+
+
+def test_workflow_reader_closes_success_and_failure_objects(monkeypatch) -> None:
+    class TrackingData:
+        instances: list["TrackingData"] = []
+
+        def __init__(self, **_kwargs) -> None:
+            self.fail = len(type(self).instances) == 1
+            self.closes = 0
+            type(self).instances.append(self)
+
+        def read(self) -> None:
+            if self.fail:
+                raise RuntimeError("secret read failure")
+
+        def measured_files(self) -> tuple[str, ...]:
+            return ("/trusted.py",)
+
+        def close(self) -> None:
+            self.closes += 1
+
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_validate_coverage_fragment_schema",
+        lambda _fragment: None,
+    )
+    assert coverage_verifier._read_fragment_measured_files(
+        Path(".coverage.success"), TrackingData
+    ) == ("/trusted.py",)
+    with pytest.raises(CoverageFragmentReadError) as caught:
+        coverage_verifier._read_fragment_measured_files(
+            Path(".coverage.failure"), TrackingData
+        )
+    assert caught.value.stage == "coverage_data_read"
+    assert [item.closes for item in TrackingData.instances] == [1, 1]
+
+
+def test_workflow_reader_classifies_close_failure(monkeypatch) -> None:
+    class CloseFailure:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read(self) -> None:
+            pass
+
+        def measured_files(self) -> tuple[str, ...]:
+            return ("/trusted.py",)
+
+        def close(self) -> None:
+            raise RuntimeError("secret close failure")
+
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_validate_coverage_fragment_schema",
+        lambda _fragment: None,
+    )
+    with pytest.raises(CoverageFragmentReadError) as caught:
+        coverage_verifier._read_fragment_measured_files(
+            Path(".coverage.close"), CloseFailure
+        )
+    assert caught.value.stage == "coverage_data_close"
+    assert "secret" not in str(caught.value)
+
+
+def test_stably_corrupt_sqlite_fragment_remains_fail_closed(tmp_path: Path) -> None:
+    fragment = tmp_path / ".coverage.corrupt"
+    original = b"not-a-sqlite-database"
+    fragment.write_bytes(original)
+    stable = _snapshot_fragments(tmp_path)
+    clock = _Clock()
+
+    with pytest.raises(CoveragePathMappingError) as caught:
+        _read_stable_fragment_set(
+            tmp_path,
+            lambda path: coverage_verifier._read_fragment_measured_files(path, object),
+            snapshot=_sequence(stable),
+            attempts=1,
+            stability_interval=0.25,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+
+    assert "stage=schema_preflight" in str(caught.value)
+    assert "corrupt" not in str(caught.value)
+    assert fragment.read_bytes() == original
+
+
+def test_schema_valid_but_incompatible_coverage_data_has_read_stage(
+    tmp_path: Path,
+) -> None:
+    coverage = pytest.importorskip("coverage")
+    fragment = tmp_path / ".coverage.incompatible"
+    with sqlite3.connect(fragment) as database:
+        database.execute("CREATE TABLE coverage_schema (version integer)")
+        database.execute("INSERT INTO coverage_schema (version) VALUES (999999)")
+
+    with pytest.raises(CoverageFragmentReadError) as caught:
+        coverage_verifier._read_fragment_measured_files(
+            fragment,
+            coverage.CoverageData,
+        )
+
+    assert caught.value.stage == "coverage_data_read"
 
 
 @pytest.mark.parametrize("suffix", ("-journal", "-wal", "-shm"))
@@ -262,6 +577,105 @@ def test_fragment_count_bound_is_fail_closed() -> None:
         _read(_sequence(over), attempts=1)
 
 
+def test_near_limit_fragment_set_is_feasible_and_fully_read() -> None:
+    fragments = {
+        Path(f".coverage.{index:04d}"): _identity(index + 1)
+        for index in range(3908)
+    }
+    reads: list[Path] = []
+
+    (sealed, measured, identities), _ = _read(
+        _sequence(fragments),
+        lambda fragment: reads.append(fragment) or ("/trusted.py",),
+        attempts=1,
+    )
+
+    assert len(sealed) == 3908
+    assert len(measured) == 3908
+    assert identities == fragments
+    assert reads == list(sealed)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux coverage.py scale receipt")
+def test_real_coverage_data_near_limit_fragment_set_is_fully_read(
+    tmp_path: Path,
+) -> None:
+    coverage = pytest.importorskip("coverage")
+    seed = tmp_path / ".coverage.0000"
+    data = coverage.CoverageData(basename=str(seed))
+    data.add_lines({str(tmp_path / "measured.py"): {1}})
+    data.write()
+    data.close()
+    for index in range(1, 3908):
+        os.link(seed, tmp_path / f".coverage.{index:04d}")
+    clock = _Clock()
+
+    fragments, measured, identities = _read_stable_fragment_set(
+        tmp_path,
+        lambda fragment: coverage_verifier._read_fragment_measured_files(
+            fragment,
+            coverage.CoverageData,
+        ),
+        attempts=1,
+        stability_interval=0.01,
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    )
+
+    assert len(fragments) == 3908
+    assert len(measured) == 3908
+    assert len(identities) == 3908
+    assert set(measured.values()) == {(str(tmp_path / "measured.py"),)}
+
+
+def test_stable_reader_retries_cache_successful_prefix() -> None:
+    first = Path(".coverage.a")
+    failing = Path(".coverage.z")
+    stable = {failing: _identity(2), first: _identity(1)}
+    reads: list[Path] = []
+
+    def reader(fragment: Path) -> tuple[str, ...]:
+        reads.append(fragment)
+        if fragment == failing:
+            raise CoverageFragmentReadError("coverage_data_read")
+        return ("/trusted.py",)
+
+    with pytest.raises(CoveragePathMappingError, match="stably unreadable"):
+        _read(_sequence(stable), reader, attempts=3)
+
+    assert reads == [first, failing, failing, failing]
+
+
+def test_first_reader_failure_is_selected_by_canonical_basename_order() -> None:
+    first = Path(".coverage.a")
+    second = Path(".coverage.z")
+    ordered = {first: _identity(1), second: _identity(2)}
+    reversed_order = {second: _identity(2), first: _identity(1)}
+
+    def failure_receipt(snapshot: dict[Path, FragmentIdentity]) -> str:
+        with pytest.raises(CoveragePathMappingError) as caught:
+            _read(
+                _sequence(snapshot),
+                lambda _fragment: (_ for _ in ()).throw(
+                    CoverageFragmentReadError("coverage_data_read")
+                ),
+                attempts=1,
+            )
+        return str(caught.value)
+
+    assert failure_receipt(ordered) == failure_receipt(reversed_order)
+
+    def success_order(snapshot: dict[Path, FragmentIdentity]) -> tuple[Path, ...]:
+        (fragments, _, _), _ = _read(
+            _sequence(snapshot),
+            lambda _fragment: ("/trusted.py",),
+            attempts=1,
+        )
+        return fragments
+
+    assert success_order(ordered) == success_order(reversed_order) == (first, second)
+
+
 def test_real_snapshot_enumeration_stops_at_the_fragment_count_bound(
     monkeypatch,
 ) -> None:
@@ -327,6 +741,28 @@ def test_fragment_basename_byte_bound_fails_typed_and_redacted() -> None:
         _snapshot_digest({fragment: _identity()})
     assert "byte bound" in str(caught.value)
     assert secret not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    (
+        [],
+        {Path(".coverage.raw"): object()},
+        {".coverage.raw": _identity()},
+        {Path(".coverage.raw"): FragmentIdentity(stat.S_IFREG, 1, object(), 1)},
+        {Path(".coverage.raw"): FragmentIdentity(stat.S_IFREG, 1, True, 1)},
+        {Path(".coverage.raw"): FragmentIdentity(stat.S_IFREG, -1, 64, 1)},
+        {Path(".coverage.raw"): FragmentIdentity(stat.S_IFREG, 1, 64, 1 << 128)},
+    ),
+)
+def test_malformed_snapshot_fails_typed_before_field_access(snapshot: object) -> None:
+    with pytest.raises(CoveragePathMappingError, match="snapshot is invalid"):
+        _read_stable_fragment_set(
+            Path("fragments"),
+            lambda _fragment: (),
+            snapshot=lambda _directory: snapshot,  # type: ignore[return-value]
+            attempts=1,
+        )
 
 
 @pytest.mark.parametrize("attempts", (True, False, 0, 9))

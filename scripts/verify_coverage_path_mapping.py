@@ -19,6 +19,7 @@ if str(_SCRIPT_ROOT) not in sys.path:
 
 from scripts.coverage_fragment_quiescence import (  # noqa: E402
     MAX_COMBINE_ATTEMPTS,
+    CoverageFragmentReadError,
     CoveragePathMappingError,
     FragmentIdentity,
     _assert_fragment_snapshot,
@@ -38,6 +39,49 @@ COVERAGE_FILE_ENV = "COVERAGE_FILE"
 MAX_MEASURED_FILES = 4096
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 _PYTEST_OWNER = re.compile(r"^pytest-of-[A-Za-z0-9._-]+$")
+
+
+def _close_fragment_data(data: Any) -> None:
+    try:
+        data.close()
+    except MemoryError:
+        raise
+    except Exception:
+        raise CoverageFragmentReadError("coverage_data_close") from None
+
+
+def _read_fragment_measured_files(
+    fragment: Path,
+    coverage_data_type: type[Any],
+) -> tuple[str, ...]:
+    """Classify coverage.py reads without exposing raw fragment or exception text."""
+
+    try:
+        _validate_coverage_fragment_schema(fragment)
+    except CoveragePathMappingError:
+        raise CoverageFragmentReadError("schema_preflight") from None
+    try:
+        data = coverage_data_type(basename=str(fragment))
+    except MemoryError:
+        raise
+    except Exception:
+        raise CoverageFragmentReadError("coverage_data_read") from None
+    try:
+        data.read()
+    except MemoryError:
+        raise
+    except Exception:
+        _close_fragment_data(data)
+        raise CoverageFragmentReadError("coverage_data_read") from None
+    try:
+        measured = tuple(data.measured_files())
+    except MemoryError:
+        raise
+    except Exception:
+        _close_fragment_data(data)
+        raise CoverageFragmentReadError("measured_files") from None
+    _close_fragment_data(data)
+    return measured
 
 
 def _write_data(
@@ -303,15 +347,9 @@ def verify_fragments(
             "coverage is required before verifying coverage fragments"
         ) from exc
 
-    def read_measured_files(fragment: Path) -> tuple[str, ...]:
-        _validate_coverage_fragment_schema(fragment)
-        data = CoverageData(basename=str(fragment))
-        data.read()
-        return tuple(data.measured_files())
-
     children, measured_by_fragment, identities = _read_stable_fragment_set(
         fragments_root,
-        read_measured_files,
+        lambda fragment: _read_fragment_measured_files(fragment, CoverageData),
     )
     seen: set[str] = set()
     categories: set[str] = set()
