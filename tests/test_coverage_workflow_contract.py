@@ -508,7 +508,7 @@ def test_fragment_reader_rejects_bounded_unstable_set_or_identity(
             Path("fragments"),
             reader,
             snapshot=_snapshot_sequence(first, second, first, second, first, second),
-            stability_interval=0.01,
+            attempts=3, stability_interval=0.01,
             monotonic=clock.monotonic,
             sleeper=clock.sleep,
         )
@@ -557,7 +557,7 @@ def test_fragment_reader_rejects_stably_invalid_coverage_data_after_delay() -> N
             monotonic=clock.monotonic,
             sleeper=clock.sleep,
         )
-    assert clock.sleep_calls == [0.125, 0.125]
+    assert clock.sleep_calls == [0.125] * 8
 
 
 def test_schema_preflight_rejects_missing_schema_without_mutating_bytes(tmp_path: Path) -> None:
@@ -601,7 +601,7 @@ def test_fragment_reader_retries_transient_parse_or_identity_change() -> None:
     assert measured == {fragment: ("/trusted.py",)}
     assert identities == recovered
     assert reader_calls == 2
-    assert clock.sleep_calls == [0.01, 0.01, 0.01]
+    assert clock.sleep_calls == [0.01, 0.01]
 
 
 def test_fragment_reader_retries_identity_change_after_read() -> None:
@@ -681,7 +681,7 @@ def test_fragment_reader_rejects_unbounded_stability_attempts() -> None:
             Path("fragments"),
             lambda _fragment: (),
             snapshot=_snapshot_sequence({Path(".coverage.one"): _identity()}),
-            attempts=4,
+            attempts=9,
         )
 
 

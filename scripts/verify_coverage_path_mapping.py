@@ -4,48 +4,40 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
-import sqlite3
 import stat
 import sys
-import time
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, NamedTuple
+from typing import Any
+
+_SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(_SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_ROOT))
+
+from scripts.coverage_fragment_quiescence import (  # noqa: E402
+    MAX_COMBINE_ATTEMPTS,
+    CoveragePathMappingError,
+    FragmentIdentity,
+    _assert_fragment_snapshot,
+    _fragment_identity,
+    _FragmentSetChanged,
+    _read_stable_fragment_set,
+    _snapshot_fragments,
+    _validate_coverage_fragment_schema,
+)
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = _SCRIPT_ROOT
 CONFIG = ROOT / ".coveragerc"
 CANONICAL_FILE = ROOT / "src" / "aoi_orgware" / "__init__.py"
 TEMP_ROOT_ENV = "AOI_COVERAGE_TEMP_ROOT"
 COVERAGE_FILE_ENV = "COVERAGE_FILE"
-MAX_FRAGMENT_FILES = 4096
-MAX_FRAGMENT_BYTES = 64 * 1024 * 1024
 MAX_MEASURED_FILES = 4096
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
-MAX_FRAGMENT_STABILITY_ATTEMPTS = 3
-FRAGMENT_STABILITY_INTERVAL_SECONDS = 0.05
 _PYTEST_OWNER = re.compile(r"^pytest-of-[A-Za-z0-9._-]+$")
-
-
-class CoveragePathMappingError(RuntimeError):
-    """The configured aliases did not preserve the trusted measurement boundary."""
-
-
-class _FragmentSetChanged(CoveragePathMappingError):
-    """A cooperative coverage writer changed the frozen shard set."""
-
-
-class FragmentIdentity(NamedTuple):
-    """The lstat identity that must remain fixed while a shard is trusted."""
-
-    file_type: int
-    inode: int
-    size: int
-    mtime_ns: int
 
 
 def _write_data(
@@ -273,174 +265,6 @@ def _verify_fragment_source(
     return category, canonical_resolved.as_posix()
 
 
-def _fragment_identity(fragment: Path) -> FragmentIdentity:
-    try:
-        status = os.lstat(fragment)
-    except OSError as exc:
-        raise _FragmentSetChanged(
-            "coverage fragment disappeared during identity check"
-        ) from exc
-    return FragmentIdentity(
-        stat.S_IFMT(status.st_mode),
-        status.st_ino,
-        status.st_size,
-        status.st_mtime_ns,
-    )
-
-
-def _snapshot_fragments(fragment_directory: Path) -> dict[Path, FragmentIdentity]:
-    """Capture every directory member without following a coverage fragment."""
-
-    try:
-        children = sorted(
-            fragment_directory.iterdir(),
-            key=lambda path: path.name.encode("utf-8"),
-        )
-    except OSError as exc:
-        raise CoveragePathMappingError(
-            "coverage fragment directory cannot be enumerated"
-        ) from exc
-    snapshot: dict[Path, FragmentIdentity] = {}
-    for fragment in children:
-        snapshot[fragment] = _fragment_identity(fragment)
-    return snapshot
-
-
-def _validate_fragment_snapshot(snapshot: dict[Path, FragmentIdentity]) -> None:
-    """Reject every stable directory member that is not an allowed shard."""
-
-    if not 1 <= len(snapshot) <= MAX_FRAGMENT_FILES:
-        raise CoveragePathMappingError("coverage fragment count is outside the bound")
-    for fragment, identity in snapshot.items():
-        if (
-            not fragment.name.startswith(".coverage.")
-            or identity.file_type != stat.S_IFREG
-            or identity.size == 0
-            or identity.size > MAX_FRAGMENT_BYTES
-        ):
-            raise CoveragePathMappingError(
-                "coverage directory contains an unexpected or empty fragment"
-            )
-
-
-def _read_stable_fragment_set(
-    fragment_directory: Path,
-    reader: Callable[[Path], tuple[str, ...]],
-    *,
-    snapshot: Callable[[Path], dict[Path, FragmentIdentity]] = (
-        _snapshot_fragments
-    ),
-    attempts: int = MAX_FRAGMENT_STABILITY_ATTEMPTS,
-    stability_interval: float = FRAGMENT_STABILITY_INTERVAL_SECONDS,
-    monotonic: Callable[[], float] = time.monotonic,
-    sleeper: Callable[[float], None] = time.sleep,
-) -> tuple[tuple[Path, ...], dict[Path, tuple[str, ...]], dict[Path, FragmentIdentity]]:
-    """Read shards only after a bounded, elapsed stable bracket."""
-
-    if (
-        not isinstance(attempts, int)
-        or not 1 <= attempts <= MAX_FRAGMENT_STABILITY_ATTEMPTS
-    ):
-        raise CoveragePathMappingError(
-            "coverage fragment stability attempt bound is invalid"
-        )
-    if not math.isfinite(stability_interval) or stability_interval <= 0:
-        raise CoveragePathMappingError("coverage fragment stability interval is invalid")
-
-    start = monotonic()
-    if not math.isfinite(start):
-        raise CoveragePathMappingError("coverage fragment stability clock is invalid")
-    last_time = start
-
-    def post_interval_snapshot() -> dict[Path, FragmentIdentity]:
-        nonlocal last_time
-        before_sleep = monotonic()
-        if not math.isfinite(before_sleep) or before_sleep < last_time:
-            raise CoveragePathMappingError(
-                "coverage fragment stability clock moved backwards"
-            )
-        sleeper(stability_interval)
-        after_sleep = monotonic()
-        if not math.isfinite(after_sleep) or after_sleep < before_sleep:
-            raise CoveragePathMappingError(
-                "coverage fragment stability clock moved backwards"
-            )
-        if after_sleep < before_sleep + stability_interval:
-            raise CoveragePathMappingError(
-                "coverage fragment stability interval did not elapse"
-            )
-        last_time = after_sleep
-        return snapshot(fragment_directory)
-
-    for _ in range(attempts):
-        before = snapshot(fragment_directory)
-        stable = post_interval_snapshot()
-        if before != stable:
-            continue
-        _validate_fragment_snapshot(stable)
-        measured_by_fragment: dict[Path, tuple[str, ...]] = {}
-        for fragment in stable:
-            try:
-                measured_by_fragment[fragment] = tuple(reader(fragment))
-            except Exception as exc:
-                if post_interval_snapshot() != stable:
-                    break
-                raise CoveragePathMappingError(
-                    "coverage fragment is stably unreadable or invalid"
-                ) from exc
-        else:
-            if snapshot(fragment_directory) == stable:
-                return tuple(stable), measured_by_fragment, stable
-    raise CoveragePathMappingError(
-        "coverage fragment set did not stabilize within the bounded attempt limit"
-    )
-
-
-def _assert_fragment_snapshot(
-    fragment_directory: Path,
-    expected: dict[Path, FragmentIdentity],
-) -> None:
-    actual = _snapshot_fragments(fragment_directory)
-    if actual != expected:
-        added = len(actual.keys() - expected.keys())
-        removed = len(expected.keys() - actual.keys())
-        changed = sum(
-            actual[path] != expected[path]
-            for path in actual.keys() & expected.keys()
-        )
-        material = "\n".join(
-            f"{path.name}:{','.join(str(value) for value in identity)}"
-            for path, identity in sorted(
-                actual.items(), key=lambda item: item[0].name.encode("utf-8")
-            )
-        )
-        raise _FragmentSetChanged(
-            "coverage fragment set or identity changed "
-            f"(added={added}, removed={removed}, changed={changed}, "
-            f"actual_sha256={sha256(material.encode('utf-8')).hexdigest()})"
-        )
-
-
-def _validate_coverage_fragment_schema(fragment: Path) -> None:
-    """Require an existing schema without letting coverage.py initialize the shard."""
-
-    try:
-        resolved = fragment.resolve(strict=True)
-        with sqlite3.connect(
-            f"{resolved.as_uri()}?mode=ro&immutable=1", uri=True, timeout=0
-        ) as database:
-            database.execute("PRAGMA query_only = ON")
-            rows = database.execute("SELECT version FROM coverage_schema").fetchall()
-    except (OSError, sqlite3.Error, ValueError) as exc:
-        raise CoveragePathMappingError(
-            "coverage fragment schema is missing or invalid"
-        ) from exc
-    if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
-        raise CoveragePathMappingError(
-            "coverage fragment schema is missing or invalid"
-        )
-
-
 def verify_fragments(
     fragment_directory: Path,
 ) -> tuple[
@@ -597,7 +421,7 @@ def combine_fragments(fragment_directory: Path) -> None:
     """Combine an exact raw snapshot with bounded retry on cooperative churn."""
 
     last_change: _FragmentSetChanged | None = None
-    for _ in range(MAX_FRAGMENT_STABILITY_ATTEMPTS):
+    for _ in range(MAX_COMBINE_ATTEMPTS):
         try:
             _combine_fragment_attempt(fragment_directory)
             return
