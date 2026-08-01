@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+import aoi_orgware.company.runtime_policy as runtime_policy
 from aoi_orgware.company.contracts import CompanyContractError, canonical_company_json_bytes
 from aoi_orgware.company.runtime_policy import (
     CURRENT_ADMITTED_MAX_DEPTH,
@@ -19,11 +20,16 @@ from aoi_orgware.company.runtime_policy import (
     DelegationDepthClassificationV1,
     RuntimePolicyDefinitionError,
     RuntimePolicyDefinitionV1,
+    RuntimePolicyDefinitionV2,
+    RUNTIME_POLICY_DEFINITION_V2,
     canonical_runtime_policy_definition_v1_bytes,
+    canonical_runtime_policy_definition_v2_bytes,
     classify_delegation_depth_v1,
     runtime_policy_definition_v1,
+    runtime_policy_definition_v2,
     validate_delegation_depth_classification_v1,
     validate_runtime_policy_definition_v1,
+    validate_runtime_policy_definition_v2,
 )
 
 
@@ -357,3 +363,86 @@ def test_contract_contains_no_activation_or_runtime_state_fields() -> None:
     assert set(DelegationDepthClassificationV1._fields) >= {
         "authority_semantics", "admission_semantics", "definition_sha256",
     }
+
+
+def test_v2_has_independent_fixed_oracle_and_preserves_v1_bytes() -> None:
+    v1 = runtime_policy_definition_v1()
+    v2 = runtime_policy_definition_v2()
+    assert v1.definition_sha256 == "d62315e882de44e307c42148eb155008ce97a0dba553e32b21805cf6ac22242d"
+    assert v2.document_type == RUNTIME_POLICY_DEFINITION_V2
+    assert v2.definition_sha256 == "e7d4c9bc90e91482da3d3623d5b3ec487e17f271decdc860e22e2647adfd7385"
+    assert v2.supersedes_definition_sha256 == v1.definition_sha256
+    assert v2.working_lead_roles == ("rtl_lead", "dv_lead", "pd_lead")
+    assert v2.current_chief_semantics == "one_exact_current_chief_and_at_most_one_exact_immediate_retiring_predecessor_d0_excluded_from_subordinate_capacity_visible_in_physical_coverage"
+    assert v2.capacity_semantics == "union_dedup_d1_d2_d3_carrier_and_reservation_holder_identities_limit_four"
+    assert v2.current_admitted_max_depth == 3
+    assert v2.history_structural_max_depth == 6
+    assert v2.subordinate_carrier_limit == 4
+    assert v2.overflow_disposition == "queue"
+    assert v2.over_depth_admission == "new_d4_to_d6_reject_before_append"
+    assert v2.unknown_semantics == "unknown_or_unattributed_not_subtracted_capacity_and_admission_unavailable"
+    assert v2.effect_unknown_semantics == "effect_unknown_holds_reservation_write_and_output_claim"
+    assert v2.over_depth_semantics == "d4_to_d6_raw_preserved_history_only_requires_exact_surface_specific_durable_terminal_closure_never_reactivates"
+    assert v2.operational_effect == "none"
+    assert v2.state_proof_semantics == "policy_semantics_not_current_state_proof"
+    assert canonical_runtime_policy_definition_v1_bytes(v1) == canonical_company_json_bytes(v1.to_dict())
+    assert validate_runtime_policy_definition_v2(v2) == v2
+
+
+def test_v1_and_v2_are_noninterchangeable_and_v2_canonical() -> None:
+    v1, v2 = runtime_policy_definition_v1(), runtime_policy_definition_v2()
+    with pytest.raises(RuntimePolicyDefinitionError):
+        validate_runtime_policy_definition_v2(v1.to_dict())
+    with pytest.raises(RuntimePolicyDefinitionError):
+        validate_runtime_policy_definition_v1(v2.to_dict())
+    assert canonical_runtime_policy_definition_v2_bytes(dict(reversed(tuple(v2.to_dict().items())))) == canonical_company_json_bytes(v2.to_dict())
+    bad = v2.to_dict()
+    bad["supersedes_definition_sha256"] = "f" * 64
+    with pytest.raises(RuntimePolicyDefinitionError):
+        validate_runtime_policy_definition_v2(bad)
+    for field, drift in (("schema_version", True), ("policy_revision", _IntSubclass(2)),
+                         ("operational_effect", "admission"), ("working_lead_roles", ["rtl_lead"]),
+                         ("working_lead_roles", [_StringSubclass("rtl_lead"), "dv_lead", "pd_lead"]),
+                         ("working_lead_roles", [_ExplodingEqual(), "dv_lead", "pd_lead"])):
+        forged = v2.to_dict()
+        forged[field] = drift
+        with pytest.raises(RuntimePolicyDefinitionError):
+            validate_runtime_policy_definition_v2(forged)
+
+
+def test_v2_definition_only_api_has_no_overlay_or_runtime_classifier() -> None:
+    for name in (
+        "RuntimeCarrierOverlayV2", "RuntimeOverlayClassificationV2",
+        "validate_runtime_carrier_overlay_v2", "classify_runtime_carrier_overlays_v2",
+    ):
+        assert not hasattr(runtime_policy, name)
+    fields = set(RuntimePolicyDefinitionV2._fields)
+    assert not fields & {
+        "company_id", "activation_cursor", "state", "admitted", "lease_id",
+        "authority_grant", "occupied", "available", "carrier_id", "reservation_id",
+    }
+    value = runtime_policy_definition_v2()
+    assert not hasattr(value, "__dict__")
+    with pytest.raises(AttributeError):
+        cast(Any, value).subordinate_carrier_limit = 5
+    detached = value.to_dict()
+    cast(list[dict[str, object]], detached["role_depths"])[0]["delegation_depth"] = 9
+    assert value.role_depths[0].delegation_depth == 0
+
+
+def test_v2_definition_rejects_named_tuple_shape_and_semantic_forgery() -> None:
+    value = runtime_policy_definition_v2()
+    malformed = tuple.__new__(RuntimePolicyDefinitionV2, tuple(value)[:-1])
+    with pytest.raises(CompanyContractError):
+        validate_runtime_policy_definition_v2(malformed)
+    for forged in (
+        value._replace(schema_version=cast(Any, True)),
+        value._replace(policy_revision=cast(Any, _IntSubclass(2))),
+        value._replace(operational_effect="activation"),
+        value._replace(capacity_semantics="caller_supplied_current_capacity"),
+        value._replace(role_depths=value.role_depths + (value.role_depths[-1],)),
+        value._replace(working_lead_roles=value.working_lead_roles + ("extra",)),
+        value._replace(definition_sha256="f" * 64),
+    ):
+        with pytest.raises(CompanyContractError):
+            validate_runtime_policy_definition_v2(forged)

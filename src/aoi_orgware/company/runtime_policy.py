@@ -479,3 +479,165 @@ def validate_delegation_depth_classification_v1(
     if _classification_plain_dict(normalized) != _classification_plain_dict(expected):
         _fail("classification differs from exact pure derivation")
     return normalized
+
+
+# V2 deliberately remains a fixed policy definition. It is not registered,
+# activated, or a substitute for a durable runtime view.
+RUNTIME_POLICY_DEFINITION_V2 = "runtime_policy_definition_v2"
+RUNTIME_POLICY_V2_REVISION = 2
+_DEFINITION_V2_DOMAIN = "aoi.company.runtime-policy-definition.v2"
+_V2_LEAD_ROLES = ("rtl_lead", "dv_lead", "pd_lead")
+_V2_ROLE_DEPTHS = (("chief", 0), *_ROLE_DEPTHS[1:])
+_V2_FIXED_TEXT = (
+    ("current_chief_semantics", "one_exact_current_chief_and_at_most_one_exact_immediate_retiring_predecessor_d0_excluded_from_subordinate_capacity_visible_in_physical_coverage"),
+    ("retiring_chief_semantics", "retiring_chief_requires_exact_writer_quiescence_proof_no_stack"),
+    ("retiring_release_semantics", "retiring_chief_physical_coverage_remains_visible_until_exact_writer_quiescence_proof"),
+    ("lead_semantics", "d1_only_rtl_lead_dv_lead_pd_lead_department_identity_bound"),
+    ("worker_semantics", "d2_worker_may_delegate_only_d3_reviewer"),
+    ("reviewer_semantics", "d3_reviewer_cannot_delegate"),
+    ("turn_semantics", "inherits_owner_depth_adds_no_carrier_slot"),
+    ("external_job_semantics", "inherits_owner_depth_adds_no_carrier_slot"),
+    ("capacity_semantics", "union_dedup_d1_d2_d3_carrier_and_reservation_holder_identities_limit_four"),
+    ("overflow_disposition", "queue"),
+    ("over_depth_admission", "new_d4_to_d6_reject_before_append"),
+    ("unknown_semantics", "unknown_or_unattributed_not_subtracted_capacity_and_admission_unavailable"),
+    ("effect_unknown_semantics", "effect_unknown_holds_reservation_write_and_output_claim"),
+    ("over_depth_semantics", "d4_to_d6_raw_preserved_history_only_requires_exact_surface_specific_durable_terminal_closure_never_reactivates"),
+    ("state_proof_semantics", "policy_semantics_not_current_state_proof"),
+    ("authority_semantics", "requires_separate_durable_activation"),
+    ("operational_effect", "none"),
+)
+
+
+class RuntimePolicyDefinitionV2(NamedTuple):
+    """Immutable V2 policy semantics; not a current-state or authority receipt."""
+
+    document_type: str
+    schema_version: int
+    policy_id: str
+    policy_revision: int
+    supersedes_definition_sha256: str
+    role_depths: tuple[RuntimeRoleDepthV1, ...]
+    working_lead_roles: tuple[str, ...]
+    current_admitted_max_depth: int
+    history_structural_max_depth: int
+    subordinate_carrier_limit: int
+    current_chief_semantics: str
+    retiring_chief_semantics: str
+    retiring_release_semantics: str
+    lead_semantics: str
+    worker_semantics: str
+    reviewer_semantics: str
+    turn_semantics: str
+    external_job_semantics: str
+    capacity_semantics: str
+    overflow_disposition: str
+    over_depth_admission: str
+    unknown_semantics: str
+    effect_unknown_semantics: str
+    over_depth_semantics: str
+    state_proof_semantics: str
+    authority_semantics: str
+    operational_effect: str
+    definition_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return _definition_v2_dict(self)
+
+
+def _definition_v2_plain_dict(value: RuntimePolicyDefinitionV2) -> dict[str, object]:
+    if type(value) is not RuntimePolicyDefinitionV2 or tuple.__len__(value) != len(RuntimePolicyDefinitionV2._fields):
+        _fail("runtime policy V2 definition must be an exact value object")
+    for field in RuntimePolicyDefinitionV2._fields:
+        item = getattr(value, field)
+        if field in {"schema_version", "policy_revision", "current_admitted_max_depth", "history_structural_max_depth", "subordinate_carrier_limit"}:
+            if type(item) is not int:
+                _fail(f"runtime policy V2 definition.{field} has an invalid exact type")
+        elif field == "role_depths":
+            if type(item) is not tuple:
+                _fail("runtime policy V2 definition.role_depths has an invalid exact type")
+            if len(cast(tuple[object, ...], item)) != len(_V2_ROLE_DEPTHS):
+                _fail("runtime policy V2 definition.role_depths has an invalid length")
+        elif field == "working_lead_roles":
+            if type(item) is not tuple:
+                _fail("runtime policy V2 definition.working_lead_roles has an invalid exact type")
+            lead_items = cast(tuple[object, ...], item)
+            if len(lead_items) != len(_V2_LEAD_ROLES) or any(type(role) is not str for role in lead_items):
+                _fail("runtime policy V2 definition.working_lead_roles has an invalid value")
+        elif type(item) is not str:
+            _fail(f"runtime policy V2 definition.{field} has an invalid exact type")
+    return {**{field: getattr(value, field) for field in RuntimePolicyDefinitionV2._fields},
+            "role_depths": [_role_depth_dict(role) for role in value.role_depths],
+            "working_lead_roles": list(value.working_lead_roles)}
+
+
+def _definition_v2_digest(value: RuntimePolicyDefinitionV2) -> str:
+    payload = _definition_v2_plain_dict(value)
+    payload["definition_sha256"] = _ZERO_SHA256
+    return _canonical_hash({"derivation_domain": _DEFINITION_V2_DOMAIN, "definition": payload}, "runtime policy V2 definition")
+
+
+def runtime_policy_definition_v2() -> RuntimePolicyDefinitionV2:
+    """Return fixed V2 semantics without publishing, activating, or admitting."""
+    v1 = runtime_policy_definition_v1()
+    values: dict[str, object] = {
+        "document_type": RUNTIME_POLICY_DEFINITION_V2, "schema_version": 1,
+        "policy_id": RUNTIME_POLICY_ID, "policy_revision": RUNTIME_POLICY_V2_REVISION,
+        "supersedes_definition_sha256": v1.definition_sha256,
+        "role_depths": tuple(RuntimeRoleDepthV1(role, depth) for role, depth in _V2_ROLE_DEPTHS),
+        "working_lead_roles": _V2_LEAD_ROLES,
+        "current_admitted_max_depth": CURRENT_ADMITTED_MAX_DEPTH,
+        "history_structural_max_depth": HISTORY_STRUCTURAL_MAX_DEPTH,
+        "subordinate_carrier_limit": SUBORDINATE_CARRIER_LIMIT,
+        **dict(_V2_FIXED_TEXT), "definition_sha256": _ZERO_SHA256,
+    }
+    provisional = RuntimePolicyDefinitionV2(**cast(Any, values))
+    return provisional._replace(definition_sha256=_definition_v2_digest(provisional))
+
+
+def validate_runtime_policy_definition_v2(value: object) -> RuntimePolicyDefinitionV2:
+    """Validate fixed V2 definition bytes; it cannot establish runtime truth."""
+    item = _definition_v2_plain_dict(value) if type(value) is RuntimePolicyDefinitionV2 else _exact_object(value, RuntimePolicyDefinitionV2._fields, "runtime policy V2 definition")
+    for field, expected in (("document_type", RUNTIME_POLICY_DEFINITION_V2), ("policy_id", RUNTIME_POLICY_ID)):
+        _fixed_text(item[field], expected, field)
+    _exact_int(item["schema_version"], 1, "schema_version")
+    _exact_int(item["policy_revision"], RUNTIME_POLICY_V2_REVISION, "policy_revision")
+    _digest(item["supersedes_definition_sha256"], "supersedes_definition_sha256")
+    if item["supersedes_definition_sha256"] != runtime_policy_definition_v1().definition_sha256:
+        _fail("supersedes_definition_sha256 does not bind exact V1 definition")
+    raw_roles = item["role_depths"]
+    if type(raw_roles) not in {list, tuple}:
+        _fail("role_depths is invalid")
+    roles = cast(list[object] | tuple[object, ...], raw_roles)
+    if len(roles) != len(_V2_ROLE_DEPTHS):
+        _fail("role_depths is invalid")
+    normalized_roles: list[RuntimeRoleDepthV1] = []
+    for index, (role_name, role_depth) in enumerate(_V2_ROLE_DEPTHS):
+        role = _exact_object(roles[index], RuntimeRoleDepthV1._fields, f"role_depths[{index}]")
+        normalized_roles.append(RuntimeRoleDepthV1(_fixed_text(role["role_class"], role_name, "role_class"), _exact_int(role["delegation_depth"], role_depth, "delegation_depth")))
+    raw_lead_roles = item["working_lead_roles"]
+    if type(raw_lead_roles) not in {list, tuple}:
+        _fail("working_lead_roles is invalid")
+    lead_roles = cast(list[object] | tuple[object, ...], raw_lead_roles)
+    if len(lead_roles) != len(_V2_LEAD_ROLES) or any(type(role) is not str for role in lead_roles):
+        _fail("working_lead_roles is invalid")
+    if tuple(lead_roles) != _V2_LEAD_ROLES:
+        _fail("working_lead_roles is invalid")
+    _exact_int(item["current_admitted_max_depth"], CURRENT_ADMITTED_MAX_DEPTH, "current_admitted_max_depth")
+    _exact_int(item["history_structural_max_depth"], HISTORY_STRUCTURAL_MAX_DEPTH, "history_structural_max_depth")
+    _exact_int(item["subordinate_carrier_limit"], SUBORDINATE_CARRIER_LIMIT, "subordinate_carrier_limit")
+    for field, expected in _V2_FIXED_TEXT:
+        _fixed_text(item[field], expected, field)
+    values: dict[str, object] = {"document_type": RUNTIME_POLICY_DEFINITION_V2, "schema_version": 1, "policy_id": RUNTIME_POLICY_ID, "policy_revision": RUNTIME_POLICY_V2_REVISION, "supersedes_definition_sha256": item["supersedes_definition_sha256"], "role_depths": tuple(normalized_roles), "working_lead_roles": _V2_LEAD_ROLES, "current_admitted_max_depth": CURRENT_ADMITTED_MAX_DEPTH, "history_structural_max_depth": HISTORY_STRUCTURAL_MAX_DEPTH, "subordinate_carrier_limit": SUBORDINATE_CARRIER_LIMIT, **dict(_V2_FIXED_TEXT), "definition_sha256": _digest(item["definition_sha256"], "definition_sha256")}
+    candidate = RuntimePolicyDefinitionV2(**cast(Any, values))
+    if candidate.definition_sha256 != _definition_v2_digest(candidate):
+        _fail("definition_sha256 does not bind the canonical V2 definition")
+    return candidate
+
+
+def _definition_v2_dict(value: RuntimePolicyDefinitionV2) -> dict[str, object]:
+    return _definition_v2_plain_dict(validate_runtime_policy_definition_v2(value))
+
+
+def canonical_runtime_policy_definition_v2_bytes(value: object) -> bytes:
+    return canonical_company_json_bytes(validate_runtime_policy_definition_v2(value).to_dict())
