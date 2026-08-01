@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
 import stat
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +17,9 @@ from scripts.verify_coverage_path_mapping import (
     FragmentIdentity,
     _classify_posix_measured_path,
     _read_stable_fragment_set,
+    _validate_coverage_fragment_schema,
 )
+import scripts.verify_coverage_path_mapping as coverage_verifier
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -409,6 +414,24 @@ def test_fragment_reader_accepts_after_exact_stability_interval() -> None:
     assert clock.sleep_calls == [0.125]
 
 
+def test_fragment_reader_uses_constant_full_snapshots_for_many_shards() -> None:
+    stable = {Path(f".coverage.{index:04d}"): _identity(index + 1) for index in range(512)}
+    snapshots = 0
+    clock = _FakeClock()
+
+    def snapshot(_directory: Path) -> dict[Path, FragmentIdentity]:
+        nonlocal snapshots
+        snapshots += 1
+        return dict(stable)
+
+    fragments, _, _ = _read_stable_fragment_set(
+        Path("fragments"), lambda _fragment: (), snapshot=snapshot,
+        monotonic=clock.monotonic, sleeper=clock.sleep,
+    )
+    assert len(fragments) == 512
+    assert snapshots == 3
+
+
 def test_fragment_reader_accepts_writer_completion_during_stability_delay() -> None:
     fragment = Path(".coverage.writer")
     publishing = {fragment: _identity(1)}
@@ -537,6 +560,18 @@ def test_fragment_reader_rejects_stably_invalid_coverage_data_after_delay() -> N
     assert clock.sleep_calls == [0.125, 0.125]
 
 
+def test_schema_preflight_rejects_missing_schema_without_mutating_bytes(tmp_path: Path) -> None:
+    fragment = tmp_path / ".coverage.missing-schema"
+    with sqlite3.connect(fragment) as database:
+        database.execute("CREATE TABLE unrelated (value INTEGER)")
+    before = hashlib.sha256(fragment.read_bytes()).hexdigest()
+
+    with pytest.raises(CoveragePathMappingError, match="schema is missing or invalid"):
+        _validate_coverage_fragment_schema(fragment)
+
+    assert hashlib.sha256(fragment.read_bytes()).hexdigest() == before
+
+
 def test_fragment_reader_retries_transient_parse_or_identity_change() -> None:
     fragment = Path(".coverage.retry")
     before = {fragment: _identity(1)}
@@ -663,3 +698,102 @@ def test_fragment_reader_rejects_backwards_monotonic_clock() -> None:
             monotonic=lambda: next(times),
             sleeper=lambda _duration: None,
         )
+
+
+class _FakeCoverageData:
+    mutation = None
+    mutate_every_attempt = False
+    update_errors_remaining = 0
+    updates = 0
+    def __init__(self, basename: str) -> None:
+        self.path = Path(basename)
+
+    def update(self, _source, map_path=None) -> None:
+        type(self).updates += 1
+        if type(self).mutation is not None and (
+            type(self).mutate_every_attempt or type(self).updates == 1
+        ):
+            type(self).mutation()
+        if type(self).update_errors_remaining > 0:
+            type(self).update_errors_remaining -= 1
+            raise RuntimeError("transient source read failure")
+        self.path.write_bytes(b"combined")
+
+    def write(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _prepare_fake_combine(monkeypatch, tmp_path: Path):
+    root = tmp_path / "repo"
+    fragments = root / "covdata"
+    fragments.mkdir(parents=True)
+    raw = fragments / ".coverage.raw"
+    raw.write_bytes(b"raw")
+    calls = 0
+
+    def verify(_directory: Path):
+        nonlocal calls
+        calls += 1
+        snapshot = coverage_verifier._snapshot_fragments(fragments)
+        return tuple(snapshot), {}, snapshot
+
+    _FakeCoverageData.mutation = None
+    _FakeCoverageData.mutate_every_attempt = False
+    _FakeCoverageData.update_errors_remaining = 0
+    _FakeCoverageData.updates = 0
+    monkeypatch.setattr(coverage_verifier, "ROOT", root)
+    monkeypatch.setattr(coverage_verifier, "verify_fragments", verify)
+    monkeypatch.setitem(sys.modules, "coverage", SimpleNamespace(CoverageData=_FakeCoverageData))
+    return fragments, raw, lambda: calls
+
+
+def test_combine_stages_own_output_outside_frozen_fragment_set(monkeypatch, tmp_path: Path) -> None:
+    fragments, raw, calls = _prepare_fake_combine(monkeypatch, tmp_path)
+    coverage_verifier.combine_fragments(fragments)
+    assert raw.read_bytes() == b"raw"
+    assert (fragments / ".coverage").read_bytes() == b"combined"
+    assert calls() == 1
+
+
+def test_combine_retries_one_raw_mutation_then_publishes(monkeypatch, tmp_path: Path) -> None:
+    fragments, raw, calls = _prepare_fake_combine(monkeypatch, tmp_path)
+    _FakeCoverageData.mutation = lambda: raw.write_bytes(raw.read_bytes() + b"x")
+    coverage_verifier.combine_fragments(fragments)
+    assert raw.read_bytes() == b"rawx"
+    assert (fragments / ".coverage").read_bytes() == b"combined"
+    assert calls() == 2
+
+
+def test_combine_classifies_update_errors_by_raw_identity(monkeypatch, tmp_path: Path) -> None:
+    fragments, raw, calls = _prepare_fake_combine(monkeypatch, tmp_path)
+    _FakeCoverageData.mutation = lambda: raw.write_bytes(raw.read_bytes() + b"x")
+    _FakeCoverageData.update_errors_remaining = 1
+    coverage_verifier.combine_fragments(fragments)
+    assert calls() == 2
+    stable, _, stable_calls = _prepare_fake_combine(monkeypatch, tmp_path / "stable")
+    _FakeCoverageData.update_errors_remaining = 1
+    with pytest.raises(CoveragePathMappingError, match="stably unreadable"):
+        coverage_verifier.combine_fragments(stable)
+    assert stable_calls() == 1
+
+
+def test_combine_retries_one_added_fragment_without_ignoring_it(monkeypatch, tmp_path: Path) -> None:
+    fragments, _, calls = _prepare_fake_combine(monkeypatch, tmp_path)
+    late = fragments / ".coverage.late"
+    _FakeCoverageData.mutation = lambda: late.write_bytes(b"late")
+    coverage_verifier.combine_fragments(fragments)
+    assert late.exists()
+    assert calls() == 2
+
+
+def test_combine_fails_closed_after_bounded_continuous_mutation(monkeypatch, tmp_path: Path) -> None:
+    fragments, raw, calls = _prepare_fake_combine(monkeypatch, tmp_path)
+    _FakeCoverageData.mutation = lambda: raw.write_bytes(raw.read_bytes() + b"x")
+    _FakeCoverageData.mutate_every_attempt = True
+    with pytest.raises(CoveragePathMappingError, match="every bounded combine attempt"):
+        coverage_verifier.combine_fragments(fragments)
+    assert not (fragments / ".coverage").exists()
+    assert calls() == 3

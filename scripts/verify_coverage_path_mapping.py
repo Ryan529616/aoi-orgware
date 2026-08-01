@@ -7,6 +7,7 @@ import argparse
 import math
 import os
 import re
+import sqlite3
 import stat
 import sys
 import time
@@ -32,6 +33,10 @@ _PYTEST_OWNER = re.compile(r"^pytest-of-[A-Za-z0-9._-]+$")
 
 class CoveragePathMappingError(RuntimeError):
     """The configured aliases did not preserve the trusted measurement boundary."""
+
+
+class _FragmentSetChanged(CoveragePathMappingError):
+    """A cooperative coverage writer changed the frozen shard set."""
 
 
 class FragmentIdentity(NamedTuple):
@@ -268,9 +273,22 @@ def _verify_fragment_source(
     return category, canonical_resolved.as_posix()
 
 
-def _snapshot_fragments(
-    fragment_directory: Path,
-) -> dict[Path, FragmentIdentity]:
+def _fragment_identity(fragment: Path) -> FragmentIdentity:
+    try:
+        status = os.lstat(fragment)
+    except OSError as exc:
+        raise _FragmentSetChanged(
+            "coverage fragment disappeared during identity check"
+        ) from exc
+    return FragmentIdentity(
+        stat.S_IFMT(status.st_mode),
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+    )
+
+
+def _snapshot_fragments(fragment_directory: Path) -> dict[Path, FragmentIdentity]:
     """Capture every directory member without following a coverage fragment."""
 
     try:
@@ -284,18 +302,7 @@ def _snapshot_fragments(
         ) from exc
     snapshot: dict[Path, FragmentIdentity] = {}
     for fragment in children:
-        try:
-            status = os.lstat(fragment)
-        except OSError as exc:
-            raise CoveragePathMappingError(
-                "coverage fragment disappeared during snapshot"
-            ) from exc
-        snapshot[fragment] = FragmentIdentity(
-            stat.S_IFMT(status.st_mode),
-            status.st_ino,
-            status.st_size,
-            status.st_mtime_ns,
-        )
+        snapshot[fragment] = _fragment_identity(fragment)
     return snapshot
 
 
@@ -343,9 +350,6 @@ def _read_stable_fragment_set(
     start = monotonic()
     if not math.isfinite(start):
         raise CoveragePathMappingError("coverage fragment stability clock is invalid")
-    deadline = start + (2 * attempts * stability_interval)
-    if not math.isfinite(deadline):
-        raise CoveragePathMappingError("coverage fragment stability deadline is invalid")
     last_time = start
 
     def post_interval_snapshot() -> dict[Path, FragmentIdentity]:
@@ -354,10 +358,6 @@ def _read_stable_fragment_set(
         if not math.isfinite(before_sleep) or before_sleep < last_time:
             raise CoveragePathMappingError(
                 "coverage fragment stability clock moved backwards"
-            )
-        if before_sleep + stability_interval > deadline:
-            raise CoveragePathMappingError(
-                "coverage fragment stability deadline elapsed"
             )
         sleeper(stability_interval)
         after_sleep = monotonic()
@@ -368,10 +368,6 @@ def _read_stable_fragment_set(
         if after_sleep < before_sleep + stability_interval:
             raise CoveragePathMappingError(
                 "coverage fragment stability interval did not elapse"
-            )
-        if after_sleep > deadline:
-            raise CoveragePathMappingError(
-                "coverage fragment stability deadline elapsed"
             )
         last_time = after_sleep
         return snapshot(fragment_directory)
@@ -392,10 +388,9 @@ def _read_stable_fragment_set(
                 raise CoveragePathMappingError(
                     "coverage fragment is stably unreadable or invalid"
                 ) from exc
-            if snapshot(fragment_directory) != stable:
-                break
         else:
-            return tuple(stable), measured_by_fragment, stable
+            if snapshot(fragment_directory) == stable:
+                return tuple(stable), measured_by_fragment, stable
     raise CoveragePathMappingError(
         "coverage fragment set did not stabilize within the bounded attempt limit"
     )
@@ -405,8 +400,45 @@ def _assert_fragment_snapshot(
     fragment_directory: Path,
     expected: dict[Path, FragmentIdentity],
 ) -> None:
-    if _snapshot_fragments(fragment_directory) != expected:
-        raise CoveragePathMappingError("coverage fragment set or identity changed")
+    actual = _snapshot_fragments(fragment_directory)
+    if actual != expected:
+        added = len(actual.keys() - expected.keys())
+        removed = len(expected.keys() - actual.keys())
+        changed = sum(
+            actual[path] != expected[path]
+            for path in actual.keys() & expected.keys()
+        )
+        material = "\n".join(
+            f"{path.name}:{','.join(str(value) for value in identity)}"
+            for path, identity in sorted(
+                actual.items(), key=lambda item: item[0].name.encode("utf-8")
+            )
+        )
+        raise _FragmentSetChanged(
+            "coverage fragment set or identity changed "
+            f"(added={added}, removed={removed}, changed={changed}, "
+            f"actual_sha256={sha256(material.encode('utf-8')).hexdigest()})"
+        )
+
+
+def _validate_coverage_fragment_schema(fragment: Path) -> None:
+    """Require an existing schema without letting coverage.py initialize the shard."""
+
+    try:
+        resolved = fragment.resolve(strict=True)
+        with sqlite3.connect(
+            f"{resolved.as_uri()}?mode=ro&immutable=1", uri=True, timeout=0
+        ) as database:
+            database.execute("PRAGMA query_only = ON")
+            rows = database.execute("SELECT version FROM coverage_schema").fetchall()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        raise CoveragePathMappingError(
+            "coverage fragment schema is missing or invalid"
+        ) from exc
+    if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
+        raise CoveragePathMappingError(
+            "coverage fragment schema is missing or invalid"
+        )
 
 
 def verify_fragments(
@@ -448,6 +480,7 @@ def verify_fragments(
         ) from exc
 
     def read_measured_files(fragment: Path) -> tuple[str, ...]:
+        _validate_coverage_fragment_schema(fragment)
         data = CoverageData(basename=str(fragment))
         data.read()
         return tuple(data.measured_files())
@@ -483,9 +516,7 @@ def verify_fragments(
     return tuple(children), mapped_paths, identities
 
 
-def combine_fragments(fragment_directory: Path) -> None:
-    """Combine only the exact fragment snapshot that passed raw-path verification."""
-
+def _combine_fragment_attempt(fragment_directory: Path) -> None:
     fragments, mapped_paths, identities = verify_fragments(fragment_directory)
     fragments_root = fragment_directory.resolve(strict=True)
     expected_data_file = ROOT.resolve(strict=True) / "covdata" / ".coverage"
@@ -500,8 +531,6 @@ def combine_fragments(fragment_directory: Path) -> None:
             "coverage is required before combining coverage fragments"
         ) from exc
 
-    destination = CoverageData(basename=str(expected_data_file))
-
     def exact_map(raw: str) -> str:
         try:
             return mapped_paths[raw]
@@ -510,27 +539,75 @@ def combine_fragments(fragment_directory: Path) -> None:
                 "coverage fragment introduced an unverified measured path"
             ) from exc
 
-    for fragment in fragments:
+    with TemporaryDirectory(prefix=".aoi-coverage-combine-", dir=ROOT) as temporary:
+        staged_data_file = Path(temporary) / ".coverage"
+        destination = CoverageData(basename=str(staged_data_file))
+        for fragment in fragments:
+            if _fragment_identity(fragment) != identities[fragment]:
+                raise _FragmentSetChanged("coverage fragment identity changed")
+            source = CoverageData(basename=str(fragment))
+            try:
+                destination.update(source, map_path=exact_map)
+            except Exception as exc:
+                if _fragment_identity(fragment) != identities[fragment]:
+                    raise _FragmentSetChanged(
+                        "coverage fragment identity changed during combine"
+                    ) from exc
+                _assert_fragment_snapshot(fragments_root, identities)
+                raise CoveragePathMappingError(
+                    "coverage fragment is stably unreadable or invalid during combine"
+                ) from exc
+            if _fragment_identity(fragment) != identities[fragment]:
+                raise _FragmentSetChanged("coverage fragment identity changed")
         _assert_fragment_snapshot(fragments_root, identities)
-        source = CoverageData(basename=str(fragment))
-        destination.update(source, map_path=exact_map)
+        destination.write()
+        destination.close()
+        staged_identity = _fragment_identity(staged_data_file)
+        if staged_identity.file_type != stat.S_IFREG or staged_identity.size == 0:
+            raise CoveragePathMappingError("combined coverage output is invalid")
         _assert_fragment_snapshot(fragments_root, identities)
-    _assert_fragment_snapshot(fragments_root, identities)
-    destination.write()
-    actual_children = set(fragments_root.iterdir())
-    if actual_children != {*fragments, expected_data_file}:
-        raise CoveragePathMappingError(
-            "coverage fragment set changed during combine"
-        )
-    _assert_fragment_snapshot(
-        fragments_root,
-        {
-            **identities,
-            expected_data_file: _snapshot_fragments(fragments_root)[
-                expected_data_file
-            ],
-        },
-    )
+        try:
+            os.link(staged_data_file, expected_data_file, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise _FragmentSetChanged(
+                "coverage combine destination appeared during publication"
+            ) from exc
+        except OSError as exc:
+            raise CoveragePathMappingError(
+                "combined coverage output could not be published"
+            ) from exc
+        expected = {**identities, expected_data_file: staged_identity}
+        try:
+            _assert_fragment_snapshot(fragments_root, expected)
+        except _FragmentSetChanged:
+            if _fragment_identity(expected_data_file) != staged_identity:
+                raise CoveragePathMappingError(
+                    "combined coverage output identity changed before rollback"
+                )
+            try:
+                expected_data_file.unlink()
+            except OSError as exc:
+                raise CoveragePathMappingError(
+                    "combined coverage output rollback failed"
+                ) from exc
+            raise
+
+
+def combine_fragments(fragment_directory: Path) -> None:
+    """Combine an exact raw snapshot with bounded retry on cooperative churn."""
+
+    last_change: _FragmentSetChanged | None = None
+    for _ in range(MAX_FRAGMENT_STABILITY_ATTEMPTS):
+        try:
+            _combine_fragment_attempt(fragment_directory)
+            return
+        except _FragmentSetChanged as exc:
+            last_change = exc
+    assert last_change is not None
+    raise CoveragePathMappingError(
+        "coverage fragments changed during every bounded combine attempt: "
+        f"{last_change}"
+    ) from last_change
 
 
 def verify() -> None:
