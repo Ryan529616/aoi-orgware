@@ -50,6 +50,68 @@ def _reader_thread_ids() -> set[int]:
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        if pid <= 0:
+            return False
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        synchronize = 0x00100000
+        still_active = 259
+        wait_object_0 = 0x00000000
+        wait_timeout = 0x00000102
+        wait_failed = 0xFFFFFFFF
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process = kernel32.OpenProcess(
+            process_query_limited_information | synchronize,
+            False,
+            pid,
+        )
+        if not process:
+            error = ctypes.get_last_error()
+            if error == 87:
+                return False
+            raise OSError(error, "OpenProcess failed")
+        probe_error: OSError | None = None
+        try:
+            wait_result = kernel32.WaitForSingleObject(process, 0)
+            if wait_result == wait_object_0:
+                return False
+            if wait_result == wait_failed:
+                raise OSError(
+                    ctypes.get_last_error(),
+                    "WaitForSingleObject failed",
+                )
+            if wait_result != wait_timeout:
+                raise OSError(0, f"WaitForSingleObject returned {wait_result}")
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
+            return exit_code.value == still_active
+        except OSError as exc:
+            probe_error = exc
+            raise
+        finally:
+            if not kernel32.CloseHandle(process):
+                close_error = OSError(ctypes.get_last_error(), "CloseHandle failed")
+                if probe_error is None:
+                    raise close_error
+                probe_error.add_note(str(close_error))
     try:
         os.kill(pid, 0)
     except OSError:
@@ -164,6 +226,239 @@ def _patch_kernel(
         return proxy
 
     monkeypatch.setattr(ctypes, "WinDLL", replacement)
+
+
+class _PidProbeKernel:
+    def __init__(
+        self,
+        *,
+        process: int,
+        wait_result: int = 0x00000102,
+        exit_code: int = 259,
+        exit_code_success: int = 1,
+        close_success: int = 1,
+    ) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self._process = process
+        self._wait_result = wait_result
+        self._exit_code = exit_code
+        self._exit_code_success = exit_code_success
+        self._close_success = close_success
+
+        def open_process(access: int, inherit: bool, pid: int) -> int:
+            self.calls.append(("OpenProcess", access, inherit, pid))
+            return self._process
+
+        def wait_for_single_object(process: int, timeout: int) -> int:
+            self.calls.append(("WaitForSingleObject", process, timeout))
+            return self._wait_result
+
+        def get_exit_code_process(process: int, exit_code: object) -> int:
+            self.calls.append(("GetExitCodeProcess", process))
+            exit_code._obj.value = self._exit_code  # type: ignore[attr-defined]
+            return self._exit_code_success
+
+        def close_handle(process: int) -> int:
+            self.calls.append(("CloseHandle", process))
+            return self._close_success
+
+        self.OpenProcess = open_process
+        self.WaitForSingleObject = wait_for_single_object
+        self.GetExitCodeProcess = get_exit_code_process
+        self.CloseHandle = close_handle
+
+
+def _patch_pid_probe_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    kernel: _PidProbeKernel,
+) -> None:
+    def replacement(
+        name: str,
+        *,
+        use_last_error: bool = False,
+    ) -> _PidProbeKernel:
+        assert name == "kernel32"
+        assert use_last_error
+        return kernel
+
+    monkeypatch.setattr(ctypes, "WinDLL", replacement)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+@pytest.mark.parametrize("pid", (0, -1))
+def test_windows_pid_probe_rejects_low_pid_without_opening_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    pid: int,
+) -> None:
+    def forbidden_windll(*args: object, **kwargs: object) -> object:
+        raise AssertionError("low PID reached WinDLL")
+
+    monkeypatch.setattr(ctypes, "WinDLL", forbidden_windll)
+    assert not _pid_alive(pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_treats_openprocess_winerror_87_as_not_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(process=0)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+    last_error_calls: list[None] = []
+
+    def get_last_error() -> int:
+        last_error_calls.append(None)
+        return 87
+
+    def system_error(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise SystemError("Windows error 87")
+
+    monkeypatch.setattr(ctypes, "get_last_error", get_last_error)
+    monkeypatch.setattr(os, "kill", system_error)
+    assert not _pid_alive(42)
+    assert last_error_calls == [None]
+    assert kernel.calls == [("OpenProcess", 0x101000, False, 42)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_surfaces_openprocess_access_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(process=0)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError, match="OpenProcess failed"):
+        _pid_alive(42)
+    assert kernel.calls == [("OpenProcess", 0x101000, False, 42)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_rejects_exited_handle_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(process=73, wait_result=0)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+
+    assert not _pid_alive(42)
+    assert kernel.calls == [
+        ("OpenProcess", 0x101000, False, 42),
+        ("WaitForSingleObject", 73, 0),
+        ("CloseHandle", 73),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_surfaces_wait_failed_and_closes_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(process=73, wait_result=0xFFFFFFFF)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError, match="WaitForSingleObject failed"):
+        _pid_alive(42)
+    assert kernel.calls == [
+        ("OpenProcess", 0x101000, False, 42),
+        ("WaitForSingleObject", 73, 0),
+        ("CloseHandle", 73),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_surfaces_exit_query_failure_and_closes_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(process=73, exit_code_success=0)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError, match="GetExitCodeProcess failed"):
+        _pid_alive(42)
+    assert kernel.calls == [
+        ("OpenProcess", 0x101000, False, 42),
+        ("WaitForSingleObject", 73, 0),
+        ("GetExitCodeProcess", 73),
+        ("CloseHandle", 73),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_surfaces_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(process=73, close_success=0)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError, match="CloseHandle failed"):
+        _pid_alive(42)
+    assert kernel.calls == [
+        ("OpenProcess", 0x101000, False, 42),
+        ("WaitForSingleObject", 73, 0),
+        ("GetExitCodeProcess", 73),
+        ("CloseHandle", 73),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_keeps_wait_failure_when_close_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _PidProbeKernel(
+        process=73,
+        wait_result=0xFFFFFFFF,
+        close_success=0,
+    )
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+    errors = iter((5, 6))
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: next(errors))
+
+    with pytest.raises(OSError, match="WaitForSingleObject failed") as caught:
+        _pid_alive(42)
+    assert caught.value.__notes__ is not None
+    assert any("CloseHandle failed" in note for note in caught.value.__notes__)
+    assert kernel.calls == [
+        ("OpenProcess", 0x101000, False, 42),
+        ("WaitForSingleObject", 73, 0),
+        ("CloseHandle", 73),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_only_claims_current_open_live_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A recycled PID has no stable child identity.  The probe may report only
+    # that the object returned by this OpenProcess call is still alive.
+    kernel = _PidProbeKernel(process=73)
+    _patch_pid_probe_kernel(monkeypatch, kernel)
+
+    assert _pid_alive(42)
+    assert kernel.calls == [
+        ("OpenProcess", 0x101000, False, 42),
+        ("WaitForSingleObject", 73, 0),
+        ("GetExitCodeProcess", 73),
+        ("CloseHandle", 73),
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PID probe contract")
+def test_windows_pid_probe_observes_spawned_process_and_exit() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-c", "import time;time.sleep(30)"]
+    )
+    try:
+        assert _pid_alive(process.pid)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+    assert not _pid_alive(process.pid)
 
 
 def test_git_reader_timeout_quiesces_process_tree_and_reader(
