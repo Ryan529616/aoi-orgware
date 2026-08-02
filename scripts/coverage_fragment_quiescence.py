@@ -495,11 +495,14 @@ def _validate_coverage_fragment_schema(fragment: Path) -> None:
 
     try:
         resolved = fragment.resolve(strict=True)
-        with sqlite3.connect(
+        database = sqlite3.connect(
             f"{resolved.as_uri()}?mode=ro&immutable=1", uri=True, timeout=0
-        ) as database:
+        )
+        try:
             database.execute("PRAGMA query_only = ON")
             rows = database.execute("SELECT version FROM coverage_schema").fetchall()
+        finally:
+            database.close()
     except (OSError, sqlite3.Error, ValueError):
         raise CoveragePathMappingError(
             "coverage fragment schema is missing or invalid"

@@ -283,22 +283,37 @@ jobs:
         # points (54% naive vs 83% subprocess-aware at the 0.3.0a3 baseline).
         run: |
           SITE=$(python -c "import site; print(site.getsitepackages()[0])")
-          printf 'import coverage\ncoverage.process_startup()\n' > "$SITE/sitecustomize.py"
+          cp scripts/coverage_fragment_attribution.py "$SITE/aoi_coverage_fragment_attribution.py"
+          printf 'from aoi_coverage_fragment_attribution import attempt_subprocess_coverage_attribution\nattempt_subprocess_coverage_attribution()\nimport coverage\ncoverage.process_startup()\n' > "$SITE/sitecustomize.py"
       - name: Run suite under coverage
         env:
           AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/aoi-coverage-tests
+          AOI_COVERAGE_FILE_BASE: ${{ github.workspace }}/covdata/.coverage
+          AOI_COVERAGE_METADATA_ROOT: ${{ runner.temp }}/aoi-coverage-metadata
           PYTHONDONTWRITEBYTECODE: "1"
           PYTHONPATH: src
           TMPDIR: ${{ runner.temp }}/aoi-coverage-tests
           COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
           COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
         run: |
-          mkdir -p covdata
+          umask 077
+          mkdir -p covdata "$AOI_COVERAGE_METADATA_ROOT"
           python -m coverage run --parallel-mode -m pytest tests/ -q --tb=short
-      - name: Combine and enforce floor
+      - name: Combine coverage fragments
+        id: coverage_combine
         env:
           AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/aoi-coverage-tests
           COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
+        run: python scripts/verify_coverage_path_mapping.py --combine-fragments covdata
+      - name: Enforce coverage floor
+        env:
+          COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
+        run: python -m coverage report --fail-under=80
+      - name: Report coverage fragment attribution
+        if: ${{ failure() && steps.coverage_combine.outcome == 'failure' }}
+        env:
+          AOI_COVERAGE_METADATA_ROOT: ${{ runner.temp }}/aoi-coverage-metadata
         run: |
-          python scripts/verify_coverage_path_mapping.py --combine-fragments covdata
-          python -m coverage report --fail-under=80
+          python -m scripts.coverage_fragment_attribution report \
+            --fragments-root "${{ github.workspace }}/covdata" \
+            --metadata-root "$AOI_COVERAGE_METADATA_ROOT"

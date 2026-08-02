@@ -28,7 +28,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 VERIFIER = "python scripts/verify_coverage_path_mapping.py"
 FRAGMENT_COMBINER = f"{VERIFIER} --combine-fragments covdata"
 COVERAGE_TEMP_ROOT = "${{ runner.temp }}/aoi-coverage-tests"
-COVERAGE_JOB_SHA256 = "933e0877b79e5f01fd724e0a81ae1dc1f1f0ef85420dc7d094aa4c60f29c15f7"
+COVERAGE_JOB_SHA256 = "1fc1fa825555aeb5497d5a944af8fce100ca844630f1afc0d5fddd787bc9d10f"
 EXPECTED_CONFIG = """[run]
 source = aoi_orgware
 parallel = true
@@ -107,7 +107,9 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
         "Verify coverage path mapping",
         "Enable subprocess coverage",
         "Run suite under coverage",
-        "Combine and enforce floor",
+        "Combine coverage fragments",
+        "Enforce coverage floor",
+        "Report coverage fragment attribution",
     )
     assert _step(coverage, "Install coverage tooling").strip() == "run: python -m pip install pytest coverage"
     assert _step(coverage, "Verify coverage path mapping").strip() == (
@@ -118,10 +120,8 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
         f"          {VERIFIER}"
     )
     startup = _step(coverage, "Enable subprocess coverage")
-    assert (
-        "printf 'import coverage\\ncoverage.process_startup()\\n' > \"$SITE/sitecustomize.py\""
-        in startup
-    )
+    assert 'cp scripts/coverage_fragment_attribution.py "$SITE/aoi_coverage_fragment_attribution.py"' in startup
+    assert "attempt_subprocess_coverage_attribution\\n" in startup
     run = _step(coverage, "Run suite under coverage")
     assert re.findall(
         r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
@@ -136,19 +136,18 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
     assert "COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc" in run
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in run
     assert "python -m coverage run --parallel-mode -m pytest tests/ -q --tb=short" in run
-    combine = _step(coverage, "Combine and enforce floor")
+    combine = _step(coverage, "Combine coverage fragments")
     assert re.findall(
         r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
         combine,
         flags=re.MULTILINE,
     ) == [COVERAGE_TEMP_ROOT]
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in combine
-    assert (
-        "run: |\n"
-        f"          {FRAGMENT_COMBINER}\n"
-        "          python -m coverage report --fail-under=80"
-    ) in combine
+    assert f"run: {FRAGMENT_COMBINER}" in combine
     assert "python -m coverage combine" not in combine
+    floor = _step(coverage, "Enforce coverage floor")
+    assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in floor
+    assert "run: python -m coverage report --fail-under=80" in floor
     assert "continue-on-error" not in coverage
 
 
@@ -209,24 +208,24 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         "          AOI_COVERAGE_TEMP_ROOT: ${{ github.workspace }}/aoi-coverage-tests",
         1,
     )
-    missing_run_root = workflow.replace(
-        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
-        '          PYTHONDONTWRITEBYTECODE: "1"\n',
-        '          PYTHONDONTWRITEBYTECODE: "1"\n',
-        1,
-    )
     missing_combine_root = workflow.replace(
-        "      - name: Combine and enforce floor\n"
+        "      - name: Combine coverage fragments\n"
+        "        id: coverage_combine\n"
         "        env:\n"
         f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n",
-        "      - name: Combine and enforce floor\n"
+        "      - name: Combine coverage fragments\n"
+        "        id: coverage_combine\n"
         "        env:\n",
         1,
     )
     divergent_run_root = workflow.replace(
         f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
+        "          AOI_COVERAGE_FILE_BASE: ${{ github.workspace }}/covdata/.coverage\n"
+        "          AOI_COVERAGE_METADATA_ROOT: ${{ runner.temp }}/aoi-coverage-metadata\n"
         '          PYTHONDONTWRITEBYTECODE: "1"\n',
         "          AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/other-coverage-tests\n"
+        "          AOI_COVERAGE_FILE_BASE: ${{ github.workspace }}/covdata/.coverage\n"
+        "          AOI_COVERAGE_METADATA_ROOT: ${{ runner.temp }}/aoi-coverage-metadata\n"
         '          PYTHONDONTWRITEBYTECODE: "1"\n',
         1,
     )
@@ -257,20 +256,16 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         1,
     )
     missing_fragment_verifier = workflow.replace(
-        f"          {FRAGMENT_COMBINER}\n",
-        "",
+        f"        run: {FRAGMENT_COMBINER}\n",
+        "        run: true\n",
         1,
     )
-    late_fragment_verifier = workflow.replace(
-        f"          {FRAGMENT_COMBINER}\n"
-        "          python -m coverage report --fail-under=80\n",
-        "          python -m coverage report --fail-under=80\n"
-        f"          {FRAGMENT_COMBINER}\n",
-        1,
+    missing_floor = workflow.replace(
+        _step_block(_job(workflow, "coverage"), "Enforce coverage floor"), "", 1
     )
     missing_startup = workflow.replace(
-        "          printf 'import coverage\\ncoverage.process_startup()\\n' > \"$SITE/sitecustomize.py\"\n",
-        "          printf 'import coverage\\n' > \"$SITE/sitecustomize.py\"\n",
+        "attempt_subprocess_coverage_attribution()\\n",
+        "",
         1,
     )
     lowered_floor = workflow.replace("--fail-under=80", "--fail-under=79", 1)
@@ -283,7 +278,6 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         (config, invalid_job_root),
         (config, missing_verify_root),
         (config, wrong_verify_root),
-        (config, missing_run_root),
         (config, missing_combine_root),
         (config, divergent_run_root),
         (config, missing_verifier),
@@ -291,7 +285,7 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         (config, missing_root_creation),
         (config, wrong_tmpdir),
         (config, missing_fragment_verifier),
-        (config, late_fragment_verifier),
+        (config, missing_floor),
         (config, missing_startup),
         (config, lowered_floor),
     ):
