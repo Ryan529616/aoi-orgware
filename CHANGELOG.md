@@ -7,6 +7,24 @@ leaves the alpha line. Until then, minor versions may still change behavior.
 
 ## [Unreleased]
 
+### v0.5.0a1 (unreleased; Company OS READY pending)
+
+- **Managed ledger writer boundary.** `CompanyStateOwner.ledger` is now a
+  fail-closed tombstone: read-only consumers use bounded owner APIs and every
+  supported mutation enters through `commit()`, so ordinary public callers
+  cannot obtain the raw append primitive and bypass reducer preflight.
+  Out-of-band ledger/read-model head drift fails closed or reports degraded.
+  Historical replay now binds
+  exact immutable company/global/stream heads and class-bound owner/store
+  reads ignore ordinary instance-method shadows. The read-only value objects
+  moved to `company.state_reader`, so direct module/pickle identities for those
+  internal alpha types change. Release refs are immutable, mapping-shaped
+  canonical value objects rather than `Mapping` ABC instances, preventing
+  reverse equality from bypassing exact scalar/key comparison. This remains cooperative same-process
+  governance, not protection against direct private-state access or replacement,
+  class monkeypatching, `ctypes`, direct database-path reopen, or a hostile same-user
+  process. Runtime policy remains writer-off; this is not READY evidence.
+
 ### v0.4.0a4 (unreleased; not release-ready)
 
 - **ARISE Operational Alpha boundary (supersedes earlier current-v3 wording).**

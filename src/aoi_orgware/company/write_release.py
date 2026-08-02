@@ -15,9 +15,8 @@ not an adversarial same-process integrity boundary against class monkeypatch,
 
 from __future__ import annotations
 
-from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, NamedTuple, Never, Sequence
+from typing import Any, Iterator, Literal, Mapping, Never, Sequence
 
 from .contracts import (
     DISPATCH_REQUEST_V1,
@@ -27,6 +26,7 @@ from .contracts import (
     MUTATION_INTENT_V1,
     PROVIDER_WORKER_OPERATION_V1,
     CompanyContractError,
+    canonical_company_json_bytes,
     company_contract_sha256,
 )
 from .invariants import (
@@ -34,10 +34,16 @@ from .invariants import (
     InvariantObject,
     reduce_company_invariants,
 )
-from .ledger import CompanyLedger, LedgerError
+from .ledger import LedgerError
 from .readmodel import ReadModelError
 from .state import CompanyQuerySnapshot, CompanyStateError, CompanyStateOwner
-from .write_admission import WORK_WRITE_INTENT_V1, WriteAdmissionError, validate_work_write_intent
+from .state_reader import CompanyStateReaderError, immutable_ledger_heads
+from .write_admission import (
+    WORK_WRITE_INTENT_V1,
+    WriteAdmissionError,
+    validate_active_write_ref,
+    validate_work_write_intent,
+)
 
 
 ReleaseDisposition = Literal["not_acquired", "held", "release_proven", "coverage_unknown"]
@@ -47,20 +53,105 @@ class WriteReleaseError(ValueError):
     """Owner-verified ledger replay could not produce one trusted cursor view."""
 
 
-class WriteReleaseObservation(NamedTuple):
-    """Immutable observation receipt; nested JSON containers are frozen too."""
+class WriteReleaseObservation:
+    """Slot-backed exact receipt value; no tuple comparison escape hatch."""
 
-    intent_id: str
-    owner_kind: str
-    owner_id: str
-    disposition: ReleaseDisposition
-    reason_codes: tuple[str, ...]
-    evidence_ids: tuple[str, ...]
-    evidence_digest: str
-    cursor: int
-    head_sha256: str
-    refs: tuple[Mapping[str, Any], ...]
-    runtime_ownership_only: bool = True
+    __slots__ = (
+        "__intent_id", "__owner_kind", "__owner_id", "__disposition",
+        "__reason_codes", "__evidence_ids", "__evidence_digest", "__cursor",
+        "__head_sha256", "__refs", "__runtime_ownership_only",
+    )
+
+    def __init_subclass__(cls, **kwargs: Any) -> Never:
+        raise TypeError("WriteReleaseObservation is final")
+
+    def __setattr__(self, name: str, value: Any) -> Never:
+        raise AttributeError("WriteReleaseObservation is immutable")
+
+    def __delattr__(self, name: str) -> Never:
+        raise AttributeError("WriteReleaseObservation is immutable")
+
+    def __init__(
+        self,
+        intent_id: str,
+        owner_kind: str,
+        owner_id: str,
+        disposition: ReleaseDisposition,
+        reason_codes: tuple[str, ...],
+        evidence_ids: tuple[str, ...],
+        evidence_digest: str,
+        cursor: int,
+        head_sha256: str,
+        refs: tuple[WriteReleaseRef, ...],
+        runtime_ownership_only: bool = True,
+    ) -> None:
+        for name, value in (
+            ("intent_id", intent_id), ("owner_kind", owner_kind),
+            ("owner_id", owner_id), ("disposition", disposition),
+            ("reason_codes", reason_codes), ("evidence_ids", evidence_ids),
+            ("evidence_digest", evidence_digest), ("cursor", cursor),
+            ("head_sha256", head_sha256), ("refs", refs),
+            ("runtime_ownership_only", runtime_ownership_only),
+        ):
+            object.__setattr__(self, f"_WriteReleaseObservation__{name}", value)
+        try:
+            _observation_comparison_plain(self)
+        except (MemoryError, SystemExit, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            raise TypeError("write release observation is invalid") from exc
+
+    intent_id = property(lambda self: self.__intent_id)
+    owner_kind = property(lambda self: self.__owner_kind)
+    owner_id = property(lambda self: self.__owner_id)
+    disposition = property(lambda self: self.__disposition)
+    reason_codes = property(lambda self: self.__reason_codes)
+    evidence_ids = property(lambda self: self.__evidence_ids)
+    evidence_digest = property(lambda self: self.__evidence_digest)
+    cursor = property(lambda self: self.__cursor)
+    head_sha256 = property(lambda self: self.__head_sha256)
+    refs = property(lambda self: self.__refs)
+    runtime_ownership_only = property(lambda self: self.__runtime_ownership_only)
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not WriteReleaseObservation or type(other) is not WriteReleaseObservation:
+            return False
+        try:
+            return (
+                canonical_company_json_bytes(_observation_comparison_plain(self))
+                == canonical_company_json_bytes(_observation_comparison_plain(other))
+            )
+        except MemoryError:
+            raise
+        except Exception:
+            return False
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def _replace(self, **changes: Any) -> WriteReleaseObservation:
+        names = (
+            "intent_id", "owner_kind", "owner_id", "disposition",
+            "reason_codes", "evidence_ids", "evidence_digest", "cursor",
+            "head_sha256", "refs", "runtime_ownership_only",
+        )
+        unknown = set(changes).difference(names)
+        if unknown:
+            raise ValueError(f"unexpected field names: {sorted(unknown)!r}")
+        values = {name: getattr(self, name) for name in names}
+        values.update(changes)
+        return WriteReleaseObservation(**values)
+
+    def __reduce__(self):  # type: ignore[no-untyped-def]
+        return (
+            WriteReleaseObservation,
+            (
+                self.intent_id, self.owner_kind, self.owner_id,
+                self.disposition, self.reason_codes, self.evidence_ids,
+                self.evidence_digest, self.cursor, self.head_sha256,
+                self.refs, self.runtime_ownership_only,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,41 +160,82 @@ class _ObservationContext:
     head_sha256: str
 
 
-class _FrozenMapping(tuple[tuple[str, Any], ...]):
-    """Tuple-backed Mapping with no mutable backing container or instance dict."""
+class WriteReleaseRef:
+    """Slot-backed, mapping-shaped canonical reference value object.
 
-    __slots__ = ()
+    This deliberately is not registered as a ``collections.abc.Mapping``.
+    That keeps reverse comparisons with ordinary ``Mapping`` implementations
+    from bypassing this class' canonical JSON comparison through the ABC's
+    lossy ``dict(items())`` equality path.  The public mapping-shaped read API
+    (indexing, iteration, ``items``/``keys``/``values``/``get``) remains
+    available without exposing mutable storage.
+    """
 
-    def __new__(cls, items: Sequence[tuple[str, Any]]) -> _FrozenMapping:
-        return tuple.__new__(cls, tuple((str(key), value) for key, value in items))
+    __slots__ = ("__items",)
+    __items: tuple[tuple[str, Any], ...]
 
-    def __iter__(self):  # type: ignore[no-untyped-def]
-        return (key for key, _value in tuple.__iter__(self))
+    def __init_subclass__(cls, **kwargs: Any) -> Never:
+        raise TypeError("WriteReleaseRef is final")
+
+    def __setattr__(self, name: str, value: Any) -> Never:
+        raise AttributeError("WriteReleaseRef is immutable")
+
+    def __delattr__(self, name: str) -> Never:
+        raise AttributeError("WriteReleaseRef is immutable")
+
+    def __init__(self, items: Sequence[tuple[str, Any]]) -> None:
+        try:
+            raw_items = tuple(items)
+            frozen_items: list[tuple[str, Any]] = []
+            seen: set[str] = set()
+            for item in raw_items:
+                if type(item) is not tuple or len(item) != 2:
+                    raise TypeError("write release ref item must be an exact pair")
+                key = item[0]
+                if type(key) is not str or key in seen:
+                    raise TypeError("write release ref key is invalid")
+                seen.add(key)
+                frozen_items.append((key, _freeze(item[1])))
+            object.__setattr__(self, "_WriteReleaseRef__items", tuple(frozen_items))
+            plain = _comparison_plain(self)
+            validated = validate_active_write_ref(plain)
+            if (
+                canonical_company_json_bytes(plain)
+                != canonical_company_json_bytes(validated)
+            ):
+                raise TypeError("write release ref differs from canonical contract")
+        except (MemoryError, SystemExit, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            raise TypeError("write release ref is not canonical JSON") from exc
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self.__items)
 
     def __len__(self) -> int:
-        return tuple.__len__(self)
+        return len(self.__items)
 
-    def __getitem__(self, key: str) -> Any:  # type: ignore[override]
-        if not isinstance(key, str):
+    def __getitem__(self, key: str) -> Any:
+        if type(key) is not str:
             raise TypeError("frozen mapping keys must be strings")
-        for candidate, value in tuple.__iter__(self):
+        for candidate, value in self.__items:
             if candidate == key:
                 return value
         raise KeyError(key)
 
     def __contains__(self, key: object) -> bool:
         return isinstance(key, str) and any(
-            candidate == key for candidate, _value in tuple.__iter__(self)
+            candidate == key for candidate, _value in self.__items
         )
 
     def items(self) -> tuple[tuple[str, Any], ...]:
-        return tuple(tuple.__iter__(self))
+        return self.__items
 
     def keys(self) -> tuple[str, ...]:
-        return tuple(key for key, _value in tuple.__iter__(self))
+        return tuple(key for key, _value in self.__items)
 
     def values(self) -> tuple[Any, ...]:
-        return tuple(value for _key, value in tuple.__iter__(self))
+        return tuple(value for _key, value in self.__items)
 
     def get(self, key: str, default: Any = None) -> Any:
         try:
@@ -112,17 +244,115 @@ class _FrozenMapping(tuple[tuple[str, Any], ...]):
             return default
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, ABCMapping):
-            return len(self) == len(other) and all(
-                key in other and other[key] == value
-                for key, value in tuple.__iter__(self)
+        if type(self) is not WriteReleaseRef:
+            return False
+        if type(other) is WriteReleaseRef:
+            left: object = self
+            right: object = other
+        elif isinstance(other, Mapping):
+            left = self
+            right = other
+        else:
+            return False
+        try:
+            return (
+                canonical_company_json_bytes(_comparison_plain(left))
+                == canonical_company_json_bytes(_comparison_plain(right))
             )
-        if isinstance(other, tuple):
-            return self.items() == other
-        return tuple.__eq__(self, other)
+        except MemoryError:
+            raise
+        except Exception:
+            return False
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __reduce__(self):  # type: ignore[no-untyped-def]
+        return (WriteReleaseRef, (self.__items,))
 
 
-ABCMapping.register(_FrozenMapping)
+def _comparison_plain(value: Any) -> Any:
+    """Build canonical comparison JSON without scalar or key coercion."""
+
+    if isinstance(value, WriteReleaseRef):
+        raw_items: object = value.items()
+    elif isinstance(value, Mapping):
+        raw_items = tuple(value.items())
+    else:
+        raw_items = None
+    if raw_items is not None:
+        if type(raw_items) is not tuple:
+            raise TypeError("comparison mapping items must be an exact tuple")
+        result: dict[str, Any] = {}
+        for item in raw_items:
+            if type(item) is not tuple or len(item) != 2:
+                raise TypeError("comparison mapping item must be an exact pair")
+            key = item[0]
+            if type(key) is not str or key in result:
+                raise TypeError("comparison mapping key is invalid")
+            result[key] = _comparison_plain(item[1])
+        return result
+    if type(value) in {tuple, list}:
+        return [_comparison_plain(member) for member in value]
+    if type(value) in {str, int, bool, float, type(None)}:
+        return value
+    raise TypeError("comparison value is not canonical JSON")
+
+
+def _observation_comparison_plain(
+    value: WriteReleaseObservation,
+) -> dict[str, Any]:
+    """Return one exact-type canonical preimage for receipt equality."""
+
+    lowercase_hex = frozenset("0123456789abcdef")
+    if (
+        type(value) is not WriteReleaseObservation
+        or type(value.intent_id) is not str
+        or not value.intent_id
+        or type(value.owner_kind) is not str
+        or value.owner_kind not in {"dispatch_request", "external_job"}
+        or type(value.owner_id) is not str
+        or not value.owner_id
+        or type(value.disposition) is not str
+        or value.disposition not in {
+            "not_acquired", "held", "release_proven", "coverage_unknown",
+        }
+        or type(value.reason_codes) is not tuple
+        or not value.reason_codes
+        or not all(type(item) is str for item in value.reason_codes)
+        or len(set(value.reason_codes)) != len(value.reason_codes)
+        or type(value.evidence_ids) is not tuple
+        or not value.evidence_ids
+        or not all(type(item) is str for item in value.evidence_ids)
+        or len(set(value.evidence_ids)) != len(value.evidence_ids)
+        or type(value.evidence_digest) is not str
+        or len(value.evidence_digest) != 64
+        or not set(value.evidence_digest).issubset(lowercase_hex)
+        or type(value.cursor) is not int
+        or value.cursor < 1
+        or type(value.head_sha256) is not str
+        or len(value.head_sha256) != 64
+        or not set(value.head_sha256).issubset(lowercase_hex)
+        or type(value.refs) is not tuple
+        or not 1 <= len(value.refs) <= 64
+        or not all(type(ref) is WriteReleaseRef for ref in value.refs)
+        or type(value.runtime_ownership_only) is not bool
+        or value.runtime_ownership_only is not True
+    ):
+        raise TypeError("write release observation has invalid field types")
+    return {
+        "intent_id": value.intent_id,
+        "owner_kind": value.owner_kind,
+        "owner_id": value.owner_id,
+        "disposition": value.disposition,
+        "reason_codes": list(value.reason_codes),
+        "evidence_ids": list(value.evidence_ids),
+        "evidence_digest": value.evidence_digest,
+        "cursor": value.cursor,
+        "head_sha256": value.head_sha256,
+        "refs": [_comparison_plain(ref) for ref in value.refs],
+        "runtime_ownership_only": value.runtime_ownership_only,
+    }
 
 
 def _fail(message: str) -> Never:
@@ -141,8 +371,8 @@ def _plain(value: Any) -> Any:
 def _freeze(value: Any) -> Any:
     """Detach W3 output from mutable read-model-compatible JSON containers."""
     if isinstance(value, Mapping):
-        return _FrozenMapping(tuple(
-            (str(key), _freeze(member)) for key, member in value.items()
+        return WriteReleaseRef(tuple(
+            (key, _freeze(member)) for key, member in value.items()
         ))
     if isinstance(value, (tuple, list)):
         return tuple(_freeze(member) for member in value)
@@ -228,25 +458,14 @@ def _verified_snapshot(
         # Calling through ``state`` would let a caller shadow this instance
         # attribute and select an older or forged replay input.
         replay = CompanyStateOwner.historical_replay_input(state)
-        # ``historical_replay_input`` is class-bound above, but its existing
-        # implementation delegates to ``ledger.load_records()``.  Re-read via
-        # the exact ledger class and require the frozen replay to bind that
-        # verified current record vector and head before projecting it.
-        ledger = CompanyStateOwner.ledger.__get__(state, CompanyStateOwner)
-        if type(ledger) is not CompanyLedger:
-            _fail("write release requires exact CompanyLedger")
-        verified_records = CompanyLedger.load_records(ledger)
-        verified_heads = CompanyLedger.snapshot_heads(ledger)
-        if (
-            not isinstance(replay.records, tuple)
-            or replay.records != verified_records
-            or verified_heads.global_head.global_sequence != len(verified_records)
-            or not verified_records
-            or verified_heads.global_head.transaction_sha256
-            != verified_records[-1].receipt["transaction_sha256"]
-        ):
+        # Compare the full immutable identity/global/stream witness captured
+        # beside the records with a second class-bound current-head read.  The
+        # owner implementation performs the exact private ledger read; this
+        # consumer never receives the append primitive itself.
+        current_heads = immutable_ledger_heads(CompanyStateOwner.heads(state))
+        if replay.heads != current_heads or not replay.records:
             _fail("write release replay does not bind the verified ledger head")
-        head_cursor = len(verified_records)
+        head_cursor = replay.heads.global_head[0]
         requested = head_cursor if cursor is None else cursor
         if (
             not isinstance(requested, int)
@@ -256,7 +475,7 @@ def _verified_snapshot(
         ):
             _fail("write release cursor is unavailable")
         snapshot = CompanyStateOwner.project_historical_replay(replay, requested)
-        expected_head_sha256 = verified_records[requested - 1].receipt[
+        expected_head_sha256 = replay.records[requested - 1].receipt[
             "transaction_sha256"
         ]
         if (
@@ -269,8 +488,8 @@ def _verified_snapshot(
     except WriteReleaseError:
         raise
     except (
-        AttributeError, CompanyStateError, LedgerError, ReadModelError, OSError, KeyError,
-        TypeError, ValueError,
+        AttributeError, CompanyStateError, CompanyStateReaderError, LedgerError,
+        ReadModelError, OSError, KeyError, TypeError, ValueError,
     ) as exc:
         raise WriteReleaseError("write release verified replay is unavailable") from exc
 
@@ -300,7 +519,7 @@ def _evidence(
     refs = tuple(_freeze(ref) for ref in refs_value if isinstance(ref, Mapping))
     if len(refs) != len(refs_value):
         _fail("validated WorkWriteIntent has malformed refs")
-    if not all(isinstance(ref, Mapping) for ref in refs):
+    if not all(type(ref) is WriteReleaseRef for ref in refs):
         _fail("validated WorkWriteIntent refs cannot be frozen")
     identity = sorted({
         (item.contract_type, item.object_key, item.event_id,
@@ -436,4 +655,10 @@ def derive_write_release(
     return _observation(intent, intent_object, context, "coverage_unknown", "write_owner_kind_unclassified")
 
 
-__all__ = ["ReleaseDisposition", "WriteReleaseError", "WriteReleaseObservation", "derive_write_release"]
+__all__ = [
+    "ReleaseDisposition",
+    "WriteReleaseError",
+    "WriteReleaseObservation",
+    "WriteReleaseRef",
+    "derive_write_release",
+]

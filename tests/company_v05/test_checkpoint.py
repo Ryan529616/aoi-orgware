@@ -90,15 +90,25 @@ def initialized(tmp_path: Path) -> CompanyStateOwner:
     return owner
 
 
+def raw_write(
+    owner: CompanyStateOwner,
+    blobs: BlobStore,
+    checkpoint_id: str,
+    generated_at: str = T,
+) -> str:
+    with CompanyLedger(owner.resolved.incarnation.ledger) as ledger:
+        return write_plain_checkpoint(lock=owner.lock, resolved=owner.resolved, ledger=ledger, blobs=blobs, checkpoint_id=checkpoint_id, generated_at=generated_at)
+
+
 def write(owner: CompanyStateOwner, name: str = "cp-1", generated_at: str = T) -> str:
-    return write_plain_checkpoint(lock=owner.lock, resolved=owner.resolved, ledger=owner.ledger, blobs=owner.blobs, checkpoint_id=name, generated_at=generated_at)
+    return raw_write(owner, owner.blobs, name, generated_at)
 
 
 def tree(path: Path) -> dict[str, str]:
     return {item.relative_to(path).as_posix(): company_contract_sha256({"bytes": item.read_bytes().hex()}) for item in path.rglob("*") if item.is_file()}
 
 
-def test_plain_checkpoint_reopens_and_source_can_continue(tmp_path: Path) -> None:
+def test_reopen_continue(tmp_path: Path) -> None:
     owner = initialized(tmp_path)
     digest = write(owner)
     checkpoint = owner.resolved.incarnation.checkpoints / "cp-1"
@@ -214,14 +224,14 @@ def test_divergent_checkpoint_id_collision_is_rejected(tmp_path: Path) -> None:
 def test_invalid_manifest_and_failure_cleanup(tmp_path: Path) -> None:
     owner = initialized(tmp_path)
     with pytest.raises(CompanyCheckpointError):
-        write_plain_checkpoint(lock=owner.lock, resolved=owner.resolved, ledger=owner.ledger, blobs=BlobStore(tmp_path / "other-blobs"), checkpoint_id="cp-bad", generated_at=T)
+        raw_write(owner, BlobStore(tmp_path / "other-blobs"), "cp-bad")
     checkpoints = owner.resolved.incarnation.checkpoints
     assert not (checkpoints / "cp-bad").exists()
     assert not list(checkpoints.glob(".c-*"))
     owner.close()
 
 
-def test_checkpoint_sources_must_be_the_active_incarnation(
+def test_sources_require_active_incarnation(
     tmp_path: Path,
 ) -> None:
     owner = initialized(tmp_path)
@@ -243,13 +253,8 @@ def test_checkpoint_sources_must_be_the_active_incarnation(
             CompanyCheckpointError,
             match="source storage differs",
         ):
-            write_plain_checkpoint(
-                lock=owner.lock,
-                resolved=owner.resolved,
-                ledger=owner.ledger,
-                blobs=BlobStore(tmp_path / "foreign-blobs"),
-                checkpoint_id="cp-foreign-blobs",
-                generated_at=T,
+            raw_write(
+                owner, BlobStore(tmp_path / "foreign-blobs"), "cp-foreign-blobs",
             )
     finally:
         foreign_ledger.close()
@@ -269,14 +274,7 @@ def test_company_genesis_is_required_before_checkpoint(
             CompanyCheckpointError,
             match="genesis transaction is required",
         ):
-            write_plain_checkpoint(
-                lock=owner.lock,
-                resolved=owner.resolved,
-                ledger=owner.ledger,
-                blobs=owner.blobs,
-                checkpoint_id="cp-before-genesis",
-                generated_at=T,
-            )
+            raw_write(owner, owner.blobs, "cp-before-genesis")
     finally:
         owner.close()
 

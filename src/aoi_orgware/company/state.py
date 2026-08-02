@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -13,7 +13,7 @@ import stat
 import tempfile
 import threading
 from typing import Any
-from typing import Literal, cast
+from typing import Literal, Never, cast
 
 from .blobs import BlobStore, BlobStoreError
 from .contracts import (
@@ -72,7 +72,6 @@ from .invariants import (
     CompanyInvariantError,
     InvariantObject,
     InvariantTransition,
-    UncertainDispatch,
     reduce_company_invariants,
     validate_provider_turn_result_lifecycle,
 )
@@ -91,6 +90,21 @@ from .readmodel import (
     ReadModelCorruptionError,
     ReadModelError,
     ReadModelHead,
+)
+from .state_reader import (
+    CompanyCheckpointDelivery,
+    CompanyDeliverySnapshot,
+    CompanyHistoricalReplayInput,
+    CompanyQuerySnapshot,
+    CompanySanitizedExportDelivery,
+    CompanyStateHealth,
+    CompanyStateReaderError,
+    _DEFAULT_DELIVERY_SNAPSHOT,
+    _unavailable_checkpoint,
+    _unavailable_sanitized_export,
+    immutable_historical_replay_input,
+    immutable_ledger_heads,
+    validate_historical_ledger_snapshot,
 )
 from .registry import (
     CompanyRegistry,
@@ -135,122 +149,6 @@ class CompanyDeliveryPartialError(CompanyStateError):
 
 
 _MAX_WORK_PROMPT_BYTES = 256 * 1024
-
-
-@dataclass(frozen=True)
-class CompanyStateHealth:
-    status: str
-    ledger_status: str
-    projection_status: str
-    pointer_sha256: str
-    ledger_heads: LedgerHeadsSnapshot
-    readmodel_head: ReadModelHead
-    blob_status: str = "ready"
-    degradation_reasons: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class CompanyCheckpointDelivery:
-    """One fully verified plain checkpoint and its currentness boundary."""
-
-    state: str
-    reason: str | None
-    checkpoint_id: str | None
-    cursor: int | None
-    head_sha256: str | None
-    manifest_sha256: str | None
-    generated_at: str | None
-    verified_at: str | None
-    current: bool
-
-
-@dataclass(frozen=True)
-class CompanySanitizedExportDelivery:
-    """One fully verified, checkpoint-bound sanitized export."""
-
-    state: str
-    reason: str | None
-    export_id: str | None
-    export_sha256: str | None
-    generated_at: str | None
-    verified_at: str | None
-    source_checkpoint_id: str | None
-    source_checkpoint_manifest_sha256: str | None
-    cursor: int | None
-    head_sha256: str | None
-    current: bool
-    canonical_bundle_json: bytes | None
-
-
-@dataclass(frozen=True)
-class CompanyDeliverySnapshot:
-    """Read-only checkpoint/export delivery truth, including discovery warnings."""
-
-    checkpoint: CompanyCheckpointDelivery
-    sanitized_export: CompanySanitizedExportDelivery
-    warnings: tuple[str, ...] = ()
-
-
-def _unavailable_checkpoint(reason: str) -> CompanyCheckpointDelivery:
-    return CompanyCheckpointDelivery(
-        state="unavailable",
-        reason=reason,
-        checkpoint_id=None,
-        cursor=None,
-        head_sha256=None,
-        manifest_sha256=None,
-        generated_at=None,
-        verified_at=None,
-        current=False,
-    )
-
-
-def _unavailable_sanitized_export(
-    reason: str,
-) -> CompanySanitizedExportDelivery:
-    return CompanySanitizedExportDelivery(
-        state="unavailable",
-        reason=reason,
-        export_id=None,
-        export_sha256=None,
-        generated_at=None,
-        verified_at=None,
-        source_checkpoint_id=None,
-        source_checkpoint_manifest_sha256=None,
-        cursor=None,
-        head_sha256=None,
-        current=False,
-        canonical_bundle_json=None,
-    )
-
-
-_DEFAULT_DELIVERY_SNAPSHOT = CompanyDeliverySnapshot(
-    checkpoint=_unavailable_checkpoint("no_verified_checkpoint"),
-    sanitized_export=_unavailable_sanitized_export("no_verified_sanitized_export"),
-)
-
-
-@dataclass(frozen=True)
-class CompanyQuerySnapshot:
-    """One cursor-consistent read-only projection served under the owner lock."""
-
-    health: CompanyStateHealth
-    objects: tuple[ProjectedObject, ...]
-    uncertain_dispatches: tuple[UncertainDispatch, ...]
-    delivery: CompanyDeliverySnapshot = _DEFAULT_DELIVERY_SNAPSHOT
-
-
-@dataclass(frozen=True)
-class CompanyHistoricalReplayInput:
-    """Verified immutable inputs for one detached historical projection."""
-
-    records: tuple[LedgerTransactionRecord, ...]
-    state_root: Path
-    pointer_sha256: str
-    ledger_status: str
-    projection_status: str
-    blob_status: str
-    degradation_reasons: tuple[str, ...]
 
 
 _LOCAL_SLOTS_LOCK = threading.Lock()
@@ -388,7 +286,7 @@ class CompanyStateOwner:
         self.resolved = resolved
         self._local_slot_key = local_slot_key
         self._mutex = threading.RLock()
-        self._ledger: CompanyLedger | None = None
+        self.__ledger: CompanyLedger | None = None
         self._readmodel: CompanyReadModel | None = None
         self._blobs: BlobStore | None = None
         self._closed = False
@@ -405,10 +303,10 @@ class CompanyStateOwner:
             finally:
                 self._readmodel = None
                 try:
-                    if self._ledger is not None:
-                        self._ledger.close()
+                    if self.__ledger is not None:
+                        CompanyLedger.close(self.__ledger)
                 finally:
-                    self._ledger = None
+                    self.__ledger = None
                     self._blobs = None
             raise
 
@@ -495,11 +393,14 @@ class CompanyStateOwner:
         self.lock.assert_owned()
 
     @property
-    def ledger(self) -> CompanyLedger:
-        self._require_open()
-        if self._ledger is None:
-            raise CompanyStateError("company ledger is unavailable")
-        return self._ledger
+    def ledger(self) -> Never:
+        """Deny raw append access; reads use owner APIs and writes use commit()."""
+
+        raise CompanyStateError(
+            "raw company ledger access is unavailable; use heads(), "
+            "records_after(), record_by_transaction_id(), "
+            "record_by_command_id(), or commit()",
+        )
 
     @property
     def readmodel(self) -> CompanyReadModel:
@@ -519,7 +420,7 @@ class CompanyStateOwner:
         self.lock.assert_owned()
         paths = self.resolved.incarnation
         self._blobs = BlobStore(paths.blobs)
-        self._ledger = CompanyLedger(paths.ledger)
+        self.__ledger = CompanyLedger(paths.ledger)
         try:
             self._readmodel = CompanyReadModel(paths.readmodel)
         except ReadModelError:
@@ -534,9 +435,9 @@ class CompanyStateOwner:
         self._discover_delivery_unlocked()
 
     def _synchronize_projection_unlocked(self) -> None:
-        ledger = self.ledger
+        ledger = cast(CompanyLedger, self.__ledger)
         model = self.readmodel
-        ledger_heads = ledger.snapshot_heads()
+        ledger_heads = CompanyLedger.snapshot_heads(ledger)
         model_head = model.head()
         if (
             model_head.global_sequence > ledger_heads.global_head.global_sequence
@@ -551,7 +452,7 @@ class CompanyStateOwner:
             return
         cursor = model_head.global_sequence
         while cursor < ledger_heads.global_head.global_sequence:
-            records = ledger.records_after(cursor, limit=1024)
+            records = CompanyLedger.records_after(ledger, cursor, limit=1024)
             if not records:
                 raise CompanyStateError(
                     "ledger catch-up returned an empty nonterminal page",
@@ -577,7 +478,8 @@ class CompanyStateOwner:
         if self._readmodel is not None:
             self._readmodel.close()
             self._readmodel = None
-        records = self.ledger.load_records()
+        ledger = cast(CompanyLedger, self.__ledger)
+        records = CompanyLedger.load_records(ledger)
         target = self.resolved.incarnation.readmodel
         if os.name == "nt":
             # Windows may deny replace-over-existing even after SQLite and the
@@ -604,7 +506,7 @@ class CompanyStateOwner:
         self._readmodel = CompanyReadModel(
             self.resolved.incarnation.readmodel,
         )
-        ledger_head = self.ledger.snapshot_heads().global_head
+        ledger_head = CompanyLedger.snapshot_heads(ledger).global_head
         projection_head = self._readmodel.verify_integrity()
         if (
             projection_head.global_sequence != ledger_head.global_sequence
@@ -628,7 +530,8 @@ class CompanyStateOwner:
             return self.readmodel.head()
 
     def _validate_binding_unlocked(self) -> None:
-        heads = self.ledger.snapshot_heads()
+        ledger = cast(CompanyLedger, self.__ledger)
+        heads = CompanyLedger.snapshot_heads(ledger)
         expected_identity = (
             str(self.resolved.manifest["company_id"]),
             int(self.resolved.manifest["company_incarnation"]),
@@ -768,7 +671,8 @@ class CompanyStateOwner:
         """Audit every durable snapshot document and predecessor on open."""
 
         snapshots_by_id: dict[str, Mapping[str, Any]] = {}
-        for record in self.ledger.load_records():
+        ledger = cast(CompanyLedger, self.__ledger)
+        for record in CompanyLedger.load_records(ledger):
             for member in record.events:
                 payload = member.event["payload"]
                 if payload.get("contract_type") != DEPARTMENT_SNAPSHOT_V1:
@@ -1927,8 +1831,10 @@ class CompanyStateOwner:
                 continue
             references.extend(dispatch["effect_evidence"])
             if state == "failed_known":
+                ledger = cast(CompanyLedger, self.__ledger)
                 receipt_from_record(
-                    self.ledger.record_by_command_id(
+                    CompanyLedger.record_by_command_id(
+                        ledger,
                         str(dispatch["command_id"]),
                     ),
                 )
@@ -2006,8 +1912,10 @@ class CompanyStateOwner:
 
         for shadow in self.readmodel.uncertain_dispatches():
             references.extend(shadow.payload["effect_evidence"])
+            ledger = cast(CompanyLedger, self.__ledger)
             receipt_from_record(
-                self.ledger.record_by_transaction_id(
+                CompanyLedger.record_by_transaction_id(
+                    ledger,
                     shadow.source_transaction_id,
                 ),
             )
@@ -2335,7 +2243,9 @@ class CompanyStateOwner:
         # lifecycle revision becomes current, replaying an older byte-exact
         # request must still reach the ledger's idempotency path rather than be
         # reinterpreted against the newer projection.
-        durable = self.ledger.record_by_transaction_id(
+        ledger = cast(CompanyLedger, self.__ledger)
+        durable = CompanyLedger.record_by_transaction_id(
+            ledger,
             str(canonical["transaction_id"]),
         )
         if durable is not None and (
@@ -2535,7 +2445,9 @@ class CompanyStateOwner:
                 receipt_state=state,
             )
             try:
-                result = self.ledger.append(
+                ledger = cast(CompanyLedger, self.__ledger)
+                result = CompanyLedger.append(
+                    ledger,
                     request,
                     state=state,
                     evidence=evidence,
@@ -2579,7 +2491,8 @@ class CompanyStateOwner:
             return False, delivery.reason
         if delivery.cursor is None or delivery.head_sha256 is None:
             return False, "company_binding_differs"
-        head = self.ledger.snapshot_heads().global_head
+        ledger = cast(CompanyLedger, self.__ledger)
+        head = CompanyLedger.snapshot_heads(ledger).global_head
         if (
             delivery.cursor != head.global_sequence
             or delivery.head_sha256 != head.transaction_sha256
@@ -2887,7 +2800,7 @@ class CompanyStateOwner:
             digest = write_plain_checkpoint(
                 lock=self.lock,
                 resolved=self.resolved,
-                ledger=self.ledger,
+                ledger=cast(CompanyLedger, self.__ledger),
                 blobs=self.blobs,
                 checkpoint_id=checkpoint_id,
                 generated_at=generated_at,
@@ -3019,7 +2932,8 @@ class CompanyStateOwner:
     def heads(self) -> LedgerHeadsSnapshot:
         with self._mutex:
             self._require_open()
-            return self.ledger.snapshot_heads()
+            ledger = cast(CompanyLedger, self.__ledger)
+            return CompanyLedger.snapshot_heads(ledger)
 
     def objects(
         self,
@@ -3038,7 +2952,9 @@ class CompanyStateOwner:
     ) -> tuple[LedgerTransactionRecord, ...]:
         with self._mutex:
             self._require_open()
-            return self.ledger.records_after(
+            ledger = cast(CompanyLedger, self.__ledger)
+            return CompanyLedger.records_after(
+                ledger,
                 global_sequence,
                 limit=limit,
             )
@@ -3049,7 +2965,8 @@ class CompanyStateOwner:
     ) -> LedgerTransactionRecord | None:
         with self._mutex:
             self._require_open()
-            return self.ledger.record_by_transaction_id(transaction_id)
+            ledger = cast(CompanyLedger, self.__ledger)
+            return CompanyLedger.record_by_transaction_id(ledger, transaction_id)
 
     def record_by_command_id(
         self,
@@ -3057,7 +2974,8 @@ class CompanyStateOwner:
     ) -> LedgerTransactionRecord | None:
         with self._mutex:
             self._require_open()
-            return self.ledger.record_by_command_id(command_id)
+            ledger = cast(CompanyLedger, self.__ledger)
+            return CompanyLedger.record_by_command_id(ledger, command_id)
 
     def health(self) -> CompanyStateHealth:
         with self._mutex:
@@ -3066,26 +2984,37 @@ class CompanyStateOwner:
 
     def _health_unlocked(self) -> CompanyStateHealth:
         self._refresh_current_blob_health_unlocked()
-        ledger_heads = self.ledger.snapshot_heads()
+        ledger = cast(CompanyLedger, self.__ledger)
+        ledger_heads = CompanyLedger.snapshot_heads(ledger)
         readmodel_head = self.readmodel.head()
+        projection_matches = (
+            ledger_heads.global_head.global_sequence
+            == readmodel_head.global_sequence
+            and ledger_heads.global_head.transaction_sha256
+            == readmodel_head.transaction_sha256
+        )
         status = (
             "ready"
             if (
-                self.ledger.health == "ready"
+                ledger.health == "ready"
                 and self._projection_status == "ready"
                 and self._blob_status == "ready"
+                and projection_matches
             )
             else "degraded"
         )
+        reasons = self._degradation_reasons
+        if not projection_matches:
+            reasons = (*reasons, "ledger_projection_head_mismatch")
         return CompanyStateHealth(
             status=status,
-            ledger_status=self.ledger.health,
+            ledger_status=ledger.health,
             projection_status=self._projection_status,
             pointer_sha256=self.resolved.pointer.pointer_sha256,
             ledger_heads=ledger_heads,
             readmodel_head=readmodel_head,
             blob_status=self._blob_status,
-            degradation_reasons=self._degradation_reasons,
+            degradation_reasons=reasons,
         )
 
     def query_snapshot(self) -> CompanyQuerySnapshot:
@@ -3126,15 +3055,32 @@ class CompanyStateOwner:
         """
         with self._mutex:
             self._require_open()
-            return CompanyHistoricalReplayInput(
-                records=self.ledger.load_records(),
-                state_root=self.resolved.incarnation.root.resolve(),
-                pointer_sha256=self.resolved.pointer.pointer_sha256,
-                ledger_status=self.ledger.health,
-                projection_status=self._projection_status,
-                blob_status=self._blob_status,
-                degradation_reasons=self._degradation_reasons,
-            )
+            ledger = cast(CompanyLedger, self.__ledger)
+            records = CompanyLedger.load_records(ledger)
+            try:
+                heads = validate_historical_ledger_snapshot(
+                    records,
+                    immutable_ledger_heads(
+                        CompanyLedger.snapshot_heads(ledger),
+                    ),
+                )
+                replay = immutable_historical_replay_input(
+                    CompanyHistoricalReplayInput(
+                        records=records,
+                        heads=heads,
+                        state_root=self.resolved.incarnation.root.resolve(),
+                        pointer_sha256=self.resolved.pointer.pointer_sha256,
+                        ledger_status=ledger.health,
+                        projection_status=self._projection_status,
+                        blob_status=self._blob_status,
+                        degradation_reasons=self._degradation_reasons,
+                    )
+                )
+                return replay
+            except CompanyStateReaderError as exc:
+                raise CompanyStateError(
+                    "company ledger replay snapshot cannot be verified",
+                ) from exc
 
     @staticmethod
     def project_historical_replay(
@@ -3142,6 +3088,14 @@ class CompanyStateOwner:
         global_sequence: int,
     ) -> CompanyQuerySnapshot:
         """Build one projection using only frozen verified replay input."""
+
+        try:
+            replay = immutable_historical_replay_input(replay)
+            replay_heads = replay.heads
+        except CompanyStateReaderError as exc:
+            raise CompanyStateError(
+                "historical replay input cannot be verified",
+            ) from exc
 
         if (
             not isinstance(global_sequence, int)
@@ -3154,7 +3108,7 @@ class CompanyStateOwner:
                 "historical cursor 0 predates the first committed company manifest",
             )
         records = replay.records
-        if global_sequence > len(records):
+        if global_sequence > replay_heads.global_head[0]:
             raise ValueError("historical cursor is ahead of the ledger head")
         prefix = records[:global_sequence]
         if (
@@ -3242,9 +3196,9 @@ class CompanyStateOwner:
                 if self._readmodel is not None:
                     self._readmodel.close()
                     self._readmodel = None
-                if self._ledger is not None:
-                    self._ledger.close()
-                    self._ledger = None
+                if self.__ledger is not None:
+                    CompanyLedger.close(self.__ledger)
+                    self.__ledger = None
                 self._blobs = None
             except BaseException as exc:
                 error = exc
