@@ -28,7 +28,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 VERIFIER = "python scripts/verify_coverage_path_mapping.py"
 FRAGMENT_COMBINER = f"{VERIFIER} --combine-fragments covdata"
 COVERAGE_TEMP_ROOT = "${{ runner.temp }}/aoi-coverage-tests"
-COVERAGE_JOB_SHA256 = "1fc1fa825555aeb5497d5a944af8fce100ca844630f1afc0d5fddd787bc9d10f"
+COVERAGE_JOB_SHA256 = "9336b0298a4504386d29c4fe64156a9582154809a62b72b0709d87b9177fe0f5"
 EXPECTED_CONFIG = """[run]
 source = aoi_orgware
 parallel = true
@@ -86,6 +86,15 @@ def _step_block(job: str, name: str) -> str:
     return match.group(0)
 
 
+def _temp_root_bindings(text: str) -> list[str]:
+    pattern = r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$"
+    return re.findall(pattern, text, flags=re.MULTILINE)
+
+
+def _assert_temp_root_binding(step: str) -> None:
+    assert _temp_root_bindings(step) == [COVERAGE_TEMP_ROOT]
+
+
 def _assert_coverage_contract(config: str, workflow: str) -> None:
     assert config == EXPECTED_CONFIG
     coverage = _job(workflow, "coverage")
@@ -94,12 +103,8 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
         == COVERAGE_JOB_SHA256
     )
     assert not re.search(r"^    env\s*:", coverage, flags=re.MULTILINE)
-    assert re.findall(
-        r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
-        coverage,
-        flags=re.MULTILINE,
-    ) == [COVERAGE_TEMP_ROOT] * 3
-    assert coverage.count(COVERAGE_TEMP_ROOT) == 4
+    assert _temp_root_bindings(coverage) == [COVERAGE_TEMP_ROOT] * 4
+    assert coverage.count(COVERAGE_TEMP_ROOT) == 5
     assert "${{ env.AOI_COVERAGE_TEMP_ROOT }}" not in coverage
     headers = _step_headers(coverage)
     assert headers == (
@@ -123,11 +128,7 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
     assert 'cp scripts/coverage_fragment_attribution.py "$SITE/aoi_coverage_fragment_attribution.py"' in startup
     assert "attempt_subprocess_coverage_attribution\\n" in startup
     run = _step(coverage, "Run suite under coverage")
-    assert re.findall(
-        r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
-        run,
-        flags=re.MULTILINE,
-    ) == [COVERAGE_TEMP_ROOT]
+    _assert_temp_root_binding(run)
     assert re.findall(
         r"^          TMPDIR:\s*([^#\n]+?)\s*(?:#.*)?$",
         run,
@@ -137,15 +138,12 @@ def _assert_coverage_contract(config: str, workflow: str) -> None:
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in run
     assert "python -m coverage run --parallel-mode -m pytest tests/ -q --tb=short" in run
     combine = _step(coverage, "Combine coverage fragments")
-    assert re.findall(
-        r"^          AOI_COVERAGE_TEMP_ROOT:\s*([^#\n]+?)\s*(?:#.*)?$",
-        combine,
-        flags=re.MULTILINE,
-    ) == [COVERAGE_TEMP_ROOT]
+    _assert_temp_root_binding(combine)
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in combine
     assert f"run: {FRAGMENT_COMBINER}" in combine
     assert "python -m coverage combine" not in combine
     floor = _step(coverage, "Enforce coverage floor")
+    _assert_temp_root_binding(floor)
     assert "COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage" in floor
     assert "run: python -m coverage report --fail-under=80" in floor
     assert "continue-on-error" not in coverage
@@ -263,6 +261,14 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
     missing_floor = workflow.replace(
         _step_block(_job(workflow, "coverage"), "Enforce coverage floor"), "", 1
     )
+    missing_floor_root = workflow.replace(
+        "      - name: Enforce coverage floor\n"
+        "        env:\n"
+        f"          AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n",
+        "      - name: Enforce coverage floor\n"
+        "        env:\n",
+        1,
+    )
     missing_startup = workflow.replace(
         "attempt_subprocess_coverage_attribution()\\n",
         "",
@@ -286,6 +292,7 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
         (config, wrong_tmpdir),
         (config, missing_fragment_verifier),
         (config, missing_floor),
+        (config, missing_floor_root),
         (config, missing_startup),
         (config, lowered_floor),
     ):

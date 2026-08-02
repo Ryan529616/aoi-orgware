@@ -307,6 +307,7 @@ jobs:
         run: python scripts/verify_coverage_path_mapping.py --combine-fragments covdata
       - name: Enforce coverage floor
         env:
+          AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/aoi-coverage-tests
           COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
         run: python -m coverage report --fail-under=80
       - name: Report coverage fragment attribution
