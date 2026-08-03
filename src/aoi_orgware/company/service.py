@@ -81,6 +81,7 @@ from .ledger import (
     LedgerError,
 )
 from .process_lock import CompanyProcessLockBusyError
+from .resident_time import ResidentLogicalEventClock
 from .sanitized_export import verify_sanitized_export
 from .state import (
     CompanyDeliveryPartialError,
@@ -2750,6 +2751,7 @@ class _ResidentService:
         self._control_thread: threading.Thread | None = None
         self._supervisor: CompanySupervisor | None = None
         self._company_binding: dict[str, Any] | None = None
+        self._logical_clock = ResidentLogicalEventClock()
         self._operations = _PrioritizedControlQueue(
             maxsize=_MAX_CONTROL_QUEUE,
         )
@@ -3111,24 +3113,6 @@ class _ResidentService:
             "cursor": cursor,
         }
 
-    @staticmethod
-    def _work_definition_recorded_at(
-        supervisor: CompanySupervisor,
-        transaction_id: str,
-    ) -> str:
-        """Reuse the resident-owned timestamp when an exact request replays."""
-
-        durable = supervisor.record_by_transaction_id(transaction_id)
-        if durable is not None and durable.events:
-            recorded_values = {
-                member.event["recorded_at"]
-                for member in durable.events
-                if isinstance(member.event.get("recorded_at"), str)
-            }
-            if len(recorded_values) == 1:
-                return str(recorded_values.pop())
-        return _utc_timestamp(_trusted_utc_now())
-
     def _execute_work_definition_register(
         self,
         pending: _PendingWorkDefinitionRegister,
@@ -3142,9 +3126,10 @@ class _ResidentService:
             pending.done.set()
             return
         try:
-            recorded_at = self._work_definition_recorded_at(
+            recorded_at = self._logical_clock.recorded_at(
                 supervisor,
                 command.transaction_id,
+                _utc_timestamp(_trusted_utc_now()),
             )
             result = supervisor.register_work_definition(
                 command.task_revision,
@@ -3242,9 +3227,10 @@ class _ResidentService:
             pending.done.set()
             return
         try:
-            activated_at = self._work_definition_recorded_at(
+            activated_at = self._logical_clock.recorded_at(
                 supervisor,
                 command.transaction_id,
+                _utc_timestamp(_trusted_utc_now()),
             )
             result = supervisor.activate_work_definition_enforcement(
                 chief_id=command.chief_id,
@@ -3340,7 +3326,11 @@ class _ResidentService:
             pending.done.set()
             return
         try:
-            recorded_at = _utc_timestamp(_trusted_utc_now())
+            recorded_at = self._logical_clock.recorded_at(
+                supervisor,
+                command.enqueue_transaction_id,
+                _utc_timestamp(_trusted_utc_now()),
+            )
             enqueue_result = supervisor.enqueue_department_dispatch_fenced(
                 command.department_id,
                 chief_id=command.chief_id,
@@ -3363,11 +3353,16 @@ class _ResidentService:
             admission_result = None
             queued_reason = None
             try:
+                admission_at = self._logical_clock.recorded_at(
+                    supervisor,
+                    command.admission_transaction_id,
+                    _utc_timestamp(_trusted_utc_now()),
+                )
                 admission_result = supervisor.admit_department_dispatch_resident(
                     command.dispatch_request_id,
                     transaction_id=command.admission_transaction_id,
                     command_id=command.admission_command_id,
-                    recorded_at=recorded_at,
+                    recorded_at=admission_at,
                 )
             except CompanyDepartmentDispatchCapacityBlocked as exc:
                 queued_reason = exc.reason

@@ -269,22 +269,66 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - name: Install coverage tooling
-        run: python -m pip install pytest coverage
+          cache-dependency-path: requirements/coverage-tools-linux.lock
+      - name: Resolve the hash-locked coverage wheelhouse
+        run: |
+          python -m pip download \
+            --require-hashes \
+            --dest .coverage-wheelhouse \
+            -r requirements/coverage-tools-linux.lock
+      - name: Install the coverage toolchain offline
+        run: |
+          python -m pip install \
+            --no-index \
+            --find-links .coverage-wheelhouse \
+            --require-hashes \
+            -r requirements/coverage-tools-linux.lock
+          python -I -c 'import coverage, pytest; assert coverage.__version__ == "7.15.2"; assert pytest.__version__ == "8.4.2"'
       - name: Verify coverage path mapping
         env:
           AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/aoi-coverage-tests
         run: |
           mkdir -p "$AOI_COVERAGE_TEMP_ROOT"
           python scripts/verify_coverage_path_mapping.py
-      - name: Enable subprocess coverage
+      - name: Install scoped subprocess coverage bootstrap
+        id: coverage_bootstrap
+        # The uniquely named executable .pth belongs only to this job.  It
+        # covers the main interpreter and same-prefix subprocesses; the one
+        # qualified system-site fixture installs its own exact child binding.
         # Most of the suite drives the CLI through real subprocesses; without
         # process_startup the measured number understates coverage by ~30
         # points (54% naive vs 83% subprocess-aware at the 0.3.0a3 baseline).
+        env:
+          AOI_COVERAGE_STARTUP_ROOT: ${{ runner.temp }}/aoi-coverage-startup
+          AOI_COVERAGE_BOOTSTRAP_RECEIPT: ${{ runner.temp }}/aoi-coverage-bootstrap.json
         run: |
-          SITE=$(python -c "import site; print(site.getsitepackages()[0])")
-          cp scripts/coverage_fragment_attribution.py "$SITE/aoi_coverage_fragment_attribution.py"
-          printf 'from aoi_coverage_fragment_attribution import attempt_subprocess_coverage_attribution\nattempt_subprocess_coverage_attribution()\nimport coverage\ncoverage.process_startup()\n' > "$SITE/sitecustomize.py"
+          set -euo pipefail
+          umask 077
+          test ! -e "$AOI_COVERAGE_STARTUP_ROOT"
+          test ! -e "$AOI_COVERAGE_BOOTSTRAP_RECEIPT"
+          mkdir -m 700 "$AOI_COVERAGE_STARTUP_ROOT"
+          cp scripts/coverage_fork_runtime.py "$AOI_COVERAGE_STARTUP_ROOT/aoi_coverage_fork_runtime.py"
+          cp scripts/coverage_fragment_attribution.py "$AOI_COVERAGE_STARTUP_ROOT/aoi_coverage_fragment_attribution.py"
+          cp scripts/coverage_sitecustomize.py "$AOI_COVERAGE_STARTUP_ROOT/aoi_coverage_bootstrap.py"
+          cmp -s scripts/coverage_fork_runtime.py "$AOI_COVERAGE_STARTUP_ROOT/aoi_coverage_fork_runtime.py"
+          cmp -s scripts/coverage_fragment_attribution.py "$AOI_COVERAGE_STARTUP_ROOT/aoi_coverage_fragment_attribution.py"
+          cmp -s scripts/coverage_sitecustomize.py "$AOI_COVERAGE_STARTUP_ROOT/aoi_coverage_bootstrap.py"
+          site_root="$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          runtime_prefix="$(python -I -c 'import sys; print(sys.prefix)')"
+          test -n "$site_root" && test -d "$site_root"
+          test -n "$runtime_prefix" && test -d "$runtime_prefix"
+          python -I -c 'import importlib.util; names=("aoi_coverage_bootstrap", "aoi_coverage_fork_runtime", "aoi_coverage_fragment_attribution"); found={name: importlib.util.find_spec(name) for name in names}; assert not any(found.values()), found'
+          printf 'runtime_prefix=%s\n' "$runtime_prefix" >> "$GITHUB_OUTPUT"
+          python scripts/coverage_bootstrap_install.py install \
+            --site-root "$site_root" \
+            --startup-root "$AOI_COVERAGE_STARTUP_ROOT" \
+            --receipt "$AOI_COVERAGE_BOOTSTRAP_RECEIPT"
+      - name: Verify scoped subprocess coverage bootstrap
+        env:
+          AOI_COVERAGE_STARTUP_ROOT: ${{ runner.temp }}/aoi-coverage-startup
+        run: |
+          set -euo pipefail
+          python -I -c 'import importlib, pathlib, sys; root=pathlib.Path(sys.argv[1]).resolve(strict=True); names=("aoi_coverage_bootstrap", "aoi_coverage_fork_runtime", "aoi_coverage_fragment_attribution"); origins={name: pathlib.Path(importlib.import_module(name).__file__).resolve(strict=True) for name in names}; expected={name: root / (name + ".py") for name in names}; assert origins == expected, (origins, expected); assert sum(pathlib.Path(item).resolve() == root for item in sys.path if item) == 1' "$AOI_COVERAGE_STARTUP_ROOT"
       - name: Run suite under coverage
         env:
           AOI_COVERAGE_TEMP_ROOT: ${{ runner.temp }}/aoi-coverage-tests
@@ -293,12 +337,26 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
           PYTHONPATH: src
           TMPDIR: ${{ runner.temp }}/aoi-coverage-tests
-          COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
+          AOI_COVERAGE_RUNTIME_PREFIX: ${{ steps.coverage_bootstrap.outputs.runtime_prefix }}
+          AOI_COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
           COVERAGE_FILE: ${{ github.workspace }}/covdata/.coverage
         run: |
           umask 077
           mkdir -p covdata "$AOI_COVERAGE_METADATA_ROOT"
-          python -m coverage run --parallel-mode -m pytest tests/ -q --tb=short
+          python -m pytest tests/ -q --tb=short
+      - name: Remove scoped subprocess coverage bootstrap
+        if: ${{ always() }}
+        env:
+          AOI_COVERAGE_BOOTSTRAP_RECEIPT: ${{ runner.temp }}/aoi-coverage-bootstrap.json
+        run: |
+          set -euo pipefail
+          site_root="$(python -I -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          test -n "$site_root" && test -d "$site_root"
+          if test -e "$AOI_COVERAGE_BOOTSTRAP_RECEIPT" || test -L "$AOI_COVERAGE_BOOTSTRAP_RECEIPT"; then
+            python scripts/coverage_bootstrap_install.py remove \
+              --receipt "$AOI_COVERAGE_BOOTSTRAP_RECEIPT"
+          fi
+          test ! -e "$site_root/aoi_coverage_bootstrap.pth"
       - name: Combine coverage fragments
         id: coverage_combine
         env:

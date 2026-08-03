@@ -13,6 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 TYPECHECK_LOCK = ROOT / "requirements" / "typecheck-tools.lock"
 RELEASE_TOOLS_LOCK = ROOT / "requirements" / "release-tools.lock"
+COVERAGE_TOOLS_LOCK = ROOT / "requirements" / "coverage-tools-linux.lock"
+COVERAGE_TOOLS_LOCK_SHA256 = (
+    "4d65a12bb2a6e659ea768839ed147b2626229f1f2f4d091fc2a9aeaef8165f65"
+)
 WINDOWS_PRIVATE_TEMP_VERIFIER = (
     "python -c 'import os; from pathlib import Path; "
     "from aoi_orgware.company.service import _verify_windows_private_directory; "
@@ -25,7 +29,7 @@ UNIT_JOB_SHA256 = (
     "ef606c1313f6656cc942b36684f130902d33f1e75ce4c2ffacbc5ceb9d9e4f56"
 )
 WORKFLOW_SHA256 = (
-    "081d07d526b9a5c11c9670cc0bb9fb425b3404a7f6344f92afeb504a4fd5ef2a"
+    "0f0d2f42505b4dbaa6aaafecbcfbeca2ffe044da2bf3223e7de8d36be09f236b"
 )
 
 
@@ -509,6 +513,32 @@ def test_typecheck_toolchain_is_exactly_pinned_and_hash_verified() -> None:
     assert "--find-links .typecheck-wheelhouse" in typing
     assert "requirements/typecheck-tools.lock" in typing
     assert "pip install mypy" not in typing
+
+
+def test_coverage_toolchain_is_exactly_pinned_and_installed_offline() -> None:
+    lock = COVERAGE_TOOLS_LOCK.read_text(encoding="utf-8")
+    assert hashlib.sha256(lock.encode("utf-8")).hexdigest() == COVERAGE_TOOLS_LOCK_SHA256
+    expected = {
+        "coverage==7.15.2",
+        "iniconfig==2.3.0",
+        "packaging==26.2",
+        "pluggy==1.6.0",
+        "pygments==2.20.0",
+        "pytest==8.4.2",
+    }
+    assert "--only-binary=:all:" in lock
+    assert all(requirement in lock for requirement in expected)
+    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", lock)) == len(expected)
+
+    coverage = _job(_workflow(), "coverage")
+    assert 'python-version: "3.13"' in coverage
+    assert "cache-dependency-path: requirements/coverage-tools-linux.lock" in coverage
+    assert "pip download" in coverage
+    assert "--require-hashes" in coverage
+    assert "--no-index" in coverage
+    assert "--find-links .coverage-wheelhouse" in coverage
+    assert "requirements/coverage-tools-linux.lock" in coverage
+    assert "pip install pytest" not in coverage
 
 
 def test_test_and_docs_workflows_pin_every_third_party_action_to_a_commit() -> None:

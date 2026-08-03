@@ -1,14 +1,13 @@
 """Test-only provenance for coverage.py fragments.
 
-This module never decides whether a coverage fragment is acceptable.  The
-existing coverage verifier remains authoritative and fail-closed.  The startup
-helper only gives fresh Python interpreters an opaque data-file prefix and
-writes a bounded sidecar so a later, failure-only diagnostic can identify the
-pytest family that launched a bad fragment.
+The existing verifier remains authoritative and fail-closed.  This diagnostic
+helper assigns opaque producer prefixes.  One version-pinned AOI fork hook
+replaces inherited measurement with exactly one child collector; coverage.py's
+recursive ``patch=fork`` hook is deliberately absent.
 
-Direct ``fork`` children do not execute ``sitecustomize`` again.  Their exact
-producer is therefore deliberately reported as unavailable rather than guessed
-from coverage.py's private filename suffix grammar.
+The fork guarantee is limited to Python runtimes that execute registered
+``os.register_at_fork`` callbacks and Python-level ``os._exit``.  Raw
+third-party C forks and direct C ``_exit`` calls remain unavailable.
 
 The receipt correlation is cooperative and diagnostic, not authenticated.
 Another process running as the same user can mint self-consistent filenames and
@@ -19,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -30,17 +30,32 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, TextIO
 
+_fork_runtime = importlib.import_module(
+    "scripts.coverage_fork_runtime"
+    if __package__ == "scripts"
+    else "aoi_coverage_fork_runtime"
+)
+COVERAGE_CONFIG_ENV = _fork_runtime.COVERAGE_CONFIG_ENV
+EXPECTED_COVERAGE_VERSION = _fork_runtime.EXPECTED_COVERAGE_VERSION
+_VENDOR_COVERAGE_START_ENVIRONMENTS = _fork_runtime.VENDOR_START_ENVIRONMENTS
+_ensure_coverage_not_started = _fork_runtime.ensure_not_started
+_install_fork_callback = _fork_runtime.install_fork_callback
+_start_exact_coverage = _fork_runtime.start_exact_coverage
+_stop_inherited_coverage = _fork_runtime.stop_inherited_coverage
 
-ATTRIBUTION_SCHEMA_VERSION = 1
+
+ATTRIBUTION_SCHEMA_VERSION = 2
 COVERAGE_FILE_BASE_ENV = "AOI_COVERAGE_FILE_BASE"
 METADATA_ROOT_ENV = "AOI_COVERAGE_METADATA_ROOT"
 PYTEST_FAMILY_TOKEN_ENV = "AOI_COVERAGE_TEST_FAMILY_TOKEN"
-_PRODUCER_PREFIX = ".aoi1."
+CURRENT_PRODUCER_ENV = "AOI_COVERAGE_CURRENT_PRODUCER_ID"
+_PRODUCER_PREFIX = ".aoi2."
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
-_FRAGMENT_RE = re.compile(r"^\.coverage\.aoi1\.(?P<producer>[0-9a-f]{64})(?:\.|\Z)")
+_FRAGMENT_RE = re.compile(r"^\.coverage\.aoi2\.(?P<producer>[0-9a-f]{64})(?:\.|\Z)")
 _MAX_RECEIPT_BYTES = 4096
+_ATTRIBUTION_SCOPES = frozenset({"fork_child", "fresh_interpreter"})
 
 
 class CoverageFragmentAttributionError(RuntimeError):
@@ -308,6 +323,7 @@ def prepare_subprocess_coverage_attribution(
     *,
     environ: MutableMapping[str, str] | None = None,
     token_bytes: Any = secrets.token_bytes,
+    attribution_scope: str = "fresh_interpreter",
 ) -> str | None:
     """Prepare one fresh interpreter before ``coverage.process_startup``.
 
@@ -317,8 +333,20 @@ def prepare_subprocess_coverage_attribution(
     """
 
     target = os.environ if environ is None else environ
-    if not target.get("COVERAGE_PROCESS_START"):
+    config_raw = target.get(COVERAGE_CONFIG_ENV)
+    if config_raw is None:
         return None
+    if (
+        type(config_raw) is not str
+        or not config_raw
+        or "\x00" in config_raw
+        or not Path(config_raw).is_absolute()
+    ):
+        raise CoverageFragmentAttributionError("coverage config binding is invalid")
+    if any(name in target for name in _VENDOR_COVERAGE_START_ENVIRONMENTS):
+        raise CoverageFragmentAttributionError("coverage started before attribution")
+    if type(attribution_scope) is not str or attribution_scope not in _ATTRIBUTION_SCOPES:
+        raise CoverageFragmentAttributionError("coverage attribution scope is invalid")
     root = _metadata_root(target)
     if root is None:
         raise CoverageFragmentAttributionError("coverage attribution metadata is required")
@@ -330,6 +358,24 @@ def prepare_subprocess_coverage_attribution(
         raise CoverageFragmentAttributionError("coverage file base must name absolute .coverage")
     base_parent = _existing_private_directory(base.parent, label="coverage data directory")
     base = base_parent / base.name
+    parent_producer_id = target.get(CURRENT_PRODUCER_ENV)
+    if parent_producer_id is not None and (
+        type(parent_producer_id) is not str
+        or _HEX64_RE.fullmatch(parent_producer_id) is None
+    ):
+        raise CoverageFragmentAttributionError("parent producer identity is invalid")
+    if attribution_scope == "fork_child" and parent_producer_id is None:
+        raise CoverageFragmentAttributionError("fork child parent identity is required")
+    if parent_producer_id is not None:
+        _validated_process_record(root, parent_producer_id)
+    inherited_file = target.get("COVERAGE_FILE")
+    expected_inherited = (
+        str(base)
+        if parent_producer_id is None
+        else f"{base}{_PRODUCER_PREFIX}{parent_producer_id}"
+    )
+    if inherited_file is not None and inherited_file != expected_inherited:
+        raise CoverageFragmentAttributionError("parent coverage file binding differs")
     try:
         entropy = token_bytes(32)
     except (KeyboardInterrupt, MemoryError, SystemExit):
@@ -345,13 +391,14 @@ def prepare_subprocess_coverage_attribution(
     ):
         raise CoverageFragmentAttributionError("pytest family token is invalid")
     record: dict[str, object] = {
-        "attribution_scope": "fresh_interpreter_or_unresolved_fork_descendant",
+        "attribution_scope": attribution_scope,
         "family_quality": (
             "cooperative_unverified_pytest_family"
             if family_token is not None
             else "unattributed"
         ),
         "family_token": family_token,
+        "parent_producer_id": parent_producer_id,
         "producer_id": producer_id,
         "schema_version": ATTRIBUTION_SCHEMA_VERSION,
     }
@@ -361,17 +408,82 @@ def prepare_subprocess_coverage_attribution(
     ):
         raise CoverageFragmentAttributionError("producer identity collision")
     target["COVERAGE_FILE"] = f"{base}{_PRODUCER_PREFIX}{producer_id}"
+    target[CURRENT_PRODUCER_ENV] = producer_id
     return producer_id
 
 
-def attempt_subprocess_coverage_attribution() -> bool:
-    """Attempt diagnostics without preventing the original coverage startup."""
+def _disable_inherited_coverage(target: MutableMapping[str, str]) -> None:
+    """Remove every inherited switch that could write under a parent identity."""
 
+    for name in _fork_runtime.COVERAGE_SELECTOR_ENVIRONMENTS:
+        try:
+            target.pop(name, None)
+        except BaseException:
+            pass
+
+
+def _after_fork_child_attribution(
+    *,
+    coverage_module: Any,
+    environ: MutableMapping[str, str] | None = None,
+    prepare: Any = prepare_subprocess_coverage_attribution,
+    hard_exit: Any = os._exit,
+) -> None:
+    """Replace inherited measurement with one child-owned collector."""
+
+    target = os.environ if environ is None else environ
     try:
-        return prepare_subprocess_coverage_attribution() is not None
-    except (KeyboardInterrupt, MemoryError, SystemExit):
-        raise
-    except Exception:
+        _stop_inherited_coverage(coverage_module)
+        producer_id = prepare(
+            environ=target,
+            attribution_scope="fork_child",
+        )
+        if producer_id is None:
+            raise CoverageFragmentAttributionError("fork attribution is disabled")
+        _start_exact_coverage(
+            coverage_module,
+            target,
+            force=True,
+            slug="aoi_fork",
+        )
+        return
+    except BaseException:
+        try:
+            _disable_inherited_coverage(target)
+        finally:
+            hard_exit(97)
+
+
+def attempt_subprocess_coverage_attribution(
+    *,
+    coverage_module: Any,
+    environ: MutableMapping[str, str] | None = None,
+    register_at_fork: Any | None = None,
+) -> bool:
+    """Start one collector; a ``False`` result requires immediate ``os._exit``."""
+
+    target = os.environ if environ is None else environ
+    try:
+        _ensure_coverage_not_started(coverage_module)
+        producer_id = prepare_subprocess_coverage_attribution(environ=target)
+        if producer_id is None:
+            return False
+        _start_exact_coverage(
+            coverage_module,
+            target,
+            force=False,
+            slug="aoi_startup",
+        )
+        def child_callback() -> None:
+            _after_fork_child_attribution(coverage_module=coverage_module)
+
+        _install_fork_callback(child_callback, register_at_fork)
+        return True
+    except BaseException:
+        try:
+            _disable_inherited_coverage(target)
+        except BaseException:
+            pass
         return False
 
 
@@ -431,6 +543,7 @@ def _validated_process_record(root: Path, producer_id: str) -> dict[str, object]
         "attribution_scope",
         "family_quality",
         "family_token",
+        "parent_producer_id",
         "producer_id",
         "schema_version",
     }:
@@ -442,8 +555,17 @@ def _validated_process_record(root: Path, producer_id: str) -> dict[str, object]
         raise CoverageFragmentAttributionError("process receipt version is invalid")
     if value["producer_id"] != producer_id:
         raise CoverageFragmentAttributionError("process receipt identity differs")
-    if value["attribution_scope"] != "fresh_interpreter_or_unresolved_fork_descendant":
+    if value["attribution_scope"] not in _ATTRIBUTION_SCOPES:
         raise CoverageFragmentAttributionError("process attribution scope is invalid")
+    parent_producer_id = value["parent_producer_id"]
+    if parent_producer_id is not None and (
+        type(parent_producer_id) is not str
+        or _HEX64_RE.fullmatch(parent_producer_id) is None
+        or parent_producer_id == producer_id
+    ):
+        raise CoverageFragmentAttributionError("parent producer binding is invalid")
+    if value["attribution_scope"] == "fork_child" and parent_producer_id is None:
+        raise CoverageFragmentAttributionError("fork child parent binding is absent")
     family_token = value["family_token"]
     quality = value["family_quality"]
     if family_token is None:
@@ -577,6 +699,9 @@ def _diagnostic_for_fragment(
     producer_id = match.group("producer")
     try:
         process = _validated_process_record(metadata_root, producer_id)
+        parent_producer_id = process["parent_producer_id"]
+        if type(parent_producer_id) is str:
+            _validated_process_record(metadata_root, parent_producer_id)
         family_token = process["family_token"]
         family = (
             _validated_family_record(metadata_root, family_token)
@@ -589,12 +714,14 @@ def _diagnostic_for_fragment(
         raise
     except CoverageFragmentAttributionError:
         family = "unavailable"
+        parent_producer_id = "unavailable"
         quality = "receipt_invalid_or_missing"
         scope = "unavailable"
     return (
         "coverage fragment attribution: "
         f"fragment_basename_sha256={name_digest}, producer_quality={quality}, "
-        f"test_family={family}, scope={scope}, reader_stage={reader_stage}"
+        f"test_family={family}, scope={scope}, "
+        f"parent_producer_id={parent_producer_id}, reader_stage={reader_stage}"
     )
 
 
@@ -612,6 +739,7 @@ def report_invalid_fragment_attribution(
     children = _bounded_fragment_children(fragments)
     invalid = 0
     for child in children:
+        stage: str | None
         if not child.name.startswith(".coverage."):
             stage = "unexpected_member"
         else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -8,6 +9,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from aoi_orgware.company import service as service_module
 from aoi_orgware.company.service import (
     CompanyServiceOperationError,
     dispatch_service_department,
@@ -219,6 +221,153 @@ def test_department_dispatch_resumes_from_enqueue_only_after_service_restart(
         assert replay["enqueue_result"]["idempotent_replay"] is True
         assert replay["admission_result"]["idempotent_replay"] is True
         assert replay["cursor"] == admitted["cursor"]
+
+
+def test_resident_dispatch_clamps_rewound_clock_to_durable_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = _slot(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    chief, departments = _chief_and_departments(slot)
+    department = departments[0]
+    queued_at = _now() + timedelta(minutes=2)
+    queued_timestamp = _utc(queued_at)
+    with CompanySupervisor.open(slot) as supervisor:
+        supervisor.enqueue_department_dispatch_fenced(
+            str(department["department_id"]),
+            chief_id=str(chief["chief_id"]),
+            carrier_id=str(chief["carrier_id"]),
+            term=int(chief["term"]),
+            epoch=int(chief["epoch"]),
+            chief_execution_id=str(chief["chief_execution_id"]),
+            transaction_id="rewound-clock-enqueue-transaction",
+            command_id="rewound-clock-enqueue-command",
+            dispatch_request_id="rewound-clock-dispatch",
+            reservation_id="rewound-clock-reservation",
+            task_id="rewound-clock-task",
+            packet_id="rewound-clock-packet",
+            route_policy_id="rewound-clock-route",
+            requested_role=f"{department['name'].lower()}_lead",
+            requested_capability_tier="standard",
+            requested_at=queued_timestamp,
+            recorded_at=queued_timestamp,
+        )
+
+    monkeypatch.setattr(
+        service_module,
+        "_trusted_utc_now",
+        lambda: queued_at - timedelta(minutes=1),
+    )
+    with _resident(slot, runtime):
+        admitted = _dispatch(
+            slot,
+            runtime,
+            chief,
+            department,
+            label="rewound-clock",
+        )
+        assert admitted["enqueue_result"]["idempotent_replay"] is True
+        assert admitted["admission_result"]["idempotent_replay"] is False
+
+    with CompanySupervisor.open(slot) as supervisor:
+        dispatch = next(
+            item.payload
+            for item in supervisor.objects(contract_type="dispatch_request_v1")
+            if item.payload["dispatch_request_id"] == "rewound-clock-dispatch"
+        )
+        assert dispatch["state"] == "admitted"
+        assert dispatch["created_at"] == queued_timestamp
+        assert dispatch["updated_at"] == queued_timestamp
+        admission_record = supervisor.record_by_transaction_id(
+            "rewound-clock-admission-transaction",
+        )
+        assert admission_record is not None
+        assert admission_record.receipt["recorded_at"] == queued_timestamp
+        assert {
+            member.event["recorded_at"]
+            for member in admission_record.events
+        } == {queued_timestamp}
+
+    with _resident(slot, runtime):
+        replay = _dispatch(
+            slot,
+            runtime,
+            chief,
+            department,
+            label="rewound-clock",
+        )
+        assert replay["admission_result"]["idempotent_replay"] is True
+        assert replay["cursor"] == admitted["cursor"]
+
+
+def test_fresh_resident_dispatch_uses_durable_time_floor_and_forward_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = _slot(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    chief, departments = _chief_and_departments(slot)
+    with CompanySupervisor.open(slot) as supervisor:
+        genesis_head = supervisor.heads().global_head.global_sequence
+        assert genesis_head == 1
+        genesis = supervisor.records_after(0, limit=1)[0]
+        durable_floor = str(genesis.receipt["recorded_at"])
+
+    clock = {"now": _now() - timedelta(minutes=5)}
+    monkeypatch.setattr(
+        service_module,
+        "_trusted_utc_now",
+        lambda: clock["now"],
+    )
+    with _resident(slot, runtime):
+        rewound = _dispatch(
+            slot,
+            runtime,
+            chief,
+            departments[0],
+            label="fresh-rewound-clock",
+        )
+        assert rewound["enqueue_result"]["idempotent_replay"] is False
+        assert rewound["admission_result"]["idempotent_replay"] is False
+
+        clock["now"] = _now() + timedelta(minutes=5)
+        forward_timestamp = _utc(clock["now"])
+        forward = _dispatch(
+            slot,
+            runtime,
+            chief,
+            departments[1],
+            label="fresh-forward-clock",
+        )
+        assert forward["enqueue_result"]["idempotent_replay"] is False
+        assert forward["admission_result"]["idempotent_replay"] is False
+
+    with CompanySupervisor.open(slot) as supervisor:
+        for transaction_id in (
+            "fresh-rewound-clock-enqueue-transaction",
+            "fresh-rewound-clock-admission-transaction",
+        ):
+            record = supervisor.record_by_transaction_id(transaction_id)
+            assert record is not None
+            assert record.receipt["recorded_at"] == durable_floor
+            assert {
+                member.event["recorded_at"]
+                for member in record.events
+            } == {durable_floor}
+        for transaction_id in (
+            "fresh-forward-clock-enqueue-transaction",
+            "fresh-forward-clock-admission-transaction",
+        ):
+            record = supervisor.record_by_transaction_id(transaction_id)
+            assert record is not None
+            assert record.receipt["recorded_at"] == forward_timestamp
+            assert {
+                member.event["recorded_at"]
+                for member in record.events
+            } == {forward_timestamp}
 
 
 def test_takeover_allows_only_the_original_chief_tuple_to_replay(

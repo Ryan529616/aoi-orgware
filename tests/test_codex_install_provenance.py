@@ -1370,68 +1370,6 @@ print(json.dumps(receipt, sort_keys=True))
         assert hook_script["record_sha256"]
 
 
-def test_real_system_site_packages_venv_is_rejected(tmp_path: Path) -> None:
-    """A real venv with inherited base site-packages is never admissible."""
-
-    repository = Path(__file__).resolve().parents[1]
-    wheelhouse = tmp_path / "wheelhouse"
-    wheelhouse.mkdir()
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--isolated",
-            "--no-deps",
-            "--wheel-dir",
-            str(wheelhouse),
-            str(repository),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    wheel = next(wheelhouse.glob("aoi_orgware-*.whl"))
-    prefix = tmp_path / "system-site"
-    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(prefix)
-    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    subprocess.run(
-        [
-            str(python),
-            "-m",
-            "pip",
-            "install",
-            "--isolated",
-            "--no-index",
-            "--no-deps",
-            str(wheel),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    script = """
-import sys
-import sysconfig
-from pathlib import Path
-from aoi_orgware import codex_install_provenance as provenance
-
-provenance._require_dedicated_venv(
-    Path(sys.prefix), Path(sysconfig.get_paths()['purelib'])
-)
-"""
-    completed = subprocess.run(
-        [str(python), "-I", "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-    )
-    assert completed.returncode != 0
-    assert "must disable system site packages" in completed.stderr
-
-
 def test_real_isolated_wheel_install_emits_local_v2_receipt(tmp_path: Path) -> None:
     """Exercise the local proof loader against pip's real direct_url/RECORD."""
     repository = Path(__file__).resolve().parents[1]

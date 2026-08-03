@@ -6,7 +6,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -17,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.coverage_fork_runtime as fork_runtime
 import scripts.coverage_fragment_attribution as attribution
 from scripts.coverage_fragment_quiescence import CoveragePathMappingError
 from scripts.verify_coverage_path_mapping import _validate_coverage_fragment_schema
@@ -31,7 +31,7 @@ def _roots(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     fragments.mkdir()
     metadata.mkdir()
     environ = {
-        "COVERAGE_PROCESS_START": str(ROOT / ".coveragerc"),
+        attribution.COVERAGE_CONFIG_ENV: str(ROOT / ".coveragerc"),
         attribution.COVERAGE_FILE_BASE_ENV: str(fragments / ".coverage"),
         attribution.METADATA_ROOT_ENV: str(metadata),
     }
@@ -104,7 +104,7 @@ def test_family_scope_is_parameter_free_canonical_and_restores_environment(
             "class_name": "TestWorker",
             "function_name": "test_case",
             "relative_path": "tests/company_v05/test_worker.py",
-            "schema_version": 1,
+            "schema_version": 2,
         }
     assert environ[attribution.PYTEST_FAMILY_TOKEN_ENV] == prior
 
@@ -160,7 +160,7 @@ def test_concurrent_family_publication_is_identical_and_atomic(tmp_path: Path) -
     temporaries = tuple((metadata / "families").glob(".*.tmp.*"))
     assert len(receipts) == 1
     assert temporaries == ()
-    assert attribution._read_record(receipts[0])["schema_version"] == 1
+    assert attribution._read_record(receipts[0])["schema_version"] == 2
 
 
 def test_atomic_receipt_never_exposes_partial_final(
@@ -220,14 +220,15 @@ def test_fsync_failure_never_publishes_or_becomes_idempotent(
 def test_startup_binds_only_opaque_ids_and_does_not_query_coverage(tmp_path: Path) -> None:
     _, metadata, environ, family_token, producer_id = _bound_producer(tmp_path)
     assert producer_id == "11" * 32
-    assert environ["COVERAGE_FILE"].endswith(f".coverage.aoi1.{producer_id}")
+    assert environ["COVERAGE_FILE"].endswith(f".coverage.aoi2.{producer_id}")
     process = attribution._validated_process_record(metadata, producer_id)
     assert process == {
-        "attribution_scope": "fresh_interpreter_or_unresolved_fork_descendant",
+        "attribution_scope": "fresh_interpreter",
         "family_quality": "cooperative_unverified_pytest_family",
         "family_token": family_token,
+        "parent_producer_id": None,
         "producer_id": producer_id,
-        "schema_version": 1,
+        "schema_version": 2,
     }
     raw = (metadata / "processes" / f"{producer_id}.json").read_text("ascii")
     for forbidden in ("argv", "cwd", "hostname", "pid", "timestamp", "provider"):
@@ -241,7 +242,7 @@ def test_startup_binds_only_opaque_ids_and_does_not_query_coverage(tmp_path: Pat
 
 def test_startup_without_coverage_is_a_strict_noop(tmp_path: Path) -> None:
     fragments, metadata, environ = _roots(tmp_path)
-    del environ["COVERAGE_PROCESS_START"]
+    del environ[attribution.COVERAGE_CONFIG_ENV]
     before = dict(environ)
     assert attribution.prepare_subprocess_coverage_attribution(environ=environ) is None
     assert environ == before
@@ -249,27 +250,40 @@ def test_startup_without_coverage_is_a_strict_noop(tmp_path: Path) -> None:
     assert tuple(fragments.iterdir()) == ()
 
 
-def test_safe_startup_wrapper_cannot_suppress_original_coverage(
+def test_safe_startup_wrapper_disables_inherited_coverage_on_any_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unavailable() -> None:
+    class FakeCoverage:
+        @classmethod
+        def current(cls) -> None:
+            return None
+
+    module = type(
+        "CoverageAPI",
+        (),
+        {
+            "Coverage": FakeCoverage,
+            "__version__": attribution.EXPECTED_COVERAGE_VERSION,
+            "process_startup": staticmethod(lambda **_kwargs: None),
+        },
+    )
+    environ = {
+        "COVERAGE_FILE": "inherited",
+        attribution.COVERAGE_CONFIG_ENV: "private-config",
+        "COVERAGE_PROCESS_CONFIG": "config",
+        "COVERAGE_PROCESS_START": "start",
+        attribution.CURRENT_PRODUCER_ENV: "a" * 64,
+    }
+
+    def unavailable(**_kwargs: object) -> None:
         raise attribution.CoverageFragmentAttributionError("synthetic metadata failure")
 
     monkeypatch.setattr(attribution, "prepare_subprocess_coverage_attribution", unavailable)
-    assert attribution.attempt_subprocess_coverage_attribution() is False
-
-    def unexpected() -> None:
-        raise RuntimeError("synthetic diagnostic bug")
-
-    monkeypatch.setattr(attribution, "prepare_subprocess_coverage_attribution", unexpected)
-    assert attribution.attempt_subprocess_coverage_attribution() is False
-
-    def fatal() -> None:
-        raise MemoryError
-
-    monkeypatch.setattr(attribution, "prepare_subprocess_coverage_attribution", fatal)
-    with pytest.raises(MemoryError):
-        attribution.attempt_subprocess_coverage_attribution()
+    assert attribution.attempt_subprocess_coverage_attribution(
+        coverage_module=module,
+        environ=environ,
+    ) is False
+    assert environ == {}
 
 
 @pytest.mark.parametrize("bad_entropy", [b"", b"x" * 31, b"x" * 33, bytearray(32), True])
@@ -306,7 +320,7 @@ def test_startup_rejects_symlinked_roots(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("directory symlink creation is unavailable")
     environ = {
-        "COVERAGE_PROCESS_START": str(ROOT / ".coveragerc"),
+        attribution.COVERAGE_CONFIG_ENV: str(ROOT / ".coveragerc"),
         attribution.COVERAGE_FILE_BASE_ENV: str(real / ".coverage"),
         attribution.METADATA_ROOT_ENV: str(link / "meta"),
     }
@@ -326,7 +340,7 @@ def test_existing_family_symlink_is_never_accepted_as_idempotent(tmp_path: Path)
     real = tmp_path / "real-family.json"
     real.write_bytes(
         attribution._canonical_bytes(
-            {"family": family, "family_token": token, "schema_version": 1}
+            {"family": family, "family_token": token, "schema_version": 2}
         )
     )
     try:
@@ -386,14 +400,14 @@ def test_failure_report_is_sanitized_read_only_and_does_not_weaken_acceptance(
     tmp_path: Path,
 ) -> None:
     fragments, metadata, _, _, producer_id = _bound_producer(tmp_path)
-    known = fragments / f".coverage.aoi1.{producer_id}.host.1.random"
+    known = fragments / f".coverage.aoi2.{producer_id}.host.1.random"
     known.write_bytes(b"truncated")
     missing_id = "22" * 32
-    missing = fragments / f".coverage.aoi1.{missing_id}.host.2.random"
+    missing = fragments / f".coverage.aoi2.{missing_id}.host.2.random"
     missing.write_bytes(b"")
     unexpected = fragments / "unexpected-member"
     unexpected.write_bytes(b"untrusted")
-    valid_without_receipt = fragments / f".coverage.aoi1.{'33' * 32}.host.3.random"
+    valid_without_receipt = fragments / f".coverage.aoi2.{'33' * 32}.host.3.random"
     _coverage_schema(valid_without_receipt)
     before = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -436,7 +450,7 @@ def test_forged_filename_token_cannot_mint_attribution(tmp_path: Path) -> None:
         environ=environ,
     ):
         family_token = environ[attribution.PYTEST_FAMILY_TOKEN_ENV]
-    forged = fragments / f".coverage.aoi1.{family_token}.forged"
+    forged = fragments / f".coverage.aoi2.{family_token}.forged"
     forged.write_bytes(b"invalid")
     output = io.StringIO()
     assert attribution.report_invalid_fragment_attribution(
@@ -455,7 +469,7 @@ def test_reporter_rejects_linked_metadata_subdirectories(
     linked_directory: str,
 ) -> None:
     fragments, metadata, _, _, producer_id = _bound_producer(tmp_path)
-    fragment = fragments / f".coverage.aoi1.{producer_id}.invalid"
+    fragment = fragments / f".coverage.aoi2.{producer_id}.invalid"
     fragment.write_bytes(b"invalid")
     original = metadata / linked_directory
     outside = tmp_path / f"outside-{linked_directory}"
@@ -570,6 +584,7 @@ def test_startup_attribution_preserves_public_coverage_measurement(tmp_path: Pat
 
             from coverage import Coverage
             from scripts.coverage_fragment_attribution import (
+                COVERAGE_CONFIG_ENV,
                 COVERAGE_FILE_BASE_ENV,
                 METADATA_ROOT_ENV,
                 prepare_subprocess_coverage_attribution,
@@ -584,7 +599,7 @@ def test_startup_attribution_preserves_public_coverage_measurement(tmp_path: Pat
                 metadata.mkdir()
                 fragments.mkdir()
                 environ = {
-                    "COVERAGE_PROCESS_START": "probe-config",
+                    COVERAGE_CONFIG_ENV: str(root / ".coveragerc"),
                     COVERAGE_FILE_BASE_ENV: str(fragments / ".coverage"),
                     METADATA_ROOT_ENV: str(metadata),
                 }
@@ -628,14 +643,21 @@ def test_startup_attribution_preserves_public_coverage_measurement(tmp_path: Pat
         encoding="utf-8",
     )
     child_env = dict(os.environ)
+    child_env[attribution.CURRENT_PRODUCER_ENV] = "e" * 64
+    child_env[fork_runtime.RUNTIME_PREFIX_ENV] = str(Path(sys.prefix).resolve())
     for name in (
         "COVERAGE_PROCESS_START",
+        attribution.COVERAGE_CONFIG_ENV,
         "COVERAGE_FILE",
         attribution.COVERAGE_FILE_BASE_ENV,
         attribution.METADATA_ROOT_ENV,
         attribution.PYTEST_FAMILY_TOKEN_ENV,
+        attribution.CURRENT_PRODUCER_ENV,
+        fork_runtime.RUNTIME_PREFIX_ENV,
     ):
         child_env.pop(name, None)
+    assert attribution.CURRENT_PRODUCER_ENV not in child_env
+    assert fork_runtime.RUNTIME_PREFIX_ENV not in child_env
     child_env["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(ROOT / "src")))
 
     def run(mode: str) -> object:
@@ -655,28 +677,23 @@ def test_startup_attribution_preserves_public_coverage_measurement(tmp_path: Pat
     assert len(tuple((tmp_path / "attributed" / "covmeta" / "processes").glob("*.json"))) == 1
 
 
-def test_sitecustomize_receipt_failure_preserves_original_coverage_startup(
+def test_sitecustomize_receipt_failure_exits_without_coverage_fragment(
     tmp_path: Path,
 ) -> None:
-    coverage = pytest.importorskip("coverage")
+    pytest.importorskip("coverage")
     site = tmp_path / "site"
     fragments = tmp_path / "covdata"
     temp_root = tmp_path / "runner-temp"
     site.mkdir()
     fragments.mkdir()
     temp_root.mkdir()
-    shutil.copyfile(
-        ROOT / "scripts" / "coverage_fragment_attribution.py",
-        site / "aoi_coverage_fragment_attribution.py",
+    copies = (
+        ("coverage_fork_runtime.py", "aoi_coverage_fork_runtime.py"),
+        ("coverage_fragment_attribution.py", "aoi_coverage_fragment_attribution.py"),
+        ("coverage_sitecustomize.py", "sitecustomize.py"),
     )
-    (site / "sitecustomize.py").write_text(
-        "from aoi_coverage_fragment_attribution import "
-        "attempt_subprocess_coverage_attribution\n"
-        "attempt_subprocess_coverage_attribution()\n"
-        "import coverage\n"
-        "coverage.process_startup()\n",
-        encoding="utf-8",
-    )
+    for source, target in copies:
+        shutil.copyfile(ROOT / "scripts" / source, site / target)
     child_env = dict(os.environ)
     child_env.update(
         {
@@ -684,100 +701,19 @@ def test_sitecustomize_receipt_failure_preserves_original_coverage_startup(
             attribution.COVERAGE_FILE_BASE_ENV: str(fragments / ".coverage"),
             attribution.METADATA_ROOT_ENV: str(tmp_path / "missing-metadata"),
             "COVERAGE_FILE": str(fragments / ".coverage"),
-            "COVERAGE_PROCESS_START": str(ROOT / ".coveragerc"),
-            "PYTHONPATH": os.pathsep.join((str(site), str(ROOT / "src"), str(ROOT))),
+            attribution.COVERAGE_CONFIG_ENV: str(ROOT / ".coveragerc"),
+            "PYTHONPATH": os.pathsep.join((str(site), str(ROOT / "src"))),
         }
     )
     child_env.pop(attribution.PYTEST_FAMILY_TOKEN_ENV, None)
-    subprocess.run(
+    completed = subprocess.run(
         [sys.executable, "-c", "import aoi_orgware.company.contracts"],
         cwd=ROOT,
         env=child_env,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
-    shards = tuple(fragments.glob(".coverage.*"))
-    assert shards
-    assert all(
-        attribution._fragment_reader_failure_stage(shard, coverage.CoverageData) is None
-        for shard in shards
-    )
+    assert completed.returncode == 97
+    assert tuple(fragments.glob(".coverage.*")) == ()
     assert not (tmp_path / "missing-metadata").exists()
-
-
-def _coverage_job(workflow: str) -> str:
-    match = re.search(
-        r"^  coverage:\n(?P<body>.*?)(?=^  [a-z][a-z0-9-]+:\n|\Z)",
-        workflow,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    assert match
-    return match.group("body")
-
-
-def _assert_attribution_workflow(workflow: str) -> None:
-    job = _coverage_job(workflow)
-    startup = job.index("      - name: Enable subprocess coverage\n")
-    suite = job.index("      - name: Run suite under coverage\n")
-    combine = job.index("      - name: Combine coverage fragments\n")
-    floor = job.index("      - name: Enforce coverage floor\n")
-    report = job.index("      - name: Report coverage fragment attribution\n")
-    assert startup < suite < combine < floor < report
-    assert (
-        'cp scripts/coverage_fragment_attribution.py '
-        '"$SITE/aoi_coverage_fragment_attribution.py"'
-    ) in job
-    startup_call = "attempt_subprocess_coverage_attribution()\\n"
-    coverage_call = "coverage.process_startup()\\n"
-    startup_call_index = job.find(startup_call)
-    coverage_call_index = job.find(coverage_call)
-    assert 0 <= startup_call_index < coverage_call_index
-    assert job.count(
-        "AOI_COVERAGE_FILE_BASE: ${{ github.workspace }}/covdata/.coverage"
-    ) == 1
-    assert job.count(
-        "AOI_COVERAGE_METADATA_ROOT: ${{ runner.temp }}/aoi-coverage-metadata"
-    ) == 2
-    assert 'umask 077\n          mkdir -p covdata "$AOI_COVERAGE_METADATA_ROOT"' in job
-    assert "        id: coverage_combine\n" in job
-    assert (
-        "        if: ${{ failure() && steps.coverage_combine.outcome == 'failure' }}\n"
-    ) in job
-    assert (
-        "python -m scripts.coverage_fragment_attribution report \\\n"
-        '            --fragments-root "${{ github.workspace }}/covdata" \\\n'
-        '            --metadata-root "$AOI_COVERAGE_METADATA_ROOT"'
-    ) in job
-    assert "python scripts/verify_coverage_path_mapping.py --combine-fragments covdata" in job
-    assert "python -m coverage report --fail-under=80" in job
-    for forbidden in ("continue-on-error", "rm -", "unlink", "delete", "--ignore"):
-        assert forbidden not in job
-
-
-def test_workflow_keeps_attribution_failure_only_and_non_authoritative() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text("utf-8")
-    _assert_attribution_workflow(workflow)
-    variants = (
-        workflow.replace("attempt_subprocess_coverage_attribution()\\n", "", 1),
-        workflow.replace(
-            "failure() && steps.coverage_combine.outcome == 'failure'",
-            "always()",
-            1,
-        ),
-        workflow.replace(
-            "${{ runner.temp }}/aoi-coverage-metadata",
-            "${{ github.workspace }}/covmeta",
-        ),
-        workflow.replace("        id: coverage_combine\n", "        id: other\n", 1),
-        workflow.replace(
-            "          python -m scripts.coverage_fragment_attribution report",
-            "          rm -f covdata/.coverage.bad\n"
-            "          python -m scripts.coverage_fragment_attribution report",
-            1,
-        ),
-    )
-    for weakened in variants:
-        assert weakened != workflow
-        with pytest.raises(AssertionError):
-            _assert_attribution_workflow(weakened)
