@@ -43,6 +43,7 @@ from aoi_orgware import semantic_events as semantic_events_impl  # noqa: E402
 
 CLI_MODULE = "aoi_orgware.cli"
 HOOK_MODULE = "aoi_orgware.codex_hook"
+render_compact = h._render_checkpoint_snapshot
 
 from tests.harness_case import HarnessTestCase  # noqa: E402
 from tests.test_commands_codex_onboarding import (  # noqa: E402
@@ -2650,11 +2651,11 @@ class LockTests(HarnessTestCase):
 
     def test_host_lock_drive_colon_allowed_but_second_colon_rejected(self) -> None:
         self.assertEqual(
-            h.normalize_lock("host:file:C:/Users/x/file.py"),
-            "host:file:C:/users/x/file.py",
+            h.normalize_lock("host:file:C:/SyntheticProfile/x/file.py"),
+            "host:file:C:/syntheticprofile/x/file.py",
         )
         with self.assertRaises(h.HarnessError):
-            h.normalize_lock("host:file:C:/Users/x:y.py")
+            h.normalize_lock("host:file:C:/SyntheticProfile/x:y.py")
 
 
 class LifecycleTests(HarnessTestCase):
@@ -2896,7 +2897,7 @@ class LifecycleTests(HarnessTestCase):
         state["claims"].append("active-claim")
 
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         canonical = json.dumps(
             sorted(terminal_claims, key=lambda claim: claim["token"]),
             ensure_ascii=False,
@@ -2941,9 +2942,8 @@ class LifecycleTests(HarnessTestCase):
         changed = json.loads(first_path.read_text(encoding="utf-8"))
         changed["intent"] = "changed terminal claim content"
         h.atomic_write_json(first_path, changed)
-        changed_rendered = h.render_checkpoint(
-            paths,
-            state,
+        changed_rendered = render_compact(
+            paths, state,
             compact_terminal_detail=True,
         )
         self.assertNotEqual(rendered, changed_rendered)
@@ -2956,7 +2956,7 @@ class LifecycleTests(HarnessTestCase):
         ]
         for token in state["claims"][retained_terminal_count:-1]:
             (paths.claims_archive / f"{token}.json").unlink()
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below_threshold,
             compact_terminal_detail=True,
@@ -3208,7 +3208,7 @@ class LifecycleTests(HarnessTestCase):
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
         full = h.render_checkpoint(paths, state)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         canonical = json.dumps(
             state["facts"],
             ensure_ascii=False,
@@ -3231,12 +3231,12 @@ class LifecycleTests(HarnessTestCase):
         changed["facts"][0] = "changed-established-fact"
         self.assertNotEqual(
             rendered,
-            h.render_checkpoint(paths, changed, compact_terminal_detail=True),
+            render_compact(paths, changed, compact_terminal_detail=True),
         )
 
         below = json.loads(json.dumps(state))
         below["facts"] = state["facts"][: h.COMPACT_FACT_HISTORY_THRESHOLD - 1]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below,
             compact_terminal_detail=True,
@@ -3282,7 +3282,7 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         terminal = state["verification"][:-1]
         canonical = json.dumps(
             terminal,
@@ -3315,7 +3315,7 @@ class LifecycleTests(HarnessTestCase):
         changed["verification"][0]["boundary"] = "changed-boundary"
         self.assertNotEqual(
             rendered,
-            h.render_checkpoint(paths, changed, compact_terminal_detail=True),
+            render_compact(paths, changed, compact_terminal_detail=True),
         )
 
         below = json.loads(json.dumps(state))
@@ -3323,7 +3323,7 @@ class LifecycleTests(HarnessTestCase):
             *terminal[: h.COMPACT_VERIFICATION_HISTORY_THRESHOLD - 1],
             state["verification"][-1],
         ]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below,
             compact_terminal_detail=True,
@@ -3375,7 +3375,7 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         terminal = state["jobs"][:-1]
         canonical = json.dumps(
             terminal,
@@ -3406,7 +3406,7 @@ class LifecycleTests(HarnessTestCase):
         changed["jobs"][0]["evidence"] = "changed-evidence"
         self.assertNotEqual(
             rendered,
-            h.render_checkpoint(paths, changed, compact_terminal_detail=True),
+            render_compact(paths, changed, compact_terminal_detail=True),
         )
 
         below = json.loads(json.dumps(state))
@@ -3414,7 +3414,7 @@ class LifecycleTests(HarnessTestCase):
             *terminal[: h.COMPACT_JOB_HISTORY_THRESHOLD - 1],
             state["jobs"][-1],
         ]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below,
             compact_terminal_detail=True,
@@ -3461,7 +3461,7 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         terminal = state["packets"][:-1]
         canonical = json.dumps(
             terminal,
@@ -3484,7 +3484,7 @@ class LifecycleTests(HarnessTestCase):
 
         changed = json.loads(json.dumps(state))
         changed["packets"][0]["summary"] = "changed-summary"
-        changed_rendered = h.render_checkpoint(
+        changed_rendered = render_compact(
             paths,
             changed,
             compact_terminal_detail=True,
@@ -3496,7 +3496,7 @@ class LifecycleTests(HarnessTestCase):
             *terminal[: h.COMPACT_PACKET_HISTORY_THRESHOLD - 1],
             state["packets"][-1],
         ]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below_threshold,
             compact_terminal_detail=True,
@@ -3531,7 +3531,7 @@ class LifecycleTests(HarnessTestCase):
             }
         )
         paths = h.get_paths(self.root)
-        compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        compact = render_compact(paths, state, compact_terminal_detail=True)
         compact_bytes = len(compact.encode("utf-8"))
         self.assertGreater(compact_bytes, h.CHECKPOINT_COMPACT_THRESHOLD_BYTES)
         self.assertLessEqual(compact_bytes, h.CHECKPOINT_MAX_BYTES)
@@ -3599,7 +3599,7 @@ class LifecycleTests(HarnessTestCase):
         self.cli_in_process(*claim_args, "--allow-nonexistent")
         paths = h.get_paths(self.root)
         state = h.load_task(paths, "active-claim-oversized-checkpoint")
-        compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        compact = render_compact(paths, state, compact_terminal_detail=True)
         for lock in locks:
             self.assertIn(lock, compact)
         with self.assertRaisesRegex(

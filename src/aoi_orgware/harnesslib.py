@@ -32,6 +32,12 @@ from .config import (
     ProjectConfig,
     load_config,
 )
+from .checkpoint_compaction import (
+    checkpoint_compaction_marker,
+    compact_fact_history,
+    first_fitting_text,
+    snapshot_exact_json_object,
+)
 
 
 SCHEMA_VERSION = 1
@@ -4432,31 +4438,6 @@ def validate_task_claim_references(
         )
 
 
-def _checkpoint_compaction_marker(
-    label: str,
-    records: list[dict[str, Any]],
-    compact_statuses: set[str],
-    omitted_fields_per_record: int,
-) -> str:
-    compact_count = sum(
-        str(record.get("status")) in compact_statuses for record in records
-    )
-    full_count = len(records) - compact_count
-    status_counts: dict[str, int] = {}
-    for record in records:
-        status = str(record.get("status") or "missing")
-        status_counts[status] = status_counts.get(status, 0) + 1
-    counts = ",".join(
-        f"{status}={status_counts[status]}" for status in sorted(status_counts)
-    ) or "none"
-    return (
-        f"Terminal-detail fallback for {label}: total={len(records)}; "
-        f"full_detail={full_count}; compact_detail={compact_count}; "
-        f"omitted_field_slots={compact_count * omitted_fields_per_record}; "
-        f"status_counts={counts}; complete records remain in state.json"
-    )
-
-
 def _compact_claim_reference(
     paths: HarnessPaths,
     claim: dict[str, Any],
@@ -4680,29 +4661,6 @@ def _compact_terminal_job_history(
     )
 
 
-def _compact_fact_history(
-    paths: HarnessPaths,
-    state: dict[str, Any],
-    facts: list[str],
-) -> str | None:
-    if len(facts) < COMPACT_FACT_HISTORY_THRESHOLD:
-        return None
-
-    canonical = json.dumps(
-        facts,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.sha256(canonical).hexdigest()
-    recent_count = min(len(facts), COMPACT_FACT_RECENT_TAIL)
-    return (
-        f"Established fact history: count={len(facts)}; "
-        f"history_sha256={digest}; "
-        f"record={_task_state_record_reference(paths, state, 'facts')}; "
-        f"recent_verbatim={recent_count}"
-    )
-
-
 def _compact_packet_result_reference(
     paths: HarnessPaths,
     state: dict[str, Any],
@@ -4780,12 +4738,21 @@ def _compact_terminal_packet_history(
     )
 
 
-def render_checkpoint(
+def _snapshot_checkpoint_state(state: object) -> dict[str, Any]:
+    try:
+        return snapshot_exact_json_object(state)
+    except TypeError as exc:
+        raise HarnessError(str(exc)) from exc
+
+
+def _render_checkpoint_snapshot(
     paths: HarnessPaths,
     state: dict[str, Any],
     *,
     compact_terminal_detail: bool = False,
+    compact_fact_recent_tail: int | None = None,
 ) -> str:
+    facts = list(state.get("facts", []))
     validate_task_claim_references(paths, state)
     for packet in state.get("packets", []):
         if packet.get("status") in ACTIVE_PACKET_STATUSES:
@@ -4821,7 +4788,7 @@ def render_checkpoint(
             claim_lines.insert(0, compact_claim_history)
         claim_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            checkpoint_compaction_marker(
                 "claims",
                 claims,
                 TERMINAL_CLAIM_STATUSES,
@@ -4867,7 +4834,7 @@ def render_checkpoint(
             verification_lines.insert(0, compact_verification_history)
         verification_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            checkpoint_compaction_marker(
                 "verification",
                 verification,
                 ACCOUNTED_VERIFICATION_STATUSES,
@@ -4908,7 +4875,7 @@ def render_checkpoint(
             job_lines.insert(0, compact_job_history)
         job_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            checkpoint_compaction_marker(
                 "jobs",
                 jobs,
                 terminal_job_statuses,
@@ -4949,7 +4916,7 @@ def render_checkpoint(
             packet_lines.insert(0, compact_packet_history)
         packet_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            checkpoint_compaction_marker(
                 "packets",
                 packets,
                 terminal_packet_statuses,
@@ -4981,16 +4948,11 @@ def render_checkpoint(
         if lane.get("status") in {"active", "waiting", "recovering", "blocked"}
     ]
     engaged_lanes.sort(key=lambda item: str(item.get("lane_id", "")))
-    lane_limit = 4 if compact_terminal_detail else 12
     lane_lines = [
         f"{lane.get('lane_id')} [{lane.get('status')}], rev={lane.get('revision')}, "
         f"owner={lane.get('owner')}, next={lane.get('next_action') or 'not recorded'}"
-        for lane in engaged_lanes[:lane_limit]
+        for lane in engaged_lanes
     ]
-    if len(engaged_lanes) > lane_limit:
-        lane_lines.append(
-            f"{len(engaged_lanes) - lane_limit} additional engaged lanes omitted; see state.json"
-        )
     active_coordination = sum(
         request.get("status") not in {"rejected", "resolved", "superseded"}
         for request in state.get("coordination_requests", [])
@@ -5047,17 +5009,25 @@ def render_checkpoint(
         *(f"BLOCKER: {item}" for item in state.get("blockers", [])),
         *open_risk_lines,
     ]
-    facts = list(state.get("facts", []))
-    compact_fact_history = (
-        _compact_fact_history(paths, state, facts)
+    fact_history_summary = (
+        compact_fact_history(
+            facts,
+            minimum_count=COMPACT_FACT_HISTORY_THRESHOLD,
+            recent_tail=(
+                COMPACT_FACT_RECENT_TAIL
+                if compact_fact_recent_tail is None
+                else compact_fact_recent_tail
+            ),
+            state_record_ref=_task_state_record_reference(paths, state, "facts"),
+        )
         if compact_terminal_detail
         else None
     )
     fact_lines = facts
-    if compact_fact_history is not None:
+    if fact_history_summary is not None:
         fact_lines = [
-            compact_fact_history,
-            *facts[-COMPACT_FACT_RECENT_TAIL:],
+            fact_history_summary.marker,
+            *fact_history_summary.recent,
         ]
     return (
         f"# Checkpoint — {state['task_id']}\n\n"
@@ -5102,13 +5072,40 @@ def render_checkpoint(
     )
 
 
+def render_checkpoint(paths: HarnessPaths, state: dict[str, Any]) -> str:
+    """Render the complete checkpoint; compaction is prepare-only policy."""
+
+    return _render_checkpoint_snapshot(paths, _snapshot_checkpoint_state(state))
+
+
 def prepare_checkpoint(
     paths: HarnessPaths, state: dict[str, Any]
 ) -> tuple[Path, str, str]:
-    destination = task_dir(paths, state["task_id"]) / "checkpoint.md"
-    text = render_checkpoint(paths, state)
-    if len(text.encode("utf-8")) > CHECKPOINT_COMPACT_THRESHOLD_BYTES:
-        text = render_checkpoint(paths, state, compact_terminal_detail=True)
+    snapshot = _snapshot_checkpoint_state(state)
+    destination = task_dir(paths, snapshot["task_id"]) / "checkpoint.md"
+    full_text = _render_checkpoint_snapshot(paths, snapshot)
+    full_bytes = len(full_text.encode("utf-8"))
+    full_over_max = full_bytes > CHECKPOINT_MAX_BYTES
+    text = full_text
+    if full_bytes > CHECKPOINT_COMPACT_THRESHOLD_BYTES:
+        compact_text = _render_checkpoint_snapshot(
+            paths, snapshot, compact_terminal_detail=True
+        )
+        if full_over_max or len(compact_text.encode("utf-8")) <= CHECKPOINT_MAX_BYTES:
+            text = compact_text
+    if full_over_max and len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
+        fitted = first_fitting_text(
+            render=lambda recent_tail: _render_checkpoint_snapshot(
+                paths,
+                snapshot,
+                compact_terminal_detail=True,
+                compact_fact_recent_tail=recent_tail,
+            ),
+            highest_recent_tail=COMPACT_FACT_RECENT_TAIL - 1,
+            max_bytes=CHECKPOINT_MAX_BYTES,
+        )
+        if fitted is not None:
+            text = fitted
     if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
         raise HarnessError(
             "checkpoint exceeds 32 KiB hard ceiling; summarize facts/evidence and keep raw logs outside state"
