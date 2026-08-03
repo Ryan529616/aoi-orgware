@@ -13,6 +13,7 @@ from aoi_orgware.company import service as service_module
 from aoi_orgware.company.service import (
     CompanyServiceOperationError,
     dispatch_service_department,
+    service_status,
 )
 from aoi_orgware.company.supervisor import CompanySupervisor
 from tests.company_v05.test_company_service_chief import (
@@ -151,18 +152,32 @@ def test_resident_dispatch_admits_three_departments_and_replays_exactly(
                 encoding="utf-8",
             ),
         )
+        status_before = service_status(slot, runtime_root=runtime)
+        assert status_before["state"] == "running"
+        assert (
+            status_before["status"]["service_instance_id"]
+            == descriptor["service_instance_id"]
+        )
         request = Request(
             str(descriptor["control_url"]) + "/control/v1/departments/dispatch",
-            data=b"{}",
             method="POST",
             headers={
                 "Authorization": f"Bearer {telemetry_capability['bearer_token']}",
-                "Content-Type": "application/json",
             },
         )
         with pytest.raises(HTTPError) as forbidden:
             urlopen(request, timeout=3.0)  # noqa: S310 - verified loopback descriptor
         assert forbidden.value.code == 403
+        status_after = service_status(slot, runtime_root=runtime)
+        assert status_after["state"] == "running"
+        assert (
+            status_after["status"]["service_instance_id"]
+            == status_before["status"]["service_instance_id"]
+        )
+        assert (
+            status_after["status"]["cursor"]
+            == status_before["status"]["cursor"]
+        )
 
 
 def test_department_dispatch_resumes_from_enqueue_only_after_service_restart(
