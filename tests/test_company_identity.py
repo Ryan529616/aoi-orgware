@@ -81,9 +81,9 @@ def _common_identity(path: Path) -> dict[str, str]:
 
 
 def test_state_roots_require_explicit_platform_and_external_base() -> None:
-    assert company_state_root("company-1", platform="windows", environ={"LOCALAPPDATA": r"C:\\Users\\alice\\AppData\\Local"}).as_posix().endswith("AOI/companies/company-1")
+    assert company_state_root("company-1", platform="windows", environ={"LOCALAPPDATA": r"C:\\S"}).as_posix().endswith("AOI/companies/company-1")
     assert company_state_root("company-1", platform="posix", environ={"XDG_STATE_HOME": "/var/state"}).as_posix() == "/var/state/aoi/companies/company-1"
-    assert company_state_root("company-1", platform="posix", environ={"HOME": "/home/alice"}).as_posix() == "/home/alice/.local/state/aoi/companies/company-1"
+    assert company_state_root("company-1", platform="posix", environ={"HOME": "/s"}).as_posix() == "/s/.local/state/aoi/companies/company-1"
     with pytest.raises(CompanyIdentityError, match="platform"):
         company_state_root("company-1", platform="", environ={})
     with pytest.raises(CompanyIdentityError, match="LOCALAPPDATA"):
@@ -316,11 +316,7 @@ def test_git_subprocess_capture_is_memory_bounded(
     monkeypatch.setattr(_IDENTITY_MODULE, "_MAX_GIT_OUTPUT_BYTES", 64)
     with pytest.raises(CompanyIdentityError, match="output exceeds bound"):
         _IDENTITY_MODULE._run_bounded_command(
-            [
-                sys.executable,
-                "-c",
-                "import os; os.write(1, b'x' * 65)",
-            ],
+            [sys.executable, "-S", "-c", "import os; os.write(1, b'x' * 65)"],
             label="run bounded-output canary",
         )
 

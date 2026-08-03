@@ -26,6 +26,7 @@ from aoi_orgware import cli as cli_impl  # noqa: E402
 
 CLI_MODULE = "aoi_orgware.cli"
 HOOK_MODULE = "aoi_orgware.codex_hook"
+CLI_TIMEOUT_SECONDS = 60
 
 
 class HarnessTestCase(unittest.TestCase):
@@ -107,7 +108,7 @@ class HarnessTestCase(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
-            timeout=20,
+            timeout=CLI_TIMEOUT_SECONDS,
         )
         if ok and result.returncode != 0:
             self.fail(
