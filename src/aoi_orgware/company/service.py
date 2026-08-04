@@ -80,14 +80,7 @@ from .ledger import (
     LedgerConflictError,
     LedgerError,
 )
-from .legacy_bridge_control_protocol import (
-    LEGACY_BRIDGE_PRESTART_RESULT_SCHEMA,
-    MAX_LEGACY_BRIDGE_PRESTART_CONTROL_BYTES,
-    LegacyBridgeControlProtocolError,
-    LegacyBridgePrestartQueryCommand,
-    derive_legacy_bridge_prestart_response,
-    parse_legacy_bridge_prestart_query,
-)
+from . import legacy_bridge_service_control as _legacy_bridge_control
 from .process_lock import CompanyProcessLockBusyError
 from .resident_time import ResidentLogicalEventClock
 from .sanitized_export import verify_sanitized_export
@@ -126,15 +119,13 @@ _MAX_CONTROL_QUEUE = 64
 _CONTROL_QUEUE_RESERVE = 4
 _CONTROL_OPERATION_TIMEOUT_SECONDS = 30.0
 _MAX_CONTROL_JSON_DEPTH = 16
+_LBC = _legacy_bridge_control
 _CHIEF_TAKEOVER_PREPARE_ROUTE = "/control/v1/chief-takeover/prepare"
 _CHIEF_TAKEOVER_CONSUME_ROUTE = "/control/v1/chief-takeover/consume"
 _DEPARTMENT_DISPATCH_ROUTE = "/control/v1/departments/dispatch"
 _WORK_DEFINITION_REGISTER_ROUTE = "/control/v1/work-definitions/register"
 _WORK_DEFINITION_ENFORCEMENT_ROUTE = (
     "/control/v1/work-definitions/enforcement/activate"
-)
-_LEGACY_BRIDGE_PRESTART_QUERY_ROUTE = (
-    "/control/v1/legacy-bridge/prestart/query"
 )
 _MAX_WORK_DEFINITION_CONTROL_BODY_BYTES = 1024 * 1024
 _CHIEF_CAPABILITY_TTL = timedelta(minutes=15)
@@ -315,7 +306,7 @@ _ControlCommand = (
     | DepartmentDispatchCommand
     | WorkDefinitionRegisterCommand
     | WorkDefinitionEnforcementActivateCommand
-    | LegacyBridgePrestartQueryCommand
+    | _LBC.LegacyBridgeResidentCommand
 )
 
 
@@ -2583,8 +2574,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
             _DEPARTMENT_DISPATCH_ROUTE,
             _WORK_DEFINITION_REGISTER_ROUTE,
             _WORK_DEFINITION_ENFORCEMENT_ROUTE,
-            _LEGACY_BRIDGE_PRESTART_QUERY_ROUTE,
-        }:
+        } | _LBC.LEGACY_BRIDGE_CONTROL_ROUTES:
             if not self._authenticated(self.server.service.bearer_token):
                 self._reply(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
@@ -2596,8 +2586,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
                             _WORK_DEFINITION_REGISTER_ROUTE,
                             _WORK_DEFINITION_ENFORCEMENT_ROUTE,
                         }
-                        else MAX_LEGACY_BRIDGE_PRESTART_CONTROL_BYTES
-                        if self.path == _LEGACY_BRIDGE_PRESTART_QUERY_ROUTE
+                        else _LBC.legacy_bridge_control_body_limit(
+                            self.path,
+                        )
+                        if self.path in _LBC.LEGACY_BRIDGE_CONTROL_ROUTES
                         else _MAX_CONTROL_BODY_BYTES
                     ),
                 )
@@ -2621,9 +2613,12 @@ class _ControlHandler(BaseHTTPRequestHandler):
                                 parse_work_definition_register(value),
                             )
                         )
-                    elif self.path == _LEGACY_BRIDGE_PRESTART_QUERY_ROUTE:
-                        response = self.server.service.submit_legacy_bridge_prestart(
-                            parse_legacy_bridge_prestart_query(value),
+                    elif self.path in _LBC.LEGACY_BRIDGE_CONTROL_ROUTES:
+                        response = self.server.service.submit_legacy_bridge_control(
+                            _LBC.parse_legacy_bridge_control_request(
+                                self.path,
+                                value,
+                            ).command,
                         )
                     else:
                         response = (
@@ -2638,7 +2633,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
                     ChiefControlProtocolError,
                     DepartmentControlProtocolError,
                     WorkDefinitionControlProtocolError,
-                    LegacyBridgeControlProtocolError,
+                    _LBC.LegacyBridgeServiceControlError,
                 ) as exc:
                     raise _ControlRequestError(
                         HTTPStatus.BAD_REQUEST,
@@ -2899,37 +2894,39 @@ class _ResidentService:
 
         return self._submit_operation(command, operation="work_definition_enforcement")
 
-    def submit_legacy_bridge_prestart(
+    def submit_legacy_bridge_control(
         self,
-        command: LegacyBridgePrestartQueryCommand,
+        command: _LBC.LegacyBridgeResidentCommand,
     ) -> dict[str, Any]:
-        return self._submit_operation(
-            command,
-            mutation=False,
-            operation="legacy_bridge_prestart",
-        )
+        mutation, operation = _LBC.legacy_bridge_control_spec(command)
+        return self._submit_operation(command, mutation=mutation, operation=operation)
 
-    def _execute_legacy_bridge_prestart(
+    submit_legacy_bridge_prestart = submit_legacy_bridge_control
+
+    def _execute_legacy_bridge_control(
         self,
         pending: _PendingControlOperation,
     ) -> None:
         supervisor = self._supervisor
-        command = cast(LegacyBridgePrestartQueryCommand, pending.command)
+        command = cast(_LBC.LegacyBridgeResidentCommand, pending.command)
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
             pending.error_code = "service_stopping"
             pending.done.set()
             return
         try:
-            pending.response = derive_legacy_bridge_prestart_response(
-                supervisor._state, command,
-            ).as_dict()
-        except CompanyStateError:
-            pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
-            pending.error_code = "legacy_bridge_prestart_unavailable"
-        except Exception:
-            pending.error_status = HTTPStatus.INTERNAL_SERVER_ERROR
-            pending.error_code = "legacy_bridge_prestart_failed"
+            pending.response = _LBC.derive_legacy_bridge_resident_response(
+                supervisor,
+                command,
+            )
+        except _LBC.LegacyBridgeServiceExecutionError as exc:
+            pending.error_status = exc.status
+            pending.error_code = exc.code
+            pending.error_effect = exc.effect
+            pending.error_cursor = exc.cursor
+            if exc.cursor is not None:
+                with self._status_lock:
+                    self._cursor = max(self._cursor or 0, exc.cursor)
         finally:
             pending.done.set()
 
@@ -3994,11 +3991,10 @@ class _ResidentService:
                         WorkDefinitionEnforcementActivateCommand,
                     ):
                         self._execute_work_definition_enforcement(pending)
-                    elif isinstance(
+                    elif _LBC.is_legacy_bridge_control_command(
                         pending.command,
-                        LegacyBridgePrestartQueryCommand,
                     ):
-                        self._execute_legacy_bridge_prestart(pending)
+                        self._execute_legacy_bridge_control(pending)
                     else:
                         pending.error_status = HTTPStatus.INTERNAL_SERVER_ERROR
                         pending.error_code = "unsupported_control_command"
