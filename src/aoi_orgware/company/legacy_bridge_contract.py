@@ -407,16 +407,51 @@ def _validate_projection_runtime_types(
             _fail("legacy bridge projection receipt ref has an invalid runtime type")
 
 
-def _scope_id(projection: LegacyBridgeProjectionV1) -> str:
+def legacy_bridge_scope_id(
+    key: LegacyBridgeCompanyKey,
+    *,
+    legacy_archive_sha256: str,
+    task_identity_digest: str,
+) -> str:
+    """Derive the shared observation/coverage scope without creating authority."""
+
+    if type(key) is not LegacyBridgeCompanyKey:
+        _fail("legacy bridge scope key has an invalid runtime type")
     return _digest(
         {
             "domain": "aoi.legacy-bridge.scope.v1",
-            "key": projection.key._asdict(),
-            "source_kind": projection.source_kind,
-            "legacy_archive_sha256": projection.legacy_archive_sha256,
-            "task_identity_digest": projection.task_identity_digest,
+            "key": {
+                "company_id": _identifier(key.company_id, "legacy bridge company id"),
+                "company_incarnation": _integer(
+                    key.company_incarnation,
+                    "legacy company incarnation",
+                    minimum=1,
+                ),
+                "lock_domain_generation": _integer(
+                    key.lock_domain_generation,
+                    "legacy lock generation",
+                    minimum=0,
+                ),
+            },
+            "source_kind": LEGACY_BRIDGE_SOURCE_KIND,
+            "legacy_archive_sha256": _sha(
+                legacy_archive_sha256,
+                "legacy archive digest",
+            ),
+            "task_identity_digest": _sha(
+                task_identity_digest,
+                "legacy task identity digest",
+            ),
         },
         "legacy bridge scope identity",
+    )
+
+
+def _scope_id(projection: LegacyBridgeProjectionV1) -> str:
+    return legacy_bridge_scope_id(
+        projection.key,
+        legacy_archive_sha256=projection.legacy_archive_sha256,
+        task_identity_digest=projection.task_identity_digest,
     )
 
 
@@ -530,5 +565,6 @@ __all__ = [
     "LEGACY_BRIDGE_OBSERVATION_V1",
     "LegacyBridgeContractError",
     "build_legacy_bridge_observation",
+    "legacy_bridge_scope_id",
     "validate_legacy_bridge_observation",
 ]

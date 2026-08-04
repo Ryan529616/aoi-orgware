@@ -27,6 +27,10 @@ from .legacy_bridge_contract import (
     LEGACY_BRIDGE_OBSERVATION_V1,
     validate_legacy_bridge_observation,
 )
+from .legacy_bridge_health import (
+    LEGACY_BRIDGE_COVERAGE_V1,
+    validate_legacy_bridge_coverage,
+)
 
 
 Validator = Callable[[Any], dict[str, Any]]
@@ -117,6 +121,7 @@ CONTRACT_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({
     _contracts.CRYPTO_VERIFICATION_RECEIPT_V1:
         _contracts.validate_crypto_verification_receipt,
     LEGACY_BRIDGE_OBSERVATION_V1: validate_legacy_bridge_observation,
+    LEGACY_BRIDGE_COVERAGE_V1: validate_legacy_bridge_coverage,
 })
 
 SOURCE_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({

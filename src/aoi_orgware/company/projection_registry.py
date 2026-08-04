@@ -67,6 +67,7 @@ from .write_reservation import (
     WRITE_ADMISSION_ENFORCEMENT_V1,
 )
 from .legacy_bridge_contract import LEGACY_BRIDGE_OBSERVATION_V1
+from .legacy_bridge_health import LEGACY_BRIDGE_COVERAGE_V1
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +130,7 @@ _STREAM_BY_CONTRACT = {
     NEEDS_USER_V1: "alert",
     NEEDS_USER_REVISION_V1: "alert",
     LEGACY_BRIDGE_OBSERVATION_V1: "evidence",
+    LEGACY_BRIDGE_COVERAGE_V1: "evidence",
 }
 
 PROJECTABLE_STREAM: Final[Mapping[str, str]] = MappingProxyType(
@@ -264,6 +266,9 @@ _SPECS = {
     LEGACY_BRIDGE_OBSERVATION_V1: ProjectionSpec(
         "evidence", "bridge_scope_id", "observation_id",
     ),
+    LEGACY_BRIDGE_COVERAGE_V1: ProjectionSpec(
+        "evidence", "bridge_scope_id", "assessment_id",
+    ),
 }
 
 if {
@@ -315,6 +320,7 @@ LOGICAL_ID_FIELDS: Final[Mapping[str, str]] = MappingProxyType({
     PROVIDER_WORKER_OPERATION_V1: "operation_id",
     PROVIDER_TURN_RESULT_RECEIPT_V1: "result_receipt_id",
     LEGACY_BRIDGE_OBSERVATION_V1: "bridge_scope_id",
+    LEGACY_BRIDGE_COVERAGE_V1: "bridge_scope_id",
 })
 
 APPEND_ONCE_WORK_DEFINITION_TYPES: Final[frozenset[str]] = frozenset({
