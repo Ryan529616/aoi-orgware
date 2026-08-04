@@ -23,6 +23,10 @@ from .write_reservation import (
     validate_work_write_capability,
     validate_write_admission_enforcement,
 )
+from .legacy_bridge_contract import (
+    LEGACY_BRIDGE_OBSERVATION_V1,
+    validate_legacy_bridge_observation,
+)
 
 
 Validator = Callable[[Any], dict[str, Any]]
@@ -112,6 +116,7 @@ CONTRACT_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({
     _contracts.BACKUP_ENVELOPE_V1: _contracts.validate_backup_envelope,
     _contracts.CRYPTO_VERIFICATION_RECEIPT_V1:
         _contracts.validate_crypto_verification_receipt,
+    LEGACY_BRIDGE_OBSERVATION_V1: validate_legacy_bridge_observation,
 })
 
 SOURCE_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({
