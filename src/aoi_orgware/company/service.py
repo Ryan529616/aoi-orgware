@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import (
@@ -80,6 +80,14 @@ from .ledger import (
     LedgerConflictError,
     LedgerError,
 )
+from .legacy_bridge_control_protocol import (
+    LEGACY_BRIDGE_PRESTART_RESULT_SCHEMA,
+    MAX_LEGACY_BRIDGE_PRESTART_CONTROL_BYTES,
+    LegacyBridgeControlProtocolError,
+    LegacyBridgePrestartQueryCommand,
+    derive_legacy_bridge_prestart_response,
+    parse_legacy_bridge_prestart_query,
+)
 from .process_lock import CompanyProcessLockBusyError
 from .resident_time import ResidentLogicalEventClock
 from .sanitized_export import verify_sanitized_export
@@ -124,6 +132,9 @@ _DEPARTMENT_DISPATCH_ROUTE = "/control/v1/departments/dispatch"
 _WORK_DEFINITION_REGISTER_ROUTE = "/control/v1/work-definitions/register"
 _WORK_DEFINITION_ENFORCEMENT_ROUTE = (
     "/control/v1/work-definitions/enforcement/activate"
+)
+_LEGACY_BRIDGE_PRESTART_QUERY_ROUTE = (
+    "/control/v1/legacy-bridge/prestart/query"
 )
 _MAX_WORK_DEFINITION_CONTROL_BODY_BYTES = 1024 * 1024
 _CHIEF_CAPABILITY_TTL = timedelta(minutes=15)
@@ -297,85 +308,31 @@ class _TelemetryIngestCommand:
     raw_sha256: str
 
 
-@dataclass
-class _PendingTelemetryIngest:
-    command: _TelemetryIngestCommand
-    done: threading.Event = field(default_factory=threading.Event)
-    response: dict[str, Any] | None = None
-    error_status: HTTPStatus | None = None
-    error_code: str | None = None
-    error_effect: str | None = None
-    error_cursor: int | None = None
-
-
-@dataclass
-class _PendingChiefPrepare:
-    command: ChiefTakeoverPrepareCommand
-    done: threading.Event = field(default_factory=threading.Event)
-    response: dict[str, Any] | None = None
-    error_status: HTTPStatus | None = None
-    error_code: str | None = None
-    error_effect: str | None = None
-    error_cursor: int | None = None
-
-
-@dataclass
-class _PendingChiefConsume:
-    command: ChiefTakeoverConsumeCommand
-    done: threading.Event = field(default_factory=threading.Event)
-    response: dict[str, Any] | None = None
-    error_status: HTTPStatus | None = None
-    error_code: str | None = None
-    error_effect: str | None = None
-    error_cursor: int | None = None
-
-
-@dataclass
-class _PendingDepartmentDispatch:
-    command: DepartmentDispatchCommand
-    done: threading.Event = field(default_factory=threading.Event)
-    response: dict[str, Any] | None = None
-    error_status: HTTPStatus | None = None
-    error_code: str | None = None
-    error_effect: str | None = None
-    error_cursor: int | None = None
-
-
-@dataclass
-class _PendingWorkDefinitionRegister:
-    command: WorkDefinitionRegisterCommand
-    done: threading.Event = field(default_factory=threading.Event)
-    response: dict[str, Any] | None = None
-    error_status: HTTPStatus | None = None
-    error_code: str | None = None
-    error_effect: str | None = None
-    error_cursor: int | None = None
-
-
-@dataclass
-class _PendingWorkDefinitionEnforcement:
-    command: WorkDefinitionEnforcementActivateCommand
-    done: threading.Event = field(default_factory=threading.Event)
-    response: dict[str, Any] | None = None
-    error_status: HTTPStatus | None = None
-    error_code: str | None = None
-    error_effect: str | None = None
-    error_cursor: int | None = None
-
-
-_PendingControlOperation = (
-    _PendingTelemetryIngest
-    | _PendingChiefPrepare
-    | _PendingChiefConsume
-    | _PendingDepartmentDispatch
-    | _PendingWorkDefinitionRegister
-    | _PendingWorkDefinitionEnforcement
+_ControlCommand = (
+    _TelemetryIngestCommand
+    | ChiefTakeoverPrepareCommand
+    | ChiefTakeoverConsumeCommand
+    | DepartmentDispatchCommand
+    | WorkDefinitionRegisterCommand
+    | WorkDefinitionEnforcementActivateCommand
+    | LegacyBridgePrestartQueryCommand
 )
 
 
-class _PrioritizedControlQueue:
-    """Bound one owner queue while allowing admin control to bypass telemetry."""
+@dataclass
+class _PendingControlOperation:
+    command: _ControlCommand
+    done: threading.Event = field(default_factory=threading.Event)
+    response: dict[str, Any] | None = None
+    error_status: HTTPStatus | None = None
+    error_code: str | None = None
+    error_effect: str | None = None
+    error_cursor: int | None = None
 
+_PendingTelemetryIngest = _PendingControlOperation
+_PendingChiefPrepare = _PendingControlOperation
+
+class _PrioritizedControlQueue:
     def __init__(self, *, maxsize: int) -> None:
         self._queue: queue.PriorityQueue[
             tuple[int, int, _PendingControlOperation | None]
@@ -386,7 +343,7 @@ class _PrioritizedControlQueue:
     def put_nowait(self, item: _PendingControlOperation | None) -> None:
         if item is None:
             priority = -1
-        elif isinstance(item, _PendingTelemetryIngest):
+        elif isinstance(item.command, _TelemetryIngestCommand):
             priority = 1
         else:
             priority = 0
@@ -2626,6 +2583,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
             _DEPARTMENT_DISPATCH_ROUTE,
             _WORK_DEFINITION_REGISTER_ROUTE,
             _WORK_DEFINITION_ENFORCEMENT_ROUTE,
+            _LEGACY_BRIDGE_PRESTART_QUERY_ROUTE,
         }:
             if not self._authenticated(self.server.service.bearer_token):
                 self._reply(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
@@ -2638,6 +2596,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
                             _WORK_DEFINITION_REGISTER_ROUTE,
                             _WORK_DEFINITION_ENFORCEMENT_ROUTE,
                         }
+                        else MAX_LEGACY_BRIDGE_PRESTART_CONTROL_BYTES
+                        if self.path == _LEGACY_BRIDGE_PRESTART_QUERY_ROUTE
                         else _MAX_CONTROL_BODY_BYTES
                     ),
                 )
@@ -2661,6 +2621,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
                                 parse_work_definition_register(value),
                             )
                         )
+                    elif self.path == _LEGACY_BRIDGE_PRESTART_QUERY_ROUTE:
+                        response = self.server.service.submit_legacy_bridge_prestart(
+                            parse_legacy_bridge_prestart_query(value),
+                        )
                     else:
                         response = (
                             self.server.service
@@ -2674,6 +2638,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
                     ChiefControlProtocolError,
                     DepartmentControlProtocolError,
                     WorkDefinitionControlProtocolError,
+                    LegacyBridgeControlProtocolError,
                 ) as exc:
                     raise _ControlRequestError(
                         HTTPStatus.BAD_REQUEST,
@@ -2791,12 +2756,7 @@ class _ResidentService:
     def _assert_command_binding(
         self,
         command: (
-            _TelemetryIngestCommand
-            | ChiefTakeoverPrepareCommand
-            | ChiefTakeoverConsumeCommand
-            | DepartmentDispatchCommand
-            | WorkDefinitionRegisterCommand
-            | WorkDefinitionEnforcementActivateCommand
+            _ControlCommand
         ),
     ) -> None:
         company = self._company_binding
@@ -2873,21 +2833,31 @@ class _ResidentService:
             )
         return pending.response
 
+    def _submit_operation(
+        self,
+        command: _ControlCommand,
+        *,
+        telemetry: bool = False,
+        mutation: bool = True,
+        operation: str,
+    ) -> dict[str, Any]:
+        self._assert_command_binding(command)
+        pending = _PendingControlOperation(command)
+        self._admit_operation(pending, telemetry=telemetry)
+        return self._await_operation(
+            pending,
+            mutation=mutation,
+            timeout_code=f"{operation}_timeout",
+            failure_code=f"{operation}_failed",
+        )
+
     def submit_telemetry(
         self,
         command: _TelemetryIngestCommand,
     ) -> dict[str, Any]:
         """Hand one bounded request to the resident owner thread."""
 
-        self._assert_command_binding(command)
-        pending = _PendingTelemetryIngest(command)
-        self._admit_operation(pending, telemetry=True)
-        return self._await_operation(
-            pending,
-            mutation=True,
-            timeout_code="ingest_timeout",
-            failure_code="ingest_failed",
-        )
+        return self._submit_operation(command, telemetry=True, operation="ingest")
 
     def submit_chief_prepare(
         self,
@@ -2895,15 +2865,7 @@ class _ResidentService:
     ) -> dict[str, Any]:
         """Serialize one fresh-user prepare on the resident owner thread."""
 
-        self._assert_command_binding(command)
-        pending = _PendingChiefPrepare(command)
-        self._admit_operation(pending, telemetry=False)
-        return self._await_operation(
-            pending,
-            mutation=False,
-            timeout_code="chief_prepare_timeout",
-            failure_code="chief_prepare_failed",
-        )
+        return self._submit_operation(command, mutation=False, operation="chief_prepare")
 
     def submit_chief_consume(
         self,
@@ -2911,15 +2873,7 @@ class _ResidentService:
     ) -> dict[str, Any]:
         """Serialize one takeover attempt on the resident owner thread."""
 
-        self._assert_command_binding(command)
-        pending = _PendingChiefConsume(command)
-        self._admit_operation(pending, telemetry=False)
-        return self._await_operation(
-            pending,
-            mutation=True,
-            timeout_code="chief_consume_timeout",
-            failure_code="chief_consume_failed",
-        )
+        return self._submit_operation(command, operation="chief_consume")
 
     def submit_department_dispatch(
         self,
@@ -2927,31 +2881,15 @@ class _ResidentService:
     ) -> dict[str, Any]:
         """Serialize a Chief-fenced department queue/admission request."""
 
-        self._assert_command_binding(command)
-        pending = _PendingDepartmentDispatch(command)
-        self._admit_operation(pending, telemetry=False)
-        return self._await_operation(
-            pending,
-            mutation=True,
-            timeout_code="department_dispatch_timeout",
-            failure_code="department_dispatch_failed",
-        )
+        return self._submit_operation(command, operation="department_dispatch")
 
     def submit_work_definition_register(
         self,
         command: WorkDefinitionRegisterCommand,
     ) -> dict[str, Any]:
-        """Serialize one Chief-fenced immutable work registration."""
+        """Serialize Chief-fenced immutable work registration."""
 
-        self._assert_command_binding(command)
-        pending = _PendingWorkDefinitionRegister(command)
-        self._admit_operation(pending, telemetry=False)
-        return self._await_operation(
-            pending,
-            mutation=True,
-            timeout_code="work_definition_register_timeout",
-            failure_code="work_definition_register_failed",
-        )
+        return self._submit_operation(command, operation="work_definition_register")
 
     def submit_work_definition_enforcement(
         self,
@@ -2959,22 +2897,48 @@ class _ResidentService:
     ) -> dict[str, Any]:
         """Serialize the one-way registered-work enforcement cutover."""
 
-        self._assert_command_binding(command)
-        pending = _PendingWorkDefinitionEnforcement(command)
-        self._admit_operation(pending, telemetry=False)
-        return self._await_operation(
-            pending,
-            mutation=True,
-            timeout_code="work_definition_enforcement_timeout",
-            failure_code="work_definition_enforcement_failed",
+        return self._submit_operation(command, operation="work_definition_enforcement")
+
+    def submit_legacy_bridge_prestart(
+        self,
+        command: LegacyBridgePrestartQueryCommand,
+    ) -> dict[str, Any]:
+        return self._submit_operation(
+            command,
+            mutation=False,
+            operation="legacy_bridge_prestart",
         )
+
+    def _execute_legacy_bridge_prestart(
+        self,
+        pending: _PendingControlOperation,
+    ) -> None:
+        supervisor = self._supervisor
+        command = cast(LegacyBridgePrestartQueryCommand, pending.command)
+        if supervisor is None or self._stop.is_set():
+            pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
+            pending.error_code = "service_stopping"
+            pending.done.set()
+            return
+        try:
+            pending.response = derive_legacy_bridge_prestart_response(
+                supervisor._state, command,
+            ).as_dict()
+        except CompanyStateError:
+            pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
+            pending.error_code = "legacy_bridge_prestart_unavailable"
+        except Exception:
+            pending.error_status = HTTPStatus.INTERNAL_SERVER_ERROR
+            pending.error_code = "legacy_bridge_prestart_failed"
+        finally:
+            pending.done.set()
 
     def _execute_telemetry(
         self,
-        pending: _PendingTelemetryIngest,
+        pending: _PendingControlOperation,
     ) -> None:
         supervisor = self._supervisor
-        command = pending.command
+        command = cast(_TelemetryIngestCommand, pending.command)
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
             pending.error_code = "service_stopping"
@@ -3115,10 +3079,10 @@ class _ResidentService:
 
     def _execute_work_definition_register(
         self,
-        pending: _PendingWorkDefinitionRegister,
+        pending: _PendingControlOperation,
     ) -> None:
         supervisor = self._supervisor
-        command = pending.command
+        command = cast(WorkDefinitionRegisterCommand, pending.command)
         result = None
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
@@ -3216,10 +3180,10 @@ class _ResidentService:
 
     def _execute_work_definition_enforcement(
         self,
-        pending: _PendingWorkDefinitionEnforcement,
+        pending: _PendingControlOperation,
     ) -> None:
         supervisor = self._supervisor
-        command = pending.command
+        command = cast(WorkDefinitionEnforcementActivateCommand, pending.command)
         result = None
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
@@ -3313,12 +3277,12 @@ class _ResidentService:
 
     def _execute_department_dispatch(
         self,
-        pending: _PendingDepartmentDispatch,
+        pending: _PendingControlOperation,
     ) -> None:
         """Queue and, when capacity permits, admit without provider launch."""
 
         supervisor = self._supervisor
-        command = pending.command
+        command = cast(DepartmentDispatchCommand, pending.command)
         enqueue_result = None
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
@@ -3449,10 +3413,10 @@ class _ResidentService:
 
     def _execute_chief_prepare(
         self,
-        pending: _PendingChiefPrepare,
+        pending: _PendingControlOperation,
     ) -> None:
         supervisor = self._supervisor
-        command = pending.command
+        command = cast(ChiefTakeoverPrepareCommand, pending.command)
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
             pending.error_code = "service_stopping"
@@ -3663,10 +3627,10 @@ class _ResidentService:
 
     def _execute_chief_consume(
         self,
-        pending: _PendingChiefConsume,
+        pending: _PendingControlOperation,
     ) -> None:
         supervisor = self._supervisor
-        command = pending.command
+        command = cast(ChiefTakeoverConsumeCommand, pending.command)
         if supervisor is None or self._stop.is_set():
             pending.error_status = HTTPStatus.SERVICE_UNAVAILABLE
             pending.error_code = "service_stopping"
@@ -4015,18 +3979,30 @@ class _ResidentService:
                 except queue.Empty:
                     pending = None
                 if pending is not None:
-                    if isinstance(pending, _PendingTelemetryIngest):
+                    if isinstance(pending.command, _TelemetryIngestCommand):
                         self._execute_telemetry(pending)
-                    elif isinstance(pending, _PendingChiefPrepare):
+                    elif isinstance(pending.command, ChiefTakeoverPrepareCommand):
                         self._execute_chief_prepare(pending)
-                    elif isinstance(pending, _PendingChiefConsume):
+                    elif isinstance(pending.command, ChiefTakeoverConsumeCommand):
                         self._execute_chief_consume(pending)
-                    elif isinstance(pending, _PendingDepartmentDispatch):
+                    elif isinstance(pending.command, DepartmentDispatchCommand):
                         self._execute_department_dispatch(pending)
-                    elif isinstance(pending, _PendingWorkDefinitionRegister):
+                    elif isinstance(pending.command, WorkDefinitionRegisterCommand):
                         self._execute_work_definition_register(pending)
-                    else:
+                    elif isinstance(
+                        pending.command,
+                        WorkDefinitionEnforcementActivateCommand,
+                    ):
                         self._execute_work_definition_enforcement(pending)
+                    elif isinstance(
+                        pending.command,
+                        LegacyBridgePrestartQueryCommand,
+                    ):
+                        self._execute_legacy_bridge_prestart(pending)
+                    else:
+                        pending.error_status = HTTPStatus.INTERNAL_SERVER_ERROR
+                        pending.error_code = "unsupported_control_command"
+                        pending.done.set()
                 now = time.monotonic()
                 if now >= next_refresh:
                     cursor = supervisor.refresh_dashboard()
