@@ -1,11 +1,7 @@
-"""Resident, single-writer service wrapper for the AOI company Supervisor.
+"""Resident single-writer wrapper for the AOI company Supervisor.
 
-This module deliberately keeps runtime discovery outside the company slot.  A
-descriptor is not ledger evidence and carries no company mutation authority;
-it lets local clients discover the read-only Dashboard plus the authenticated
-administrative and provider-specific telemetry endpoints of the process that
-currently owns the company lock.  Every ledger mutation is still serialized
-onto that resident owner thread.
+Runtime descriptors stay outside the company slot and are not ledger evidence.
+Only the resident owner serializes company-ledger mutations.
 """
 
 from __future__ import annotations
@@ -35,6 +31,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import (
     HTTPRedirectHandler,
+    ProxyHandler,
     Request,
     build_opener,
 )
@@ -1151,7 +1148,7 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 
 
 def _open_local(request: Request, *, timeout_seconds: float) -> Any:
-    return build_opener(_NoRedirectHandler()).open(
+    return build_opener(ProxyHandler({}), _NoRedirectHandler()).open(
         request,
         timeout=timeout_seconds,
     )
@@ -2915,10 +2912,17 @@ class _ResidentService:
             pending.done.set()
             return
         try:
-            pending.response = _LBC.derive_legacy_bridge_resident_response(
+            response = _LBC.derive_legacy_bridge_resident_response(
                 supervisor,
                 command,
             )
+            response_cursor = response.get(
+                "global_sequence" if _LBC.legacy_bridge_control_is_mutation(command) else "cursor",
+            )
+            if type(response_cursor) is int and response_cursor >= 1:
+                with self._status_lock:
+                    self._cursor = max(self._cursor or 0, response_cursor)
+            pending.response = response
         except _LBC.LegacyBridgeServiceExecutionError as exc:
             pending.error_status = exc.status
             pending.error_code = exc.code

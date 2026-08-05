@@ -119,6 +119,7 @@ from .commands.context_memory import (
     register_context_memory_commands,
 )
 from .commands.company_init import cmd_company_init, register_company_commands
+from .commands.legacy_bridge_runtime import cmd_legacy_bridge_ingest_v04, register_legacy_bridge_runtime_commands
 from .commands.company_runtime import (
     CompanyRuntimeCommandError,
     cmd_dashboard_open,
@@ -737,6 +738,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "cohort-show",
     "inspect-legacy",
     "integrity-show",
+    "legacy-bridge",
     "release-manifest-observe",
     "release-show",
     "release-tag-push-preflight",
@@ -748,9 +750,6 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "verify-backup",
     "doctor",
 }
-# Permit consumption is an explicit no-Chief project mutation.  It is not
-# read-only: the command may publish one already Chief-issued exact semantic
-# transition, and its handler therefore owns the normal project state lock.
 CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS = {
     "external-export-permit-consume",
     "permit-consume",
@@ -781,7 +780,7 @@ KNOWN_MANAGED_POLICY_SHA256 = {
 
 
 class AOIArgumentParser(argparse.ArgumentParser):
-    """Disable ambiguous long-option abbreviation on every parser level."""
+    """Disable long-option abbreviation."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("allow_abbrev", False)
@@ -789,7 +788,7 @@ class AOIArgumentParser(argparse.ArgumentParser):
 
 
 def command_requires_chief(command: str, *, initialized: bool) -> bool:
-    """Default-fence every project command not explicitly proven exempt."""
+    """Fence project commands unless exempt."""
 
     if command in {"init", "claude-init", "codex-init"}:
         return initialized
@@ -8215,6 +8214,7 @@ def build_parser(
         init_handler=cmd_company_init,
         add_json_argument=add_json_argument,
     )
+    register_legacy_bridge_runtime_commands(sub, handler=cmd_legacy_bridge_ingest_v04, add_json_argument=add_json_argument)
 
     mini_completion_services = _mini_completion_services(task_lifecycle_services)
     register_task_lifecycle_commands(

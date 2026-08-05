@@ -26,6 +26,10 @@ from aoi_orgware.company.legacy_bridge_control_protocol import (
     require_verified_legacy_bridge_prestart_result,
     verify_legacy_bridge_prestart_result,
 )
+from aoi_orgware.company.legacy_bridge_ingest_protocol import (
+    build_legacy_bridge_ingest_command,
+    decode_legacy_bridge_ingest_wire_result,
+)
 from aoi_orgware.company.legacy_bridge_publisher import (
     publish_legacy_bridge_snapshot,
 )
@@ -37,6 +41,7 @@ from tests.company_v05.test_company_service import (
     _await_status,
     _descriptor,
     _foreground_process,
+    _get_json,
     _raw_control_request,
 )
 from tests.company_v05.test_legacy_bridge import (
@@ -49,6 +54,7 @@ from tests.company_v05.test_supervisor import manifest
 
 
 ROUTE = "/control/v1/legacy-bridge/prestart/query"
+INGEST_ROUTE = "/control/v1/legacy-bridge/ingest"
 TASK_DIGEST = _identity_digest("task", "task-1")
 RECEIVED_AT = "2026-08-04T01:00:00Z"
 
@@ -120,6 +126,7 @@ def _post(
     *,
     token: str | None = None,
     origin: str | None = None,
+    route: str = ROUTE,
 ) -> tuple[int, dict[str, Any]]:
     headers = {
         "Authorization": f"Bearer {descriptor['bearer_token'] if token is None else token}",
@@ -128,7 +135,7 @@ def _post(
     if origin is not None:
         headers["Origin"] = origin
     request = Request(
-        descriptor["control_url"] + ROUTE,
+        descriptor["control_url"] + route,
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
         headers=headers,
         method="POST",
@@ -142,6 +149,41 @@ def _post(
         value = json.loads(exc.read())
         assert isinstance(value, dict)
         return int(exc.code), value
+
+
+def test_successful_ingest_immediately_advances_resident_status_cursor(
+    tmp_path: Path,
+) -> None:
+    slot, runtime, raw, _scope, before = _prepare(tmp_path, "missing")
+    with _running_service(slot, runtime) as descriptor:
+        company = descriptor["company"]
+        command = build_legacy_bridge_ingest_command(
+            service_instance_id=descriptor["service_instance_id"],
+            company_id=company["company_id"],
+            company_incarnation=company["company_incarnation"],
+            lock_domain_generation=company["lock_domain_generation"],
+            manifest_sha256=company["manifest_sha256"],
+            source_document=raw,
+            task_identity_digest=TASK_DIGEST,
+            legacy_archive_sha256=H,
+            received_at=RECEIVED_AT,
+        )
+        status, value = _post(
+            descriptor,
+            command.as_dict(),
+            route=INGEST_ROUTE,
+        )
+        assert status == HTTPStatus.OK
+        result = decode_legacy_bridge_ingest_wire_result(value, command=command)
+        assert result.global_sequence is not None
+        assert result.global_sequence > before[0]
+
+        status, resident = _get_json(
+            descriptor["control_url"] + "/status",
+            token=descriptor["bearer_token"],
+        )
+        assert status == HTTPStatus.OK
+        assert resident["cursor"] >= result.global_sequence
 
 
 def _reseal_gate(gate: dict[str, Any]) -> None:
@@ -314,6 +356,34 @@ def test_protocol_rejects_malformed_or_recomputed_forged_values(
             forged["gate"][name] = invalid
             with pytest.raises(LegacyBridgeControlProtocolError):
                 decode_legacy_bridge_prestart_wire_result(forged, command=command)
+
+
+def test_result_binding_rejects_non_exact_integer_identity(
+    tmp_path: Path,
+) -> None:
+    slot, runtime, raw, scope, _before = _prepare(tmp_path, "observed")
+    with _running_service(slot, runtime) as descriptor:
+        command = _command(descriptor, scope, raw)
+        status, value = _post(descriptor, command.as_dict())
+        assert status == 200
+        exact = decode_legacy_bridge_prestart_wire_result(value, command=command)
+
+        for name in ("company_incarnation", "lock_domain_generation"):
+            expected = getattr(command, name)
+            for invalid in (True, False, float(expected)):
+                forged = copy.deepcopy(value)
+                forged[name] = invalid
+                with pytest.raises(LegacyBridgeControlProtocolError) as error:
+                    decode_legacy_bridge_prestart_wire_result(
+                        forged,
+                        command=command,
+                    )
+                assert error.value.code == f"invalid_{name}"
+    with CompanySupervisor.open(slot) as reopened:
+        verified = verify_legacy_bridge_prestart_result(
+            reopened._state, value, command=command,
+        )
+    assert verified.result == exact
 
 
 def test_recomputed_semantic_forgery_requires_resident_state(

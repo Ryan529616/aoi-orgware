@@ -525,6 +525,8 @@ def decode_legacy_bridge_prestart_wire_result(
         or result.get("schema_version") != LEGACY_BRIDGE_PRESTART_RESULT_SCHEMA
     ):
         _fail("invalid_result_schema")
+    for name in ("company_incarnation", "lock_domain_generation"):
+        _positive_int(result[name], name=name)
     for name in (
         "service_instance_id", "company_id", "company_incarnation",
         "lock_domain_generation", "manifest_sha256", "bridge_scope_id",
