@@ -4,9 +4,11 @@ import errno
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 
 import pytest
@@ -34,6 +36,37 @@ def test_put_uses_canonical_lowercase_sha256_fanout_and_verified_metadata(tmp_pa
     assert store.path_for_digest(expected) == metadata.path
     assert store.read(expected) == payload
     assert store.metadata(expected) == metadata
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows long-path regression")
+def test_native_windows_long_member_path_preserves_blob_semantics() -> None:
+    base = Path(tempfile.mkdtemp(prefix="aoi-blob-long-", dir=Path.cwd().anchor))
+    payload = b"native Windows long-path blob publication"
+    digest = hashlib.sha256(payload).hexdigest()
+    fixed_root = base / "root"
+    padding = 209 - len(os.fspath(fixed_root)) - 1 - 1 - 2 - 1 - 2
+    assert 1 <= padding <= 240
+    root = fixed_root / ("r" * padding)
+    expected_parent = root / digest[:2] / digest[2:4]
+    assert len(os.fspath(expected_parent)) == 209
+
+    try:
+        store = BlobStore(root)
+        first = store.put(payload)
+        second = store.put(payload)
+
+        assert len(os.fspath(first.path)) == 274
+        assert not os.fspath(first.path).startswith("\\\\?\\")
+        assert first == second
+        assert store.read(digest) == payload
+        assert store.metadata(digest) == first
+        assert os.lstat(blobs_module._native_filesystem_path(first.path)).st_nlink == 1
+        with os.scandir(
+            blobs_module._native_filesystem_path(first.path.parent),
+        ) as entries:
+            assert not any(entry.name.startswith(".aoi-blob-v1.") for entry in entries)
+    finally:
+        shutil.rmtree(blobs_module._native_filesystem_path(base))
 
 
 def test_root_is_explicit_and_digest_is_canonical(tmp_path: Path) -> None:

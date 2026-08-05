@@ -89,9 +89,27 @@ def _as_bytes(payload: bytes | bytearray | memoryview) -> bytes:
     raise TypeError("blob payload must be bytes-like")
 
 
+def _native_filesystem_path(path: Path) -> str | Path:
+    """Return an internal long-path syscall spelling without changing identity.
+
+    Public roots deliberately reject Windows namespace aliases.  Internally,
+    however, a canonical absolute path can exceed the legacy Win32 ``MAX_PATH``
+    limit once the fixed SHA-256 fanout and member name are appended.  Use the
+    extended namespace only at the syscall boundary so returned ``Path`` values,
+    digest identities, and caller-visible root spelling remain unchanged.
+    """
+
+    if os.name != "nt":
+        return path
+    raw = os.fspath(path)
+    if raw.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + raw[2:]
+    return "\\\\?\\" + raw
+
+
 def _lstat_regular(path: Path, label: str) -> os.stat_result:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(_native_filesystem_path(path))
     except FileNotFoundError:
         raise
     if _is_windows_reparse_point(metadata):
@@ -103,7 +121,7 @@ def _lstat_regular(path: Path, label: str) -> os.stat_result:
 
 def _lstat_directory(path: Path, label: str) -> os.stat_result:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(_native_filesystem_path(path))
     except FileNotFoundError:
         raise
     if _is_windows_reparse_point(metadata):
@@ -297,7 +315,10 @@ class BlobStore:
             try:
                 # ``link`` is no-replace on both POSIX and supported NTFS Python
                 # builds.  There is intentionally no rename/replace fallback.
-                os.link(temporary, destination)
+                os.link(
+                    _native_filesystem_path(temporary),
+                    _native_filesystem_path(destination),
+                )
             except FileExistsError:
                 return self._match_existing_after_settling(destination, digest, data)
             published = True
@@ -394,7 +415,7 @@ class BlobStore:
         parent_before = _lstat_directory(parent, f"{label} parent")
         created = False
         try:
-            path.mkdir(mode=0o700)
+            os.mkdir(_native_filesystem_path(path), mode=0o700)
             created = True
         except FileExistsError:
             pass
@@ -419,7 +440,9 @@ class BlobStore:
             for _ in range(128):
                 candidate = parent / f".aoi-blob-v1.{secrets.token_hex(16)}.tmp"
                 try:
-                    descriptor = os.open(candidate, flags, 0o600)
+                    descriptor = os.open(
+                        _native_filesystem_path(candidate), flags, 0o600,
+                    )
                 except FileExistsError:
                     continue
                 temporary = candidate
@@ -462,7 +485,7 @@ class BlobStore:
         expected_links = 2 if linked_destination else 1
         if not _same_identity(current, expected) or current.st_nlink != expected_links:
             raise BlobPathError("blob temporary changed or was aliased before cleanup")
-        temporary.unlink()
+        os.unlink(_native_filesystem_path(temporary))
         self._fsync_directory(temporary.parent)
 
     def _match_existing(self, destination: Path, digest: str, data: bytes) -> BlobMetadata:
@@ -524,7 +547,7 @@ class BlobStore:
             raise BlobPathError("blob member must have exactly one hard link")
 
         matches: list[tuple[Path, os.stat_result]] = []
-        with os.scandir(destination.parent) as entries:
+        with os.scandir(_native_filesystem_path(destination.parent)) as entries:
             for index, entry in enumerate(entries):
                 if index >= _MAX_RECOVERY_SCAN_ENTRIES:
                     raise BlobPathError(
@@ -532,7 +555,7 @@ class BlobStore:
                     )
                 if _TEMPORARY_NAME_RE.fullmatch(entry.name) is None:
                     continue
-                temporary = Path(entry.path)
+                temporary = destination.parent / entry.name
                 try:
                     temporary_stat = _lstat_regular(
                         temporary, "blob recovery temporary",
@@ -571,7 +594,7 @@ class BlobStore:
                 "existing blob digest collides with different bytes"
             )
         try:
-            temporary.unlink()
+            os.unlink(_native_filesystem_path(temporary))
         except FileNotFoundError:
             # A cooperative original publisher may have won the same cleanup.
             if _lstat_regular(destination, "blob member").st_nlink != 1:
@@ -599,7 +622,7 @@ class BlobStore:
         if before.st_size > self._max_bytes:
             raise BlobSizeError(f"stored blob size {before.st_size} exceeds configured maximum {self._max_bytes}")
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
+        descriptor = os.open(_native_filesystem_path(path), flags)
         try:
             opened = os.fstat(descriptor)
             if not stat.S_ISREG(opened.st_mode) or not _same_identity(before, opened):

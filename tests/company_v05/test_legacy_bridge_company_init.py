@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -112,6 +113,44 @@ def test_fresh_genesis_is_exactly_reopenable_and_has_no_work(
         assert supervisor.objects(contract_type=DISPATCH_REQUEST_V1) == ()
         assert supervisor.objects(contract_type=EXTERNAL_JOB_V1) == ()
         assert supervisor.objects(contract_type=MUTATION_INTENT_V1) == ()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows long-path regression")
+def test_fresh_genesis_is_reopenable_when_blob_members_exceed_max_path(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    base = Path(tempfile.mkdtemp(prefix="aoi-lb-long-", dir=tmp_path.anchor))
+    try:
+        selected: tuple[dict[str, str], Path] | None = None
+        for padding in range(1, 241):
+            environment = _environment(base / ("r" * padding))
+            _manifest, slot, _platform = bridge._expected_slot(
+                paths.root,
+                environ=environment,
+                bootstrap_at=bridge.utc_second(T),
+            )
+            if len(os.fspath(slot / "blobs" / "aa" / "bb")) == 209:
+                selected = environment, slot
+                break
+        assert selected is not None
+        environment, slot = selected
+
+        created = bridge.initialize_legacy_bridge_company(
+            paths.root, environ=environment, now=T,
+        )
+        reopened = bridge.initialize_legacy_bridge_company(
+            paths.root, environ=environment, now=T,
+        )
+
+        assert created.action == "created"
+        assert reopened.action == "existing_exact"
+        assert created.company_id == reopened.company_id
+        assert len(os.fspath(slot / "blobs" / "aa" / "bb" / ("a" * 64))) == 274
+        with CompanySupervisor.open(created.state_root) as supervisor:
+            assert supervisor.heads().global_head.global_sequence == 1
+    finally:
+        shutil.rmtree("\\\\?\\" + os.fspath(base))
 
 
 def test_stopped_exact_reopen_accepts_later_legacy_snapshot(
