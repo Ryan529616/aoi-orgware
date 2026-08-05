@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
@@ -25,12 +26,14 @@ from aoi_orgware.company.legacy_bridge_contract import (
 from aoi_orgware.company.legacy_bridge_health import (
     LEGACY_BRIDGE_COVERAGE_V1,
     LegacyBridgeHealthError,
+    build_legacy_bridge_coverage,
     legacy_bridge_attempt_id,
     validate_legacy_bridge_coverage,
 )
 from aoi_orgware.company.legacy_bridge_publisher import (
     LegacyBridgePublicationError,
     publish_legacy_bridge_snapshot,
+    validate_legacy_bridge_publication_envelope,
 )
 from aoi_orgware.company.state import CompanyStateOwner
 from aoi_orgware.company.supervisor import (
@@ -444,12 +447,181 @@ def test_canonical_preseed_with_crossed_event_payloads_is_not_replay(
         head = target.heads().global_head
         with pytest.raises(
             LegacyBridgePublicationError,
-            match="durable event payload contract differs",
+            match="durable publication envelope is invalid",
         ):
             _publish(target, received_at=R2)
         assert target.heads().global_head == head
     finally:
         target.close()
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    (
+        ("transaction_id", "forged-transaction"),
+        ("command_id", "forged-command"),
+        ("event_id", "forged-event"),
+        ("provenance", "agent_reported"),
+        ("recorded_at", R2),
+        ("actor_authority", {"actor_id": "forged-actor"}),
+    ),
+)
+def test_publication_envelope_rejects_forged_durable_event_fields(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    supervisor = _initialized(tmp_path)
+    try:
+        published = _publish(supervisor)
+        record = supervisor.record_by_transaction_id(published.transaction_id)
+        assert record is not None
+        altered = cast(dict[str, Any], thaw_json_payload(record.events[0].event))
+        if field == "actor_authority":
+            actor = cast(dict[str, Any], altered[field])
+            altered[field] = {**actor, **cast(dict[str, Any], value)}
+        else:
+            altered[field] = value
+        forged = replace(
+            record,
+            events=(replace(record.events[0], event=altered), *record.events[1:]),
+        )
+        head = supervisor.heads().global_head
+        with pytest.raises(
+            LegacyBridgePublicationError,
+            match="durable publication envelope is invalid",
+        ):
+            validate_legacy_bridge_publication_envelope(supervisor, forged)
+        assert supervisor.heads().global_head == head
+    finally:
+        supervisor.close()
+
+
+def test_split_timestamp_observation_publication_cannot_replay(
+    tmp_path: Path,
+) -> None:
+    supervisor = _initialized(tmp_path)
+    raw = _raw(_snapshot())
+    projection = normalize_legacy_bridge_snapshot(raw)
+    observation = build_legacy_bridge_observation(projection, ingested_at=R1)
+    coverage = build_legacy_bridge_coverage(
+        projection.key,
+        legacy_archive_sha256=H,
+        task_identity_digest=TASK_DIGEST,
+        source_document_sha256=hashlib.sha256(raw).hexdigest(),
+        source_document_size_bytes=len(raw),
+        ingest_state="observed",
+        reason="provider_runtime_unavailable",
+        assessed_at=R2,
+        observation_id=str(observation["observation_id"]),
+    )
+    attempt = legacy_bridge_attempt_id(
+        str(coverage["bridge_scope_id"]),
+        source_document_sha256=str(coverage["source_document_sha256"]),
+        source_document_size_bytes=int(coverage["source_document_size_bytes"]),
+    )
+    transaction_id = f"legacy-bridge-transaction-{attempt}"
+    command_id = f"legacy-bridge-command-{attempt}"
+    events = (
+        CompanyEventDraft(
+            f"legacy-bridge-event-1-{attempt}",
+            "legacy.bridge.observation",
+            R1,
+            observation,
+            provenance="adapter_receipt_persisted",
+        ),
+        CompanyEventDraft(
+            f"legacy-bridge-event-2-{attempt}",
+            "legacy.bridge.coverage",
+            R2,
+            coverage,
+            provenance="adapter_receipt_persisted",
+        ),
+    )
+    try:
+        request = build_company_transaction_request(
+            supervisor.heads(),
+            supervisor._supervisor_authority(),
+            transaction_id=transaction_id,
+            command_id=command_id,
+            events=events,
+        )
+        committed = supervisor.commit(request, recorded_at=R2)
+        head = supervisor.heads().global_head
+        with pytest.raises(
+            LegacyBridgePublicationError,
+            match="durable publication envelope is invalid",
+        ):
+            validate_legacy_bridge_publication_envelope(supervisor, committed.record)
+        with pytest.raises(
+            LegacyBridgePublicationError,
+            match="durable publication envelope is invalid",
+        ):
+            _publish(supervisor, raw, received_at=R3)
+        assert supervisor.heads().global_head == head
+    finally:
+        supervisor.close()
+
+
+def test_receipt_timestamp_mismatch_cannot_replay(tmp_path: Path) -> None:
+    supervisor = _initialized(tmp_path)
+    raw = _raw(_snapshot())
+    projection = normalize_legacy_bridge_snapshot(raw)
+    observation = build_legacy_bridge_observation(projection, ingested_at=R1)
+    coverage = build_legacy_bridge_coverage(
+        projection.key,
+        legacy_archive_sha256=H,
+        task_identity_digest=TASK_DIGEST,
+        source_document_sha256=hashlib.sha256(raw).hexdigest(),
+        source_document_size_bytes=len(raw),
+        ingest_state="observed",
+        reason="provider_runtime_unavailable",
+        assessed_at=R1,
+        observation_id=str(observation["observation_id"]),
+    )
+    attempt = legacy_bridge_attempt_id(
+        str(coverage["bridge_scope_id"]),
+        source_document_sha256=str(coverage["source_document_sha256"]),
+        source_document_size_bytes=int(coverage["source_document_size_bytes"]),
+    )
+    transaction_id = f"legacy-bridge-transaction-{attempt}"
+    command_id = f"legacy-bridge-command-{attempt}"
+    events = (
+        CompanyEventDraft(
+            f"legacy-bridge-event-1-{attempt}",
+            "legacy.bridge.observation",
+            R1,
+            observation,
+            provenance="adapter_receipt_persisted",
+        ),
+        CompanyEventDraft(
+            f"legacy-bridge-event-2-{attempt}",
+            "legacy.bridge.coverage",
+            R1,
+            coverage,
+            provenance="adapter_receipt_persisted",
+        ),
+    )
+    try:
+        request = build_company_transaction_request(
+            supervisor.heads(),
+            supervisor._supervisor_authority(),
+            transaction_id=transaction_id,
+            command_id=command_id,
+            events=events,
+        )
+        committed = supervisor.commit(request, recorded_at=R2)
+        head = supervisor.heads().global_head
+        with pytest.raises(
+            LegacyBridgePublicationError,
+            match="durable publication envelope is invalid",
+        ):
+            validate_legacy_bridge_publication_envelope(supervisor, committed.record)
+        with pytest.raises(LegacyBridgePublicationError):
+            _publish(supervisor, raw, received_at=R3)
+        assert supervisor.heads().global_head == head
+    finally:
+        supervisor.close()
 
 
 def test_task_terminal_does_not_become_provider_runtime_stopped(tmp_path: Path) -> None:

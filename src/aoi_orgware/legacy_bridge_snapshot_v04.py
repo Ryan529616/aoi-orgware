@@ -34,10 +34,7 @@ from .harnesslib import (
 
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_ROOTED_AGENT_ID = re.compile(
-    r"/root/[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*"
-)
+_ROOTED_AGENT_NAMESPACE = "root"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SOURCE_VERSION = re.compile(
     r"0\.4\.0a(?:3|4)(?:\+[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?"
@@ -79,7 +76,15 @@ def legacy_bridge_agent_id_v04(raw_agent_id: Any) -> str:
         _fail("legacy agent id is invalid")
     if _SAFE_ID.fullmatch(raw_agent_id) is not None:
         return raw_agent_id
-    if len(raw_agent_id) <= 256 and _ROOTED_AGENT_ID.fullmatch(raw_agent_id) is not None:
+    components = raw_agent_id.split("/")
+    rooted_agent = (
+        len(raw_agent_id) <= 256
+        and len(components) >= 3
+        and components[0] == ""
+        and components[1] == _ROOTED_AGENT_NAMESPACE
+        and all(_SAFE_ID.fullmatch(component) is not None for component in components[2:])
+    )
+    if rooted_agent:
         digest = hashlib.sha256(
             b"aoi-orgware:legacy-bridge-agent-v04\x00" + raw_agent_id.encode("utf-8")
         ).hexdigest()

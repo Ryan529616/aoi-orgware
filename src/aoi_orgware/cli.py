@@ -118,6 +118,7 @@ from .commands.context_memory import (
     cmd_context_receipt_record,
     register_context_memory_commands,
 )
+from .commands.company_init import cmd_company_init, register_company_commands
 from .commands.company_runtime import (
     CompanyRuntimeCommandError,
     cmd_dashboard_open,
@@ -125,7 +126,6 @@ from .commands.company_runtime import (
     cmd_supervisor_ensure,
     cmd_supervisor_status,
     cmd_supervisor_stop,
-    register_company_runtime_commands,
 )
 from .commands.coordination import (
     CoordinationCmdServices,
@@ -8203,16 +8203,16 @@ def build_parser(
         },
         add_json_argument=add_json_argument,
     )
-
-    register_company_runtime_commands(
+    register_company_commands(
         sub,
-        handlers={
-            "supervisor_ensure": cmd_supervisor_ensure,
-            "supervisor_status": cmd_supervisor_status,
-            "supervisor_stop": cmd_supervisor_stop,
-            "dashboard_url": cmd_dashboard_url,
-            "dashboard_open": cmd_dashboard_open,
-        },
+        runtime_handlers=(
+            cmd_supervisor_ensure,
+            cmd_supervisor_status,
+            cmd_supervisor_stop,
+            cmd_dashboard_url,
+            cmd_dashboard_open,
+        ),
+        init_handler=cmd_company_init,
         add_json_argument=add_json_argument,
     )
 

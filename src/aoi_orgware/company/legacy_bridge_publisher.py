@@ -20,7 +20,10 @@ from .contracts import (
     MAX_EVENT_PAYLOAD_BYTES,
     CompanyContractError,
     canonical_company_json_bytes,
+    validate_actor_authority,
     validate_company_manifest,
+    validate_company_transaction_receipt,
+    validate_company_transaction_request,
 )
 from .ledger import (
     LedgerCommitEffectUnknownError,
@@ -65,6 +68,16 @@ class LegacyBridgeIngestResult(NamedTuple):
     effect: str
     global_sequence: int | None
     idempotent_replay: bool
+
+
+class LegacyBridgePublicationEnvelope(NamedTuple):
+    """One replay-safe, Supervisor-authenticated legacy publication."""
+
+    attempt_id: str
+    transaction_id: str
+    command_id: str
+    observation: dict[str, Any] | None
+    coverage: dict[str, Any]
 
 
 class _ReplayInputs(NamedTuple):
@@ -169,27 +182,125 @@ def _require_monotonic_assessment(
         _fail("legacy bridge assessment time does not advance")
 
 
-def _record_payloads(
+def validate_legacy_bridge_publication_envelope(
+    supervisor: CompanySupervisor,
     record: LedgerTransactionRecord,
-    *,
-    transaction_id: str,
-    command_id: str,
-) -> tuple[list[dict[str, Any]], list[Mapping[str, Any]]]:
-    if (
-        record.request.get("transaction_id") != transaction_id
-        or record.request.get("command_id") != command_id
-    ):
-        _fail("legacy bridge durable transaction identity differs")
-    payloads: list[dict[str, Any]] = []
-    events: list[Mapping[str, Any]] = []
-    for wrapped in record.events:
-        event = wrapped.event
-        payload = event.get("payload")
-        if not isinstance(payload, Mapping):
-            _fail("legacy bridge durable event payload is invalid")
-        payloads.append(_plain(payload))
-        events.append(event)
-    return payloads, events
+) -> LegacyBridgePublicationEnvelope:
+    """Validate one exact, committed bridge publication without side effects.
+
+    This is deliberately stronger than payload-schema validation: it binds the
+    durable request, event envelopes, and Supervisor authority together before
+    callers use an observation to represent a reopened company.
+    """
+
+    if type(supervisor) is not CompanySupervisor or type(record) is not LedgerTransactionRecord:
+        _fail("legacy bridge durable publication envelope is invalid")
+    try:
+        request = validate_company_transaction_request(_plain(record.request))
+        receipt = validate_company_transaction_receipt(_plain(record.receipt))
+        authority = validate_actor_authority(
+            _plain(request["actor_authority"]),
+        )
+        expected_authority = _plain(CompanySupervisor._supervisor_authority(supervisor))
+        if authority != expected_authority or authority.get("actor_kind") != "supervisor":
+            _fail("legacy bridge durable publication envelope is invalid")
+        request_events = request["events"]
+        if len(record.events) != len(request_events) or len(record.events) not in {1, 2}:
+            _fail("legacy bridge durable publication envelope is invalid")
+        events = [_plain(wrapped.event) for wrapped in record.events]
+        if any(event != expected for event, expected in zip(events, request_events, strict=True)):
+            _fail("legacy bridge durable publication envelope is invalid")
+        payloads = [_plain(event["payload"]) for event in events]
+        types = tuple(payload.get("contract_type") for payload in payloads)
+        if types == (LEGACY_BRIDGE_OBSERVATION_V1, LEGACY_BRIDGE_COVERAGE_V1):
+            observation = validate_legacy_bridge_observation(payloads[0])
+            coverage = validate_legacy_bridge_coverage(payloads[1])
+        elif types == (LEGACY_BRIDGE_COVERAGE_V1,):
+            observation = None
+            coverage = validate_legacy_bridge_coverage(payloads[0])
+        else:
+            _fail("legacy bridge durable publication envelope is invalid")
+        expected_attempt = legacy_bridge_attempt_id(
+            str(coverage["bridge_scope_id"]),
+            source_document_sha256=str(coverage["source_document_sha256"]),
+            source_document_size_bytes=int(coverage["source_document_size_bytes"]),
+        )
+        transaction_id = _wire_id("transaction", expected_attempt)
+        command_id = _wire_id("command", expected_attempt)
+        expected_labels = (
+            ("legacy.bridge.observation", "legacy.bridge.coverage")
+            if observation is not None
+            else ("legacy.bridge.coverage",)
+        )
+        expected_times = (
+            (str(observation["ingested_at"]), str(coverage["assessed_at"]))
+            if observation is not None
+            else (str(coverage["assessed_at"]),)
+        )
+        if (
+            request["transaction_id"] != transaction_id
+            or request["command_id"] != command_id
+            or receipt["transaction_id"] != transaction_id
+            or receipt["command_id"] != command_id
+            or receipt["request_sha256"] != request["request_sha256"]
+            or receipt["state"] != "committed"
+            or receipt["recorded_at"] != str(coverage["assessed_at"])
+            or receipt["global_sequence"] != record.global_sequence
+            or receipt["evidence"] != []
+            or tuple(
+                receipt[field]
+                for field in (
+                    "company_id",
+                    "company_incarnation",
+                    "lock_domain_generation",
+                )
+            )
+            != tuple(
+                coverage[field]
+                for field in (
+                    "company_id",
+                    "company_incarnation",
+                    "lock_domain_generation",
+                )
+            )
+            or any(
+                event["transaction_id"] != transaction_id
+                or event["command_id"] != command_id
+                or event["event_id"] != _wire_id(f"event-{index}", expected_attempt)
+                or event["event_type"] != label
+                or event["recorded_at"] != recorded_at
+                or event["provenance"] != "adapter_receipt_persisted"
+                or validate_actor_authority(_plain(event["actor_authority"])) != authority
+                for index, (event, label, recorded_at) in enumerate(
+                    zip(events, expected_labels, expected_times, strict=True),
+                    start=1,
+                )
+            )
+            or (observation is None and coverage["observation_id"] is not None)
+            or (
+                observation is not None
+                and (
+                    coverage["observation_id"] != observation["observation_id"]
+                    or observation["ingested_at"] != coverage["assessed_at"]
+                    or tuple(coverage[field] for field in ("company_id", "company_incarnation", "lock_domain_generation"))
+                    != tuple(observation[field] for field in ("company_id", "company_incarnation", "lock_domain_generation"))
+                )
+            )
+        ):
+            _fail("legacy bridge durable publication envelope is invalid")
+        return LegacyBridgePublicationEnvelope(
+            expected_attempt,
+            transaction_id,
+            command_id,
+            observation,
+            coverage,
+        )
+    except (MemoryError, SystemExit, KeyboardInterrupt, LegacyBridgePublicationError):
+        raise
+    except Exception as exc:
+        raise LegacyBridgePublicationError(
+            "legacy bridge durable publication envelope is invalid",
+        ) from exc
 
 
 def _replay_result(
@@ -197,38 +308,16 @@ def _replay_result(
     record: LedgerTransactionRecord,
     inputs: _ReplayInputs,
 ) -> LegacyBridgeIngestResult:
-    payloads, events = _record_payloads(
-        record,
-        transaction_id=inputs.transaction_id,
-        command_id=inputs.command_id,
-    )
-    expected_pairs = (
-        (
-            ("legacy.bridge.observation", LEGACY_BRIDGE_OBSERVATION_V1),
-            ("legacy.bridge.coverage", LEGACY_BRIDGE_COVERAGE_V1),
-        )
-        if inputs.projection is not None
-        else (("legacy.bridge.coverage", LEGACY_BRIDGE_COVERAGE_V1),)
-    )
-    if len(events) != len(expected_pairs):
-        _fail("legacy bridge durable transaction membership differs")
-    for event, payload, (expected_event_type, expected_contract_type) in zip(
-        events,
-        payloads,
-        expected_pairs,
-        strict=True,
+    envelope = validate_legacy_bridge_publication_envelope(supervisor, record)
+    if (
+        envelope.transaction_id != inputs.transaction_id
+        or envelope.command_id != inputs.command_id
+        or envelope.attempt_id != inputs.attempt_id
+        or (inputs.projection is None) != (envelope.observation is None)
     ):
-        if (
-            event.get("event_type") != expected_event_type
-            or payload.get("contract_type") != expected_contract_type
-        ):
-            _fail("legacy bridge durable event payload contract differs")
-    observation = (
-        None
-        if inputs.projection is None
-        else validate_legacy_bridge_observation(payloads[0])
-    )
-    health = validate_legacy_bridge_coverage(payloads[-1])
+        _fail("legacy bridge durable transaction identity differs")
+    observation = envelope.observation
+    health = envelope.coverage
     if inputs.projection is not None and observation is not None:
         expected_observation = build_legacy_bridge_observation(
             inputs.projection,
@@ -258,27 +347,6 @@ def _replay_result(
         and health["observation_id"] != observation["observation_id"]
     ):
         _fail("legacy bridge durable coverage observation join differs")
-    expected_ids = [
-        _wire_id(f"event-{index}", inputs.attempt_id)
-        for index in range(1, len(events) + 1)
-    ]
-    expected_times = [
-        *(
-            []
-            if observation is None
-            else [str(observation["ingested_at"])]
-        ),
-        str(health["assessed_at"]),
-    ]
-    if (
-        [event.get("event_id") for event in events] != expected_ids
-        or [event.get("recorded_at") for event in events] != expected_times
-        or any(
-            event.get("provenance") != "adapter_receipt_persisted"
-            for event in events
-        )
-    ):
-        _fail("legacy bridge durable event envelope differs")
     try:
         replayed = CompanySupervisor.commit(
             supervisor,
@@ -480,6 +548,8 @@ def publish_legacy_bridge_snapshot(
 
 __all__ = [
     "LegacyBridgeIngestResult",
+    "LegacyBridgePublicationEnvelope",
     "LegacyBridgePublicationError",
     "publish_legacy_bridge_snapshot",
+    "validate_legacy_bridge_publication_envelope",
 ]

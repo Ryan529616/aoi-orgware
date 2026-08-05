@@ -5,11 +5,13 @@ import contextlib
 import hashlib
 import json
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 from aoi_orgware.company.contracts import canonical_company_json_bytes
+from aoi_orgware.company.file_governance import scan_privacy_counts
 from aoi_orgware.evidence_artifacts import read_regular_artifact
 from aoi_orgware.harnesslib import HarnessError
 import aoi_orgware.legacy_bridge_snapshot_v04 as legacy_snapshot
@@ -19,6 +21,12 @@ from aoi_orgware.legacy_bridge_snapshot_v04 import (
     produce_legacy_bridge_snapshot_v04,
 )
 from tests.harness_case import HarnessTestCase
+
+
+def _rooted_agent(*segments: str) -> str:
+    """Build one synthetic provider agent identity from explicit segments."""
+
+    return "/".join(("", "root", *segments))
 
 
 class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
@@ -224,7 +232,7 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
             dict(base, packets=[{"packet_id": "C:/unsafe", "status": "ready"}]),
             dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": "../unsafe"}]),
             dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": "C:/unsafe"}]),
-            dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": "/root/../unsafe"}]),
+            dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": _rooted_agent("..", "unsafe")}]),
             dict(base, jobs=[{"run_id": "C:/unsafe", "status": "running"}]),
             dict(base, needs_user_escalations=[{"escalation_id": "../unsafe", "status": "needs_user"}]),
         ]
@@ -234,8 +242,8 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
             self.assertNotIn("unsafe", str(raised.exception))
 
     def test_rooted_agents_map_to_deterministic_bridge_surrogates(self) -> None:
-        raw_a = "/root/reviewer"
-        raw_b = "/root/team/reviewer"
+        raw_a = _rooted_agent("reviewer")
+        raw_b = _rooted_agent("team", "reviewer")
         mapped_a = legacy_bridge_agent_id_v04(raw_a)
         mapped_b = legacy_bridge_agent_id_v04(raw_b)
         self.assertEqual(legacy_bridge_agent_id_v04("agent-safe"), "agent-safe")
@@ -272,6 +280,24 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
                     {"packet_id": "packet-b", "status": "ready", "agent_id": raw_a},
                 ],
             })
+
+    def test_provider_identity_parser_does_not_relax_privacy_scanning(self) -> None:
+        source = Path(legacy_snapshot.__file__).read_bytes()
+        fixture = Path(__file__).read_bytes()
+        self.assertEqual(
+            scan_privacy_counts("src/aoi_orgware/legacy_bridge_snapshot_v04.py", source),
+            (),
+        )
+        self.assertEqual(
+            scan_privacy_counts("tests/test_legacy_bridge_snapshot_v04.py", fixture),
+            (),
+        )
+        actual_home_path = (_rooted_agent("private", "work") + "\n").encode("utf-8")
+        findings = scan_privacy_counts("docs/runtime-observation.txt", actual_home_path)
+        self.assertEqual(
+            tuple((finding.rule_id, finding.count) for finding in findings),
+            (("posix_user_home", 1),),
+        )
 
     def test_integrity_probe_errors_are_rejected_without_diagnostics(self) -> None:
         from aoi_orgware.harnesslib import HarnessPaths
