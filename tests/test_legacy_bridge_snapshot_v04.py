@@ -281,6 +281,43 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
                 ],
             })
 
+    def test_rooted_agents_accept_canonical_versioned_segments(self) -> None:
+        raw_ids = (
+            _rooted_agent("legacy_smoke_successor_review@v2"),
+            _rooted_agent("legacy_smoke_successor_review@v3"),
+            _rooted_agent("team:review", "legacy_smoke_successor_review@v4"),
+        )
+        mapped = tuple(legacy_bridge_agent_id_v04(value) for value in raw_ids)
+        self.assertEqual(len(set(mapped)), len(raw_ids))
+        for value in mapped:
+            self.assertRegex(value, r"\Aroot@[0-9a-f]{64}\Z")
+
+        result = self._produce({
+            "status": "active", "jobs": [], "needs_user_escalations": [], "packets": [
+                {
+                    "packet_id": f"packet-{index}",
+                    "status": "done",
+                    "agent_id": raw_agent_id,
+                }
+                for index, raw_agent_id in enumerate(raw_ids, start=1)
+            ],
+        })
+        snapshot_text = result.snapshot_bytes.decode("utf-8")
+        self.assertTrue(all(raw_agent_id not in snapshot_text for raw_agent_id in raw_ids))
+        self.assertTrue(all(projected in snapshot_text for projected in mapped))
+
+        invalid = (
+            _rooted_agent("reviewer@v2") + "/",
+            _rooted_agent("@v2"),
+            _rooted_agent("reviewer+v2"),
+            _rooted_agent("a" * 251),
+        )
+        for raw_agent_id in invalid:
+            with self.subTest(raw_agent_id=raw_agent_id), self.assertRaises(
+                LegacyBridgeSnapshotV04Error
+            ):
+                legacy_bridge_agent_id_v04(raw_agent_id)
+
     def test_provider_identity_parser_does_not_relax_privacy_scanning(self) -> None:
         source = Path(legacy_snapshot.__file__).read_bytes()
         fixture = Path(__file__).read_bytes()

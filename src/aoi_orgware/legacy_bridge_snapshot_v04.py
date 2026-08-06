@@ -13,6 +13,7 @@ import os
 import re
 from typing import Any, NamedTuple, NoReturn
 
+from .agent_identity import AGENT_ID_RE
 from .company.contracts import CompanyContractError, canonical_company_json_bytes
 from .company.legacy_bridge import (
     LEGACY_BRIDGE_SNAPSHOT_V1,
@@ -34,6 +35,7 @@ from .harnesslib import (
 
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_ROOTED_AGENT_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
 _ROOTED_AGENT_NAMESPACE = "root"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SOURCE_VERSION = re.compile(
@@ -79,10 +81,14 @@ def legacy_bridge_agent_id_v04(raw_agent_id: Any) -> str:
     components = raw_agent_id.split("/")
     rooted_agent = (
         len(raw_agent_id) <= 256
+        and AGENT_ID_RE.fullmatch(raw_agent_id) is not None
         and len(components) >= 3
         and components[0] == ""
         and components[1] == _ROOTED_AGENT_NAMESPACE
-        and all(_SAFE_ID.fullmatch(component) is not None for component in components[2:])
+        and all(
+            _ROOTED_AGENT_COMPONENT.fullmatch(component) is not None
+            for component in components[2:]
+        )
     )
     if rooted_agent:
         digest = hashlib.sha256(
