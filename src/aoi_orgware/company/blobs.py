@@ -21,6 +21,8 @@ import stat
 import time
 from typing import Final
 
+from .native_filesystem import native_filesystem_path as _native_filesystem_path
+
 
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _DEFAULT_MAX_BYTES: Final[int] = 64 * 1024 * 1024
@@ -87,24 +89,6 @@ def _as_bytes(payload: bytes | bytearray | memoryview) -> bytes:
     if isinstance(payload, memoryview):
         return payload.tobytes()
     raise TypeError("blob payload must be bytes-like")
-
-
-def _native_filesystem_path(path: Path) -> str | Path:
-    """Return an internal long-path syscall spelling without changing identity.
-
-    Public roots deliberately reject Windows namespace aliases.  Internally,
-    however, a canonical absolute path can exceed the legacy Win32 ``MAX_PATH``
-    limit once the fixed SHA-256 fanout and member name are appended.  Use the
-    extended namespace only at the syscall boundary so returned ``Path`` values,
-    digest identities, and caller-visible root spelling remain unchanged.
-    """
-
-    if os.name != "nt":
-        return path
-    raw = os.fspath(path)
-    if raw.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + raw[2:]
-    return "\\\\?\\" + raw
 
 
 def _lstat_regular(path: Path, label: str) -> os.stat_result:

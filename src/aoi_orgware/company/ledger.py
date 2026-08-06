@@ -33,6 +33,7 @@ from .contracts import (
     validate_takeover_capability,
     validate_takeover_consumption_receipt,
 )
+from .native_filesystem import native_filesystem_path as _native
 
 
 class LedgerError(RuntimeError):
@@ -321,24 +322,20 @@ def _takeover_consumption(
 
 
 class CompanyLedger:
-    """One WAL-backed, append-only company ledger.
-
-    Every append takes ``BEGIN IMMEDIATE``.  This makes SQLite's writer lock
-    the sole-writer boundary and keeps global plus all requested stream heads
-    in one transaction.
-    """
+    """WAL ledger with one SQLite writer and atomic global/stream heads."""
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5000) -> None:
         if not isinstance(busy_timeout_ms, int) or isinstance(busy_timeout_ms, bool) or busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must be a non-negative integer")
         self.path = Path(path)
+        self._native_path = _native(self.path)
         self._busy_timeout_ms = busy_timeout_ms
         self._writer_lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         self._database_guard_fd: int | None = None
         self._database_identity: tuple[str, int, int] | None = None
         self._health = "opening"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(_native(self.path.parent), exist_ok=True)
         connection: sqlite3.Connection | None = None
         try:
             (
@@ -392,7 +389,7 @@ class CompanyLedger:
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
-                self.path,
+                self._native_path,
                 isolation_level=None,
                 timeout=self._busy_timeout_ms / 1000,
                 check_same_thread=False,
@@ -422,7 +419,7 @@ class CompanyLedger:
 
     def _database_file_identity(self) -> tuple[str, int, int]:
         try:
-            resolved = self.path.resolve(strict=True)
+            resolved = Path(self._native_path).resolve(strict=True)
             stat = resolved.stat()
         except OSError as exc:
             raise LedgerOwnershipError(
@@ -444,12 +441,12 @@ class CompanyLedger:
         try:
             try:
                 descriptor = os.open(
-                    self.path,
+                    self._native_path,
                     flags | os.O_CREAT | os.O_EXCL,
                     0o600,
                 )
             except FileExistsError:
-                descriptor = os.open(self.path, flags)
+                descriptor = os.open(self._native_path, flags)
             opened = os.fstat(descriptor)
             pathname_identity = self._database_file_identity()
             identity = (

@@ -1,9 +1,4 @@
-"""Replaceable SQLite projection for the AOI v0.5 company ledger.
-
-The ledger remains authoritative.  This module accepts only immutable,
-chain-verified ``LedgerTransactionRecord`` instances and maintains a query
-projection that may be discarded and rebuilt at any time.
-"""
+"""Replaceable SQLite projection of the authoritative company ledger."""
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -77,6 +72,7 @@ from .ledger import (
     LedgerReservationRecord,
     LedgerTransactionRecord,
 )
+from .native_filesystem import native_filesystem_path as _native
 from .invariants import (
     CompanyInvariantError,
     InvariantObject,
@@ -325,7 +321,8 @@ class CompanyReadModel:
                 "busy_timeout_ms must be a non-negative integer",
             )
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._native_path = _native(self.path)
+        os.makedirs(_native(self.path.parent), exist_ok=True)
         self._busy_timeout_ms = busy_timeout_ms
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
@@ -381,16 +378,13 @@ class CompanyReadModel:
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
-                self.path,
+                self._native_path,
                 isolation_level=None,
                 timeout=self._busy_timeout_ms / 1000,
                 check_same_thread=False,
             )
             connection.row_factory = sqlite3.Row
-            # The read model is replaced as one database file during rebuild;
-            # authoritative concurrency is served by the Supervisor API, not
-            # direct browser connections, so WAL sidecars are intentionally
-            # avoided here.
+            # Rebuild replaces one database; readers use the Supervisor API.
             connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
@@ -844,7 +838,7 @@ class CompanyReadModel:
 
     def _database_file_identity(self) -> tuple[str, int, int]:
         try:
-            resolved = self.path.resolve(strict=True)
+            resolved = Path(self._native_path).resolve(strict=True)
             stat = resolved.stat()
         except OSError as exc:
             raise ReadModelCorruptionError(
@@ -858,12 +852,12 @@ class CompanyReadModel:
         try:
             try:
                 descriptor = os.open(
-                    self.path,
+                    self._native_path,
                     flags | os.O_CREAT | os.O_EXCL,
                     0o600,
                 )
             except FileExistsError:
-                descriptor = os.open(self.path, flags)
+                descriptor = os.open(self._native_path, flags)
             opened = os.fstat(descriptor)
             pathname_identity = self._database_file_identity()
             identity = (
@@ -1981,7 +1975,7 @@ class CompanyReadModel:
         """Build a fresh sibling database and atomically replace ``path``."""
 
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(_native(target.parent), exist_ok=True)
         temporary = target.with_name(
             f".{target.name}.aoi-readmodel-v1.{uuid.uuid4().hex}.tmp",
         )
@@ -1992,12 +1986,17 @@ class CompanyReadModel:
             head = model.head()
             model.close()
             model = None
-            os.replace(temporary, target)
+            os.replace(
+                _native(temporary),
+                _native(target),
+            )
             return head
         finally:
             if model is not None:
                 model.close()
             try:
-                temporary.unlink(missing_ok=True)
+                os.unlink(_native(temporary))
+            except FileNotFoundError:
+                pass
             except OSError:
                 pass

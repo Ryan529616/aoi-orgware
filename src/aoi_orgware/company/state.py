@@ -83,6 +83,7 @@ from .ledger import (
     LedgerHeadsSnapshot,
     LedgerTransactionRecord,
 )
+from .native_filesystem import fsync_directory, native_filesystem_path
 from .process_lock import CompanyProcessLock, CompanyProcessLockBusyError
 from .readmodel import (
     CompanyReadModel,
@@ -255,19 +256,6 @@ def _ensure_slot_root(root: Path) -> None:
             ) from exc
         _assert_directory(path, "company slot directory")
     _assert_directory(root, "company slot")
-
-
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 class CompanyStateOwner:
@@ -482,14 +470,12 @@ class CompanyStateOwner:
         records = CompanyLedger.load_records(ledger)
         target = self.resolved.incarnation.readmodel
         if os.name == "nt":
-            # Windows may deny replace-over-existing even after SQLite and the
-            # path guard are closed.  The projection is non-authoritative, so
-            # deleting it under the lifetime lock is a safe crash boundary:
-            # the next open rebuilds it from the ledger.
+            # A closed projection is replaceable; retire it under the lifetime
+            # lock so the ledger remains the sole recovery authority.
             for candidate in (
-                target,
-                target.with_name(f"{target.name}-wal"),
-                target.with_name(f"{target.name}-shm"),
+                Path(native_filesystem_path(target)),
+                Path(native_filesystem_path(target.with_name(f"{target.name}-wal"))),
+                Path(native_filesystem_path(target.with_name(f"{target.name}-shm"))),
             ):
                 try:
                     candidate.unlink(missing_ok=True)
@@ -502,10 +488,8 @@ class CompanyStateOwner:
             target,
             records,
         )
-        _fsync_directory(self.resolved.incarnation.root)
-        self._readmodel = CompanyReadModel(
-            self.resolved.incarnation.readmodel,
-        )
+        fsync_directory(self.resolved.incarnation.root)
+        self._readmodel = CompanyReadModel(self.resolved.incarnation.readmodel)
         ledger_head = CompanyLedger.snapshot_heads(ledger).global_head
         projection_head = self._readmodel.verify_integrity()
         if (

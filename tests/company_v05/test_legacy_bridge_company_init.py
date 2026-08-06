@@ -17,6 +17,7 @@ from aoi_orgware.company.contracts import (
     EXECUTION_NODE_V1,
     EXTERNAL_JOB_V1,
     MUTATION_INTENT_V1,
+    canonical_company_json_bytes,
 )
 from aoi_orgware.company.discovery import BoundCompanyTarget
 from aoi_orgware.company.legacy_bridge import normalize_legacy_bridge_snapshot
@@ -26,6 +27,7 @@ from aoi_orgware.company.legacy_bridge_health import (
     legacy_bridge_attempt_id,
 )
 from aoi_orgware.company.legacy_bridge_publisher import publish_legacy_bridge_snapshot
+from aoi_orgware.company.native_filesystem import native_filesystem_path
 from aoi_orgware.company.supervisor import CompanySupervisor
 from aoi_orgware.company.transactions import (
     CompanyEventDraft,
@@ -116,25 +118,41 @@ def test_fresh_genesis_is_exactly_reopenable_and_has_no_work(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows long-path regression")
-def test_fresh_genesis_is_reopenable_when_blob_members_exceed_max_path(
+def test_fresh_genesis_is_reopenable_when_registry_and_databases_are_long(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
     base = Path(tempfile.mkdtemp(prefix="aoi-lb-long-", dir=tmp_path.anchor))
     try:
-        selected: tuple[dict[str, str], Path] | None = None
+        selected: tuple[dict[str, str], Path, Path] | None = None
         for padding in range(1, 241):
             environment = _environment(base / ("r" * padding))
-            _manifest, slot, _platform = bridge._expected_slot(
+            manifest, slot, _platform = bridge._expected_slot(
                 paths.root,
                 environ=environment,
                 bootstrap_at=bridge.utc_second(T),
             )
-            if len(os.fspath(slot / "blobs" / "aa" / "bb")) == 209:
-                selected = environment, slot
+            manifest_sha256 = hashlib.sha256(
+                canonical_company_json_bytes(manifest),
+            ).hexdigest()
+            incarnation_id = (
+                f"i{int(manifest['company_incarnation']):08d}-"
+                f"{manifest_sha256[:12]}"
+            )
+            incarnation = (
+                slot / "incarnations" / incarnation_id
+            )
+            if len(os.fspath(slot)) == 210:
+                selected = environment, slot, incarnation
                 break
         assert selected is not None
-        environment, slot = selected
+        environment, slot, incarnation = selected
+
+        assert len(os.fspath(incarnation)) == 246
+        assert len(os.fspath(incarnation / "blobs")) == 252
+        assert len(os.fspath(incarnation / "manifest.json")) == 260
+        assert len(os.fspath(incarnation / "ledger.sqlite3")) == 261
+        assert len(os.fspath(incarnation / "readmodel.sqlite3")) == 264
 
         created = bridge.initialize_legacy_bridge_company(
             paths.root, environ=environment, now=T,
@@ -146,11 +164,12 @@ def test_fresh_genesis_is_reopenable_when_blob_members_exceed_max_path(
         assert created.action == "created"
         assert reopened.action == "existing_exact"
         assert created.company_id == reopened.company_id
-        assert len(os.fspath(slot / "blobs" / "aa" / "bb" / ("a" * 64))) == 274
         with CompanySupervisor.open(created.state_root) as supervisor:
             assert supervisor.heads().global_head.global_sequence == 1
+            rebuilt = supervisor._state.rebuild_projection()  # noqa: SLF001
+            assert rebuilt.global_sequence == 1
     finally:
-        shutil.rmtree("\\\\?\\" + os.fspath(base))
+        shutil.rmtree(native_filesystem_path(base))
 
 
 def test_stopped_exact_reopen_accepts_later_legacy_snapshot(

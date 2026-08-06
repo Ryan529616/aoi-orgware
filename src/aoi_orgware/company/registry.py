@@ -1,11 +1,4 @@
-"""Stable company-slot registry and active-incarnation pointer.
-
-The registry is a cooperative state primitive.  Every public method requires a
-caller-supplied lifetime company lock witness; this module never acquires or
-releases that lock itself.  ``current.json`` is authoritative only between
-Supervisor lifetimes.  The ledger opened from the verified pointer is the
-transaction authority during one Supervisor lifetime.
-"""
+"""Cooperative company registry."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -27,6 +20,7 @@ from .contracts import (
     company_contract_sha256,
     validate_company_manifest,
 )
+from .native_filesystem import fsync_directory as _fsync, native_filesystem_path as _native
 
 
 _COMPANY_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}")
@@ -251,7 +245,7 @@ def _is_windows_reparse_point(metadata: os.stat_result) -> bool:
 
 def _assert_directory(path: Path, label: str) -> os.stat_result:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(_native(path))
     except OSError as exc:
         raise CompanyRegistryError(f"{label} is unavailable: {path}") from exc
     if (
@@ -265,7 +259,7 @@ def _assert_directory(path: Path, label: str) -> os.stat_result:
 
 def _assert_regular(path: Path, label: str) -> os.stat_result:
     try:
-        metadata = path.lstat()
+        metadata = os.lstat(_native(path))
     except OSError as exc:
         raise CompanyRegistryError(f"{label} is unavailable: {path}") from exc
     if (
@@ -282,23 +276,17 @@ def _assert_regular(path: Path, label: str) -> os.stat_result:
 
 def _ensure_private_directory(path: Path, label: str) -> None:
     try:
-        path.mkdir(mode=0o700, parents=False, exist_ok=True)
-        if os.name != "nt":
-            path.chmod(0o700)
+        os.mkdir(_native(path), mode=0o700)
+    except FileExistsError:
+        _assert_directory(path, label)
     except OSError as exc:
         raise CompanyRegistryError(f"cannot create {label}: {path}") from exc
-    _assert_directory(path, label)
-
-
-def _fsync_parent(path: Path) -> None:
-    if os.name == "nt":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        if os.name != "nt":
+            os.chmod(_native(path), 0o700)
+    except OSError as exc:
+        raise CompanyRegistryError(f"cannot protect {label}: {path}") from exc
+    _assert_directory(path, label)
 
 
 def _atomic_replace(path: Path, payload: bytes) -> None:
@@ -306,7 +294,7 @@ def _atomic_replace(path: Path, payload: bytes) -> None:
     descriptor: int | None = None
     try:
         descriptor = os.open(
-            temporary,
+            _native(temporary),
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
         )
@@ -315,11 +303,14 @@ def _atomic_replace(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.replace(
+            _native(temporary),
+            _native(path),
+        )
         if os.name != "nt":
-            path.chmod(0o600)
+            os.chmod(_native(path), 0o600)
         _assert_regular(path, "published company registry member")
-        _fsync_parent(path.parent)
+        _fsync(path.parent)
     except OSError as exc:
         raise CompanyRegistryError(
             f"cannot publish company registry member: {path}",
@@ -328,7 +319,9 @@ def _atomic_replace(path: Path, payload: bytes) -> None:
         if descriptor is not None:
             os.close(descriptor)
         try:
-            temporary.unlink(missing_ok=True)
+            os.unlink(_native(temporary))
+        except FileNotFoundError:
+            pass
         except OSError:
             pass
 
@@ -336,13 +329,15 @@ def _atomic_replace(path: Path, payload: bytes) -> None:
 def _create_immutable(path: Path, payload: bytes, label: str) -> None:
     try:
         descriptor = os.open(
-            path,
+            _native(path),
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
         )
     except FileExistsError:
         _assert_regular(path, label)
-        if path.read_bytes() != payload:
+        with open(_native(path), "rb") as source:
+            existing = source.read(len(payload) + 1)
+        if existing != payload:
             raise CompanyRegistryError(f"{label} already has divergent bytes")
         return
     except OSError as exc:
@@ -353,12 +348,14 @@ def _create_immutable(path: Path, payload: bytes, label: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         if os.name != "nt":
-            path.chmod(0o600)
+            os.chmod(_native(path), 0o600)
         _assert_regular(path, label)
-        _fsync_parent(path.parent)
+        _fsync(path.parent)
     except BaseException:
         try:
-            path.unlink(missing_ok=True)
+            os.unlink(_native(path))
+        except FileNotFoundError:
+            pass
         except OSError:
             pass
         raise
@@ -369,7 +366,8 @@ def _read_json(path: Path, label: str, *, maximum: int = 256 * 1024) -> Any:
     if int(metadata.st_size) > maximum:
         raise CompanyRegistryError(f"{label} exceeds its byte bound")
     try:
-        raw = path.read_bytes()
+        with open(_native(path), "rb") as source:
+            raw = source.read(maximum + 1)
         value = json.loads(raw.decode("utf-8", "strict"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise CompanyRegistryError(f"{label} is not canonical JSON") from exc
