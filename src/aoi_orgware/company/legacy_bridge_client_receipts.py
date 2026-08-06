@@ -39,6 +39,11 @@ from .legacy_bridge_client_receipt_contract import (
     validate_terminal as _validate_terminal_contract,
 )
 from .legacy_bridge_health import MAX_SOURCE_DOCUMENT_BYTES
+from .native_filesystem import (
+    NativeFilesystemIdentityError,
+    native_filesystem_path as _native_filesystem_path,
+    unlink_identity_checked,
+)
 
 
 _RECEIPT_ROOT = ("cv1", "lb")
@@ -143,6 +148,23 @@ def _link_like(path: Path, metadata: os.stat_result) -> bool:
     )
 
 
+def _lstat(path: Path) -> os.stat_result:
+    return os.lstat(_native_filesystem_path(path))
+
+
+def _exists(path: Path) -> bool:
+    try:
+        _lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _entries(path: Path) -> list[Path]:
+    with os.scandir(_native_filesystem_path(path)) as entries:
+        return [path / entry.name for entry in entries]
+
+
 def safe_directory(path: Path, *, create: bool) -> Path:
     if not path.is_absolute() or ".." in path.parts:
         fail("unsafe_client_receipt_path")
@@ -151,16 +173,18 @@ def safe_directory(path: Path, *, create: bool) -> Path:
         current /= part
         created = False
         try:
-            metadata = current.lstat()
+            metadata = _lstat(current)
         except FileNotFoundError:
             if not create:
-                raise
+                raise LegacyBridgeClientError(
+                    "client_receipt_path_unavailable"
+                ) from None
             try:
-                current.mkdir(mode=0o700)
+                os.mkdir(_native_filesystem_path(current), mode=0o700)
                 created = True
             except FileExistsError:
                 pass
-            metadata = current.lstat()
+            metadata = _lstat(current)
         except OSError as exc:
             raise LegacyBridgeClientError("client_receipt_path_unavailable") from exc
         if _link_like(current, metadata) or not stat.S_ISDIR(metadata.st_mode):
@@ -175,15 +199,19 @@ def safe_directory(path: Path, *, create: bool) -> Path:
 
 def read_regular(path: Path, *, max_bytes: int = _MAX_RECEIPT_BYTES) -> bytes:
     try:
-        before = path.lstat()
+        before = _lstat(path)
         if _link_like(path, before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             fail("unsafe_client_receipt_file")
-        with path.open("rb") as handle:
+        descriptor = os.open(
+            _native_filesystem_path(path),
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
             opened = os.fstat(handle.fileno())
             if _regular_identity(opened) != _regular_identity(before):
                 fail("client_receipt_file_changed")
             raw = handle.read(max_bytes + 1)
-        after = path.lstat()
+        after = _lstat(path)
     except LegacyBridgeClientError:
         raise
     except OSError as exc:
@@ -201,19 +229,23 @@ def _member_max_bytes(name: str) -> int:
 
 def _read_recovery_file(path: Path, *, max_bytes: int) -> tuple[bytes, os.stat_result]:
     try:
-        before = path.lstat()
+        before = _lstat(path)
         if (
             _link_like(path, before)
             or not stat.S_ISREG(before.st_mode)
             or before.st_nlink not in {1, 2}
         ):
             fail("unsafe_client_temporary_file")
-        with path.open("rb") as handle:
+        descriptor = os.open(
+            _native_filesystem_path(path),
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
             opened = os.fstat(handle.fileno())
             if _regular_identity(opened) != _regular_identity(before):
                 fail("client_temporary_file_changed")
             raw = handle.read(max_bytes + 1)
-        after = path.lstat()
+        after = _lstat(path)
     except LegacyBridgeClientError:
         raise
     except OSError as exc:
@@ -227,7 +259,7 @@ def _read_recovery_file(path: Path, *, max_bytes: int) -> tuple[bytes, os.stat_r
 
 def _sync_parent_directory(path: Path) -> None:
     descriptor = os.open(
-        path,
+        _native_filesystem_path(path),
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
     )
     try:
@@ -243,12 +275,11 @@ def _sync_created_directory_parent(path: Path) -> None:
 
 def _unlink_recovered_temporary(path: Path, expected: os.stat_result) -> None:
     try:
-        observed = path.lstat()
-        if _regular_identity(observed) != _regular_identity(expected):
-            fail("client_temporary_file_changed")
-        path.unlink()
+        unlink_identity_checked(path, expected)
         if os.name != "nt":
             _sync_parent_directory(path.parent)
+    except NativeFilesystemIdentityError:
+        fail("client_temporary_file_changed")
     except LegacyBridgeClientError:
         raise
     except OSError as exc:
@@ -259,7 +290,7 @@ def _recover_temporary(path: Path, destination: Path) -> None:
     max_bytes = _member_max_bytes(destination.name)
     temporary_bytes, temporary_stat = _read_recovery_file(path, max_bytes=max_bytes)
     try:
-        destination_stat = destination.lstat()
+        destination_stat = _lstat(destination)
     except FileNotFoundError:
         if temporary_stat.st_nlink != 1:
             fail("orphan_client_temporary_has_links")
@@ -293,7 +324,7 @@ def recover_temporaries(directory: Path, allowed_destinations: frozenset[str]) -
     if not allowed_destinations or not allowed_destinations <= _RECEIPT_MEMBER_NAMES:
         fail("invalid_client_temporary_recovery_scope")
     temporaries: list[tuple[Path, str]] = []
-    for entry in directory.iterdir():
+    for entry in _entries(directory):
         if not entry.name.startswith(".aoi-cv1-"):
             continue
         matched = _TEMPORARY.fullmatch(entry.name)
@@ -321,7 +352,11 @@ def _windows_move_no_replace_write_through(source: Path, destination: Path) -> b
     move_file = kernel32.MoveFileExW
     move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
     move_file.restype = wintypes.BOOL
-    if move_file(str(source), str(destination), 0x00000008):
+    if move_file(
+        os.fspath(_native_filesystem_path(source)),
+        os.fspath(_native_filesystem_path(destination)),
+        0x00000008,
+    ):
         return True
     error = get_last_error()
     if error in {80, 183}:
@@ -339,7 +374,7 @@ def publish_exact(
         fail("invalid_client_receipt_payload")
     safe_directory(path.parent, create=True)
     recover_temporaries(path.parent, frozenset({path.name}))
-    if path.exists():
+    if _exists(path):
         if read_regular(path, max_bytes=max_bytes) != payload:
             fail("divergent_client_receipt")
         return False
@@ -347,7 +382,7 @@ def publish_exact(
     descriptor: int | None = None
     try:
         descriptor = os.open(
-            temporary,
+            _native_filesystem_path(temporary),
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
             0o600,
         )
@@ -364,8 +399,12 @@ def publish_exact(
                         fail("divergent_client_receipt")
                     return False
             else:
-                os.link(temporary, path, follow_symlinks=False)
-                temporary.unlink()
+                os.link(
+                    _native_filesystem_path(temporary),
+                    _native_filesystem_path(path),
+                    follow_symlinks=False,
+                )
+                os.unlink(_native_filesystem_path(temporary))
         except FileExistsError:
             if read_regular(path, max_bytes=max_bytes) != payload:
                 fail("divergent_client_receipt")
@@ -383,7 +422,7 @@ def publish_exact(
         if descriptor is not None:
             os.close(descriptor)
         try:
-            temporary_stat = temporary.lstat()
+            temporary_stat = _lstat(temporary)
         except FileNotFoundError:
             pass
         else:
@@ -426,15 +465,14 @@ def _receipt_contract(call: Any, *args: Any) -> dict[str, Any]:
 def _marker(path: Path, full_id: str, label: str, *, create: bool) -> None:
     sha(full_id, label)
     marker = path / f"{label}.id"
-    if marker.exists():
+    if _exists(marker):
         if read_regular(marker, max_bytes=64) != full_id.encode("ascii"):
             fail(f"{label}_path_collision")
     elif create:
         publish_exact(marker, full_id.encode("ascii"), max_bytes=64)
-    try:
-        observed = read_regular(marker, max_bytes=64)
-    except FileNotFoundError as exc:
-        raise LegacyBridgeClientError(f"missing_{label}_marker") from exc
+    else:
+        fail(f"missing_{label}_marker")
+    observed = read_regular(marker, max_bytes=64)
     if observed != full_id.encode("ascii"):
         fail(f"{label}_path_collision")
 
@@ -461,19 +499,19 @@ def _load_attempt(path: Path, *, expected_scope_id: str, expected_attempt_id: st
         "reconciled.json",
     }
     recover_temporaries(path, frozenset(allowed))
-    entries = list(path.iterdir())
+    entries = _entries(path)
     if len(entries) > len(allowed) or any(entry.name not in allowed for entry in entries):
         fail("unexpected_client_receipt_member")
     _marker(path, expected_attempt_id, "attempt", create=False)
     source_path = path / "source.json"
     prepared_path = path / "prepared.json"
-    if not prepared_path.exists():
+    if not _exists(prepared_path):
         if any(entry.name in {"terminal.json", "reconciled.json"} for entry in entries):
             fail("incomplete_client_receipt_attempt")
-        if source_path.exists():
+        if _exists(source_path):
             read_regular(source_path, max_bytes=MAX_SOURCE_DOCUMENT_BYTES)
         return None
-    if not source_path.exists():
+    if not _exists(source_path):
         fail("prepared_source_missing")
     source = read_regular(source_path, max_bytes=MAX_SOURCE_DOCUMENT_BYTES)
     prepared = _receipt_contract(
@@ -496,7 +534,7 @@ def _load_attempt(path: Path, *, expected_scope_id: str, expected_attempt_id: st
     terminal_path = path / "terminal.json"
     terminal = (
         None
-        if not terminal_path.exists()
+        if not _exists(terminal_path)
         else _receipt_contract(
             _validate_terminal_contract,
             _parse_json(read_regular(terminal_path)),
@@ -505,11 +543,11 @@ def _load_attempt(path: Path, *, expected_scope_id: str, expected_attempt_id: st
         )
     )
     reconciliation_path = path / "reconciled.json"
-    if reconciliation_path.exists() and terminal is None:
+    if _exists(reconciliation_path) and terminal is None:
         fail("reconciliation_without_terminal")
     reconciliation = (
         None
-        if not reconciliation_path.exists()
+        if not _exists(reconciliation_path)
         else _receipt_contract(
             _validate_reconciliation_contract,
             _parse_json(read_regular(reconciliation_path)),
@@ -529,7 +567,7 @@ def _capacity_attempt(
 ) -> CapacityAttemptV1:
     source_path = path / "source.json"
     source_sha256 = None
-    if source_path.exists():
+    if _exists(source_path):
         source = (
             attempt.source
             if attempt is not None
@@ -590,7 +628,7 @@ def inventory(scope_root: Path, expected_scope_id: str) -> ReceiptInventory:
     result: list[ReceiptAttempt] = []
     attempt_ids: list[str] = []
     capacity_attempts: list[CapacityAttemptV1] = []
-    entries = list(scope_root.iterdir())
+    entries = _entries(scope_root)
     if len(entries) > _MAX_ATTEMPTS + 3:
         fail("client_attempt_inventory_overbound")
     for entry in sorted(entries, key=lambda member: member.name):
@@ -619,7 +657,7 @@ def inventory(scope_root: Path, expected_scope_id: str) -> ReceiptInventory:
     normalized_capacity_attempts = tuple(capacity_attempts)
     capacity_path = scope_root / "capacity.json"
     capacity_receipt = None
-    if capacity_path.exists():
+    if _exists(capacity_path):
         try:
             capacity_receipt = validate_capacity_receipt(
                 _parse_json(read_regular(

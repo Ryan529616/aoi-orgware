@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -27,12 +29,97 @@ from aoi_orgware.company.legacy_bridge_ingest_protocol import (
     build_legacy_bridge_ingest_command,
 )
 from aoi_orgware.company.legacy_bridge_publisher import LegacyBridgeIngestResult
+from aoi_orgware.company.native_filesystem import native_filesystem_path
 
 
 T0 = "2026-08-05T08:00:00Z"
 ARCHIVE = "a" * 64
 MANIFEST = "b" * 64
 STATE = "c" * 64
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows long paths")
+def test_client_receipt_store_uses_extended_paths_only_at_syscall_boundary(
+    tmp_path: Path,
+) -> None:
+    slot_root = tmp_path
+    while len(str(slot_root)) < 184:
+        slot_root /= "legacy-client-receipt-long-path-segment"
+    slot_root.mkdir(parents=True)
+
+    scope_id = "a" * 64
+    attempt_id = "b" * 64
+    expected_scope = slot_root / "cv1" / "lb" / scope_id[:32]
+    expected_temporary = expected_scope / (
+        ".aoi-cv1-scope.id-" + ("0" * 32) + ".tmp"
+    )
+    assert len(str(expected_temporary)) > 260
+
+    scope_root = receipts.ensure_scope_root(slot_root, scope_id)
+    attempt_root = receipts.attempt_root(scope_root, attempt_id, create=True)
+    member = attempt_root / "source.json"
+    payload = b'{"synthetic":"AOI-SYNTHETIC-FIXTURE-V1"}'
+
+    assert scope_root == expected_scope
+    assert not str(scope_root).startswith("\\\\?\\")
+    assert receipts.publish_exact(member, payload)
+    assert not receipts.publish_exact(member, payload)
+    assert receipts.read_regular(member) == payload
+
+    temporary = attempt_root / (
+        ".aoi-cv1-terminal.json-" + ("1" * 32) + ".tmp"
+    )
+    descriptor = os.open(
+        native_filesystem_path(temporary),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(b"orphan")
+    receipts.recover_temporaries(attempt_root, frozenset({"terminal.json"}))
+    assert not receipts._exists(temporary)
+
+
+def test_missing_receipt_paths_and_markers_have_stable_typed_errors(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    with pytest.raises(
+        receipts.LegacyBridgeClientError,
+        match="client_receipt_path_unavailable",
+    ):
+        receipts.safe_directory(missing, create=False)
+
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    with pytest.raises(
+        receipts.LegacyBridgeClientError,
+        match="missing_scope_marker",
+    ):
+        receipts._marker(existing, "a" * 64, "scope", create=False)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle deletion")
+def test_temporary_cleanup_does_not_delete_a_replacement_path(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / (".aoi-cv1-source.json-" + ("2" * 32) + ".tmp")
+    survivor = tmp_path / "survivor.tmp"
+    replacement = tmp_path / "replacement.tmp"
+    temporary.write_bytes(b"original")
+    replacement.write_bytes(b"replacement")
+    expected = receipts._lstat(temporary)
+
+    os.replace(temporary, survivor)
+    os.replace(replacement, temporary)
+    with pytest.raises(
+        receipts.LegacyBridgeClientError,
+        match="client_temporary_file_changed",
+    ):
+        receipts._unlink_recovered_temporary(temporary, expected)
+
+    assert temporary.read_bytes() == b"replacement"
+    assert survivor.read_bytes() == b"original"
 
 
 def _source() -> bytes:

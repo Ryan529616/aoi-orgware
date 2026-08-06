@@ -9,8 +9,10 @@ import pytest
 
 from aoi_orgware.company.ledger import CompanyLedger
 from aoi_orgware.company.native_filesystem import (
+    NativeFilesystemIdentityError,
     _windows_extended_path,
     native_filesystem_path,
+    unlink_identity_checked,
 )
 from aoi_orgware.company.readmodel import CompanyReadModel
 from aoi_orgware.company.registry import (
@@ -41,6 +43,24 @@ def test_native_filesystem_path_preserves_public_identity() -> None:
         assert native_filesystem_path(Path(observed)) == observed
     else:
         assert observed is canonical
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle deletion")
+def test_unlink_identity_checked_is_handle_bound_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original.bin"
+    other = tmp_path / "other.bin"
+    original.write_bytes(b"original")
+    other.write_bytes(b"other")
+    expected = os.lstat(native_filesystem_path(original))
+
+    with pytest.raises(NativeFilesystemIdentityError):
+        unlink_identity_checked(other, expected)
+    assert other.read_bytes() == b"other"
+
+    unlink_identity_checked(original, expected)
+    assert not original.exists()
 
 
 def test_database_objects_preserve_canonical_public_path(tmp_path: Path) -> None:
