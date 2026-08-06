@@ -1,10 +1,4 @@
-"""Read-only, truth-preserving views over the AOI company read model.
-
-The browser never opens SQLite directly.  ``CompanyViewService`` takes one
-bounded snapshot through :class:`CompanyStateOwner` and turns the projected
-contracts into versioned API sections.  It deliberately preserves unknown
-values and keeps runtime state separate from engineering state.
-"""
+"""Read-only, truth-preserving views over the AOI company read model."""
 
 from __future__ import annotations
 
@@ -57,6 +51,9 @@ from .invariants import (
     reduce_company_invariants,
 )
 from .ledger import LedgerTransactionRecord
+from .legacy_bridge_contract import LEGACY_BRIDGE_OBSERVATION_V1
+from .legacy_bridge_health import LEGACY_BRIDGE_COVERAGE_V1
+from .legacy_bridge_views import LegacyBridgeViewError, merge_legacy_bridge_coverage, project_legacy_bridge_dashboard
 from .readmodel import ProjectedObject
 from .state import (
     CompanyDeliverySnapshot,
@@ -161,9 +158,7 @@ def _plain(value: Any) -> Any:
     return value
 
 
-# Provider resume handles and fresh-user-intent material are durable ledger
-# inputs, not dashboard data.  Apply this at the view boundary as a final
-# defence for both current sections and incremental event payloads.
+# Strip durable provider secrets at the view boundary.
 _REDACTED_VIEW_KEYS = frozenset({
     "session_id",
     "thread_id",
@@ -887,8 +882,7 @@ def _queue_item_view(
         "updated_at": str(payload["updated_at"]),
         "evidence_count": len(evidence),
         "reconcile_required": reconcile_required,
-        # This is only the durable registered-work admission predicate.  It
-        # never claims that a provider worker has been launched or is present.
+        # Registered-work admission never proves provider launch.
         "launch_eligible": launch_eligible,
         "launch_eligibility_reason": launch_eligibility_reason,
     }
@@ -1022,8 +1016,7 @@ def _work_view(
         if not active_gate:
             eligibility[dispatch_id] = (False, "registered_launch_gate_inactive")
             continue
-        # Contract timestamps are canonical UTC strings, so string comparison
-        # is also an exact chronological comparison here.
+        # Canonical UTC strings preserve chronological ordering.
         if str(binding.get("expires_at", "")) <= now:
             eligibility[dispatch_id] = (False, "registered_binding_expired")
             continue
@@ -1348,13 +1341,15 @@ def _execution_orphans(
         if not isinstance(execution_id, str):
             continue
         reason = invalid_reasons.get(execution_id)
-        if reason is None and node.get("organization_node_id") is None:
+        if reason is None and node.get("projection_source") == "legacy_bridge_observation":
+            reason = node.get("orphan_reason")
+        elif reason is None and node.get("organization_node_id") is None:
             reason = "organization_node_missing"
         if reason is not None:
             orphans.append({
                 **node,
                 "orphan_reason": reason,
-                "projection_source": "derived_read_only",
+                "projection_source": node.get("projection_source", "derived_read_only"),
             })
     orphans.sort(
         key=lambda node: (
@@ -1603,7 +1598,17 @@ class CompanyViewService:
             }
             for identity in department_identities
         ]
-        execution_nodes = _payloads(objects, EXECUTION_NODE_V1)
+        try:
+            legacy_bridge = project_legacy_bridge_dashboard(
+                _payloads(objects, LEGACY_BRIDGE_OBSERVATION_V1),
+                _payloads(objects, LEGACY_BRIDGE_COVERAGE_V1),
+            )
+        except LegacyBridgeViewError as exc:
+            raise CompanyViewError("legacy bridge Dashboard projection is invalid") from exc
+        if legacy_bridge.coverage_degraded:
+            completeness = "partial"
+        warnings.extend(x for x in legacy_bridge.warnings if x not in warnings)
+        execution_nodes = [*_payloads(objects, EXECUTION_NODE_V1), *legacy_bridge.nodes]
         execution_events = _payloads(objects, EXECUTION_EVENT_V1)
         telemetry_receipts = _payloads(
             objects,
@@ -1669,8 +1674,7 @@ class CompanyViewService:
             if manager_reason is not None:
                 occupied: int | None = None
             else:
-                # The only way to clear manager_reason is a proven string
-                # department lead present in the organization projection.
+                # A clear reason requires a projected department lead.
                 assert lead_key is not None
                 occupied = manager_capacity.get(lead_key, 0)
             department["manager_capacity"] = {
@@ -1710,7 +1714,7 @@ class CompanyViewService:
             reason=capacity_reason,
             eligibility=work_eligibility,
         )
-        jobs = _payloads(objects, EXTERNAL_JOB_V1)
+        jobs = [*_payloads(objects, EXTERNAL_JOB_V1), *legacy_bridge.jobs]
         evidence_records = _payloads(objects, EVIDENCE_RECORD_V1)
         provider_receipts = [
             item
@@ -1734,6 +1738,7 @@ class CompanyViewService:
         alerts = [
             *alerts,
             *_derived_execution_orphan_alerts(execution_orphans, alerts),
+            *legacy_bridge.alerts,
         ]
         needs_user_revisions = _payloads(objects, NEEDS_USER_REVISION_V1)
         latest_needs_user_revisions: dict[str, dict[str, Any]] = {}
@@ -1785,10 +1790,9 @@ class CompanyViewService:
             all_coverage,
             absent_reason="provider_adapters_not_yet_connected",
         )
+        overall_coverage = merge_legacy_bridge_coverage(overall_coverage, legacy_bridge.summary)
         if health.blob_status != "ready":
-            # Preserve the provider assessment separately while ensuring the
-            # Command Center top bar cannot hide a known evidence-coverage
-            # failure behind an otherwise observed or unknown adapter state.
+            # A blob failure must remain visible in the Command Center.
             warning = {
                 "state": "degraded",
                 "reason": (
@@ -2121,11 +2125,10 @@ class CompanyViewService:
                 "external_job_effect_receipts":
                     external_job_effect_receipts,
                 "edges": artifact_edges,
+                "legacy_bridge": legacy_bridge.summary,
             },
             "usage": {
-                # Raw counter samples are intentionally not aggregated here.
-                # Legacy UsageEvent may contain a derived scope or delta, so
-                # it is not exported by this operational telemetry surface.
+                # Never aggregate cumulative samples or export legacy deltas.
                 "counting_semantics": "non_additive_cumulative",
                 "counter_samples": [
                     _usage_counter_sample_view(sample)
@@ -2182,12 +2185,7 @@ class CompanyViewService:
         }
 
     def snapshot_at(self, cursor: int) -> dict[str, Any]:
-        """Return one exact historical snapshot envelope at a ledger cursor.
-
-        This deliberately serves only the composite snapshot: individual
-        sections remain current-state API endpoints, so a client cannot mix a
-        historical department response with a current execution response.
-        """
+        """Return one composite historical snapshot at an exact cursor."""
 
         return self.snapshot_from_replay(
             self._state.historical_replay_input(),

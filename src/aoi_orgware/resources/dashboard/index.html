@@ -458,6 +458,7 @@
     const empty = text => `<div class="empty">${safe(text)}</div>`;
     const pill = (label, value) =>
       `<span class="pill ${safe(value)}">${safe(label)} ${safe(value)}</span>`;
+    const truthPills = item => pill("engineering", item.engineering_status ?? "unknown") + pill("runtime", item.runtime_status ?? "unknown") + pill("coverage", item.coverage_status ?? "unknown") + pill("effect", item.effect_status ?? "unknown");
     const copy = value =>
       `<button class="copy" data-copy="${safe(value)}" title="複製 immutable ID">${safe(value)}</button>`;
     const isHistoricalView = () => historicalCursor !== null;
@@ -596,8 +597,7 @@
           && item.dispatch_join?.execution_id === executionId
           && typeof item.receipt_id === "string" && item.receipt_id)
         .map(item => item.receipt_id));
-      // Counter samples never carry execution_id.  Attribute them only through
-      // their immutable telemetry receipt, never by timing or a guessed turn.
+      // Attribute counters only through immutable telemetry receipt IDs.
       const usageSamples = (Array.isArray(usage.counter_samples)
         ? usage.counter_samples : [])
         .filter(item => isRecord(item)
@@ -608,8 +608,7 @@
         ...(Array.isArray(execution.nodes) ? execution.nodes : []),
         ...(Array.isArray(execution.orphans) ? execution.orphans : [])
       ].filter(node => isRecord(node) && node.execution_id === executionId);
-      // A duplicate normal/orphan identity is ambiguous.  Do not attach its
-      // node evidence IDs; the detail endpoint itself fails closed for it.
+      // Duplicate node IDs remain ambiguous and unassociated.
       const uniqueNodeEvidenceIds = matchingNodes.length === 1
         ? (Array.isArray(matchingNodes[0].evidence_ids)
           ? matchingNodes[0].evidence_ids : [])
@@ -634,9 +633,7 @@
         ? evidence.records : [])
         .filter(record => isRecord(record) && record.execution_id === executionId)
         .map(record => record.evidence_id);
-      // Association is deliberately ID-only: unique node IDs, exact execution
-      // event IDs, direct record IDs, or the evidence endpoint of a direct
-      // execution edge.  Never infer an association from time or adjacency.
+      // Evidence association is exact-ID only, never temporal or adjacent.
       const evidenceIds = new Set([
         ...uniqueNodeEvidenceIds,
         ...matchingEventEvidenceIds,
@@ -651,8 +648,7 @@
         .filter(id => typeof id === "string" && id));
       const artifactSha256s = new Set(executionEvidence.map(record => record.artifact?.sha256)
         .filter(sha256 => typeof sha256 === "string" && sha256));
-      // This is one-hop identity linkage only.  Do not recursively infer an
-      // execution relation from a graph path or an incidental time window.
+      // Link one hop only; graph paths never imply evidence association.
       const relatedEdges = allEdges
         .filter(edge => edgeReferences(edge, "execution", new Set([executionId]))
           || edgeReferences(edge, "evidence", visibleEvidenceIds)
@@ -714,7 +710,7 @@
       if (drawer.tab === "Overview") {
         content.innerHTML = `<div class="card"><h3>${safe(detail.display_name || detail.execution_id)}</h3>
           <div class="mono">${safe(detail.execution_id)}</div>
-          <div class="status-pair">${pill("engineering", detail.engineering_status)}${pill("runtime", detail.runtime_status)}${pill("carrier", detail.carrier_state ?? "unknown")}</div>
+          <div class="status-pair">${truthPills(detail)}${pill("carrier", detail.carrier_state ?? "unknown")}</div>
           <div class="sub">${safe(detail.objective || detail.phase || "No projected objective or phase.")}</div>
           <div class="sub">Read-only projection; no mutation controls are available.</div></div>`;
       } else if (drawer.tab === "Activity") {
@@ -1132,8 +1128,7 @@
           <span class="sub">${safe(node.role || node.execution_kind)}</span></div>
           <div class="mono">${copy(node.execution_id)}</div>
           <div class="status-pair">
-            ${pill("engineering", node.engineering_status)}
-            ${pill("runtime", node.runtime_status)}
+            ${truthPills(node)}
             ${pill("carrier", node.carrier_state ?? "unknown")}
             ${row.invalid ? pill("ancestry", row.reason) : ""}
           </div>
@@ -1148,8 +1143,7 @@
           <div class="mono">${copy(node.execution_id)}</div>
           <div class="status-pair">
             ${pill("orphan", node.orphan_reason || "unattributed")}
-            ${pill("engineering", node.engineering_status)}
-            ${pill("runtime", node.runtime_status)}
+            ${truthPills(node)}
           </div>
           <div class="sub">${safe(`source: ${node.projection_source || "unknown"}`)}</div>
           <div class="sub">${safe(node.objective || node.phase || "")}</div>
@@ -1166,9 +1160,9 @@
       const jobs = (data.jobs || []).filter(match);
       el("jobs").innerHTML = jobs.length ? jobs.map(job => `
         <div class="card ${safe(job.state)}">
-          <div class="row"><h3 class="grow">External job</h3>
-          ${pill("", job.state)}</div>
+          <div class="row"><h3 class="grow">External job</h3>${pill("", job.state)}</div>
           <div class="mono">${copy(job.job_id)}</div>
+          <div class="status-pair">${truthPills(job)}</div>
           <div class="sub">${safe(`owner execution: ${job.owner_execution_id}`)}</div>
           <div class="sub">${safe(`mutation intent: ${job.mutation_intent_id} · command: ${job.command_id}`)}</div>
           <div class="sub">${safe(`scope digest: ${job.scope_sha256}`)}</div>
