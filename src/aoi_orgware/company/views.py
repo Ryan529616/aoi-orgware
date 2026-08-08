@@ -1340,7 +1340,7 @@ def _execution_orphans(
         if not isinstance(execution_id, str):
             continue
         reason = invalid_reasons.get(execution_id)
-        if reason is None and node.get("projection_source") == "legacy_bridge_observation":
+        if reason is None and type(node.get("bridge_scope_id")) is str:
             reason = node.get("orphan_reason")
         elif reason is None and node.get("organization_node_id") is None:
             reason = "organization_node_missing"

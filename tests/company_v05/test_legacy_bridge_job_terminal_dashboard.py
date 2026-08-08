@@ -55,6 +55,10 @@ def test_terminal_receipt_enriches_same_entity_and_preserves_old_cursor(
         observation_cursor = supervisor.heads().global_head.global_sequence
         before = _view(supervisor)
         before_node, before_job = _legacy_job(before["data"])
+        assert before_node["execution_id"] not in {
+            item["execution_id"] for item in before["data"]["execution"]["orphans"]
+        }
+        assert "execution_orphan_detected" not in before["warnings"]
         assert (
             before_node["runtime_status"], before_node["coverage_status"],
             before_node["effect_status"],
@@ -81,11 +85,25 @@ def test_terminal_receipt_enriches_same_entity_and_preserves_old_cursor(
         )
         assert current_job["process_observation"]["state"] == "known"
         assert current_job["effect_evidence"]
+        assert current_node["execution_id"] not in {
+            item["execution_id"] for item in current["data"]["execution"]["orphans"]
+        }
+        assert "execution_orphan_detected" not in current["warnings"]
+        assert not any(
+            item.get("execution_id") == current_node["execution_id"]
+            and item["category"] == "execution_orphan"
+            for item in current["data"]["alerts"]["alerts"]
+        )
         historical = _view(supervisor, observation_cursor)
         old_node, old_job = _legacy_job(historical["data"])
         assert old_node == before_node
         assert old_job == before_job
         assert old_node["runtime_status"] == "unknown"
+        assert old_node["execution_id"] not in {
+            item["execution_id"]
+            for item in historical["data"]["execution"]["orphans"]
+        }
+        assert "execution_orphan_detected" not in historical["warnings"]
         assert current["cursor"] == terminal.global_sequence
         assert "legacy_bridge_terminal_receipt_observed" in current["warnings"]
         assert current["completeness"] == "partial"
