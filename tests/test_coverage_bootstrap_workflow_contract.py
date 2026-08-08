@@ -15,7 +15,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 VERIFIER = "python scripts/verify_coverage_path_mapping.py"
 FRAGMENT_COMBINER = f"{VERIFIER} --combine-fragments covdata"
 COVERAGE_TEMP_ROOT = "${{ runner.temp }}/aoi-coverage-tests"
-COVERAGE_JOB_SHA256 = "2548a4f9597ac5688a22069c7ddc7482a81daae2d38c7efcf7e4d908dfaeefc1"
+COVERAGE_JOB_SHA256 = "be4b8339468dc0db3e6bcbd0e27645ba70a565a611af722a970541f23a201d3c"
 EXPECTED_CONFIG = """[run]
 source = aoi_orgware
 parallel = true
@@ -210,11 +210,11 @@ def test_coverage_contract_rejects_alias_and_workflow_weakening() -> None:
     invalid_job_root = workflow.replace(
         "  coverage:\n"
         "    runs-on: ubuntu-latest\n"
-        "    timeout-minutes: 120\n"
+        "    timeout-minutes: 180\n"
         "    steps:\n",
         "  coverage:\n"
         "    runs-on: ubuntu-latest\n"
-        "    timeout-minutes: 120\n"
+        "    timeout-minutes: 180\n"
         f"    env:\n      AOI_COVERAGE_TEMP_ROOT: {COVERAGE_TEMP_ROOT}\n"
         "    steps:\n",
         1,
