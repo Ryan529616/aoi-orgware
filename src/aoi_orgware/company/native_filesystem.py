@@ -55,7 +55,9 @@ def unlink_identity_checked(path: Path, expected: os.stat_result) -> None:
     from ctypes import wintypes
 
     msvcrt = importlib.import_module("msvcrt")
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    win_dll = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel32 = win_dll("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
     create_file.argtypes = [
         wintypes.LPCWSTR,
@@ -91,7 +93,7 @@ def unlink_identity_checked(path: Path, expected: os.stat_result) -> None:
     invalid_handle = ctypes.c_void_p(-1).value
     handle_value = int(handle)
     if handle_value == invalid_handle:
-        error = ctypes.get_last_error()
+        error = get_last_error()
         raise OSError(error, "CreateFileW identity-bound delete failed", str(path))
 
     descriptor: int | None = None
@@ -114,7 +116,7 @@ def unlink_identity_checked(path: Path, expected: os.stat_result) -> None:
             ctypes.byref(delete_file),
             ctypes.sizeof(delete_file),
         ):
-            error = ctypes.get_last_error()
+            error = get_last_error()
             raise OSError(
                 error,
                 "SetFileInformationByHandle delete failed",

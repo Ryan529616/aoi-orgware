@@ -435,7 +435,7 @@ class BlobStore:
             if descriptor is None or temporary is None or temporary_stat is None:
                 raise BlobStoreError("could not allocate private blob temporary")
             if os.name != "nt":
-                os.fchmod(descriptor, 0o600)
+                getattr(os, "fchmod")(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = None
                 handle.write(data)
