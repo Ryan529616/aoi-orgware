@@ -57,7 +57,9 @@ def _repo(tmp_path: Path) -> Path:
         capture_output=True,
     )
     (repo / "aoi.toml").write_text(
-        (Path(__file__).resolve().parents[2] / "aoi.toml").read_text(encoding="utf-8"),
+        (Path(__file__).resolve().parents[2] / "examples" / "aoi.toml").read_text(
+            encoding="utf-8"
+        ),
         encoding="utf-8",
     )
     return repo
@@ -363,7 +365,7 @@ def test_config_or_remote_drift_and_partial_residue_fail_closed(
     environment = _environment(short_state_root)
     result = bridge.initialize_legacy_bridge_company(paths.root, environ=environment, now=T)
     changed = paths.config.read_text(encoding="utf-8").replace(
-        'name = "aoi-v05-company-core"',
+        'name = "Example Project"',
         'name = "synthetic-changed"',
     )
     (paths.config).write_text(changed, encoding="utf-8")

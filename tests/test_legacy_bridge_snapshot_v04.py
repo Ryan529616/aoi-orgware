@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -69,8 +70,7 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
             from aoi_orgware.harnesslib import HarnessPaths
 
             paths = mock.create_autospec(HarnessPaths, instance=True)
-            paths.project.profile_id = "profile-1"
-            paths.project.sha256 = "a" * 64
+            paths.project = SimpleNamespace(profile_id="profile-1", sha256="a" * 64)
             return produce_legacy_bridge_snapshot_v04(
                 paths, "task-1", "company-1", 1, 0, "a" * 64,
                 "0.4.0a4", "2026-08-05T00:00:00Z",

@@ -80,7 +80,7 @@ def test_existing_non_directory_is_rejected_without_chmod(tmp_path: Path) -> Non
     os.chmod(occupied, 0o640)
     before = stat.S_IMODE(occupied.stat().st_mode)
 
-    with pytest.raises(CompanyRegistryError, match="must be one directory"):
+    with pytest.raises(CompanyRegistryError, match="must be a non-link directory"):
         _ensure_private_directory(occupied, "synthetic private directory")
 
     assert stat.S_IMODE(occupied.stat().st_mode) == before
