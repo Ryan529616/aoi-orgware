@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Shared CLI integration-test fixture without importing the full test suite."""
 
+# AOI-SYNTHETIC-FIXTURE-V1: test identities and host paths are synthetic.
+
 from __future__ import annotations
 
 import datetime as dt
@@ -240,6 +242,124 @@ class HarnessTestCase(unittest.TestCase):
             agent_id,
             *extra,
         )
+
+    def git_commit(self, name: str) -> str:
+        marker = self.root / f"authority-{name}.txt"
+        marker.write_text(f"{name}\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", marker.name], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "-m", f"authority {name}"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+    def task_state(self, task_id: str) -> dict:
+        return json.loads(
+            (
+                self.root
+                / ".aoi"
+                / "tasks"
+                / task_id
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+
+    def create_lane(
+        self,
+        task_id: str,
+        lane_id: str,
+        *,
+        kind: str,
+        role: str,
+        authority_commit: str,
+        contract_version: str = "cv1",
+        generator_version: str | None = "gv1",
+        adapter_version: str | None = "av1",
+        status: str = "active",
+    ) -> dict:
+        args = [
+            "lane-create",
+            "--task",
+            task_id,
+            "--lane-id",
+            lane_id,
+            "--kind",
+            kind,
+            "--status",
+            status,
+            "--owner",
+            f"{lane_id}-agent",
+            "--role",
+            role,
+            "--authority-commit",
+            authority_commit,
+            "--contract-version",
+            contract_version,
+            "--next-action",
+            f"Advance {lane_id} independently",
+        ]
+        if generator_version is not None:
+            args.extend(["--generator-version", generator_version])
+        if adapter_version is not None:
+            args.extend(["--adapter-version", adapter_version])
+        args.append("--json")
+        return json.loads(self.cli(*args).stdout)
+
+    def create_exact_job_owner(
+        self,
+        task_id: str,
+        packet_id: str,
+        *,
+        command: str,
+        work_root: str,
+        agent_role: str = "external_operator",
+        model_tier: str = "standard",
+        lane_id: str | None = None,
+        execution_selection_id: str | None = None,
+        dispatch: bool = True,
+    ) -> str:
+        """Create and dispatch one exact-command packet for a synthetic job."""
+
+        artifact_name = f"{packet_id}-job-command.sh"
+        artifact = self.root / artifact_name
+        supplied = command.encode("utf-8")
+        artifact.write_bytes(supplied)
+        arguments = [
+            "create-packet", "--task", task_id, "--packet-id", packet_id,
+            "--agent-role", agent_role, "--model-tier", model_tier,
+            "--objective", "Own one exact synthetic external command",
+            "--scope", "Only the claimed command and external output tree",
+            "--deliverable", "Terminal job evidence",
+            "--validation", "Packet and job command identities remain exact",
+            "--packet-mode", "exact_command",
+            "--lock", f"repo:file:{artifact_name}",
+            "--lock", f"external:tree:{work_root}",
+            "--command-artifact", str(artifact),
+            "--command-sha256", hashlib.sha256(supplied).hexdigest(),
+        ]
+        if lane_id is not None:
+            arguments.extend(["--lane-id", lane_id])
+        if execution_selection_id is not None:
+            arguments.extend([
+                "--execution-selection-id", execution_selection_id,
+            ])
+        self.cli(*arguments)
+        if dispatch:
+            self.dispatch_packet(
+                task_id,
+                packet_id,
+                f"/home/tester/{packet_id}",
+            )
+        return artifact_name
 
     def add_passing_verification(
         self,

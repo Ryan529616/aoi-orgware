@@ -1,4 +1,4 @@
-"""Read-only, truth-preserving views over the AOI company read model."""
+"""Truthful read-only company views."""
 
 from __future__ import annotations
 
@@ -51,8 +51,7 @@ from .invariants import (
     reduce_company_invariants,
 )
 from .ledger import LedgerTransactionRecord
-from .legacy_bridge_contract import LEGACY_BRIDGE_OBSERVATION_V1
-from .legacy_bridge_health import LEGACY_BRIDGE_COVERAGE_V1
+from . import legacy_bridge_contract as bc, legacy_bridge_health as bh, legacy_bridge_job_terminal as bj
 from .legacy_bridge_views import LegacyBridgeViewError, merge_legacy_bridge_coverage, project_legacy_bridge_dashboard
 from .readmodel import ProjectedObject
 from .state import (
@@ -175,7 +174,7 @@ _REDACTED_VIEW_KEYS = frozenset({
 
 
 def _is_redacted_view_key(key: str) -> bool:
-    """Recognize raw transport and secret-bearing fields at any nesting."""
+    """Recognize secret-bearing transport fields."""
 
     normalized = key.lower()
     return (
@@ -190,7 +189,7 @@ def _is_redacted_view_key(key: str) -> bool:
 
 
 def _takeover_capability_view(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Render issuance identity only; never return the executable capability."""
+    """Render issuance identity without executable capability."""
 
     return {
         "contract_type": TAKEOVER_CAPABILITY_V1,
@@ -1600,8 +1599,9 @@ class CompanyViewService:
         ]
         try:
             legacy_bridge = project_legacy_bridge_dashboard(
-                _payloads(objects, LEGACY_BRIDGE_OBSERVATION_V1),
-                _payloads(objects, LEGACY_BRIDGE_COVERAGE_V1),
+                _payloads(objects, bc.LEGACY_BRIDGE_OBSERVATION_V1),
+                _payloads(objects, bh.LEGACY_BRIDGE_COVERAGE_V1),
+                _payloads(objects, bj.LEGACY_BRIDGE_JOB_TERMINAL_RECEIPT_V1),
             )
         except LegacyBridgeViewError as exc:
             raise CompanyViewError("legacy bridge Dashboard projection is invalid") from exc

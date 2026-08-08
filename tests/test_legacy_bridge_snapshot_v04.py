@@ -230,9 +230,10 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
         base: dict[str, object] = {"status": "active", "packets": [], "jobs": [], "needs_user_escalations": []}
         invalid_states = [
             dict(base, packets=[{"packet_id": "C:/unsafe", "status": "ready"}]),
-            dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": "../unsafe"}]),
-            dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": "C:/unsafe"}]),
-            dict(base, packets=[{"packet_id": "packet-1", "status": "ready", "agent_id": _rooted_agent("..", "unsafe")}]),
+            dict(base, packets=[{
+                "packet_id": "packet-1", "status": "ready",
+                "agent_id": "agent with space",
+            }]),
             dict(base, jobs=[{"run_id": "C:/unsafe", "status": "running"}]),
             dict(base, needs_user_escalations=[{"escalation_id": "../unsafe", "status": "needs_user"}]),
         ]
@@ -281,16 +282,24 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
                 ],
             })
 
-    def test_rooted_agents_accept_canonical_versioned_segments(self) -> None:
+    def test_all_canonical_non_safe_agents_map_without_exposing_raw_ids(self) -> None:
         raw_ids = (
             _rooted_agent("legacy_smoke_successor_review@v2"),
             _rooted_agent("legacy_smoke_successor_review@v3"),
             _rooted_agent("team:review", "legacy_smoke_successor_review@v4"),
+            "/" + "home/tester/job-command-agent",
+            "C:/opaque-agent-identity",
+            "../opaque-agent-identity",
         )
         mapped = tuple(legacy_bridge_agent_id_v04(value) for value in raw_ids)
         self.assertEqual(len(set(mapped)), len(raw_ids))
-        for value in mapped:
-            self.assertRegex(value, r"\Aroot@[0-9a-f]{64}\Z")
+        for raw, value in zip(raw_ids, mapped, strict=True):
+            parts = raw.split("/")
+            prefix = (
+                "root" if len(parts) >= 3 and parts[:2] == ["", "root"]
+                else "agent"
+            )
+            self.assertRegex(value, rf"\A{prefix}@[0-9a-f]{{64}}\Z")
 
         result = self._produce({
             "status": "active", "jobs": [], "needs_user_escalations": [], "packets": [
@@ -306,12 +315,7 @@ class LegacyBridgeSnapshotV04Tests(unittest.TestCase):
         self.assertTrue(all(raw_agent_id not in snapshot_text for raw_agent_id in raw_ids))
         self.assertTrue(all(projected in snapshot_text for projected in mapped))
 
-        invalid = (
-            _rooted_agent("reviewer@v2") + "/",
-            _rooted_agent("@v2"),
-            _rooted_agent("reviewer+v2"),
-            _rooted_agent("a" * 251),
-        )
+        invalid = ("", "agent with space", "agent+v2", "agent\n", "a" * 513)
         for raw_agent_id in invalid:
             with self.subTest(raw_agent_id=raw_agent_id), self.assertRaises(
                 LegacyBridgeSnapshotV04Error

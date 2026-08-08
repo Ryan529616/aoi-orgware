@@ -13,7 +13,7 @@ import os
 import re
 from typing import Any, NamedTuple, NoReturn
 
-from .agent_identity import AGENT_ID_RE
+from .agent_identity import AgentIdentityError, validate_agent_id
 from .company.contracts import CompanyContractError, canonical_company_json_bytes
 from .company.legacy_bridge import (
     LEGACY_BRIDGE_SNAPSHOT_V1,
@@ -35,8 +35,6 @@ from .harnesslib import (
 
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_ROOTED_AGENT_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
-_ROOTED_AGENT_NAMESPACE = "root"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SOURCE_VERSION = re.compile(
     r"0\.4\.0a(?:3|4)(?:\+[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?"
@@ -61,6 +59,14 @@ class LegacyBridgeSnapshotV04Result(NamedTuple):
     projection: LegacyBridgeProjectionV1
 
 
+class LegacyBridgeTaskStateV04(NamedTuple):
+    """One integrity-checked stable task-state read for sibling adapters."""
+
+    state: dict[str, Any]
+    state_bytes: bytes
+    state_sha256: str
+
+
 def _fail(message: str) -> NoReturn:
     raise LegacyBridgeSnapshotV04Error(message)
 
@@ -74,28 +80,22 @@ def _identifier(value: Any, label: str) -> str:
 def legacy_bridge_agent_id_v04(raw_agent_id: Any) -> str:
     """Map a raw v0.4 agent ID into the bridge-safe identity domain."""
 
-    if type(raw_agent_id) is not str:
-        _fail("legacy agent id is invalid")
-    if _SAFE_ID.fullmatch(raw_agent_id) is not None:
-        return raw_agent_id
-    components = raw_agent_id.split("/")
-    rooted_agent = (
-        len(raw_agent_id) <= 256
-        and AGENT_ID_RE.fullmatch(raw_agent_id) is not None
-        and len(components) >= 3
-        and components[0] == ""
-        and components[1] == _ROOTED_AGENT_NAMESPACE
-        and all(
-            _ROOTED_AGENT_COMPONENT.fullmatch(component) is not None
-            for component in components[2:]
-        )
+    try:
+        agent_id = validate_agent_id(raw_agent_id, "legacy agent id")
+    except AgentIdentityError as exc:
+        raise LegacyBridgeSnapshotV04Error("legacy agent id is invalid") from exc
+    if _SAFE_ID.fullmatch(agent_id) is not None:
+        return agent_id
+    digest = hashlib.sha256(
+        b"aoi-orgware:legacy-bridge-agent-v04\x00" + agent_id.encode("utf-8")
+    ).hexdigest()
+    components = agent_id.split("/")
+    prefix = (
+        "root"
+        if len(components) >= 3 and components[:2] == ["", "root"]
+        else "agent"
     )
-    if rooted_agent:
-        digest = hashlib.sha256(
-            b"aoi-orgware:legacy-bridge-agent-v04\x00" + raw_agent_id.encode("utf-8")
-        ).hexdigest()
-        return f"root@{digest}"
-    _fail("legacy agent id is invalid")
+    return f"{prefix}@{digest}"
 
 
 def _integer(value: Any, label: str, *, minimum: int) -> int:
@@ -320,28 +320,15 @@ def _validate_legacy_integrity(paths: HarnessPaths, state: dict[str, Any]) -> No
         _fail("legacy task integrity validation failed")
 
 
-def produce_legacy_bridge_snapshot_v04(
+def read_legacy_bridge_task_state_v04(
     paths: HarnessPaths,
     task_id: str,
-    company_id: str,
-    incarnation: int,
-    generation: int,
-    legacy_archive_sha256: str,
-    source_version: str,
-    observed_at: str,
-) -> LegacyBridgeSnapshotV04Result:
-    """Produce a canonical, redacted snapshot of one non-semantic v0.4 task."""
+) -> LegacyBridgeTaskStateV04:
+    """Read one non-semantic task under the existing legacy integrity fence."""
 
     if not isinstance(paths, HarnessPaths):
         _fail("paths must be HarnessPaths")
     task_id = _identifier(task_id, "task_id")
-    company_id = _identifier(company_id, "company_id")
-    incarnation = _integer(incarnation, "incarnation", minimum=1)
-    generation = _integer(generation, "generation", minimum=0)
-    archive_sha = _sha(legacy_archive_sha256, "legacy_archive_sha256")
-    source_version = _source_version(source_version)
-    if type(observed_at) is not str:
-        _fail("observed_at is invalid")
     try:
         with state_lock(paths, create_layout=False):
             if is_semantic_v2_task(paths, task_id):
@@ -361,11 +348,40 @@ def produce_legacy_bridge_snapshot_v04(
             after_identity, after_bytes = _stable_state_read(state_path)
     except LegacyBridgeSnapshotV04Error:
         raise
-    except (CompanyContractError, HarnessError, OSError, ValueError, TypeError, RecursionError):
+    except (
+        CompanyContractError, HarnessError, OSError, ValueError, TypeError,
+        RecursionError,
+    ):
         _fail("legacy v0.4 task read failed")
     if before_identity != after_identity or before_bytes != after_bytes:
         _fail("legacy task state changed during bounded snapshot read")
-    state_sha = hashlib.sha256(before_bytes).hexdigest()
+    return LegacyBridgeTaskStateV04(
+        state, before_bytes, hashlib.sha256(before_bytes).hexdigest(),
+    )
+
+
+def produce_legacy_bridge_snapshot_v04(
+    paths: HarnessPaths,
+    task_id: str,
+    company_id: str,
+    incarnation: int,
+    generation: int,
+    legacy_archive_sha256: str,
+    source_version: str,
+    observed_at: str,
+) -> LegacyBridgeSnapshotV04Result:
+    """Produce a canonical, redacted snapshot of one non-semantic v0.4 task."""
+
+    task_id = _identifier(task_id, "task_id")
+    company_id = _identifier(company_id, "company_id")
+    incarnation = _integer(incarnation, "incarnation", minimum=1)
+    generation = _integer(generation, "generation", minimum=0)
+    archive_sha = _sha(legacy_archive_sha256, "legacy_archive_sha256")
+    source_version = _source_version(source_version)
+    if type(observed_at) is not str:
+        _fail("observed_at is invalid")
+    stable = read_legacy_bridge_task_state_v04(paths, task_id)
+    state, state_sha = stable.state, stable.state_sha256
     try:
         document = {
             "document_type": LEGACY_BRIDGE_SNAPSHOT_V1, "schema_version": 1,
@@ -389,5 +405,6 @@ def produce_legacy_bridge_snapshot_v04(
 
 __all__ = [
     "LegacyBridgeSnapshotV04Error", "LegacyBridgeSnapshotV04Result",
-    "legacy_bridge_agent_id_v04", "produce_legacy_bridge_snapshot_v04",
+    "LegacyBridgeTaskStateV04", "legacy_bridge_agent_id_v04",
+    "produce_legacy_bridge_snapshot_v04", "read_legacy_bridge_task_state_v04",
 ]

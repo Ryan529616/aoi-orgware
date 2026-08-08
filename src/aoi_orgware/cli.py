@@ -533,13 +533,7 @@ VERIFICATION_CATEGORIES = {
 def _require_codex_transport_packet_terminal_status(
     launch_state: str, packet_status: str
 ) -> None:
-    """Keep runtime terminal meaning distinct from the packet lifecycle.
-
-    Unknown launch/runtime outcomes require explicit reconciliation and cannot
-    be collapsed into any terminal packet verdict.  Known outcomes have one
-    exact packet-status mapping; a technical result such as rejection belongs
-    in ``typed_outcome`` rather than by contradicting the runtime state.
-    """
+    """Keep runtime terminal truth distinct from packet lifecycle verdicts."""
 
     if launch_state in _CODEX_TRANSPORT_UNRESOLVED_TERMINAL_STATES:
         raise HarnessError(
@@ -5631,7 +5625,10 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if args.status != "queued":
         raise HarnessError("job-start must record status queued before any launch")
     tool_version = require_text(args.tool_version, "tool version")
-    command = require_text(args.command, "command")
+    command_supplied = require_text(args.command, "command")
+    command_bytes = packet_integrity_impl.normalize_exact_command_bytes(
+        command_supplied.encode("utf-8"))
+    command = command_bytes.decode("utf-8")
     registered_at = now_iso()
     observed_start_at: str | None = None
     registration_lag_seconds: float | None = None
@@ -5671,7 +5668,7 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         source_sha,
         tool_path=tool_path,
         tool_version=tool_version,
-        command=command,
+        command=command_supplied,
     )
     with state_lock(paths):
         state = load_task(paths, args.task)
@@ -5705,17 +5702,18 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "external job cannot start during the sequential Steward synthesis phase: "
                 + ", ".join(active_synthesis_packets)
             )
-        owner_packet = (
-            _packet_by_id(state, args.owner_packet_id)
-            if args.owner_packet_id
-            else None
-        )
+        if not args.owner_packet_id:
+            raise HarnessError("job-start requires --owner-packet-id")
+        owner_packet = _packet_by_id(state, args.owner_packet_id)
+        if owner_packet.get("packet_mode") != "exact_command":
+            raise HarnessError("job owner must be exact-command")
+        owner_packet_sha = owner_packet.get("packet_contract_sha256", "")
         namespace = paths.project.external_lock_namespace
         required_output_locks = [
             f"{namespace}:tree:{work_root}",
             f"{namespace}:file:{log}",
         ]
-        command_authority_sha = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        command_sha = hashlib.sha256(command_bytes).hexdigest()
         _validate_job_activation_topology(
             state,
             {
@@ -5724,17 +5722,13 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "execution_selection_id": selection.get("selection_id", "")
                 if selection
                 else "",
-                "owner_packet_id": args.owner_packet_id or "",
-                "owner_packet_contract_sha256": (
-                    owner_packet.get("packet_contract_sha256", "")
-                    if owner_packet is not None
-                    else ""
-                ),
+                "owner_packet_id": args.owner_packet_id,
+                "owner_packet_contract_sha256": owner_packet_sha,
                 "external_lock_namespace": namespace,
                 "required_output_locks": required_output_locks,
                 "work_root": work_root,
                 "log": log,
-                "command_sha256": command_authority_sha,
+                "command_sha256": command_sha,
             },
             selection,
             paths=paths,
@@ -5772,10 +5766,9 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         command_snapshot = (
             task_dir(paths, args.task) / "results" / f"job-command-{run_id}.txt"
         )
-        atomic_write_text(command_snapshot, command)
+        atomic_write_bytes(command_snapshot, command_bytes)
         os.chmod(command_snapshot, 0o600)
-        command_sha = sha256_file(command_snapshot)
-        if command_sha != command_authority_sha:
+        if sha256_file(command_snapshot) != command_sha:
             raise HarnessError("external job command snapshot changed during copy")
         job = {
             "integrity_version": 1,
@@ -5788,12 +5781,8 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_selection_id": selection.get("selection_id", "")
             if selection
             else "",
-            "owner_packet_id": args.owner_packet_id or "",
-            "owner_packet_contract_sha256": (
-                owner_packet.get("packet_contract_sha256", "")
-                if owner_packet is not None
-                else ""
-            ),
+            "owner_packet_id": args.owner_packet_id,
+            "owner_packet_contract_sha256": owner_packet_sha,
             "external_lock_namespace": namespace,
             "required_output_locks": required_output_locks,
             **(skill_binding or {}),
@@ -5814,8 +5803,9 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "command_path": str(command_snapshot),
             "command_sha256": command_sha,
             "command_size_bytes": command_snapshot.stat().st_size,
+            "command_normalization": packet_integrity_impl.EXACT_COMMAND_NORMALIZATION_V1,
             "success_exit_code": args.success_exit_code,
-            "evidence": "queued before launch" if args.status == "queued" else "launch recorded",
+            "evidence": "queued before launch",
             "registered_at": registered_at,
             "started_at": now_iso(),
             "updated_at": now_iso(),

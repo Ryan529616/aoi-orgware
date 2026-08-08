@@ -31,6 +31,12 @@ from .legacy_bridge_health import (
     LEGACY_BRIDGE_COVERAGE_V1,
     validate_legacy_bridge_coverage,
 )
+from .legacy_bridge_job_terminal import (
+    LEGACY_BRIDGE_JOB_TERMINAL_RECEIPT_V1,
+    LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_V1,
+    validate_legacy_bridge_job_terminal_receipt,
+    validate_legacy_bridge_job_terminal_source,
+)
 
 
 Validator = Callable[[Any], dict[str, Any]]
@@ -122,6 +128,8 @@ CONTRACT_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({
         _contracts.validate_crypto_verification_receipt,
     LEGACY_BRIDGE_OBSERVATION_V1: validate_legacy_bridge_observation,
     LEGACY_BRIDGE_COVERAGE_V1: validate_legacy_bridge_coverage,
+    LEGACY_BRIDGE_JOB_TERMINAL_RECEIPT_V1:
+        validate_legacy_bridge_job_terminal_receipt,
 })
 
 SOURCE_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({
@@ -133,6 +141,8 @@ SOURCE_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({
         _contracts.validate_engineering_disposition_source,
     _contracts.EXTERNAL_JOB_EFFECT_SOURCE_V1:
         _contracts.validate_external_job_effect_source,
+    LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_V1:
+        validate_legacy_bridge_job_terminal_source,
 })
 
 DOCUMENT_VALIDATORS: Final[Mapping[str, Validator]] = MappingProxyType({

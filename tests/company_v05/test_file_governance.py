@@ -44,8 +44,8 @@ from aoi_orgware.company.file_governance_io import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ACCEPTED_COMMIT = "95c6ba0a364f749d55deb9d46eabb965577360c9"
-ACCEPTED_TREE = "c4592610a855009f7eeffa32f5d19477f8c5f084"
+ACCEPTED_COMMIT = "130ca900bdc7bdbc224ba53eeda1157a39916121"
+ACCEPTED_TREE = "c2123cbf2bf2f65fb1b91015003b8b07f6b5bb1f"
 OBSERVED_AT = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
 SELF_ONLY = (
     ExactExclusionV1(
@@ -659,13 +659,13 @@ def test_packaged_baseline_covers_source_docs_tests_and_exact_counts() -> None:
     assert packaged["accepted_commit_sha1"] == ACCEPTED_COMMIT
     assert packaged["accepted_tree_sha1"] == ACCEPTED_TREE
     assert packaged["totals"] == {
-        "excluded_file_count": 2,
-        "hand_authored_file_count": 315,
-        "hand_authored_logical_lines": 264890,
-        "hand_authored_size_bytes": 10829305,
-        "legacy_privacy_finding_count": 160,
-        "tracked_file_count": 317,
-        "tracked_size_bytes": 11357346,
+        "excluded_file_count": 3,
+        "hand_authored_file_count": 434,
+        "hand_authored_logical_lines": 318621,
+        "hand_authored_size_bytes": 12984665,
+        "legacy_privacy_finding_count": 151,
+        "tracked_file_count": 437,
+        "tracked_size_bytes": 13587932,
     }
     paths = {item["path"] for item in packaged["files"]}
     assert {

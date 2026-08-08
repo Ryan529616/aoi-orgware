@@ -5791,6 +5791,8 @@ def _validate_append_once_projection_ids(
             error = "immutable work definition logical ID is already durable"
         elif item.contract_type in _APPEND_ONCE_WRITE_ADMISSION_TYPES:
             error = "immutable write-admission logical ID is already durable"
+        elif item.contract_type in _APPEND_ONCE_PROVIDER_PROJECTION_TYPES:
+            error = "append-only provider projection logical ID is already durable"
         else:
             continue
         key = (item.contract_type, _logical_key(item))
@@ -6225,8 +6227,6 @@ def _validate_provider_worker_projection(
     for item in provider_batch:
         key = (item.contract_type, _logical_key(item))
         prior = old_objects.get(key)
-        if item.contract_type in _APPEND_ONCE_PROVIDER_PROJECTION_TYPES and prior is not None:
-            _error("append-only provider-worker logical ID is already durable")
         if item.contract_type == PROVIDER_CODEX_HOME_V1 and prior is not None:
             payload, old = item.payload, prior.payload
             if (

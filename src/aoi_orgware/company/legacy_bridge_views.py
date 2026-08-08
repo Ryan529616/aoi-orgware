@@ -13,6 +13,7 @@ from typing import Any, NamedTuple
 from .contracts import company_contract_sha256
 from .legacy_bridge_contract import validate_legacy_bridge_observation
 from .legacy_bridge_health import validate_legacy_bridge_coverage
+from .legacy_bridge_job_terminal import validate_legacy_bridge_job_terminal_receipt
 
 
 class LegacyBridgeViewError(RuntimeError):
@@ -187,6 +188,7 @@ def _node(
 
 
 def _job(node: Mapping[str, Any]) -> dict[str, Any]:
+    terminal = node.get("terminal_receipt_id") is not None
     return {
         "job_id": node["execution_id"],
         "owner_execution_id": node["parent_execution_id"],
@@ -199,31 +201,113 @@ def _job(node: Mapping[str, Any]) -> dict[str, Any]:
         "command_id": None,
         "scope_sha256": None,
         "external_handle": {"availability": "unavailable"},
-        "process_observation": {
+        "process_observation": ({
+            "state": "known",
+            "reason": "registered_job_process_nonzero_exit_reconciled",
+        } if terminal else {
             "state": "unknown",
             "reason": "legacy_provider_runtime_unavailable",
-        },
-        "effect_evidence": [],
-        "observation": {
+        }),
+        "effect_evidence": (
+            [node["terminal_raw_artifact"]] if terminal else []
+        ),
+        "observation": ({
+            "state": "known",
+            "reason": "legacy_registered_process_nonzero_exit_reconciled",
+        } if terminal else {
             "state": "unknown",
             "reason": "legacy_state_inventory_only_provider_runtime_unavailable",
-        },
+        }),
         "bridge_scope_id": node["bridge_scope_id"],
         "bridge_entity_id": node["bridge_entity_id"],
         "source_record_sha256": node["source_record_sha256"],
-        "projection_source": "legacy_bridge_observation",
+        "projection_source": node["projection_source"],
         "authority": "none",
     }
+
+
+def _terminal_overlay(
+    node: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        **dict(node),
+        "engineering_status": "blocked",
+        "runtime_status": "stopped",
+        "coverage_status": "degraded",
+        "effect_status": "failed_known",
+        "updated_at": receipt["observed_at"],
+        "observation": dict(receipt["observation"]),
+        "projection_source": "legacy_bridge_terminal_receipt",
+        "terminal_receipt_id": receipt["receipt_id"],
+        "terminal_receipt_sha256": receipt["receipt_sha256"],
+        "terminal_source_observation_id": receipt["source_observation_id"],
+        "terminal_raw_artifact": dict(receipt["raw_artifact"]),
+    }
+
+
+def _terminal_conflicts(
+    observation: Mapping[str, Any],
+    entity: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> bool:
+    projection = observation["projection"]
+    entities = {
+        item["bridge_entity_id"]: item for item in projection["entities"]
+    }
+    task = entities.get(receipt["task_bridge_entity_id"])
+    packet = entities.get(receipt["owner_packet_bridge_entity_id"])
+    return any((
+        receipt["company_id"] != observation["company_id"],
+        receipt["company_incarnation"] != observation["company_incarnation"],
+        receipt["lock_domain_generation"] != observation["lock_domain_generation"],
+        receipt["bridge_scope_id"] != observation["bridge_scope_id"],
+        receipt["legacy_archive_sha256"] != projection["legacy_archive_sha256"],
+        receipt["task_identity_digest"] != projection["task_identity_digest"],
+        receipt["task_bridge_entity_id"]
+        != projection["task_bridge_entity_id"],
+        task is None,
+        task is not None and (
+            task["kind"] != "task"
+            or task["source_record_sha256"]
+            != receipt["task_source_record_sha256"]
+        ),
+        receipt["job_bridge_entity_id"] != entity["bridge_entity_id"],
+        receipt["job_source_record_sha256"] != entity["source_record_sha256"],
+        receipt["owner_packet_bridge_entity_id"]
+        != entity["parent_bridge_entity_id"],
+        packet is None,
+        packet is not None and (
+            packet["kind"] != "packet"
+            or packet["source_record_sha256"]
+            != receipt["owner_packet_source_record_sha256"]
+        ),
+    ))
 
 
 def project_legacy_bridge_dashboard(
     observations: Sequence[Mapping[str, Any]],
     coverages: Sequence[Mapping[str, Any]],
+    terminal_receipts: Sequence[Mapping[str, Any]] = (),
 ) -> LegacyBridgeDashboardProjection:
     """Derive bounded Dashboard rows from validated read-model objects."""
 
     observed_by_scope = _validated_by_scope(observations, coverage=False)
     coverage_by_scope = _validated_by_scope(coverages, coverage=True)
+    terminal_by_job: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in terminal_receipts:
+        try:
+            receipt = validate_legacy_bridge_job_terminal_receipt(raw)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise LegacyBridgeViewError(
+                "legacy terminal projected object is invalid",
+            ) from exc
+        key = (str(receipt["bridge_scope_id"]), str(receipt["job_bridge_entity_id"]))
+        if key in terminal_by_job:
+            raise LegacyBridgeViewError(
+                "legacy terminal projection is ambiguous",
+            )
+        terminal_by_job[key] = receipt
     nodes: list[dict[str, Any]] = []
     jobs: list[dict[str, Any]] = []
     orphans: list[dict[str, Any]] = []
@@ -251,11 +335,32 @@ def project_legacy_bridge_dashboard(
                 entity,
                 lineages[str(entity["bridge_entity_id"])],
             )
+            terminal_key = (scope_id, str(entity["bridge_entity_id"]))
+            joined_receipt = (
+                terminal_by_job.pop(terminal_key)
+                if terminal_key in terminal_by_job else None
+            )
+            conflict = False
+            if joined_receipt is not None:
+                conflict = _terminal_conflicts(
+                    observation, entity, joined_receipt,
+                )
+                if not conflict:
+                    node = _terminal_overlay(node, joined_receipt)
             nodes.append(node)
             kind = str(entity["kind"])
             counts[kind] += 1
             if kind == "job":
                 jobs.append(_job(node))
+                if conflict and joined_receipt is not None:
+                    alerts.append(_alert(
+                        scope_id=scope_id,
+                        category="legacy_bridge_terminal_conflict",
+                        created_at=str(joined_receipt["observed_at"]),
+                        severity="critical",
+                        reason="terminal_receipt_current_source_conflict",
+                        node=node,
+                    ))
             if entity["orphan_reason"] is not None:
                 orphans.append(dict(node))
             if entity["needs_user"] is True:
@@ -288,6 +393,14 @@ def project_legacy_bridge_dashboard(
         }
         for _, coverage in sorted(coverage_by_scope.items())
     ]
+    for (scope_id, _job_id), receipt in sorted(terminal_by_job.items()):
+        alerts.append(_alert(
+            scope_id=scope_id,
+            category="legacy_bridge_terminal_conflict",
+            created_at=str(receipt["observed_at"]),
+            severity="critical",
+            reason="terminal_receipt_current_entity_missing",
+        ))
     for row in coverage_rows:
         alerts.append(_alert(
             scope_id=str(row["bridge_scope_id"]),
@@ -306,6 +419,12 @@ def project_legacy_bridge_dashboard(
         warnings.append("legacy_bridge_needs_user_observed")
     if any(node["effect_status"] == "effect_unknown" for node in nodes):
         warnings.append("legacy_bridge_effect_unknown")
+    if terminal_receipts:
+        warnings.append("legacy_bridge_terminal_receipt_observed")
+    if any(alert["category"] == "legacy_bridge_terminal_conflict" for alert in alerts):
+        warnings.append("legacy_bridge_terminal_conflict")
+    if terminal_by_job:
+        warnings.append("legacy_bridge_terminal_without_current_entity")
     summary = {
         "state": "observed" if observation_rows else "unavailable",
         "reason": (
@@ -325,6 +444,10 @@ def project_legacy_bridge_dashboard(
         "coverage": coverage_rows,
         "entity_counts": dict(sorted(counts.items())),
         "entity_count": sum(counts.values()),
+        **({
+            "terminal_receipt_count": len(terminal_receipts),
+            "terminal_unjoined_count": len(terminal_by_job),
+        } if terminal_receipts else {}),
     }
     return LegacyBridgeDashboardProjection(
         tuple(sorted(nodes, key=lambda item: str(item["execution_id"]))),

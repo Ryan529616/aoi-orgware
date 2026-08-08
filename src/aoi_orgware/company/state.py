@@ -75,6 +75,7 @@ from .invariants import (
     reduce_company_invariants,
     validate_provider_turn_result_lifecycle,
 )
+from . import legacy_bridge_job_terminal_integrity as jt
 from .ledger import (
     CompanyLedger,
     LedgerAppendResult,
@@ -2197,14 +2198,7 @@ class CompanyStateOwner:
         *,
         receipt_state: str,
     ) -> None:
-        """Reject unsafe company lifecycle effects before the ledger mutation.
-
-        The ledger remains the exact-byte/idempotency authority.  This bounded
-        preflight reads the projection while the sole state-owner mutex is
-        held.  Dispatch queue rules and Chief authority/fencing therefore use
-        the same pure reducer as replay, and a rejected admission cannot
-        advance either ledger head.
-        """
+        """Reject lifecycle effects before append using the replay reducer."""
 
         has_dispatch_claim = any(
             isinstance(event, Mapping)
@@ -2422,6 +2416,9 @@ class CompanyStateOwner:
             self._verify_provider_telemetry_sources_unlocked(request)
             self._verify_needs_user_revision_sources_unlocked(request)
             self._verify_external_job_effect_sources_unlocked(request)
+            jt.verify_legacy_bridge_job_terminal_state(
+                request, self.blobs, self.readmodel, CompanyStateInvariantError,
+            )
             self._verify_execution_registration_sources_unlocked(request)
             self._verify_work_definition_request_unlocked(request)
             self._preflight_invariants_unlocked(

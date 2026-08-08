@@ -72,6 +72,16 @@ from .contracts import (
     validate_work_packet,
     validate_work_result_receipt,
 )
+from .legacy_bridge_job_terminal import (
+    LEGACY_BRIDGE_JOB_TERMINAL_RECEIPT_V1,
+    LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_MEDIA_TYPE,
+    LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_V1,
+    LegacyBridgeJobTerminalError,
+    build_legacy_bridge_job_terminal_receipt,
+    build_legacy_bridge_job_terminal_source,
+    validate_legacy_bridge_job_terminal_receipt,
+    validate_legacy_bridge_job_terminal_source,
+)
 from .ledger import LedgerCommitEffectUnknownError
 from .dashboard import (
     CompanyDashboardError,
@@ -165,6 +175,14 @@ __all__ = [
     "WORK_PACKET_PROMPT_MEDIA_TYPE",
     "WORK_PACKET_V1",
     "WORK_RESULT_RECEIPT_V1",
+    "LEGACY_BRIDGE_JOB_TERMINAL_RECEIPT_V1",
+    "LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_MEDIA_TYPE",
+    "LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_V1",
+    "LegacyBridgeJobTerminalError",
+    "build_legacy_bridge_job_terminal_receipt",
+    "build_legacy_bridge_job_terminal_source",
+    "validate_legacy_bridge_job_terminal_receipt",
+    "validate_legacy_bridge_job_terminal_source",
     "CompanyContractError",
     "authority_from_grant",
     "canonical_company_json_bytes",

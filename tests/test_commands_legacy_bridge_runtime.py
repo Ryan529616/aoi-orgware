@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,6 +11,12 @@ import pytest
 from aoi_orgware import cli
 from aoi_orgware.commands import legacy_bridge_runtime
 from aoi_orgware.company.legacy_bridge_client import LegacyBridgeIngestClientResult
+from aoi_orgware.company.legacy_bridge_job_terminal_client import (
+    LegacyBridgeJobTerminalClientResult,
+)
+from aoi_orgware.legacy_bridge_job_terminal_v04 import (
+    LegacyBridgeJobTerminalEvidenceV04,
+)
 
 
 def _result(
@@ -156,3 +163,74 @@ def test_command_preserves_memory_error(tmp_path: Path) -> None:
             argparse.Namespace(root=tmp_path),
             runner=fail,
         )
+
+
+def _terminal_argv(exit_artifact: Path) -> list[str]:
+    return [
+        "legacy-bridge", "reconcile-job-terminal-v04",
+        "--task", "task-1", "--run-id", "run-1",
+        "--legacy-archive-sha256", "a" * 64,
+        "--source-version", "0.4.0a4",
+        "--process-exit-artifact", str(exit_artifact),
+        "--process-exit-sha256", "b" * 64,
+        "--json",
+    ]
+
+
+def test_terminal_parser_dispatches_exact_reconcile_handler(tmp_path: Path) -> None:
+    exit_artifact = (tmp_path / "process-exit.json").resolve()
+    args = cli.build_parser({}).parse_args(_terminal_argv(exit_artifact))
+    assert args._aoi_command == "legacy-bridge"
+    assert args.legacy_bridge_action == "reconcile-job-terminal-v04"
+    assert args.handler is (
+        legacy_bridge_runtime.cmd_legacy_bridge_reconcile_job_terminal_v04
+    )
+
+
+def test_terminal_command_passes_exact_artifact_bytes_to_single_runner(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exit_artifact = (tmp_path / "process-exit.json").resolve()
+    exit_artifact.write_bytes(b"{}")
+    evidence = {"company_id": "company-1", "bridge_scope_id": "c" * 64}
+    artifacts = (("command", b"exit 3\n"), ("process_exit", b"{}"))
+    produced = LegacyBridgeJobTerminalEvidenceV04(
+        b"{}", object(), evidence, artifacts,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        legacy_bridge_runtime,
+        "resolve_bound_company",
+        lambda _root, _company_id: SimpleNamespace(
+            company_id="company-1",
+            manifest={"company_incarnation": 1, "lock_domain_generation": 1},
+        ),
+    )
+    monkeypatch.setattr(
+        legacy_bridge_runtime,
+        "produce_legacy_bridge_job_terminal_evidence_v04",
+        lambda *_args, **_kwargs: produced,
+    )
+    observed: dict[str, Any] = {}
+
+    def runner(root: Path, **kwargs: Any) -> LegacyBridgeJobTerminalClientResult:
+        observed["root"] = root
+        observed.update(kwargs)
+        return LegacyBridgeJobTerminalClientResult(
+            "transaction-1", "command-1", "c" * 64, "d" * 64,
+            "e" * 64, "committed", 9, False,
+        )
+
+    args = cli.build_parser({}).parse_args(_terminal_argv(exit_artifact))
+    assert legacy_bridge_runtime.cmd_legacy_bridge_reconcile_job_terminal_v04(
+        args,
+        argparse.Namespace(root=tmp_path),
+        runner=runner,
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effect"] == "committed"
+    assert observed["root"] == tmp_path
+    assert observed["terminal_evidence"] == evidence
+    assert observed["terminal_artifacts"] == dict(artifacts)
+    assert "bearer" not in json.dumps(payload).lower()

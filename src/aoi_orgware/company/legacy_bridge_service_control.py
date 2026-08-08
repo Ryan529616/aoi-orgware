@@ -24,6 +24,17 @@ from .legacy_bridge_ingest_protocol import (
     build_legacy_bridge_ingest_wire_result,
     parse_legacy_bridge_ingest,
 )
+from .legacy_bridge_job_terminal_protocol import (
+    LEGACY_BRIDGE_JOB_TERMINAL_RESULT_SCHEMA,
+    MAX_LEGACY_BRIDGE_JOB_TERMINAL_CONTROL_BYTES,
+    LegacyBridgeJobTerminalCommand,
+    LegacyBridgeJobTerminalProtocolError,
+    parse_legacy_bridge_job_terminal_reconcile,
+)
+from .legacy_bridge_job_terminal_publisher import (
+    LegacyBridgeJobTerminalPublicationError,
+    publish_legacy_bridge_job_terminal,
+)
 from .legacy_bridge_publisher import (
     LegacyBridgePublicationError,
     publish_legacy_bridge_snapshot,
@@ -38,11 +49,19 @@ from .supervisor import (
 
 LEGACY_BRIDGE_PRESTART_QUERY_ROUTE = "/control/v1/legacy-bridge/prestart/query"
 LEGACY_BRIDGE_INGEST_ROUTE = "/control/v1/legacy-bridge/ingest"
+LEGACY_BRIDGE_JOB_TERMINAL_ROUTE = (
+    "/control/v1/legacy-bridge/job-terminal/reconcile"
+)
 LEGACY_BRIDGE_CONTROL_ROUTES = frozenset(
-    {LEGACY_BRIDGE_PRESTART_QUERY_ROUTE, LEGACY_BRIDGE_INGEST_ROUTE},
+    {
+        LEGACY_BRIDGE_PRESTART_QUERY_ROUTE,
+        LEGACY_BRIDGE_INGEST_ROUTE,
+        LEGACY_BRIDGE_JOB_TERMINAL_ROUTE,
+    },
 )
 LegacyBridgeResidentCommand = (
     LegacyBridgePrestartQueryCommand | LegacyBridgeIngestCommand
+    | LegacyBridgeJobTerminalCommand
 )
 
 
@@ -126,6 +145,8 @@ def legacy_bridge_control_body_limit(route: str) -> int:
         return MAX_LEGACY_BRIDGE_PRESTART_CONTROL_BYTES
     if route == LEGACY_BRIDGE_INGEST_ROUTE:
         return MAX_LEGACY_BRIDGE_INGEST_CONTROL_BYTES
+    if route == LEGACY_BRIDGE_JOB_TERMINAL_ROUTE:
+        return MAX_LEGACY_BRIDGE_JOB_TERMINAL_CONTROL_BYTES
     _fail("unsupported_legacy_bridge_route")
 
 
@@ -148,9 +169,16 @@ def parse_legacy_bridge_control_request(
                 True,
                 "legacy_bridge_ingest",
             )
+        if route == LEGACY_BRIDGE_JOB_TERMINAL_ROUTE:
+            return LegacyBridgeControlOperation(
+                parse_legacy_bridge_job_terminal_reconcile(value),
+                True,
+                "legacy_bridge_job_terminal",
+            )
     except (
         LegacyBridgeControlProtocolError,
         LegacyBridgeIngestProtocolError,
+        LegacyBridgeJobTerminalProtocolError,
     ) as exc:
         raise LegacyBridgeServiceControlError(exc.code) from exc
     _fail("unsupported_legacy_bridge_route")
@@ -173,6 +201,8 @@ def legacy_bridge_control_spec(
         return False, "legacy_bridge_prestart"
     if type(command) is LegacyBridgeIngestCommand:
         return True, "legacy_bridge_ingest"
+    if type(command) is LegacyBridgeJobTerminalCommand:
+        return True, "legacy_bridge_job_terminal"
     _fail("unsupported_legacy_bridge_command")
 
 
@@ -182,6 +212,7 @@ def is_legacy_bridge_control_command(value: Any) -> bool:
     return type(value) in {
         LegacyBridgePrestartQueryCommand,
         LegacyBridgeIngestCommand,
+        LegacyBridgeJobTerminalCommand,
     }
 
 
@@ -253,12 +284,66 @@ def derive_legacy_bridge_resident_response(
                 "effect_unknown",
                 "effect_unknown",
             ) from exc
+    if type(command) is LegacyBridgeJobTerminalCommand:
+        try:
+            terminal_result = publish_legacy_bridge_job_terminal(
+                supervisor,
+                command.terminal_evidence,
+                command.terminal_artifacts,
+            )
+            if (
+                terminal_result.effect != "committed"
+                or terminal_result.global_sequence is None
+            ):
+                raise LegacyBridgeServiceExecutionError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "effect_unknown",
+                    "effect_unknown",
+                )
+            return {
+                "schema_version": LEGACY_BRIDGE_JOB_TERMINAL_RESULT_SCHEMA,
+                "service_instance_id": command.service_instance_id,
+                "company_id": command.company_id,
+                "company_incarnation": command.company_incarnation,
+                "lock_domain_generation": command.lock_domain_generation,
+                "manifest_sha256": command.manifest_sha256,
+                **terminal_result._asdict(),
+            }
+        except LegacyBridgeServiceExecutionError:
+            raise
+        except LegacyBridgeJobTerminalPublicationError as exc:
+            raise LegacyBridgeServiceExecutionError(
+                HTTPStatus.CONFLICT,
+                "legacy_bridge_job_terminal_rejected",
+            ) from exc
+        except CompanyProjectionDegradedError as exc:
+            raise _committed_ingest_failure(
+                exc.result,
+                code="committed_projection_degraded",
+            ) from exc
+        except CompanySupervisorDashboardRefreshError as exc:
+            raise _committed_ingest_failure(
+                exc.result,
+                code="committed_dashboard_refresh_failed",
+            ) from exc
+        except CompanyStateError as exc:
+            raise LegacyBridgeServiceExecutionError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "legacy_bridge_job_terminal_unavailable",
+            ) from exc
+        except Exception as exc:
+            raise LegacyBridgeServiceExecutionError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "effect_unknown",
+                "effect_unknown",
+            ) from exc
     _fail("unsupported_legacy_bridge_command")
 
 
 __all__ = [
     "LEGACY_BRIDGE_CONTROL_ROUTES",
     "LEGACY_BRIDGE_INGEST_ROUTE",
+    "LEGACY_BRIDGE_JOB_TERMINAL_ROUTE",
     "LEGACY_BRIDGE_PRESTART_QUERY_ROUTE",
     "LegacyBridgeControlOperation",
     "LegacyBridgeResidentCommand",
