@@ -30,6 +30,7 @@ from tests.company_v05.test_company_service import (
 )
 from tests.company_v05.test_legacy_bridge_job_terminal import (
     _terminal_evidence,
+    _with_terminal_timestamp,
 )
 from tests.company_v05.test_supervisor import manifest
 
@@ -159,6 +160,52 @@ def test_protocol_binds_all_artifact_bytes_and_rejects_mutation(tmp_path: Path) 
             terminal_evidence=evidence,
             terminal_artifacts={"command": True},  # type: ignore[dict-item]
         )
+
+
+def test_protocol_accepts_only_exact_windows_100ns_z_extension(
+    tmp_path: Path,
+) -> None:
+    with CompanySupervisor.initialize(
+        tmp_path / "company",
+        manifest(),
+        bootstrap_at="2026-07-27T00:00:00Z",
+        grant_expires_at="2026-08-06T00:00:00Z",
+        platform="windows" if os.name == "nt" else "posix",
+    ) as supervisor:
+        evidence, artifacts = _terminal_evidence(supervisor)
+    descriptor = {
+        "service_instance_id": "service-1",
+        "company": {
+            "company_id": "company-1",
+            "company_incarnation": 1,
+            "lock_domain_generation": 1,
+            "manifest_sha256": "b" * 64,
+        },
+    }
+    accepted, accepted_artifacts = _with_terminal_timestamp(
+        evidence,
+        artifacts,
+        "2026-08-08T11:09:24.1594778Z",
+    )
+    command = _command(descriptor, accepted, accepted_artifacts)
+    assert command.terminal_evidence["terminal_at"] == (
+        "2026-08-08T11:09:24.1594778Z"
+    )
+    assert parse_legacy_bridge_job_terminal_reconcile(
+        command.as_dict(),
+    ) == command
+
+    for invalid in (
+        "2026-08-08T11:09:24.15947789Z",
+        "2026-08-08T11:09:24.1594778+00:00",
+        "2026-02-30T11:09:24.1594778Z",
+        "2026-08-08T11:09:24.1594778",
+    ):
+        rejected = copy.deepcopy(evidence)
+        rejected["terminal_at"] = invalid
+        rejected["observed_at"] = invalid
+        with pytest.raises(LegacyBridgeJobTerminalProtocolError):
+            _command(descriptor, rejected, artifacts)
 
 
 def test_live_authenticated_terminal_reconcile_and_exact_replay(

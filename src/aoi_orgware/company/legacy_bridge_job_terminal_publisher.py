@@ -24,6 +24,7 @@ from .legacy_bridge_job_terminal import (
     LEGACY_BRIDGE_JOB_TERMINAL_SOURCE_MEDIA_TYPE,
     build_legacy_bridge_job_terminal_receipt,
     build_legacy_bridge_job_terminal_source,
+    legacy_bridge_job_terminal_ledger_recorded_at,
 )
 from .supervisor import CompanySupervisor
 from .state import CompanyStateInvariantError
@@ -140,9 +141,10 @@ def _store_terminal_artifacts(
 def _request(
     supervisor: CompanySupervisor,
     receipt: Mapping[str, Any],
+    *,
+    recorded_at: str,
 ) -> dict[str, Any]:
     receipt_id = str(receipt["receipt_id"])
-    recorded_at = str(receipt["observed_at"])
     return build_company_transaction_request(
         CompanySupervisor.heads(supervisor),
         CompanySupervisor._supervisor_authority(supervisor),
@@ -228,7 +230,10 @@ def publish_legacy_bridge_job_terminal(
         raise LegacyBridgeJobTerminalPublicationError(
             "legacy terminal source or receipt is invalid",
         ) from exc
-    request = _request(supervisor, receipt)
+    recorded_at = legacy_bridge_job_terminal_ledger_recorded_at(
+        receipt["observed_at"],
+    )
+    request = _request(supervisor, receipt, recorded_at=recorded_at)
     transaction_id = str(request["transaction_id"])
     durable = CompanySupervisor.record_by_transaction_id(
         supervisor, transaction_id,
@@ -237,7 +242,7 @@ def publish_legacy_bridge_job_terminal(
         return _result_from_record(durable, receipt=receipt, replay=True)
     try:
         committed = CompanySupervisor.commit(
-            supervisor, request, recorded_at=str(receipt["observed_at"]),
+            supervisor, request, recorded_at=recorded_at,
         )
     except LedgerCommitEffectUnknownError:
         return LegacyBridgeJobTerminalPublicationResult(

@@ -36,6 +36,10 @@ _TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
 )
+_WINDOWS_100NS_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"\.[0-9]{7}Z"
+)
 _REQUIRED_ARTIFACT_ROLES = frozenset(
     {
         "command", "legacy_state", "terminal_manifest", "primary_log",
@@ -200,15 +204,28 @@ def _integer(value: Any, label: str, *, minimum: int, maximum: int) -> int:
 
 
 def _timestamp(value: Any, label: str) -> str:
-    if type(value) is not str or _TIMESTAMP.fullmatch(value) is None:
+    if type(value) is not str:
         _fail(f"{label} is invalid")
+    is_windows_100ns = _WINDOWS_100NS_TIMESTAMP.fullmatch(value) is not None
+    if _TIMESTAMP.fullmatch(value) is None and not is_windows_100ns:
+        _fail(f"{label} is invalid")
+    parse_value = value[:-2] + "Z" if is_windows_100ns else value
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(parse_value.replace("Z", "+00:00"))
     except (OverflowError, ValueError) as exc:
         raise LegacyBridgeJobTerminalError(f"{label} is invalid") from exc
     if parsed.tzinfo is None:
         _fail(f"{label} lacks a timezone")
     return value
+
+
+def legacy_bridge_job_terminal_ledger_recorded_at(value: Any) -> str:
+    """Project raw Windows 100 ns evidence onto the ledger microsecond clock."""
+
+    timestamp = _timestamp(value, "legacy terminal ledger time")
+    if _WINDOWS_100NS_TIMESTAMP.fullmatch(timestamp) is not None:
+        return timestamp[:-2] + "Z"
+    return timestamp
 
 
 def _digest(value: Any, label: str) -> str:
@@ -645,6 +662,7 @@ __all__ = [
     "build_legacy_bridge_job_terminal_source",
     "build_legacy_bridge_job_terminal_receipt",
     "legacy_bridge_job_terminal_receipt_id",
+    "legacy_bridge_job_terminal_ledger_recorded_at",
     "legacy_bridge_job_terminal_request_evidence_sha256",
     "legacy_bridge_job_terminal_key_id",
     "validate_legacy_bridge_job_terminal_receipt",

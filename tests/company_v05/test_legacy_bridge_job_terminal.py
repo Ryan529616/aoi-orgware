@@ -230,6 +230,30 @@ def _terminal_evidence(
     }, ARTIFACTS
 
 
+def _with_terminal_timestamp(
+    evidence: dict[str, Any],
+    artifacts: tuple[tuple[str, bytes], ...],
+    timestamp: str,
+) -> tuple[dict[str, Any], tuple[tuple[str, bytes], ...]]:
+    changed = copy.deepcopy(evidence)
+    changed["terminal_at"] = timestamp
+    changed["observed_at"] = timestamp
+    rewritten: list[tuple[str, bytes]] = []
+    for role, payload in artifacts:
+        if role == "process_exit":
+            process_exit = json.loads(payload)
+            process_exit["terminal_at"] = timestamp
+            payload = canonical_company_json_bytes(process_exit)
+            reference = next(
+                item for item in changed["artifacts"]
+                if item["role"] == "process_exit"
+            )
+            reference["sha256"] = hashlib.sha256(payload).hexdigest()
+            reference["size_bytes"] = len(payload)
+        rewritten.append((role, payload))
+    return changed, tuple(rewritten)
+
+
 def _receipts(supervisor: CompanySupervisor) -> list[dict[str, Any]]:
     return _payloads(supervisor, LEGACY_BRIDGE_JOB_TERMINAL_RECEIPT_V1)
 
@@ -257,6 +281,55 @@ def test_terminal_publication_stores_all_artifacts_and_exact_replay_is_noop(
         head = supervisor.heads().global_head
         replay = publish_legacy_bridge_job_terminal(supervisor, evidence, artifacts)
         assert replay == first._replace(idempotent_replay=True)
+        assert supervisor.heads().global_head == head
+        assert len(_receipts(supervisor)) == 1
+    finally:
+        supervisor.close()
+
+
+def test_windows_100ns_timestamp_preserves_raw_truth_and_floors_ledger_clock(
+    tmp_path: Path,
+) -> None:
+    supervisor = _initialized(tmp_path)
+    try:
+        evidence, artifacts = _terminal_evidence(supervisor)
+        timestamp = "2026-08-04T02:00:00.1594778Z"
+        evidence, artifacts = _with_terminal_timestamp(
+            evidence, artifacts, timestamp,
+        )
+        first = publish_legacy_bridge_job_terminal(
+            supervisor, evidence, artifacts,
+        )
+        receipt = _receipts(supervisor)[0]
+        assert receipt["terminal_at"] == timestamp
+        assert receipt["observed_at"] == timestamp
+        source_bytes = supervisor._state.blobs.read(
+            receipt["raw_artifact"]["sha256"],
+        )
+        assert hashlib.sha256(source_bytes).hexdigest() == receipt["source_sha256"]
+        assert json.loads(source_bytes)["terminal_at"] == timestamp
+        record = supervisor.record_by_transaction_id(first.transaction_id)
+        assert record is not None
+        ledger_time = "2026-08-04T02:00:00.159477Z"
+        assert record.events[0].event["recorded_at"] == ledger_time
+        assert record.receipt["recorded_at"] == ledger_time
+        head = supervisor.heads().global_head
+        replay = publish_legacy_bridge_job_terminal(
+            supervisor, evidence, artifacts,
+        )
+        assert replay == first._replace(idempotent_replay=True)
+        assert supervisor.heads().global_head == head
+
+        divergent, divergent_artifacts = _terminal_evidence(supervisor)
+        divergent, divergent_artifacts = _with_terminal_timestamp(
+            divergent,
+            divergent_artifacts,
+            "2026-08-04T02:00:00.1594779Z",
+        )
+        with pytest.raises(LegacyBridgeJobTerminalPublicationError):
+            publish_legacy_bridge_job_terminal(
+                supervisor, divergent, divergent_artifacts,
+            )
         assert supervisor.heads().global_head == head
         assert len(_receipts(supervisor)) == 1
     finally:
@@ -548,7 +621,13 @@ def test_readmodel_replay_rejects_divergent_same_key_receipt(
                 "availability": "available",
             },
         )
-        request = terminal_publisher._request(supervisor, second)
+        request = terminal_publisher._request(
+            supervisor,
+            second,
+            recorded_at=terminal_contract.legacy_bridge_job_terminal_ledger_recorded_at(
+                second["observed_at"],
+            ),
+        )
         ledger_path = supervisor._state.resolved.incarnation.ledger
         supervisor.close()
         closed = True

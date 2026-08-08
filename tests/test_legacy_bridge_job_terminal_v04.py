@@ -24,7 +24,11 @@ from aoi_orgware.legacy_bridge_snapshot_v04 import (
 )
 
 
-def _fixture(tmp_path: Path) -> tuple[Any, LegacyBridgeSnapshotV04Result, LegacyBridgeTaskStateV04, Path, str]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    terminal_at: str = "2026-08-08T00:00:03Z",
+) -> tuple[Any, LegacyBridgeSnapshotV04Result, LegacyBridgeTaskStateV04, Path, str]:
     task_id = "task-1"
     run_id = "run-1"
     task_root = tmp_path / "tasks" / task_id
@@ -87,7 +91,7 @@ def _fixture(tmp_path: Path) -> tuple[Any, LegacyBridgeSnapshotV04Result, Legacy
             "sha256": hashlib.sha256(log).hexdigest(),
             "size_bytes": len(log),
         },
-        "recorded_at": "2026-08-08T00:00:03Z",
+        "recorded_at": terminal_at,
     }
     manifest_raw = json.dumps(manifest, indent=2).encode("utf-8") + b"\n"
     manifest_path.write_bytes(manifest_raw)
@@ -165,7 +169,7 @@ def _fixture(tmp_path: Path) -> tuple[Any, LegacyBridgeSnapshotV04Result, Legacy
         "host_fingerprint_sha256": host_sha,
         "process_fingerprint_sha256": process_sha,
         "exit_code": 3,
-        "terminal_at": "2026-08-08T00:00:03Z",
+        "terminal_at": terminal_at,
         "terminal_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
         "primary_log_sha256": hashlib.sha256(log).hexdigest(),
     }
@@ -178,8 +182,12 @@ def _fixture(tmp_path: Path) -> tuple[Any, LegacyBridgeSnapshotV04Result, Legacy
 def _produce(
     tmp_path: Path,
     observed_at: str = "2026-08-08T00:00:04Z",
+    *,
+    terminal_at: str = "2026-08-08T00:00:03Z",
 ):
-    paths, snapshot, stable, exit_path, exit_sha = _fixture(tmp_path)
+    paths, snapshot, stable, exit_path, exit_sha = _fixture(
+        tmp_path, terminal_at=terminal_at,
+    )
     with (
         mock.patch(
             "aoi_orgware.legacy_bridge_job_terminal_v04."
@@ -230,6 +238,26 @@ def test_adapter_identity_is_stable_across_cli_observation_time(tmp_path: Path) 
     second = _produce(tmp_path, "2026-08-08T00:05:00Z")
     assert first.evidence == second.evidence
     assert first.artifacts == second.artifacts
+
+
+def test_adapter_preserves_windows_100ns_terminal_spelling_and_artifact_hash(
+    tmp_path: Path,
+) -> None:
+    timestamp = "2026-08-08T11:09:24.1594778Z"
+    produced = _produce(tmp_path, terminal_at=timestamp)
+    assert produced.evidence["terminal_at"] == timestamp
+    assert produced.evidence["observed_at"] == timestamp
+    process_exit = next(
+        payload for role, payload in produced.artifacts
+        if role == "process_exit"
+    )
+    assert json.loads(process_exit)["terminal_at"] == timestamp
+    reference = next(
+        item for item in produced.evidence["artifacts"]
+        if item["role"] == "process_exit"
+    )
+    assert reference["sha256"] == hashlib.sha256(process_exit).hexdigest()
+    assert reference["size_bytes"] == len(process_exit)
 
 
 @pytest.mark.parametrize(
