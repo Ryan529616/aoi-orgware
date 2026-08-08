@@ -864,6 +864,11 @@ def read_regular_artifact(
     )
 
 
+def _registered_terminal_log_paths(value: Any) -> tuple[str, Path]:
+    origin_path = str(value)
+    return origin_path, Path(origin_path)
+
+
 def snapshot_evidence_artifact(
     paths: HarnessPaths,
     task_id: str,
@@ -5890,8 +5895,9 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 raise HarnessError(
                     "--terminal-log-artifact and --terminal-log-sha256 must be provided together"
                 )
-            origin_path = Path(str(job.get("log", "")))
-            capture_source = origin_path
+            origin_path, capture_source = _registered_terminal_log_paths(
+                job.get("log", "")
+            )
             data: bytes | None = None
             if args.terminal_log_artifact:
                 capture_source, data = read_regular_artifact(
@@ -5902,7 +5908,7 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             else:
                 try:
                     capture_source, data = read_regular_artifact(
-                        origin_path,
+                        capture_source,
                         "terminal log artifact",
                         max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
                     )
@@ -5930,7 +5936,7 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     os.chmod(blob_path, 0o600)
                 artifact = {
                     "role": "primary_log",
-                    "origin_path": str(origin_path),
+                    "origin_path": origin_path,
                     "capture_source": str(capture_source),
                     "capture_status": "preserved",
                     "blob_path": str(blob_path),
@@ -5940,7 +5946,7 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             else:
                 artifact = {
                     "role": "primary_log",
-                    "origin_path": str(origin_path),
+                    "origin_path": origin_path,
                     "capture_source": str(capture_source),
                     "capture_status": "missing_at_capture",
                     "blob_path": "",

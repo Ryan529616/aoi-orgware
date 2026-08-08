@@ -5259,12 +5259,151 @@ class HardeningTests(HarnessTestCase):
         self.assertEqual(job["terminal_artifact_status"], "preserved")
         terminal_manifest = h.load_json(Path(job["terminal_manifest_path"]))
         self.assertEqual(
-            Path(terminal_manifest["artifact"]["capture_source"]),
-            terminal_log.resolve(),
+            (
+                terminal_manifest["artifact"]["origin_path"],
+                Path(terminal_manifest["artifact"]["capture_source"]),
+                terminal_manifest["artifact"]["sha256"],
+            ),
+            ("/tmp/receipt-run/driver.log", terminal_log.resolve(), terminal_log_sha),
         )
-        self.assertEqual(
-            terminal_manifest["artifact"]["sha256"], terminal_log_sha
+
+    def test_terminal_manifest_preserves_registered_log_spelling(self) -> None:
+        task_id = "terminal-log-spelling"
+        self.init_task(task_id)
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "terminal-log-spelling-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "EDA-RUN",
+            "--lock",
+            "external:tree:/tmp/terminal-log-spelling",
+            "--lock",
+            "repo:file:posix-owner-job-command.sh",
+            "--intent",
+            "test registered terminal log spelling",
+            "--validation",
+            "terminal manifest keeps the durable job log string",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
         )
+        receipt, receipt_sha = self.write_source_receipt(
+            "terminal-log-spelling-source.json"
+        )
+        spellings = (
+            "/tmp/terminal-log-spelling/posix/driver.log",
+            "/mnt/c/AOI-Work/terminal-log-spelling/wsl/driver.log",
+            r"C:\AOI-Work\terminal-log-spelling\windows\driver.log",
+        )
+        for registered_log in spellings:
+            origin_path, capture_source = cli_impl._registered_terminal_log_paths(
+                registered_log
+            )
+            self.assertEqual(origin_path, registered_log)
+            self.assertEqual(capture_source, Path(registered_log))
+        cases = (("posix", spellings[0]),)
+        for index, (label, registered_log) in enumerate(cases, start=1):
+            with self.subTest(label=label):
+                packet_id = f"{label}-owner"
+                run_id = f"terminal-log-spelling-{label}"
+                self.create_exact_job_owner(
+                    task_id,
+                    packet_id,
+                    command="timeout 1m run.sh",
+                    work_root=f"/tmp/terminal-log-spelling/{label}",
+                )
+                self.cli(
+                    "job-start",
+                    "--task",
+                    task_id,
+                    "--run-id",
+                    run_id,
+                    "--host",
+                    "eda",
+                    "--tool",
+                    "VCS",
+                    "--work-root",
+                    f"/tmp/terminal-log-spelling/{label}",
+                    "--status",
+                    "queued",
+                    "--log",
+                    registered_log,
+                    "--stop-condition",
+                    "intentional nonzero terminal",
+                    "--tool-path",
+                    "/tools/vcs",
+                    "--tool-version",
+                    "VCS-test",
+                    "--command",
+                    "timeout 1m run.sh",
+                    "--owner-packet-id",
+                    packet_id,
+                    "--source-sha",
+                    receipt_sha,
+                    "--source-manifest",
+                    str(receipt),
+                )
+                self.cli(
+                    "job-update",
+                    "--task",
+                    task_id,
+                    "--run-id",
+                    run_id,
+                    "--status",
+                    "running",
+                    "--evidence",
+                    "synthetic test process launched",
+                    "--pid",
+                    str(4200 + index),
+                )
+                terminal_log, terminal_log_sha = self.write_terminal_log(
+                    f"{run_id}.log"
+                )
+                self.cli(
+                    "job-update",
+                    "--task",
+                    task_id,
+                    "--run-id",
+                    run_id,
+                    "--status",
+                    "fail",
+                    "--evidence",
+                    "synthetic process exited nonzero",
+                    "--exit-code",
+                    "3",
+                    "--terminal-log-artifact",
+                    str(terminal_log),
+                    "--terminal-log-sha256",
+                    terminal_log_sha,
+                )
+                jobs = h.load_json(
+                    self.root / ".aoi" / "tasks" / task_id / "state.json"
+                )["jobs"]
+                job = next(item for item in jobs if item["run_id"] == run_id)
+                manifest = h.load_json(Path(job["terminal_manifest_path"]))
+                self.assertEqual(manifest["artifact"]["origin_path"], registered_log)
+                self.assertEqual(
+                    Path(manifest["artifact"]["capture_source"]),
+                    terminal_log.resolve(),
+                )
+                self.cli(
+                    "packet-update",
+                    "--task",
+                    task_id,
+                    "--packet-id",
+                    packet_id,
+                    "--status",
+                    "done",
+                    "--summary",
+                    "terminal log spelling case completed",
+                    "--evidence",
+                    "terminal manifest preserves the registered log spelling",
+                )
 
     def test_packet_result_tamper_blocks_close_and_doctor(self) -> None:
         self.init_task("packet-tamper")
