@@ -6,12 +6,13 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import importlib.resources
 import json
 import threading
 from types import TracebackType
 from typing import Any, Protocol
 from urllib.parse import parse_qs, unquote, urlsplit
+
+from .dashboard_company_os import legacy_console_html, serve_company_os
 
 
 class CompanyDashboardError(RuntimeError):
@@ -403,21 +404,6 @@ class CompanyDashboardSnapshotCache:
         return snapshot
 
 
-def _dashboard_html() -> bytes:
-    resource = importlib.resources.files(
-        "aoi_orgware.resources",
-    ).joinpath("dashboard", "index.html")
-    try:
-        payload = resource.read_bytes()
-    except (FileNotFoundError, ModuleNotFoundError) as exc:
-        raise CompanyDashboardError(
-            "installed package is missing the Command Center asset",
-        ) from exc
-    if not payload or len(payload) > 1024 * 1024:
-        raise CompanyDashboardError("Command Center asset size is invalid")
-    return payload
-
-
 class _ReadOnlyHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
@@ -748,9 +734,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/index.html"}:
             self._write_bytes(
                 HTTPStatus.OK,
-                _dashboard_html(),
+                legacy_console_html(),
                 content_type="text/html; charset=utf-8",
             )
+            return
+        if serve_company_os(self, parsed.path):
             return
         if parsed.path == "/api/v1/events":
             self._sse(query)

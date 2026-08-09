@@ -12,6 +12,7 @@ import json
 import re
 from typing import Any, Literal
 import unicodedata
+from .dashboard_asset_governance import exact_exclusion_specs
 FILE_GOVERNANCE_BASELINE_V1 = "FileGovernanceBaselineV1"
 BASELINE_RESOURCE_PATH = (
     "src/aoi_orgware/resources/company/file-governance-baseline-v1.json"
@@ -21,7 +22,7 @@ BASELINE_RESOURCE_PARTS = (
     "company",
     "file-governance-baseline-v1.json",
 )
-SCOPE_ROOTS = ("docs", "src", "tests")
+SCOPE_ROOTS = ("docs", "frontend", "src", "tests")
 NEW_FILE_TARGET_LOGICAL_LINES = 800
 NEW_FILE_HARD_LOGICAL_LINES = 1500
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -315,7 +316,7 @@ def _reject_aliases(paths: Iterable[str]) -> None:
 
 def file_category(path: str) -> FileCategory:
     root = normalize_repo_path(path).split("/", 1)[0]
-    return {"docs": "documentation", "src": "source", "tests": "test"}[root]  # type: ignore[return-value]
+    return {"docs": "documentation", "frontend": "source", "src": "source", "tests": "test"}[root]  # type: ignore[return-value]
 def logical_line_count(data: bytes) -> int:
     if not data:
         return 0
@@ -396,21 +397,15 @@ def snapshot_file(
         scan_privacy_counts(path, blob.data, known_values=known_values),
     )
 
-def default_exact_exclusions() -> tuple[ExactExclusionV1, ...]:
-    base = "src/aoi_orgware/resources/codex_app_server/0.145.0/"
-    return (
-        ExactExclusionV1(
-            base + "codex_app_server_protocol.v2.schemas.json", "generated",
-            "provider-generated protocol schema pinned by runtime receipt",
-        ),
-        ExactExclusionV1(
-            base + "schema-manifest.json", "generated",
-            "provider-generated protocol member manifest",
-        ),
-        ExactExclusionV1(
-            BASELINE_RESOURCE_PATH, "generated",
-            "self-describing deterministic file-governance baseline", True,
-        ),
+def default_exact_exclusions(
+    files: Mapping[str, GitBlob] | None = None,
+) -> tuple[ExactExclusionV1, ...]:
+    specs = exact_exclusion_specs(
+        None if files is None else {path: blob.data for path, blob in files.items()}
+    )
+    return tuple(
+        ExactExclusionV1(spec.path, spec.kind, spec.reason, spec.self_unbound)
+        for spec in specs
     )
 
 def _canonical(value: Mapping[str, Any]) -> bytes:
@@ -432,7 +427,7 @@ def build_baseline_manifest(
     _reject_aliases(files)
     excluded: list[dict[str, Any]] = []
     for rule in sorted(
-        exclusions or default_exact_exclusions(),
+        exclusions or default_exact_exclusions(files),
         key=lambda item: item.path.encode("utf-8"),
     ):
         blob = files.pop(rule.path, None)

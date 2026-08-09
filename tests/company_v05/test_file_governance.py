@@ -10,6 +10,10 @@ import subprocess
 
 import pytest
 
+from aoi_orgware.company.dashboard_asset_governance import (
+    DashboardAssetGovernanceError,
+    exact_exclusion_specs,
+)
 from aoi_orgware.company.file_governance import (
     BASELINE_RESOURCE_PATH,
     SYNTHETIC_FIXTURE_MARKER,
@@ -25,6 +29,7 @@ from aoi_orgware.company.file_governance import (
     _evaluate_verified_candidate,
     baseline_manifest_bytes,
     build_baseline_manifest,
+    default_exact_exclusions,
     load_packaged_baseline,
     logical_line_count,
     normalize_repo_identity,
@@ -79,6 +84,24 @@ def _current(
     }
     result[BASELINE_RESOURCE_PATH] = GitBlob("100644", baseline_wire)
     return result
+
+
+def _company_os_governance_files() -> dict[str, bytes]:
+    paths = (
+        REPO_ROOT / "frontend/company-os/package-lock.json",
+        REPO_ROOT / "frontend/company-os/src/styles.css",
+        *(
+            path
+            for path in (
+                REPO_ROOT / "src/aoi_orgware/resources/dashboard_company_os"
+            ).rglob("*")
+            if path.is_file()
+        ),
+    )
+    return {
+        path.relative_to(REPO_ROOT).as_posix(): path.read_bytes()
+        for path in paths
+    }
 
 
 def _pure_report(
@@ -214,6 +237,61 @@ def test_exact_exclusion_does_not_hide_a_resource_subtree() -> None:
     assert manifest["totals"]["tracked_file_count"] == 2
     with pytest.raises(FileGovernanceError, match="missing exact"):
         build_baseline_manifest(_scope({}), exclusions=(exclusion, *SELF_ONLY))
+
+
+def test_company_os_frontend_and_assets_have_exact_governance() -> None:
+    files = _company_os_governance_files()
+    specs = exact_exclusion_specs(files)
+    paths = {spec.path for spec in specs}
+    generated = {
+        path for path in files
+        if path.startswith("src/aoi_orgware/resources/dashboard_company_os/")
+    }
+    assert generated <= paths
+    assert {
+        "frontend/company-os/package-lock.json",
+        "frontend/company-os/src/styles.css",
+    } <= paths
+    assert len(specs) == 3 + len(generated) + 2
+    assert snapshot_file(
+        "frontend/company-os/src/live-adapter.ts",
+        GitBlob("100644", b"export const live = true;\n"),
+    ).category == "source"
+    exclusions = default_exact_exclusions({
+        path: GitBlob("100644", data) for path, data in files.items()
+    })
+    assert {item.path for item in exclusions} == paths
+
+
+def test_company_os_asset_exclusions_fail_closed() -> None:
+    files = _company_os_governance_files()
+    generated = sorted(
+        path for path in files
+        if "/assets/" in path
+    )
+    missing = dict(files)
+    missing.pop(generated[0])
+    with pytest.raises(
+        DashboardAssetGovernanceError,
+        match="generated asset identity differs",
+    ):
+        exact_exclusion_specs(missing)
+    extra = dict(files)
+    extra[
+        "src/aoi_orgware/resources/dashboard_company_os/assets/unlisted.js"
+    ] = b"export {};\n"
+    with pytest.raises(
+        DashboardAssetGovernanceError,
+        match="subtree differs",
+    ):
+        exact_exclusion_specs(extra)
+    drifted = dict(files)
+    drifted["frontend/company-os/src/styles.css"] += b"/* drift */\n"
+    with pytest.raises(
+        DashboardAssetGovernanceError,
+        match="pinned Company OS provenance differs",
+    ):
+        exact_exclusion_specs(drifted)
 
 
 def test_self_exclusion_supports_two_baseline_generations() -> None:
