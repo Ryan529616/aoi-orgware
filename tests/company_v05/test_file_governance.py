@@ -42,6 +42,7 @@ from aoi_orgware.company.file_governance_io import (
     _run_git,
     build_baseline_from_git,
     evaluate_file_governance,
+    evaluate_packaged_file_governance,
     read_git_commit_scope,
     read_worktree_scope,
     verify_baseline_against_git,
@@ -49,8 +50,8 @@ from aoi_orgware.company.file_governance_io import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ACCEPTED_COMMIT = "130ca900bdc7bdbc224ba53eeda1157a39916121"
-ACCEPTED_TREE = "c2123cbf2bf2f65fb1b91015003b8b07f6b5bb1f"
+ACCEPTED_COMMIT = "878da62bf81d8318f5a8e44c607d572c09ab68a2"
+ACCEPTED_TREE = "c3b3938e516ffb17f83d73281250638f745ba1db"
 OBSERVED_AT = datetime(2026, 7, 28, 15, 0, tzinfo=timezone.utc)
 SELF_ONLY = (
     ExactExclusionV1(
@@ -285,6 +286,21 @@ def test_company_os_asset_exclusions_fail_closed() -> None:
         match="subtree differs",
     ):
         exact_exclusion_specs(extra)
+    current = read_worktree_scope(REPO_ROOT)
+    current[
+        "src/aoi_orgware/resources/dashboard_company_os/assets/unlisted.js"
+    ] = GitBlob("100644", b"export {};\n")
+    report = evaluate_packaged_file_governance(
+        REPO_ROOT,
+        current_files=current,
+        release="0.5.0a1",
+        observed_at=OBSERVED_AT,
+    )
+    assert not report.accepted
+    assert {(item.rule_id, item.path) for item in report.errors} == {(
+        "excluded_inventory_drift",
+        "src/aoi_orgware/resources/dashboard_company_os",
+    )}
     drifted = dict(files)
     drifted["frontend/company-os/src/styles.css"] += b"/* drift */\n"
     with pytest.raises(
@@ -737,13 +753,13 @@ def test_packaged_baseline_covers_source_docs_tests_and_exact_counts() -> None:
     assert packaged["accepted_commit_sha1"] == ACCEPTED_COMMIT
     assert packaged["accepted_tree_sha1"] == ACCEPTED_TREE
     assert packaged["totals"] == {
-        "excluded_file_count": 3,
-        "hand_authored_file_count": 434,
-        "hand_authored_logical_lines": 318621,
-        "hand_authored_size_bytes": 12984665,
-        "legacy_privacy_finding_count": 151,
-        "tracked_file_count": 437,
-        "tracked_size_bytes": 13587932,
+        "excluded_file_count": 53,
+        "hand_authored_file_count": 487,
+        "hand_authored_logical_lines": 329619,
+        "hand_authored_size_bytes": 13364847,
+        "legacy_privacy_finding_count": 150,
+        "tracked_file_count": 540,
+        "tracked_size_bytes": 15834922,
     }
     paths = {item["path"] for item in packaged["files"]}
     assert {

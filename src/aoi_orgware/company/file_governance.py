@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, Literal
 import unicodedata
-from .dashboard_asset_governance import exact_exclusion_specs
+from .dashboard_asset_governance import candidate_dashboard_asset_inventory_is_exact, exact_exclusion_specs
 FILE_GOVERNANCE_BASELINE_V1 = "FileGovernanceBaselineV1"
 BASELINE_RESOURCE_PATH = (
     "src/aoi_orgware/resources/company/file-governance-baseline-v1.json"
@@ -650,9 +650,11 @@ def _evaluate_verified_candidate(
     if len(current) != len(current_files):
         raise FileGovernanceError("duplicate normalized candidate path")
     _reject_aliases(current)
+    errors: list[tuple[GovernanceFinding, FileSnapshot | None]] = []
+    if not candidate_dashboard_asset_inventory_is_exact({path: blob.data for path, blob in current.items()}):
+        errors.append((_finding("error", "excluded_inventory_drift", "src/aoi_orgware/resources/dashboard_company_os"), None))
     prior_files = {item["path"]: item for item in checked["files"]}
     exclusions = {item["path"]: item for item in checked["exact_exclusions"]}
-    errors: list[tuple[GovernanceFinding, FileSnapshot | None]] = []
     for path, rule in exclusions.items():
         blob = current.pop(path, None)
         if blob is None:

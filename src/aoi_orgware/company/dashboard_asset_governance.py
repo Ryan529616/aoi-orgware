@@ -169,9 +169,20 @@ def exact_exclusion_specs(
     return tuple(sorted(specs, key=lambda item: item.path.encode("utf-8")))
 
 
+def candidate_dashboard_asset_inventory_is_exact(
+    files: Mapping[str, bytes],
+) -> bool:
+    try:
+        exact_exclusion_specs(files)
+    except DashboardAssetGovernanceError:
+        return False
+    return True
+
+
 __all__ = [
     "DashboardAssetGovernanceError",
     "ExactExclusionSpec",
     "FROZEN_V8_RECEIPT_SHA256",
+    "candidate_dashboard_asset_inventory_is_exact",
     "exact_exclusion_specs",
 ]
