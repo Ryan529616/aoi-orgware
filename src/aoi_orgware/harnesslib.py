@@ -2655,9 +2655,8 @@ def atomic_create_bytes(path: Path, payload: bytes) -> None:
         publication_handle.flush()
         os.fsync(publication_handle.fileno())
         if os.name == "nt":
-            # Preserve the existing Windows close-before-observation and
-            # close-before-rename behavior. Windows does not use the POSIX
-            # hard-link publication window below.
+            # Preserve Windows close-before-observation/rename without the
+            # POSIX hard-link publication window below.
             publication_handle.close()
             publication_handle = None
         _emit_atomic_io_event("create", "temp_fsynced", path, temporary)
@@ -2670,10 +2669,8 @@ def atomic_create_bytes(path: Path, payload: bytes) -> None:
                 published_temporary = temporary
                 temporary = None
             else:
-                # POSIX no-replace publication briefly exposes two names for
-                # one inode. Managed-state recovery is serialized by the
-                # project state lock; root-config and state-lock aliases fail
-                # closed and require explicit offline/manual recovery.
+                # POSIX no-replace briefly exposes two names. Managed recovery is
+                # locked; root-config and state-lock aliases require manual recovery.
                 os.link(temporary, path, follow_symlinks=False)
                 _emit_atomic_io_event("create", "linked", path, temporary)
                 published_temporary = temporary
@@ -3088,6 +3085,8 @@ def load_json(path: Path) -> dict[str, Any]:
     try:
         path = canonicalize_no_link_traversal(path, "managed JSON state")
         metadata = path.lstat()
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+            raise HarnessError(f"managed JSON state changed while being read: {path}")
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise HarnessError(f"managed JSON state must be a private regular file: {path}")
         with path.open("rb") as handle:
