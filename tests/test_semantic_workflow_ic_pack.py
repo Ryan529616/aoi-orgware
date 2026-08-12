@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from copy import deepcopy
 from pathlib import Path
 
+from aoi_orgware import harnesslib as h
 from aoi_orgware.ic_pack import (
     canonical_command,
     canonical_json_bytes,
@@ -39,7 +41,8 @@ def setup_workflow(output_root: Path):
     )
     data = request_bytes(pack_request)
     command = canonical_command(data)
-    output_lock = f"host:tree:{output_root.as_posix()}"
+    namespace = "host" if os.name == "nt" else "external"
+    output_lock = h.normalize_lock(f"{namespace}:tree:{output_root.as_posix()}")
     flow = WorkflowBuilder()
     plan = plan_request()
     plan["payload"]["source_manifest_sha256"] = fixture_manifest_sha256()
