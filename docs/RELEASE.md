@@ -85,7 +85,7 @@ substitute for it.
 
 `scripts/verify_dist.py` installs the wheel and sdist independently in fresh
 environments, checks packaged resources and exact metadata/runtime versions,
-and confirms all four entry points complete a `--help` smoke from outside the
+and confirms all five entry points complete a `--help` smoke from outside the
 source tree. The sdist path first builds its derived wheel with the verified
 backend and then runs the same offline installed-artifact smoke; passing a
 prebuilt wheel alone is insufficient. This verifies the built artifacts; it

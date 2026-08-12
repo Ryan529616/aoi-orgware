@@ -227,18 +227,8 @@ from .commands.status import (
     register_status_commands,
     resolve_resume_task,
 )
-from .commands.semantic import (
-    cmd_cohort_round_prepare,
-    cmd_cohort_round_preview,
-    cmd_cohort_show,
-    cmd_packet_arm_prepare,
-    cmd_permit_consume,
-    cmd_permit_issue,
-    cmd_semantic_head,
-    cmd_semantic_migrate,
-    cmd_semantic_migration_rollback,
-    register_semantic_commands,
-)
+from .commands import semantic as semcmd
+from .commands.semantic_workflow import register_ic_phase1
 from .commands.temporary_recovery import (
     TemporaryRecoveryServices,
     cmd_recover_temporaries,
@@ -732,6 +722,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "cohort-show",
     "inspect-legacy",
     "integrity-show",
+    "ic-rag-query",
     "legacy-bridge",
     "release-manifest-observe",
     "release-show",
@@ -740,6 +731,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "reconcile",
     "resume",
     "semantic-head",
+    "semantic-workflow-show",
     "status",
     "verify-backup",
     "doctor",
@@ -8167,7 +8159,6 @@ def build_parser(
         },
         add_json_argument=add_json_argument,
     )
-
     task_lifecycle_services = _task_lifecycle_cmd_services()
     register_chief_commands(
         sub,
@@ -8257,33 +8248,34 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
-    argparse_subparsers = cast(
+    typed_sub = cast(
         "argparse._SubParsersAction[argparse.ArgumentParser]", sub
     )
-    register_semantic_commands(
-        argparse_subparsers,
+    semcmd.register_semantic_commands(
+        typed_sub,
         handlers={
-            "cohort_round_prepare": cmd_cohort_round_prepare,
-            "cohort_round_preview": cmd_cohort_round_preview,
-            "cohort_show": cmd_cohort_show,
-            "packet_arm_prepare": cmd_packet_arm_prepare,
+            "cohort_round_prepare": semcmd.cmd_cohort_round_prepare,
+            "cohort_round_preview": semcmd.cmd_cohort_round_preview,
+            "cohort_show": semcmd.cmd_cohort_show,
+            "packet_arm_prepare": semcmd.cmd_packet_arm_prepare,
             "permit_consume": functools.partial(
-                cmd_permit_consume,
+                semcmd.cmd_permit_consume,
                 validate_packet_arm_preimage=_validate_packet_arm_preimage,
             ),
             "permit_issue": functools.partial(
-                cmd_permit_issue,
+                semcmd.cmd_permit_issue,
                 validate_packet_arm_preimage=_validate_packet_arm_preimage,
             ),
-            "semantic_head": cmd_semantic_head,
-            "semantic_migrate": cmd_semantic_migrate,
-            "semantic_migration_rollback": cmd_semantic_migration_rollback,
+            "semantic_head": semcmd.cmd_semantic_head,
+            "semantic_migrate": semcmd.cmd_semantic_migrate,
+            "semantic_migration_rollback": semcmd.cmd_semantic_migration_rollback,
         },
         add_json_argument=add_json_argument,
     )
+    register_ic_phase1(typed_sub, add_json_argument=add_json_argument)
 
     register_confidentiality_commands(
-        argparse_subparsers,
+        typed_sub,
         handlers={
             "confidentiality_git_push_preflight": (
                 cmd_confidentiality_git_push_preflight
@@ -8301,7 +8293,7 @@ def build_parser(
     )
 
     register_integrity_commands(
-        argparse_subparsers,
+        typed_sub,
         handlers={
             "integrity_adopt": cmd_integrity_adopt,
             "integrity_snapshot": cmd_integrity_snapshot,
@@ -8316,7 +8308,7 @@ def build_parser(
     )
 
     register_release_commands(
-        argparse_subparsers,
+        typed_sub,
         handlers={
             "release_abandon_pending": cmd_release_abandon_pending,
             "release_manifest_observe": cmd_release_manifest_observe,
@@ -8793,6 +8785,8 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "release-tag-push-verify",
     "resume",
     "semantic-head",
+    "semantic-workflow-apply",
+    "semantic-workflow-show",
     "semantic-migrate",
     "semantic-migration-rollback",
     "status",

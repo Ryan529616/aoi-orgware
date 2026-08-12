@@ -40,6 +40,7 @@ aoi = "aoi_orgware.cli:main"
 aoi-codex-hook = "aoi_orgware.codex_hook:main"
 aoi-codex-bridge = "aoi_orgware.codex_transport_cli:main"
 aoi-claude-hook = "aoi_orgware.claude_hook:main"
+aoi-ic-pack = "aoi_orgware.ic_pack_cli:main"
 
 [tool.pytest.ini_options]
 # Scope collection to the real suite; the pilot sample project under

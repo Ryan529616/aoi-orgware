@@ -33,6 +33,13 @@ _VERSION = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$', re.MULTILIN
 _HOOK = re.compile(r'^HOOK_PROTOCOL_VERSION\s*=\s*["\'](\d+)["\']\s*$', re.MULTILINE)
 _SAFE_REL = re.compile(r"[A-Za-z0-9.][A-Za-z0-9._/@+-]{0,511}\Z")
 _SAFE_REVIEWER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
+_WHEEL_CONSOLE_ENTRY_POINTS = (
+    "aoi = aoi_orgware.cli:main",
+    "aoi-claude-hook = aoi_orgware.claude_hook:main",
+    "aoi-codex-bridge = aoi_orgware.codex_transport_cli:main",
+    "aoi-codex-hook = aoi_orgware.codex_hook:main",
+    "aoi-ic-pack = aoi_orgware.ic_pack_cli:main",
+)
 
 
 class LocalInstallProofError(ValueError):
@@ -85,24 +92,24 @@ def _sha(value: Any, label: str) -> str:
 
 
 def _timestamp(value: Any, label: str) -> str:
-    value = _text(value, label, limit=27)
-    if _UTC.fullmatch(value) is None:
+    text = _text(value, label, limit=27)
+    if _UTC.fullmatch(text) is None:
         _fail(f"{label} is not canonical UTC time")
     try:
-        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ")
     except ValueError as exc:
         raise LocalInstallProofError(f"{label} is not a real UTC time") from exc
-    return value
+    return text
 
 
 def _safe_relative(value: Any, label: str) -> str:
-    value = _text(value, label, limit=512)
-    if value in {".", ".."} or "\\" in value or _SAFE_REL.fullmatch(value) is None:
+    text = _text(value, label, limit=512)
+    if text in {".", ".."} or "\\" in text or _SAFE_REL.fullmatch(text) is None:
         _fail(f"{label} is not a safe relative path")
-    parsed = PurePosixPath(value)
-    if parsed.is_absolute() or ".." in parsed.parts or str(parsed) != value:
+    parsed = PurePosixPath(text)
+    if parsed.is_absolute() or ".." in parsed.parts or str(parsed) != text:
         _fail(f"{label} is not a safe relative path")
-    return value
+    return text
 
 
 def _is_link(stat_result: os.stat_result) -> bool:
@@ -471,7 +478,7 @@ def _wheel_interface(wheel_raw: bytes, *, version: str) -> dict[str, Any]:
         metadata[key] = member_value
     if metadata.get("Name") != "aoi-orgware" or metadata.get("Version") != version:
         _fail("wheel METADATA does not bind package identity")
-    required = {"aoi = aoi_orgware.cli:main", "aoi-codex-hook = aoi_orgware.codex_hook:main", "aoi-codex-bridge = aoi_orgware.codex_transport_cli:main", "aoi-claude-hook = aoi_orgware.claude_hook:main"}
+    required = set(_WHEEL_CONSOLE_ENTRY_POINTS)
     in_console = False; found: list[str] = []
     for line in entries_text.splitlines():
         stripped = line.strip()
@@ -583,7 +590,7 @@ def _validate_subject(value: Mapping[str, Any]) -> dict[str, Any]:
     _rehearsal(rehearsal["report"], source, manifest, lock["raw_sha256"], inventory)
     interface = _object(item["wheel_interface"], {"metadata_sha256", "entry_points_sha256", "record_sha256", "cli_sha256", "hook_protocol_version", "entry_points"}, "subject wheel interface")
     for key in ("metadata_sha256", "entry_points_sha256", "record_sha256", "cli_sha256"): _sha(interface[key], f"subject wheel {key}")
-    expected_entries = sorted(["aoi = aoi_orgware.cli:main", "aoi-codex-hook = aoi_orgware.codex_hook:main", "aoi-codex-bridge = aoi_orgware.codex_transport_cli:main", "aoi-claude-hook = aoi_orgware.claude_hook:main"])
+    expected_entries = sorted(_WHEEL_CONSOLE_ENTRY_POINTS)
     if interface["hook_protocol_version"] != 6 or interface["entry_points"] != expected_entries: _fail("subject wheel interface is invalid")
     _sha(item["subject_sha256"], "subject sha256")
     if _digest({key: item[key] for key in item if key != "subject_sha256"}) != item["subject_sha256"]: _fail("subject digest does not match")
