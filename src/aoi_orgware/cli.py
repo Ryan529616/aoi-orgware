@@ -34,6 +34,7 @@ from . import codex_install_provenance as codex_install_provenance_impl
 from . import confidentiality as confidentiality_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
+from .delivery_lineage import remote_tip_error
 from . import evidence_artifacts as evidence_artifacts_impl
 from .agent_identity import AgentIdentityError, AGENT_ID_RE, validate_agent_id
 from . import execution_topology as execution_topology_impl
@@ -1675,14 +1676,12 @@ def delivery_integrity_errors(
             errors.append(str(exc))
         else:
             expected_tip = current["head_sha"] if terminal else commit
-            if actual_tip != expected_tip and not (
-                terminal and allow_terminal_remote_advance
+            if error := remote_tip_error(
+                state_worktree(paths, state), expected_tip, actual_tip, remote,
+                remote_ref, "terminal task worktree HEAD" if terminal else
+                "delivery commit", terminal and allow_terminal_remote_advance,
             ):
-                errors.append(
-                    f"remote {remote} {remote_ref} points to {actual_tip}, "
-                    f"not the {'terminal task worktree HEAD' if terminal else 'delivery commit'} "
-                    f"{expected_tip}"
-                )
+                errors.append(error)
     return errors
 
 
@@ -7505,8 +7504,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     task,
                     verify_remote=True,
                     allow_terminal_remote_advance=(
-                        paths.project.confidentiality.selective_protection
-                        and task.get("status") in {"done", "cancelled"}
+                        task.get("status") in {"done", "cancelled"}
                     ),
                 )
             )
