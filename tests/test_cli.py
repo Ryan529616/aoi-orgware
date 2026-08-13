@@ -43,10 +43,12 @@ from aoi_orgware import semantic_events as semantic_events_impl  # noqa: E402
 
 CLI_MODULE = "aoi_orgware.cli"
 HOOK_MODULE = "aoi_orgware.codex_hook"
+render_compact = h._render_checkpoint_snapshot
 
 from tests.harness_case import HarnessTestCase  # noqa: E402
 from tests.test_commands_codex_onboarding import (  # noqa: E402
     fake_local_provenance_receipt,
+    mock_fake_local_codex_client_skill_binding,
 )
 
 
@@ -2649,11 +2651,11 @@ class LockTests(HarnessTestCase):
 
     def test_host_lock_drive_colon_allowed_but_second_colon_rejected(self) -> None:
         self.assertEqual(
-            h.normalize_lock("host:file:C:/Users/x/file.py"),
-            "host:file:C:/users/x/file.py",
+            h.normalize_lock("host:file:C:/SyntheticProfile/x/file.py"),
+            "host:file:C:/syntheticprofile/x/file.py",
         )
         with self.assertRaises(h.HarnessError):
-            h.normalize_lock("host:file:C:/Users/x:y.py")
+            h.normalize_lock("host:file:C:/SyntheticProfile/x:y.py")
 
 
 class LifecycleTests(HarnessTestCase):
@@ -2895,7 +2897,7 @@ class LifecycleTests(HarnessTestCase):
         state["claims"].append("active-claim")
 
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         canonical = json.dumps(
             sorted(terminal_claims, key=lambda claim: claim["token"]),
             ensure_ascii=False,
@@ -2940,9 +2942,8 @@ class LifecycleTests(HarnessTestCase):
         changed = json.loads(first_path.read_text(encoding="utf-8"))
         changed["intent"] = "changed terminal claim content"
         h.atomic_write_json(first_path, changed)
-        changed_rendered = h.render_checkpoint(
-            paths,
-            state,
+        changed_rendered = render_compact(
+            paths, state,
             compact_terminal_detail=True,
         )
         self.assertNotEqual(rendered, changed_rendered)
@@ -2955,7 +2956,7 @@ class LifecycleTests(HarnessTestCase):
         ]
         for token in state["claims"][retained_terminal_count:-1]:
             (paths.claims_archive / f"{token}.json").unlink()
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below_threshold,
             compact_terminal_detail=True,
@@ -3207,7 +3208,7 @@ class LifecycleTests(HarnessTestCase):
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
         full = h.render_checkpoint(paths, state)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         canonical = json.dumps(
             state["facts"],
             ensure_ascii=False,
@@ -3230,12 +3231,12 @@ class LifecycleTests(HarnessTestCase):
         changed["facts"][0] = "changed-established-fact"
         self.assertNotEqual(
             rendered,
-            h.render_checkpoint(paths, changed, compact_terminal_detail=True),
+            render_compact(paths, changed, compact_terminal_detail=True),
         )
 
         below = json.loads(json.dumps(state))
         below["facts"] = state["facts"][: h.COMPACT_FACT_HISTORY_THRESHOLD - 1]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below,
             compact_terminal_detail=True,
@@ -3281,7 +3282,7 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         terminal = state["verification"][:-1]
         canonical = json.dumps(
             terminal,
@@ -3314,7 +3315,7 @@ class LifecycleTests(HarnessTestCase):
         changed["verification"][0]["boundary"] = "changed-boundary"
         self.assertNotEqual(
             rendered,
-            h.render_checkpoint(paths, changed, compact_terminal_detail=True),
+            render_compact(paths, changed, compact_terminal_detail=True),
         )
 
         below = json.loads(json.dumps(state))
@@ -3322,7 +3323,7 @@ class LifecycleTests(HarnessTestCase):
             *terminal[: h.COMPACT_VERIFICATION_HISTORY_THRESHOLD - 1],
             state["verification"][-1],
         ]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below,
             compact_terminal_detail=True,
@@ -3374,7 +3375,7 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         terminal = state["jobs"][:-1]
         canonical = json.dumps(
             terminal,
@@ -3405,7 +3406,7 @@ class LifecycleTests(HarnessTestCase):
         changed["jobs"][0]["evidence"] = "changed-evidence"
         self.assertNotEqual(
             rendered,
-            h.render_checkpoint(paths, changed, compact_terminal_detail=True),
+            render_compact(paths, changed, compact_terminal_detail=True),
         )
 
         below = json.loads(json.dumps(state))
@@ -3413,7 +3414,7 @@ class LifecycleTests(HarnessTestCase):
             *terminal[: h.COMPACT_JOB_HISTORY_THRESHOLD - 1],
             state["jobs"][-1],
         ]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below,
             compact_terminal_detail=True,
@@ -3460,7 +3461,7 @@ class LifecycleTests(HarnessTestCase):
         )
         paths = h.get_paths(self.root)
         before = json.dumps(state, sort_keys=True)
-        rendered = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        rendered = render_compact(paths, state, compact_terminal_detail=True)
         terminal = state["packets"][:-1]
         canonical = json.dumps(
             terminal,
@@ -3483,7 +3484,7 @@ class LifecycleTests(HarnessTestCase):
 
         changed = json.loads(json.dumps(state))
         changed["packets"][0]["summary"] = "changed-summary"
-        changed_rendered = h.render_checkpoint(
+        changed_rendered = render_compact(
             paths,
             changed,
             compact_terminal_detail=True,
@@ -3495,7 +3496,7 @@ class LifecycleTests(HarnessTestCase):
             *terminal[: h.COMPACT_PACKET_HISTORY_THRESHOLD - 1],
             state["packets"][-1],
         ]
-        below_rendered = h.render_checkpoint(
+        below_rendered = render_compact(
             paths,
             below_threshold,
             compact_terminal_detail=True,
@@ -3530,7 +3531,7 @@ class LifecycleTests(HarnessTestCase):
             }
         )
         paths = h.get_paths(self.root)
-        compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        compact = render_compact(paths, state, compact_terminal_detail=True)
         compact_bytes = len(compact.encode("utf-8"))
         self.assertGreater(compact_bytes, h.CHECKPOINT_COMPACT_THRESHOLD_BYTES)
         self.assertLessEqual(compact_bytes, h.CHECKPOINT_MAX_BYTES)
@@ -3598,7 +3599,7 @@ class LifecycleTests(HarnessTestCase):
         self.cli_in_process(*claim_args, "--allow-nonexistent")
         paths = h.get_paths(self.root)
         state = h.load_task(paths, "active-claim-oversized-checkpoint")
-        compact = h.render_checkpoint(paths, state, compact_terminal_detail=True)
+        compact = render_compact(paths, state, compact_terminal_detail=True)
         for lock in locks:
             self.assertIn(lock, compact)
         with self.assertRaisesRegex(
@@ -4226,12 +4227,19 @@ class LifecycleTests(HarnessTestCase):
             "EDA-RUN",
             "--lock",
             "external:tree:/tmp/aoi-example-run",
+            "--lock",
+            "repo:file:eda-owner-job-command.sh",
             "--intent",
             "bounded EDA test",
             "--validation",
             "job gate",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        )
+        self.create_exact_job_owner(
+            "eda-task", "eda-owner", command="timeout 1m run.sh",
+            work_root="/tmp/aoi-example-run",
         )
         self.cli(
             "job-start",
@@ -4261,6 +4269,8 @@ class LifecycleTests(HarnessTestCase):
             "VCS-test",
             "--command",
             "timeout 1m run.sh",
+            "--owner-packet-id",
+            "eda-owner",
         )
         self.cli(
             "job-update",
@@ -4359,6 +4369,19 @@ class LifecycleTests(HarnessTestCase):
             str(terminal_log),
             "--terminal-log-sha256",
             terminal_log_sha,
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            "eda-task",
+            "--packet-id",
+            "eda-owner",
+            "--status",
+            "done",
+            "--summary",
+            "Exact-command owner closed after its terminal job",
+            "--evidence",
+            "The registered job reached an evidence-bound terminal state",
         )
         self.cli(
             "release-claim",
@@ -4476,12 +4499,19 @@ class LifecycleTests(HarnessTestCase):
             "EDA-RUN",
             "--lock",
             "external:tree:/tmp/aoi-lag",
+            "--lock",
+            "repo:file:job-lag-owner-job-command.sh",
             "--intent",
             "bounded lag test",
             "--validation",
             "job gate",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        )
+        self.create_exact_job_owner(
+            "job-lag", "job-lag-owner", command="timeout 1m run.sh",
+            work_root="/tmp/aoi-lag",
         )
 
         def start(run_id: str, *extra: str, ok: bool = True):
@@ -4514,6 +4544,8 @@ class LifecycleTests(HarnessTestCase):
                 "VCS-test",
                 "--command",
                 "timeout 1m run.sh",
+                "--owner-packet-id",
+                "job-lag-owner",
                 "--json",
                 *extra,
                 ok=ok,
@@ -5075,12 +5107,19 @@ class HardeningTests(HarnessTestCase):
             "EDA-RUN",
             "--lock",
             "external:tree:/tmp/receipt-run",
+            "--lock",
+            "repo:file:receipt-owner-job-command.sh",
             "--intent",
             "test source receipt integrity",
             "--validation",
             "job state remains transactional",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        )
+        self.create_exact_job_owner(
+            "receipt-task", "receipt-owner", command="timeout 1m run.sh",
+            work_root="/tmp/receipt-run",
         )
         base = [
             "job-start",
@@ -5106,6 +5145,8 @@ class HardeningTests(HarnessTestCase):
             "VCS-test",
             "--command",
             "timeout 1m run.sh",
+            "--owner-packet-id",
+            "receipt-owner",
         ]
         state_path = (
             self.root / ".aoi" / "tasks" / "receipt-task" / "state.json"
@@ -5218,12 +5259,151 @@ class HardeningTests(HarnessTestCase):
         self.assertEqual(job["terminal_artifact_status"], "preserved")
         terminal_manifest = h.load_json(Path(job["terminal_manifest_path"]))
         self.assertEqual(
-            Path(terminal_manifest["artifact"]["capture_source"]),
-            terminal_log.resolve(),
+            (
+                terminal_manifest["artifact"]["origin_path"],
+                Path(terminal_manifest["artifact"]["capture_source"]),
+                terminal_manifest["artifact"]["sha256"],
+            ),
+            ("/tmp/receipt-run/driver.log", terminal_log.resolve(), terminal_log_sha),
         )
-        self.assertEqual(
-            terminal_manifest["artifact"]["sha256"], terminal_log_sha
+
+    def test_terminal_manifest_preserves_registered_log_spelling(self) -> None:
+        task_id = "terminal-log-spelling"
+        self.init_task(task_id)
+        self.cli(
+            "claim",
+            "--task",
+            task_id,
+            "--token",
+            "terminal-log-spelling-claim",
+            "--owner",
+            "root",
+            "--kind",
+            "EDA-RUN",
+            "--lock",
+            "external:tree:/tmp/terminal-log-spelling",
+            "--lock",
+            "repo:file:posix-owner-job-command.sh",
+            "--intent",
+            "test registered terminal log spelling",
+            "--validation",
+            "terminal manifest keeps the durable job log string",
+            "--expires-at",
+            "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
         )
+        receipt, receipt_sha = self.write_source_receipt(
+            "terminal-log-spelling-source.json"
+        )
+        spellings = (
+            "/tmp/terminal-log-spelling/posix/driver.log",
+            "/mnt/c/AOI-Work/terminal-log-spelling/wsl/driver.log",
+            r"C:\AOI-Work\terminal-log-spelling\windows\driver.log",
+        )
+        for registered_log in spellings:
+            origin_path, capture_source = cli_impl._registered_terminal_log_paths(
+                registered_log
+            )
+            self.assertEqual(origin_path, registered_log)
+            self.assertEqual(capture_source, Path(registered_log))
+        cases = (("posix", spellings[0]),)
+        for index, (label, registered_log) in enumerate(cases, start=1):
+            with self.subTest(label=label):
+                packet_id = f"{label}-owner"
+                run_id = f"terminal-log-spelling-{label}"
+                self.create_exact_job_owner(
+                    task_id,
+                    packet_id,
+                    command="timeout 1m run.sh",
+                    work_root=f"/tmp/terminal-log-spelling/{label}",
+                )
+                self.cli(
+                    "job-start",
+                    "--task",
+                    task_id,
+                    "--run-id",
+                    run_id,
+                    "--host",
+                    "eda",
+                    "--tool",
+                    "VCS",
+                    "--work-root",
+                    f"/tmp/terminal-log-spelling/{label}",
+                    "--status",
+                    "queued",
+                    "--log",
+                    registered_log,
+                    "--stop-condition",
+                    "intentional nonzero terminal",
+                    "--tool-path",
+                    "/tools/vcs",
+                    "--tool-version",
+                    "VCS-test",
+                    "--command",
+                    "timeout 1m run.sh",
+                    "--owner-packet-id",
+                    packet_id,
+                    "--source-sha",
+                    receipt_sha,
+                    "--source-manifest",
+                    str(receipt),
+                )
+                self.cli(
+                    "job-update",
+                    "--task",
+                    task_id,
+                    "--run-id",
+                    run_id,
+                    "--status",
+                    "running",
+                    "--evidence",
+                    "synthetic test process launched",
+                    "--pid",
+                    str(4200 + index),
+                )
+                terminal_log, terminal_log_sha = self.write_terminal_log(
+                    f"{run_id}.log"
+                )
+                self.cli(
+                    "job-update",
+                    "--task",
+                    task_id,
+                    "--run-id",
+                    run_id,
+                    "--status",
+                    "fail",
+                    "--evidence",
+                    "synthetic process exited nonzero",
+                    "--exit-code",
+                    "3",
+                    "--terminal-log-artifact",
+                    str(terminal_log),
+                    "--terminal-log-sha256",
+                    terminal_log_sha,
+                )
+                jobs = h.load_json(
+                    self.root / ".aoi" / "tasks" / task_id / "state.json"
+                )["jobs"]
+                job = next(item for item in jobs if item["run_id"] == run_id)
+                manifest = h.load_json(Path(job["terminal_manifest_path"]))
+                self.assertEqual(manifest["artifact"]["origin_path"], registered_log)
+                self.assertEqual(
+                    Path(manifest["artifact"]["capture_source"]),
+                    terminal_log.resolve(),
+                )
+                self.cli(
+                    "packet-update",
+                    "--task",
+                    task_id,
+                    "--packet-id",
+                    packet_id,
+                    "--status",
+                    "done",
+                    "--summary",
+                    "terminal log spelling case completed",
+                    "--evidence",
+                    "terminal manifest preserves the registered log spelling",
+                )
 
     def test_packet_result_tamper_blocks_close_and_doctor(self) -> None:
         self.init_task("packet-tamper")
@@ -6293,35 +6473,6 @@ class HardeningTests(HarnessTestCase):
 class ParallelLaneCoordinationTests(HarnessTestCase):
     """Contract tests for lean parallel lanes and root arbitration."""
 
-    def git_commit(self, name: str) -> str:
-        marker = self.root / f"authority-{name}.txt"
-        marker.write_text(f"{name}\n", encoding="utf-8")
-        subprocess.run(
-            ["git", "-C", str(self.root), "add", marker.name], check=True
-        )
-        subprocess.run(
-            ["git", "-C", str(self.root), "commit", "-m", f"authority {name}"],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-        return subprocess.run(
-            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
-            check=True,
-            text=True,
-            capture_output=True,
-        ).stdout.strip()
-
-    def task_state(self, task_id: str) -> dict:
-        return json.loads(
-            (
-                self.root
-                / ".aoi"
-                / "tasks"
-                / task_id
-                / "state.json"
-            ).read_text(encoding="utf-8")
-        )
 
     def test_skill_canary_binding_precedes_wall_clock_order(self) -> None:
         canary_time = "2026-07-14T00:00:00+00:00"
@@ -6373,46 +6524,6 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             if path.is_file()
         }
 
-    def create_lane(
-        self,
-        task_id: str,
-        lane_id: str,
-        *,
-        kind: str,
-        role: str,
-        authority_commit: str,
-        contract_version: str = "cv1",
-        generator_version: str | None = "gv1",
-        adapter_version: str | None = "av1",
-        status: str = "active",
-    ) -> dict:
-        args = [
-            "lane-create",
-            "--task",
-            task_id,
-            "--lane-id",
-            lane_id,
-            "--kind",
-            kind,
-            "--status",
-            status,
-            "--owner",
-            f"{lane_id}-agent",
-            "--role",
-            role,
-            "--authority-commit",
-            authority_commit,
-            "--contract-version",
-            contract_version,
-            "--next-action",
-            f"Advance {lane_id} independently",
-        ]
-        if generator_version is not None:
-            args.extend(["--generator-version", generator_version])
-        if adapter_version is not None:
-            args.extend(["--adapter-version", adapter_version])
-        args.append("--json")
-        return json.loads(self.cli(*args).stdout)
 
     def revise_lane(
         self,
@@ -6747,7 +6858,7 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             cli_impl._execution_brief_coverage_error(paths, state, selection) or "",
         )
 
-    def test_task_global_execution_epoch_includes_standalone_jobs(self) -> None:
+    def test_task_global_execution_epoch_includes_exact_command_job_owner(self) -> None:
         task_id = "job-execution-epoch"
         self.init_task(task_id, session_id="chief-job-epoch")
         commit = self.git_commit(task_id)
@@ -6806,12 +6917,38 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "external:tree:/tmp/job-epoch-rtl",
             "--lock",
             "external:tree:/tmp/job-epoch-numeric",
+            "--lock",
+            "repo:file:rtl-owner-job-command.sh",
+            "--lock",
+            "repo:file:numeric-owner-job-command.sh",
             "--intent",
             "Exercise task-global job topology without launching a real tool",
             "--validation",
             "The second queued job must be rejected before state mutation",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        )
+        self.create_exact_job_owner(
+            task_id,
+            "rtl-owner",
+            command="timeout 1m run.sh",
+            work_root="/tmp/job-epoch-rtl",
+            agent_role="implementation_specialist",
+            model_tier="expert",
+            lane_id="rtl",
+            execution_selection_id="rtl-single",
+        )
+        self.create_exact_job_owner(
+            task_id,
+            "numeric-owner",
+            command="timeout 1m run.sh",
+            work_root="/tmp/job-epoch-numeric",
+            agent_role="analysis_specialist",
+            model_tier="frontier",
+            lane_id="numeric",
+            execution_selection_id="numeric-single",
+            dispatch=False,
         )
         receipt, receipt_sha = self.write_source_receipt("job-epoch-source.json")
 
@@ -6843,6 +6980,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
                 "VCS-test",
                 "--command",
                 "timeout 1m run.sh",
+                "--owner-packet-id",
+                f"{lane_id}-owner",
                 "--lane-id",
                 lane_id,
                 "--execution-selection-id",
@@ -6851,240 +6990,13 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             )
 
         start_job("rtl-run", "rtl")
-        rejected = start_job("numeric-run", "numeric", ok=False)
-        self.assertIn("task-global execution epoch", rejected.stderr)
+        with self.assertRaisesRegex(AssertionError, "task-global execution epoch"):
+            self.arm_packet(task_id, "numeric-owner")
         doctor = json.loads(
             self.cli("doctor", "--task", task_id, "--json").stdout
         )
         self.assertTrue(doctor["ok"], doctor)
 
-    def test_external_job_can_be_owned_by_one_dispatched_packet_chain(self) -> None:
-        task_id = "owned-job-chain"
-        self.init_task(task_id, session_id="chief-owned-job")
-        commit = self.git_commit(task_id)
-        self.create_lane(
-            task_id,
-            "rtl",
-            kind="implementation",
-            role="implementation_specialist",
-            authority_commit=commit,
-        )
-        self.cli(
-            "execution-select",
-            "--task",
-            task_id,
-            "--selection-id",
-            "owned-job-single",
-            "--work-unit-id",
-            "owned-job-work",
-            "--mode",
-            "single",
-            "--lane",
-            "rtl",
-            "--scope",
-            "One specialist packet owns one external command lifecycle",
-            "--sequential-dependency",
-            "high",
-            "--tool-density",
-            "high",
-            "--shared-context",
-            "high",
-            "--rationale",
-            "The job is nested in the already-authorized packet chain",
-            "--falsification-condition",
-            "Reject if packet and job authorities diverge",
-            "--escalation-condition",
-            "Stop the job before completing its owner packet",
-            "--session-id",
-            "chief-owned-job",
-        )
-        self.cli(
-            "claim",
-            "--task",
-            task_id,
-            "--token",
-            "owned-job-claim",
-            "--owner",
-            "test-root",
-            "--kind",
-            "EDA-RUN",
-            "--lock",
-            "external:tree:/tmp/owned-job-chain",
-            "--intent",
-            "Exercise nested job authority without launching a real tool",
-            "--validation",
-            "Owner packet cannot finish while its job remains active",
-            "--expires-at",
-            "2099-01-01T00:00:00+00:00",
-        )
-        self.cli(
-            "create-packet",
-            "--task",
-            task_id,
-            "--packet-id",
-            "job-owner",
-            "--agent-role",
-            "implementation_specialist",
-            "--model-tier",
-            "expert",
-            "--objective",
-            "Own one bounded external command lifecycle",
-            "--scope",
-            "Run only inside the claimed external output tree",
-            "--deliverable",
-            "Terminal job evidence and one bounded conclusion",
-            "--validation",
-            "The Chief checks job and packet terminal evidence",
-            "--packet-mode",
-            "bounded_mutation",
-            "--lock",
-            "external:tree:/tmp/owned-job-chain",
-            "--lane-id",
-            "rtl",
-            "--execution-selection-id",
-            "owned-job-single",
-        )
-        self.dispatch_packet(task_id, "job-owner", "/root/job-owner")
-        receipt, receipt_sha = self.write_source_receipt("owned-job-source.json")
-        self.cli(
-            "job-start",
-            "--task",
-            task_id,
-            "--run-id",
-            "owned-run",
-            "--host",
-            "eda",
-            "--tool",
-            "VCS",
-            "--work-root",
-            "/tmp/owned-job-chain",
-            "--log",
-            "/tmp/owned-job-chain/driver.log",
-            "--stop-condition",
-            "PASS or first fatal",
-            "--source-sha",
-            receipt_sha,
-            "--source-manifest",
-            str(receipt),
-            "--tool-path",
-            "/tools/vcs",
-            "--tool-version",
-            "VCS-test",
-            "--command",
-            "timeout 1m run.sh",
-            "--lane-id",
-            "rtl",
-            "--execution-selection-id",
-            "owned-job-single",
-            "--owner-packet-id",
-            "job-owner",
-        )
-        state_path = self.root / ".aoi" / "tasks" / task_id / "state.json"
-        state = self.task_state(task_id)
-        owner_packet = next(
-            packet for packet in state["packets"] if packet["packet_id"] == "job-owner"
-        )
-        owner_contract = Path(owner_packet["path"])
-        owner_contract_bytes = owner_contract.read_bytes()
-        owner_contract.write_bytes(owner_contract_bytes + b"\nphysical drift\n")
-        drifted_launch = self.cli(
-            "job-update",
-            "--task",
-            task_id,
-            "--run-id",
-            "owned-run",
-            "--status",
-            "running",
-            "--pid",
-            "424242",
-            "--evidence",
-            "Owner contract drift must be rejected at the launch boundary",
-            ok=False,
-        )
-        self.assertIn("owner packet authority is missing or tampered", drifted_launch.stderr)
-        owner_contract.write_bytes(owner_contract_bytes)
-
-        valid_state_bytes = state_path.read_bytes()
-        lock_drift = json.loads(valid_state_bytes)
-        next(
-            packet
-            for packet in lock_drift["packets"]
-            if packet["packet_id"] == "job-owner"
-        )["locks"] = []
-        state_path.write_text(
-            json.dumps(lock_drift, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        lock_doctor = subprocess.run(
-            [sys.executable, "-m", CLI_MODULE, "doctor", "--task", task_id, "--json"],
-            cwd=self.root,
-            env=self.env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(lock_doctor.returncode, 1, lock_doctor.stderr)
-        self.assertIn("output paths exceed the owner packet locks", lock_doctor.stdout)
-        state_path.write_bytes(valid_state_bytes)
-
-        self.cli(
-            "job-update",
-            "--task",
-            task_id,
-            "--run-id",
-            "owned-run",
-            "--status",
-            "running",
-            "--pid",
-            "424242",
-            "--evidence",
-            "Physical owner authority and canonical output locks were revalidated",
-        )
-        blocked = self.cli(
-            "packet-update",
-            "--task",
-            task_id,
-            "--packet-id",
-            "job-owner",
-            "--status",
-            "done",
-            "--summary",
-            "Owner attempted to finish before its job",
-            "--evidence",
-            "The active owned job must block this transition",
-            ok=False,
-        )
-        self.assertIn("child work is active", blocked.stderr)
-        self.cli(
-            "job-update",
-            "--task",
-            task_id,
-            "--run-id",
-            "owned-run",
-            "--status",
-            "stopped",
-            "--evidence",
-            "The bounded external job was stopped before owner completion",
-            "--exit-code",
-            "143",
-        )
-        self.cli(
-            "packet-update",
-            "--task",
-            task_id,
-            "--packet-id",
-            "job-owner",
-            "--status",
-            "done",
-            "--summary",
-            "Owner completed after its nested job became terminal",
-            "--evidence",
-            "The job lifecycle and owner packet share one exact chain",
-        )
-        doctor = json.loads(
-            self.cli("doctor", "--task", task_id, "--json").stdout
-        )
-        self.assertTrue(doctor["ok"], doctor)
 
     def test_centralized_parallel_allows_cross_lane_but_not_same_lane_overlap(self) -> None:
         task_id = "centralized-lane-fence"
@@ -12019,12 +11931,25 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "EDA-RUN",
             "--lock",
             "external:tree:/tmp/topology-transition-run",
+            "--lock",
+            "repo:file:transition-owner-job-command.sh",
             "--intent",
             "Test queued job topology revalidation without launching EDA",
             "--validation",
             "Only harness state transitions are exercised",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        )
+        self.create_exact_job_owner(
+            "topology-transition",
+            "transition-owner",
+            command="timeout 1m run.sh",
+            work_root="/tmp/topology-transition-run",
+            agent_role="implementation_specialist",
+            model_tier="expert",
+            lane_id="rtl",
+            execution_selection_id="transition-eda",
         )
         receipt, receipt_sha = self.write_source_receipt("transition-source.json")
         self.cli(
@@ -12055,6 +11980,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "VCS-test",
             "--command",
             "timeout 1m run.sh",
+            "--owner-packet-id",
+            "transition-owner",
             "--lane-id",
             "rtl",
             "--execution-selection-id",
@@ -12234,12 +12161,25 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "EDA-RUN",
             "--lock",
             "external:tree:/tmp/unknown-launch-run",
+            "--lock",
+            "repo:file:unknown-launch-owner-job-command.sh",
             "--intent",
             "Exercise launch-authority state only",
             "--validation",
             "No EDA process is launched",
             "--expires-at",
             "2099-01-01T00:00:00+00:00",
+            "--allow-nonexistent",
+        )
+        self.create_exact_job_owner(
+            "unknown-launch",
+            "unknown-launch-owner",
+            command="timeout 1m run.sh",
+            work_root="/tmp/unknown-launch-run",
+            agent_role="implementation_specialist",
+            model_tier="expert",
+            lane_id="rtl",
+            execution_selection_id="unknown-launch-selection",
         )
         receipt, receipt_sha = self.write_source_receipt("unknown-launch-source.json")
         self.cli(
@@ -12270,6 +12210,8 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "VCS-test",
             "--command",
             "timeout 1m run.sh",
+            "--owner-packet-id",
+            "unknown-launch-owner",
             "--lane-id",
             "rtl",
             "--execution-selection-id",
@@ -12323,6 +12265,19 @@ class ParallelLaneCoordinationTests(HarnessTestCase):
             "Unlaunched stale job is explicitly stopped",
             "--exit-code",
             "1",
+        )
+        self.cli(
+            "packet-update",
+            "--task",
+            "unknown-launch",
+            "--packet-id",
+            "unknown-launch-owner",
+            "--status",
+            "cancelled",
+            "--summary",
+            "Owner packet cancelled after the unlaunched job was stopped",
+            "--evidence",
+            "No validated launch occurred and no work result is claimed",
         )
         self.cli(
             "execution-select",
@@ -14641,14 +14596,16 @@ class ConfigurationTests(HarnessTestCase):
 
 
 class CodexLocalProvenanceDoctorTests(HarnessTestCase):
-    def test_doctor_consumes_strict_local_v2_receipt_and_reports_runtime_drift(
+    def test_doctor_wraps_strict_local_v2_receipt_and_reports_runtime_drift(
         self,
     ) -> None:
-        """Doctor must preserve strict v2 loading and surface liveness drift.
+        """Doctor must preserve strict v2 proof and surface liveness drift.
 
         The local receipt fixture is intentionally a fully shaped schema-v2
-        receipt.  This test owns the doctor boundary only: the dedicated
-        provenance tests exercise the real wheel/RECORD/bundle construction.
+        receipt. Codex onboarding wraps it in schema-v3 client-adapter binding
+        without rewriting the immutable v2 proof. This test owns the doctor
+        boundary only: dedicated provenance tests exercise the real
+        wheel/RECORD/bundle construction.
         """
 
         receipt = fake_local_provenance_receipt(self.root, salt="doctor-v2")
@@ -14660,10 +14617,13 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
         )
         local_bundle = self.root / "reviewed-local-install.json"
         expected_bundle_sha256 = "b" * 64
-        with mock.patch.object(
-            cli_impl.codex_install_provenance_impl,
-            "validate_codex_local_install_provenance",
-            return_value=receipt,
+        with (
+            mock_fake_local_codex_client_skill_binding(receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=receipt,
+            ),
         ):
             initialized = self.cli_in_process(
                 "codex-init",
@@ -14676,18 +14636,49 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
                 "--json",
             )
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
-        self.assertEqual(
+        persisted = (
             codex_install_provenance_impl.load_codex_install_provenance_receipt(
                 self.root
-            ),
-            receipt,
+            )
         )
+        self.assertEqual(persisted["schema_version"], 3)
+        self.assertEqual(persisted["install_provenance_schema_version"], 2)
+        self.assertEqual(
+            persisted["install_provenance_receipt_sha256"],
+            receipt["provenance_receipt_sha256"],
+        )
+        self.assertEqual(
+            persisted["codex_client_skill"]["role"], "client_adapter_only"
+        )
+        expected_native, expected_windows = cli_impl._codex_hook_commands_for_receipt(
+            persisted, self.root
+        )
+        self.assertIn(f"-m {HOOK_MODULE}", expected_native)
+        hooks = json.loads((self.root / ".codex" / "hooks.json").read_text())[
+            "hooks"
+        ]
+        for event, entries in hooks.items():
+            with self.subTest(event=event):
+                handler = entries[0]["hooks"][0]
+                self.assertEqual(
+                    handler["command"],
+                    cli_impl.codex_onboarding_impl.bind_codex_hook_event(
+                        expected_native, event
+                    ),
+                )
+                self.assertEqual(
+                    handler["commandWindows"],
+                    cli_impl.codex_onboarding_impl.bind_codex_hook_event(
+                        expected_windows, event
+                    ),
+                )
 
         def doctor_with_runtime_verifier(
             *, side_effect: Exception | None = None
         ) -> tuple[int, dict[str, object]]:
             stdout = io.StringIO()
             with (
+                mock_fake_local_codex_client_skill_binding(receipt),
                 mock.patch.dict(os.environ, self.env, clear=True),
                 mock.patch("sys.stdout", stdout),
                 mock.patch("sys.stderr", new=io.StringIO()),
@@ -14703,7 +14694,7 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
 
         accepted_code, accepted = doctor_with_runtime_verifier()
         self.assertEqual(accepted_code, 0, accepted)
-        self.assertEqual(accepted["codex_install_provenance"], receipt)
+        self.assertEqual(accepted["codex_install_provenance"], persisted)
 
         for drift in (
             "current wheel RECORD differs from provenance receipt",
@@ -14717,10 +14708,151 @@ class CodexLocalProvenanceDoctorTests(HarnessTestCase):
                     )
                 )
                 self.assertEqual(code, 1, payload)
-                self.assertEqual(payload["codex_install_provenance"], receipt)
+                self.assertEqual(payload["codex_install_provenance"], persisted)
                 self.assertIn(
                     f"Codex install provenance is invalid: {drift}",
                     payload["errors"],
+                )
+
+    def test_doctor_disabled_adapter_matrix_preserves_provenance_failures(self) -> None:
+        """Disabled hooks downgrade only user-adapter drift, never provenance."""
+
+        receipt = fake_local_provenance_receipt(self.root, salt="doctor-disabled")
+        with (
+            mock_fake_local_codex_client_skill_binding(receipt),
+            mock.patch.object(
+                cli_impl.codex_install_provenance_impl,
+                "validate_codex_local_install_provenance",
+                return_value=receipt,
+            ),
+        ):
+            initialized = self.cli_in_process(
+                "codex-init",
+                "--local-artifact-bundle-file",
+                str(self.root / "reviewed-local-install.json"),
+                "--expected-local-artifact-bundle-sha256",
+                "c" * 64,
+                "--user-skills-root",
+                str(self.root / "user-skills"),
+                "--json",
+            )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        persisted = codex_install_provenance_impl.load_codex_install_provenance_receipt(
+            self.root
+        )
+        skill_path = Path(persisted["codex_client_skill"]["installed_skill"]["path"])
+        original_skill = skill_path.read_bytes()
+        config_path = self.root / "aoi.toml"
+        enabled_config = config_path.read_text(encoding="utf-8")
+        disabled_config = enabled_config.replace(
+            "[hooks.codex]\nenabled = true", "[hooks.codex]\nenabled = false"
+        )
+        self.assertNotEqual(disabled_config, enabled_config)
+
+        def doctor() -> tuple[int, dict[str, object]]:
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, self.env, clear=True),
+                mock.patch("sys.stdout", stdout),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                returncode = cli_impl.main(["doctor", "--json"])
+            return returncode, json.loads(stdout.getvalue())
+
+        config_path.write_text(disabled_config, encoding="utf-8")
+        for status in ("missing", "drifted", "uninspectable"):
+            with self.subTest(hooks="disabled", status=status):
+                if status == "missing":
+                    skill_path.unlink()
+                elif status == "drifted":
+                    skill_path.write_bytes(b"drifted client adapter\n")
+                else:
+                    skill_path.unlink()
+                    skill_path.mkdir()
+                with mock_fake_local_codex_client_skill_binding(receipt):
+                    code, payload = doctor()
+                self.assertEqual(code, 0, payload)
+                report = payload["codex_client_skill"]
+                self.assertEqual(report["status"], status)
+                self.assertTrue(
+                    any(
+                        "Codex client adapter is not exact while Codex hooks are disabled"
+                        in warning
+                        for warning in payload["warnings"]
+                    ),
+                    payload,
+                )
+                self.assertFalse(
+                    any("Codex client skill binding is not exact" in error for error in payload["errors"]),
+                    payload,
+                )
+                if skill_path.is_dir():
+                    skill_path.rmdir()
+                skill_path.write_bytes(original_skill)
+
+        config_path.write_text(enabled_config, encoding="utf-8")
+        for status in ("missing", "drifted", "uninspectable"):
+            with self.subTest(hooks="enabled", status=status):
+                if status == "missing":
+                    skill_path.unlink()
+                elif status == "drifted":
+                    skill_path.write_bytes(b"drifted client adapter\n")
+                else:
+                    skill_path.unlink()
+                    skill_path.mkdir()
+                with mock_fake_local_codex_client_skill_binding(receipt), mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "verify_runtime_hook_provenance",
+                    return_value=receipt,
+                ):
+                    code, payload = doctor()
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_client_skill"]["status"], status)
+                self.assertTrue(
+                    any("Codex client skill binding is not exact" in error for error in payload["errors"]),
+                    payload,
+                )
+                if skill_path.is_dir():
+                    skill_path.rmdir()
+                skill_path.write_bytes(original_skill)
+
+        config_path.write_text(disabled_config, encoding="utf-8")
+        provenance_path = (
+            self.root / codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_RECEIPT
+        )
+        original_receipt = provenance_path.read_bytes()
+        for corruption in ("receipt", "schema"):
+            with self.subTest(hooks="disabled", corruption=corruption):
+                if corruption == "receipt":
+                    provenance_path.write_text("{}\n", encoding="utf-8")
+                else:
+                    malformed = dict(persisted)
+                    malformed["schema_version"] = 99
+                    provenance_path.write_text(json.dumps(malformed), encoding="utf-8")
+                code, payload = doctor()
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_client_skill"]["status"], "uninspectable")
+                self.assertTrue(
+                    any("Codex client skill binding is uninspectable" in error for error in payload["errors"]),
+                    payload,
+                )
+                provenance_path.write_bytes(original_receipt)
+
+        for corruption in ("package", "wheel"):
+            with self.subTest(hooks="disabled", corruption=corruption):
+                with mock.patch.object(
+                    cli_impl.codex_install_provenance_impl,
+                    "_recorded_codex_client_skill",
+                    side_effect=codex_install_provenance_impl.CodexInstallProvenanceError(
+                        f"proved {corruption} bytes differ from installed package"
+                    ),
+                ):
+                    code, payload = doctor()
+                self.assertEqual(code, 1, payload)
+                self.assertEqual(payload["codex_client_skill"]["status"], "uninspectable")
+                self.assertTrue(
+                    any("Codex client skill binding is not exact" in error for error in payload["errors"]),
+                    payload,
                 )
 
 

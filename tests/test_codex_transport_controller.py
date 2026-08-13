@@ -27,6 +27,7 @@ from aoi_orgware.codex_app_server_stdio import (
     RuntimeDisconnected,
     RuntimeEvent,
     TurnObservation,
+    VersionProbeJournalEntry,
 )
 from aoi_orgware.codex_transport_controller import (
     CodexTransportController,
@@ -190,6 +191,8 @@ class Sink:
 class FakeAdapter:
     def __init__(self, mode: str = "completed") -> None:
         self.mode = mode
+        self.on_version_probe_pending: Any = None
+        self.on_version_probe_observed: Any = None
         self.on_process_start_pending: Any = None
         self.on_process_started: Any = None
         self.on_send_pending: Any = None
@@ -210,7 +213,49 @@ class FakeAdapter:
         ).encode("ascii")
         return ProcessJournalEntry(phase, raw, hashlib.sha256(raw).hexdigest(), pid)
 
+    @staticmethod
+    def _version_probe_entry(phase: str) -> VersionProbeJournalEntry:
+        argv = ("codex", "--version")
+        if phase == "version_probe_pending":
+            stdout = None
+            stderr = None
+            returncode = None
+            payload: dict[str, Any] = {"phase": phase, "argv": list(argv)}
+        else:
+            stdout = b"codex-app-server 0.145.0\n"
+            stderr = b""
+            returncode = 0
+            payload = {
+                "phase": phase,
+                "argv": list(argv),
+                "stdout_hex": stdout.hex(),
+                "stderr_hex": stderr.hex(),
+                "returncode": returncode,
+            }
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        return VersionProbeJournalEntry(
+            phase,
+            argv,
+            stdout,
+            stderr,
+            returncode,
+            raw,
+            hashlib.sha256(raw).hexdigest(),
+        )
+
     def start(self) -> None:
+        self.on_version_probe_pending(
+            self._version_probe_entry("version_probe_pending")
+        )
+        if self.mode == "version_probe_loss":
+            raise AppServerError("version probe effect was not observed")
+        self.on_version_probe_observed(
+            self._version_probe_entry("version_probe_observed")
+        )
+        if self.mode == "version_probe_mismatch":
+            raise AppServerError("App Server --version does not match packaged runtime pin")
         self.on_process_start_pending(
             self._process_entry("process_start_pending", None)
         )
@@ -440,6 +485,8 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
     }
     assert [row["event_type"] for row in result.journal] == [
         "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
         "process_start_pending",
         "process_started",
         "initialize_send_pending",
@@ -468,6 +515,172 @@ def test_success_is_runtime_observed_and_never_task_completion() -> None:
     }
     assert sink.published == [result.terminal_receipt]
     assert adapter.closed is True
+
+
+def test_version_probe_journal_is_local_effect_evidence_not_provider_response() -> None:
+    value, _sink, adapter = controller()
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+    pending, observed = result.journal[1:3]
+    assert pending["event_type"] == "version_probe_pending"
+    assert pending["wire_method"] == "process/version-probe"
+    assert pending["request_id"] == "version-probe:launch-1"
+    assert pending["request_bytes_sha256"] is not None
+    assert pending["wire_event_sha256"] is None
+    assert pending["response_sha256"] is None
+    assert observed["event_type"] == "version_probe_observed"
+    assert observed["wire_method"] == "process/version-probe"
+    assert observed["wire_event_sha256"] is not None
+    assert observed["request_id"] is None
+    assert observed["request_bytes_sha256"] is None
+    assert observed["response_sha256"] is None
+
+
+def test_version_probe_pending_canonical_tamper_is_known_no_effect_failure() -> None:
+    value, _sink, adapter = controller()
+    entry = adapter._version_probe_entry("version_probe_pending")
+    tampered_payload = entry.payload_bytes + b" "
+    tampered = VersionProbeJournalEntry(
+        entry.phase,
+        entry.argv,
+        entry.stdout_bytes,
+        entry.stderr_bytes,
+        entry.returncode,
+        tampered_payload,
+        hashlib.sha256(tampered_payload).hexdigest(),
+    )
+
+    def start() -> None:
+        adapter.on_version_probe_pending(tampered)
+
+    adapter.start = start  # type: ignore[method-assign]
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    assert result.terminal_state == "failed"
+    assert [row["event_type"] for row in result.journal] == [
+        "reserved",
+        "failed",
+    ]
+    assert result.journal[-1]["wire_method"] == "process/version-probe"
+    assert result.journal[-1]["request_id"] is None
+    assert result.journal[-1]["request_bytes_sha256"] is None
+
+
+def test_version_probe_observed_argv_mismatch_preserves_pending_unknown() -> None:
+    value, _sink, adapter = controller()
+    pending_entry = adapter._version_probe_entry("version_probe_pending")
+    observed_entry = adapter._version_probe_entry("version_probe_observed")
+    mismatched_argv = ("other-codex", "--version")
+    observed_payload = json.dumps(
+        {
+            "phase": observed_entry.phase,
+            "argv": list(mismatched_argv),
+            "stdout_hex": observed_entry.stdout_bytes.hex(),
+            "stderr_hex": observed_entry.stderr_bytes.hex(),
+            "returncode": observed_entry.returncode,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    mismatched = VersionProbeJournalEntry(
+        observed_entry.phase,
+        mismatched_argv,
+        observed_entry.stdout_bytes,
+        observed_entry.stderr_bytes,
+        observed_entry.returncode,
+        observed_payload,
+        hashlib.sha256(observed_payload).hexdigest(),
+    )
+
+    def start() -> None:
+        adapter.on_version_probe_pending(pending_entry)
+        adapter.on_version_probe_observed(mismatched)
+
+    adapter.start = start  # type: ignore[method-assign]
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    pending = result.journal[1]
+    terminal = result.journal[-1]
+    assert result.terminal_state == "launch_unknown"
+    assert [row["event_type"] for row in result.journal] == [
+        "reserved",
+        "version_probe_pending",
+        "launch_unknown",
+    ]
+    assert terminal["wire_method"] == "process/version-probe"
+    assert terminal["request_id"] == pending["request_id"]
+    assert terminal["request_bytes_sha256"] == pending["request_bytes_sha256"]
+
+
+def test_version_probe_observed_persistence_failure_preserves_pending_unknown() -> None:
+    value, _sink, adapter = controller()
+    original_persist = value._persist_milestone
+
+    def fail_observed(
+        event: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        if event["event_type"] == "version_probe_observed":
+            raise CodexTransportControllerError(
+                "synthetic observed persistence rejection"
+            )
+        return list(original_persist(event))
+
+    value._persist_milestone = fail_observed
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+
+    pending = result.journal[1]
+    terminal = result.journal[-1]
+    assert result.terminal_state == "launch_unknown"
+    assert [row["event_type"] for row in result.journal] == [
+        "reserved",
+        "version_probe_pending",
+        "launch_unknown",
+    ]
+    assert terminal["wire_method"] == "process/version-probe"
+    assert terminal["request_id"] == pending["request_id"]
+    assert terminal["request_bytes_sha256"] == pending["request_bytes_sha256"]
+
+
+@pytest.mark.parametrize(
+    "callback_name",
+    ["on_version_probe_pending", "on_version_probe_observed"],
+)
+def test_controller_owns_version_probe_callbacks_before_any_effect(
+    callback_name: str,
+) -> None:
+    value, _sink, adapter = controller()
+    setattr(adapter, callback_name, lambda _entry: None)
+    with pytest.raises(
+        CodexTransportControllerError,
+        match="callbacks are already owned",
+    ):
+        value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+    assert [row["event_type"] for row in value.journal] == ["reserved"]
+
+
+def test_process_start_preflight_failure_after_probe_is_not_version_failure() -> None:
+    value, _sink, adapter = controller()
+    original_persist = value._persist_milestone
+
+    def fail_process_start(
+        event: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        if event["event_type"] == "process_start_pending":
+            raise CodexTransportControllerError(
+                "synthetic process/start preflight rejection"
+            )
+        return list(original_persist(event))
+
+    value._persist_milestone = fail_process_start
+    result = value.run(adapter, prompt="hello")  # type: ignore[arg-type]
+    assert result.terminal_state == "failed"
+    assert [row["event_type"] for row in result.journal] == [
+        "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
+        "failed",
+    ]
+    assert result.journal[-1]["wire_method"] == "process/start"
 
 
 @pytest.mark.parametrize(
@@ -752,6 +965,8 @@ def test_production_stream_seal_blocks_actual_controller_terminal_publication(
 
     def start() -> None:
         for name in (
+            "on_version_probe_pending",
+            "on_version_probe_observed",
             "on_process_start_pending",
             "on_process_started",
             "on_send_pending",
@@ -912,6 +1127,8 @@ def test_error_envelope_cannot_enter_success_response_callback() -> None:
 @pytest.mark.parametrize(
     ("mode", "terminal", "thread_id"),
     [
+        ("version_probe_loss", "launch_unknown", None),
+        ("version_probe_mismatch", "failed", None),
         ("process_loss", "launch_unknown", None),
         ("model_list_loss", "failed", None),
         ("model_list_schema_error", "failed", None),

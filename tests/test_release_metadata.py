@@ -98,7 +98,14 @@ class ReleaseMetadataTests(unittest.TestCase):
 
     def test_release_verifier_requires_bridge_entry_point_and_pinned_resources(self) -> None:
         self.assertIn("aoi-codex-bridge", dist_verify.CONSOLE_SCRIPTS)
+        self.assertIn("aoi-ic-pack", dist_verify.CONSOLE_SCRIPTS)
         expected = {
+            "aoi_orgware/ic_pack.py",
+            "aoi_orgware/ic_pack_cli.py",
+            "aoi_orgware/ic_pack_terminal.py",
+            "aoi_orgware/ic_pack_worker.py",
+            "aoi_orgware/resources/ic_pack/tiny_vcs/tiny_tb.sv",
+            "aoi_orgware/resources/ic_pack/tiny_vcs/tiny_top.sv",
             "aoi_orgware/resources/codex_app_server/0.145.0/runtime-pin.json",
             "aoi_orgware/resources/codex_app_server/0.145.0/schema-manifest.json",
             "aoi_orgware/resources/codex_app_server/0.145.0/codex_app_server_protocol.v2.schemas.json",

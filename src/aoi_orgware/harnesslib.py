@@ -32,6 +32,7 @@ from .config import (
     ProjectConfig,
     load_config,
 )
+from . import checkpoint_compaction as cp
 
 
 SCHEMA_VERSION = 1
@@ -175,6 +176,7 @@ TASK_OBJECT_LIST_FIELDS = {
     "packets",
     "plan_revisions",
     "resource_config_events",
+    "resource_config_legacy_migrations",
     "resource_session_registrations",
     "skill_adoption_events",
     "skill_releases",
@@ -2653,9 +2655,8 @@ def atomic_create_bytes(path: Path, payload: bytes) -> None:
         publication_handle.flush()
         os.fsync(publication_handle.fileno())
         if os.name == "nt":
-            # Preserve the existing Windows close-before-observation and
-            # close-before-rename behavior. Windows does not use the POSIX
-            # hard-link publication window below.
+            # Preserve Windows close-before-observation/rename without the
+            # POSIX hard-link publication window below.
             publication_handle.close()
             publication_handle = None
         _emit_atomic_io_event("create", "temp_fsynced", path, temporary)
@@ -2668,10 +2669,8 @@ def atomic_create_bytes(path: Path, payload: bytes) -> None:
                 published_temporary = temporary
                 temporary = None
             else:
-                # POSIX no-replace publication briefly exposes two names for
-                # one inode. Managed-state recovery is serialized by the
-                # project state lock; root-config and state-lock aliases fail
-                # closed and require explicit offline/manual recovery.
+                # POSIX no-replace briefly exposes two names. Managed recovery is
+                # locked; root-config and state-lock aliases require manual recovery.
                 os.link(temporary, path, follow_symlinks=False)
                 _emit_atomic_io_event("create", "linked", path, temporary)
                 published_temporary = temporary
@@ -3086,6 +3085,8 @@ def load_json(path: Path) -> dict[str, Any]:
     try:
         path = canonicalize_no_link_traversal(path, "managed JSON state")
         metadata = path.lstat()
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+            raise HarnessError(f"managed JSON state changed while being read: {path}")
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise HarnessError(f"managed JSON state must be a private regular file: {path}")
         with path.open("rb") as handle:
@@ -4431,31 +4432,6 @@ def validate_task_claim_references(
         )
 
 
-def _checkpoint_compaction_marker(
-    label: str,
-    records: list[dict[str, Any]],
-    compact_statuses: set[str],
-    omitted_fields_per_record: int,
-) -> str:
-    compact_count = sum(
-        str(record.get("status")) in compact_statuses for record in records
-    )
-    full_count = len(records) - compact_count
-    status_counts: dict[str, int] = {}
-    for record in records:
-        status = str(record.get("status") or "missing")
-        status_counts[status] = status_counts.get(status, 0) + 1
-    counts = ",".join(
-        f"{status}={status_counts[status]}" for status in sorted(status_counts)
-    ) or "none"
-    return (
-        f"Terminal-detail fallback for {label}: total={len(records)}; "
-        f"full_detail={full_count}; compact_detail={compact_count}; "
-        f"omitted_field_slots={compact_count * omitted_fields_per_record}; "
-        f"status_counts={counts}; complete records remain in state.json"
-    )
-
-
 def _compact_claim_reference(
     paths: HarnessPaths,
     claim: dict[str, Any],
@@ -4679,29 +4655,6 @@ def _compact_terminal_job_history(
     )
 
 
-def _compact_fact_history(
-    paths: HarnessPaths,
-    state: dict[str, Any],
-    facts: list[str],
-) -> str | None:
-    if len(facts) < COMPACT_FACT_HISTORY_THRESHOLD:
-        return None
-
-    canonical = json.dumps(
-        facts,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.sha256(canonical).hexdigest()
-    recent_count = min(len(facts), COMPACT_FACT_RECENT_TAIL)
-    return (
-        f"Established fact history: count={len(facts)}; "
-        f"history_sha256={digest}; "
-        f"record={_task_state_record_reference(paths, state, 'facts')}; "
-        f"recent_verbatim={recent_count}"
-    )
-
-
 def _compact_packet_result_reference(
     paths: HarnessPaths,
     state: dict[str, Any],
@@ -4779,11 +4732,20 @@ def _compact_terminal_packet_history(
     )
 
 
-def render_checkpoint(
+def _snapshot_checkpoint_state(state: object) -> dict[str, Any]:
+    try:
+        return cp.snapshot_exact_json_object(state)
+    except TypeError as exc:
+        raise HarnessError(str(exc)) from exc
+
+
+def _render_checkpoint_snapshot(
     paths: HarnessPaths,
     state: dict[str, Any],
     *,
     compact_terminal_detail: bool = False,
+    history_tail: int | None = None,
+    policy: cp.CheckpointStringHistoryPolicy = cp.EMPTY_CHECKPOINT_STRING_HISTORY_POLICY,
 ) -> str:
     validate_task_claim_references(paths, state)
     for packet in state.get("packets", []):
@@ -4820,7 +4782,7 @@ def render_checkpoint(
             claim_lines.insert(0, compact_claim_history)
         claim_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            cp.checkpoint_compaction_marker(
                 "claims",
                 claims,
                 TERMINAL_CLAIM_STATUSES,
@@ -4866,7 +4828,7 @@ def render_checkpoint(
             verification_lines.insert(0, compact_verification_history)
         verification_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            cp.checkpoint_compaction_marker(
                 "verification",
                 verification,
                 ACCOUNTED_VERIFICATION_STATUSES,
@@ -4907,7 +4869,7 @@ def render_checkpoint(
             job_lines.insert(0, compact_job_history)
         job_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            cp.checkpoint_compaction_marker(
                 "jobs",
                 jobs,
                 terminal_job_statuses,
@@ -4948,7 +4910,7 @@ def render_checkpoint(
             packet_lines.insert(0, compact_packet_history)
         packet_lines.insert(
             0,
-            _checkpoint_compaction_marker(
+            cp.checkpoint_compaction_marker(
                 "packets",
                 packets,
                 terminal_packet_statuses,
@@ -4980,16 +4942,11 @@ def render_checkpoint(
         if lane.get("status") in {"active", "waiting", "recovering", "blocked"}
     ]
     engaged_lanes.sort(key=lambda item: str(item.get("lane_id", "")))
-    lane_limit = 4 if compact_terminal_detail else 12
     lane_lines = [
         f"{lane.get('lane_id')} [{lane.get('status')}], rev={lane.get('revision')}, "
         f"owner={lane.get('owner')}, next={lane.get('next_action') or 'not recorded'}"
-        for lane in engaged_lanes[:lane_limit]
+        for lane in engaged_lanes
     ]
-    if len(engaged_lanes) > lane_limit:
-        lane_lines.append(
-            f"{len(engaged_lanes) - lane_limit} additional engaged lanes omitted; see state.json"
-        )
     active_coordination = sum(
         request.get("status") not in {"rejected", "resolved", "superseded"}
         for request in state.get("coordination_requests", [])
@@ -5046,18 +5003,19 @@ def render_checkpoint(
         *(f"BLOCKER: {item}" for item in state.get("blockers", [])),
         *open_risk_lines,
     ]
-    facts = list(state.get("facts", []))
-    compact_fact_history = (
-        _compact_fact_history(paths, state, facts)
-        if compact_terminal_detail
-        else None
+    history_lines = cp.project_checkpoint_string_histories(
+        {
+            field: (
+                list(state.get(field, [])),
+                _task_state_record_reference(paths, state, field),
+            )
+            for field in cp.CHECKPOINT_STRING_HISTORY_FIELDS
+        },
+        compact=compact_terminal_detail,
+        minimum_count=COMPACT_FACT_HISTORY_THRESHOLD,
+        recent_tail=COMPACT_FACT_RECENT_TAIL if history_tail is None else history_tail,
+        policy=policy,
     )
-    fact_lines = facts
-    if compact_fact_history is not None:
-        fact_lines = [
-            compact_fact_history,
-            *facts[-COMPACT_FACT_RECENT_TAIL:],
-        ]
     return (
         f"# Checkpoint — {state['task_id']}\n\n"
         f"- State revision: `{state['revision']}`\n"
@@ -5075,13 +5033,13 @@ def render_checkpoint(
         "## Portfolio control plane\n\n"
         f"{_markdown_list([*lane_lines, *control_plane_lines])}\n\n"
         "## Established facts\n\n"
-        f"{_markdown_list(fact_lines)}\n\n"
+        f"{_markdown_list(history_lines['facts'])}\n\n"
         "## Decisions\n\n"
-        f"{_markdown_list(state.get('decisions', []))}\n\n"
+        f"{_markdown_list(history_lines['decisions'])}\n\n"
         "## Rejected paths\n\n"
-        f"{_markdown_list(state.get('rejected_paths', []))}\n\n"
+        f"{_markdown_list(history_lines['rejected_paths'])}\n\n"
         "## Changed files\n\n"
-        f"{_markdown_list(state.get('changed_files', []))}\n\n"
+        f"{_markdown_list(history_lines['changed_files'])}\n\n"
         "## Verification and evidence boundary\n\n"
         f"{_markdown_list(verification_lines)}\n\n"
         "## Active jobs\n\n"
@@ -5101,14 +5059,49 @@ def render_checkpoint(
     )
 
 
+def render_checkpoint(paths: HarnessPaths, state: dict[str, Any]) -> str:
+    """Render the complete checkpoint; compaction is prepare-only policy."""
+
+    return _render_checkpoint_snapshot(paths, _snapshot_checkpoint_state(state))
+
+
 def prepare_checkpoint(
     paths: HarnessPaths, state: dict[str, Any]
 ) -> tuple[Path, str, str]:
-    destination = task_dir(paths, state["task_id"]) / "checkpoint.md"
-    text = render_checkpoint(paths, state)
-    if len(text.encode("utf-8")) > CHECKPOINT_COMPACT_THRESHOLD_BYTES:
-        text = render_checkpoint(paths, state, compact_terminal_detail=True)
-    if len(text.encode("utf-8")) > CHECKPOINT_MAX_BYTES:
+    snapshot = _snapshot_checkpoint_state(state)
+    destination = task_dir(paths, snapshot["task_id"]) / "checkpoint.md"
+    full_text = _render_checkpoint_snapshot(paths, snapshot)
+    full_bytes = len(full_text.encode("utf-8"))
+    policy = cp.EMPTY_CHECKPOINT_STRING_HISTORY_POLICY
+    state_path = task_state_path(paths, snapshot["task_id"])
+    if (
+        full_bytes > CHECKPOINT_COMPACT_THRESHOLD_BYTES
+        and _chief_lock_is_held(paths)
+        and state_path.is_file()
+    ):
+        try:
+            policy = cp.derive_durable_string_history_policy(
+                snapshot, load_task(paths, snapshot["task_id"]),
+                minimum_count=COMPACT_FACT_HISTORY_THRESHOLD,
+            )
+        except (TypeError, ValueError) as exc:
+            raise HarnessError(str(exc)) from exc
+    text = cp.select_checkpoint_text(
+        full_text,
+        render_compact=lambda recent_tail: _render_checkpoint_snapshot(
+            paths,
+            snapshot,
+            compact_terminal_detail=True,
+            history_tail=(
+                COMPACT_FACT_RECENT_TAIL if recent_tail is None else recent_tail
+            ),
+            policy=policy,
+        ),
+        compact_threshold_bytes=CHECKPOINT_COMPACT_THRESHOLD_BYTES,
+        max_bytes=CHECKPOINT_MAX_BYTES,
+        highest_recent_tail=COMPACT_FACT_RECENT_TAIL - 1,
+    )
+    if text is None:
         raise HarnessError(
             "checkpoint exceeds 32 KiB hard ceiling; summarize facts/evidence and keep raw logs outside state"
         )

@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  PUBLICATION_POLICY_SHA256: 11ad65c25fee5d4060422001a344faa7c8e06b427e452bd7d48a76231e4b905f
+  PUBLICATION_POLICY_SHA256: 0f9b56727e171f022d4cb8be11bc8ceafb83f63467cfa5d6e0729b762ecf2a40
 
 concurrency:
   group: docs-deploy

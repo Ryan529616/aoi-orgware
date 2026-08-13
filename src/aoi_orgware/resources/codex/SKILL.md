@@ -12,6 +12,29 @@ tool flows, evidence requirements, and exclusions belong in that project's
 AOI is a cooperative procedural guardrail for authority, exact claims, evidence,
 checkpoints, jobs, and bounded delegation. It is not a filesystem sandbox.
 
+## Client-adapter authority boundary
+
+This skill is only a `client_adapter_only` guide shipped inside the same exact
+AOI distribution as the CLI/runtime. It does not define or grant governance
+authority. The installed CLI/runtime, ledger, `aoi.toml`, `.aoi/POLICY.md`, and
+repository instructions remain authoritative when this prose disagrees with
+them. `aoi doctor` must report the package-bound Codex client skill as `exact`
+before relying on it for governed work; a missing, drifted, uninspectable, or
+legacy-unbound skill must not be treated as current policy.
+
+For this unpublished ARISE Operational Alpha candidate (not a complete v0.5
+release), current schema-v3 hooks can be created only from reviewed local-v2
+exact-wheel proof. Public schema-v1 receipts are readable and historically
+upgradable, but cannot newly enable current hooks; the public current-hook route
+is deferred. With hooks disabled, missing, drifted, or user-path-uninspectable
+adapter status is warning/status only and does not block `doctor`; corrupt
+receipt/schema/package/wheel provenance remains blocking. The skill never turns
+any of those states into governance authority.
+
+The user-scope install is a transitional compatibility surface for this release.
+A repository-scoped skill or stable bootstrap contract is future work; do not
+interpret this layout as the final multi-repository/company architecture.
+
 ## Establish the project and executable
 
 1. Find the exact Git worktree root.
@@ -19,9 +42,11 @@ checkpoints, jobs, and bounded delegation. It is not a filesystem sandbox.
 3. Read `aoi.toml`, `.aoi/POLICY.md`, and the short `.aoi/INDEX.md` when
    present.
 4. Run `aoi --version`, `aoi status --json`, and `aoi chief-status --json`.
-5. If project hooks use an absolute `.../bin/aoi-codex-hook`, prefer the sibling
-   `.../bin/aoi` and confirm its version. Do not mix PATH, hook, or wrapper
-   installations against one live state tree.
+5. For current schema-v3 hooks, inspect the recorded absolute venv Python
+   command `-I -B -m aoi_orgware.codex_hook` and use its sibling absolute `aoi`
+   CLI for read-only checks. The pip `aoi-codex-hook` launcher is v1/v2
+   historical/diagnostic only; do not promote its local-v2 console/bridge
+   evidence into current-hook authority.
 
 Read-only explanation and inspection need no AOI task. Before a material edit,
 external launch, evidence write, process stop, merge, or other state change,
@@ -157,6 +182,40 @@ Keep compile acceptance, runtime result, synthesis anchor, proxy/trace evidence,
 exploratory physical evidence, and engineering inference distinct. Never
 promote weaker evidence into a stronger claim.
 
+## Closure honesty
+
+AOI requires the terminal outcome to be explicit. A verification may use
+`--asserts-completion-boundary` only when that exact passing,
+close-qualifying check actually covers the task's registered completion
+boundary; do not add it to a partial, proxy, compile-only, or narrower check.
+
+```bash
+aoi add-verification \
+  --task <id> \
+  --category <close-qualifying-category> \
+  --status pass \
+  --evidence "<observed result>" \
+  --command "<exact command>" \
+  --boundary "<why this covers the registered completion boundary>" \
+  --asserts-completion-boundary
+
+aoi close-task \
+  --task <id> \
+  --summary "<result>" \
+  --outcome achieved
+```
+
+Use `--outcome partial`, `scope_changed`, or `superseded` when the registered
+boundary was not achieved, and supply `--boundary-disposition` explaining
+where the unmet scope went. An achieved close with recorded blockers also
+requires `--blockers-disposition`; the flag accounts for blockers but does not
+turn an unmet boundary into achievement.
+
+Change title, objective, or completion boundary only with `retarget-task`, then
+re-approve the exact updated plan. If packets or jobs already ran under the
+superseded plan, `approve-plan` requires `--coverage-note` stating which work
+that earlier plan governed.
+
 Before an external job, claim its source/runner/output/log surfaces and create
 the exact source receipt required by project policy. Record queued, running,
 and terminal transitions with concrete PID/log/exit evidence. A
@@ -182,8 +241,10 @@ Before achieved close:
 2. Record delivery as pushed, local-only, blocked, or none.
 3. Release claims with truthful terminal reasons.
 4. Checkpoint again.
-5. Run `close-task` only when the completion boundary is achieved and
-   qualifying PASS evidence exists; otherwise block or cancel truthfully.
+5. Run `close-task --outcome achieved` only when the completion boundary is
+   achieved and a qualifying PASS explicitly recorded with
+   `--asserts-completion-boundary` exists; otherwise use the truthful
+   non-achieved outcome and required boundary disposition, or block/cancel.
 6. Run task-local doctor during work and global doctor for final migration/audit.
 
 Never sweep unrelated dirty files into a commit. Report the real state, exact

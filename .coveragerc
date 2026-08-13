@@ -1,3 +1,9 @@
 [run]
 source = aoi_orgware
 parallel = true
+
+[paths]
+source =
+    src/aoi_orgware
+    ${AOI_COVERAGE_TEMP_ROOT?}/pytest-of-*/pytest-0/test_standalone_gate_runs_from0/checkout/src/aoi_orgware
+    ${AOI_COVERAGE_TEMP_ROOT?}/pytest-of-*/pytest-0/test_real_system_site_packages0/system-site/lib/python3.13/site-packages/aoi_orgware

@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import zipfile
 from contextlib import contextmanager
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -101,9 +102,12 @@ def _strict_local_v2_runtime(project: Path):
             "cli.py",
             "codex_hook.py",
             "codex_transport_cli.py",
+            "resources/codex/SKILL.md",
         )
         for name in package_files:
-            (package / name).write_text("# reviewed wheel\n", encoding="utf-8")
+            package_file = package.joinpath(*name.split("/"))
+            package_file.parent.mkdir(parents=True, exist_ok=True)
+            package_file.write_text("# reviewed wheel\n", encoding="utf-8")
         for name, target in (
             ("aoi", "aoi_orgware.cli:main"),
             ("aoi-codex-hook", "aoi_orgware.codex_hook:main"),
@@ -113,7 +117,35 @@ def _strict_local_v2_runtime(project: Path):
         store = root / "reviewed-store"
         wheel = store / "dist" / "aoi_orgware-1.2.3-py3-none-any.whl"
         wheel.parent.mkdir(parents=True)
-        wheel.write_bytes(b"reviewed local wheel")
+        wheel_members = {
+            path.relative_to(site).as_posix(): path.read_bytes()
+            for path in (
+                dist / "METADATA",
+                *(package.joinpath(*name.split("/")) for name in package_files),
+            )
+        }
+        wheel_record_name = f"{dist.name}/RECORD"
+        wheel_record_rows = [
+            ",".join(
+                [
+                    name,
+                    "sha256="
+                    + base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
+                    .decode("ascii")
+                    .rstrip("="),
+                    str(len(raw)),
+                ]
+            )
+            for name, raw in sorted(wheel_members.items())
+        ]
+        wheel_record_rows.append(f"{wheel_record_name},,")
+        wheel_record = ("\n".join(wheel_record_rows) + "\n").encode("utf-8")
+        with zipfile.ZipFile(
+            wheel, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for name, raw in sorted(wheel_members.items()):
+                archive.writestr(name, raw)
+            archive.writestr(wheel_record_name, wheel_record)
         wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
         direct = dist / "direct_url.json"
         direct.write_text(
@@ -436,6 +468,8 @@ class CodexHookV2Tests(HarnessTestCase):
             str(self.root),
             "--provenance-sha256",
             "a" * 64,
+            "--expected-event",
+            "PreToolUse",
         ]
         output = io.StringIO()
         with mock.patch.object(sys, "argv", argv), mock.patch(
@@ -619,10 +653,12 @@ class CodexHookV2Tests(HarnessTestCase):
             str(self.root),
             "--provenance-sha256",
             "a" * 64,
+            "--expected-event",
+            "UserPromptSubmit",
         ]
         order: list[str] = []
 
-        def verified(*_args) -> dict:
+        def verified(*_args, **_kwargs) -> dict:
             order.append("verify")
             return {}
 
@@ -634,22 +670,61 @@ class CodexHookV2Tests(HarnessTestCase):
         with mock.patch.object(sys, "argv", argv), mock.patch(
             "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
             side_effect=verified,
-        ), mock.patch.object(codex_hook, "read_input", side_effect=read), redirect_stdout(
+        ) as verify, mock.patch.object(codex_hook, "read_input", side_effect=read), redirect_stdout(
             output
         ):
             self.assertEqual(codex_hook.main(), 0)
         self.assertEqual(order, ["verify", "read"])
+        verify.assert_called_once_with(
+            self.root,
+            "a" * 64,
+            Path(argv[0]),
+            runtime_python=Path(sys.executable),
+            runtime_module_path=Path(codex_hook.__file__),
+            runtime_argv_prefix=("-I", "-B", "-m", "aoi_orgware.codex_hook"),
+        )
         self.assertEqual(json.loads(output.getvalue()), {"continue": True})
 
         output = io.StringIO()
         with mock.patch.object(sys, "argv", argv), mock.patch(
             "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
             side_effect=ValueError("tampered provenance"),
-        ), mock.patch.object(codex_hook, "read_input") as read_mock, redirect_stdout(
-            output
-        ):
+        ), mock.patch.object(
+            codex_hook, "read_input", return_value={"hook_event_name": "UserPromptSubmit"}
+        ) as read_mock, redirect_stdout(output):
             self.assertEqual(codex_hook.main(), 0)
-        read_mock.assert_not_called()
+        read_mock.assert_called_once()
+        self.assertEqual(json.loads(output.getvalue()), {"continue": True})
+
+    def test_main_malformed_current_definition_verifies_module_runtime_before_probe(self) -> None:
+        """The malformed-current probe retains v3 runtime binding arguments."""
+
+        argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "6",
+            "--project-root",
+            str(self.root),
+            "--provenance-sha256",
+            "a" * 64,
+            "--unexpected-option",
+        ]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+            return_value={},
+        ) as verify, mock.patch.object(
+            codex_hook, "read_input", return_value={"hook_event_name": "Stop"}
+        ), redirect_stdout(output):
+            self.assertEqual(codex_hook.main(), 0)
+        verify.assert_called_once_with(
+            self.root,
+            "a" * 64,
+            Path(argv[0]),
+            runtime_python=Path(sys.executable),
+            runtime_module_path=Path(codex_hook.__file__),
+            runtime_argv_prefix=("-I", "-B", "-m", "aoi_orgware.codex_hook"),
+        )
         self.assertEqual(json.loads(output.getvalue()), {"continue": True})
 
     def test_main_accepts_strict_local_v2_and_fails_open_on_mapping_drift(self) -> None:
@@ -668,6 +743,8 @@ class CodexHookV2Tests(HarnessTestCase):
                 str(self.root),
                 "--provenance-sha256",
                 receipt["provenance_receipt_sha256"],
+                "--expected-event",
+                "UserPromptSubmit",
             ]
             output = io.StringIO()
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
@@ -706,8 +783,9 @@ class CodexHookV2Tests(HarnessTestCase):
             )
             target.write_bytes(canonical_json_bytes(mapping_drift))
             drift_argv = [
-                *argv[:-1],
+                *argv[:6],
                 mapping_drift["provenance_receipt_sha256"],
+                *argv[7:],
             ]
             with self.assertRaisesRegex(
                 provenance.CodexInstallProvenanceError,
@@ -718,10 +796,10 @@ class CodexHookV2Tests(HarnessTestCase):
                 )
             output = io.StringIO()
             with mock.patch.object(sys, "argv", drift_argv), mock.patch.object(
-                codex_hook, "read_input"
+                codex_hook, "read_input", return_value={"hook_event_name": "UserPromptSubmit"}
             ) as read_mock, redirect_stdout(output):
                 self.assertEqual(codex_hook.main(), 0)
-            read_mock.assert_not_called()
+            read_mock.assert_called_once()
             self.assertEqual(json.loads(output.getvalue()), {"continue": True})
 
             direct.write_bytes(direct_original)
@@ -734,11 +812,270 @@ class CodexHookV2Tests(HarnessTestCase):
                 )
             output = io.StringIO()
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
-                codex_hook, "read_input"
+                codex_hook, "read_input", return_value={"hook_event_name": "UserPromptSubmit"}
             ) as read_mock, redirect_stdout(output):
                 self.assertEqual(codex_hook.main(), 0)
-            read_mock.assert_not_called()
+            read_mock.assert_called_once()
             self.assertEqual(json.loads(output.getvalue()), {"continue": True})
+
+    def test_main_expected_pretool_bootstrap_faults_and_event_mismatch_deny(self) -> None:
+        argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "6",
+            "--project-root",
+            str(self.root),
+            "--provenance-sha256",
+            "a" * 64,
+            "--expected-event",
+            "PreToolUse",
+        ]
+        fixed_deny = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": codex_hook.PRETOOL_FAIL_CLOSED_DENY_MESSAGE,
+            }
+        }
+        for fault in (
+            {"argv": [*argv[:2], "5", *argv[3:]]},
+            {"argv": [item for index, item in enumerate(argv) if index not in {3, 4}]},
+            {"argv": [item for index, item in enumerate(argv) if index not in {5, 6}]},
+            {"argv": [*argv, "--unexpected-option"]},
+            {"argv": [*argv, "--project-root", str(self.root)]},
+            {"argv": [*argv, "--provenance-sha256", "b" * 64]},
+            {"verify": ValueError("invalid provenance")},
+            {"read": ValueError("malformed stdin")},
+            {"payload": {}},
+            {"payload": {"hook_event_name": 7}},
+            {"payload": {"hook_event_name": "PostToolUse"}},
+        ):
+            with self.subTest(fault=fault):
+                output = io.StringIO()
+                kwargs: dict[str, object] = {}
+                if "verify" in fault:
+                    kwargs["side_effect"] = fault["verify"]
+                else:
+                    kwargs["return_value"] = {}
+                with mock.patch.object(sys, "argv", fault.get("argv", argv)), mock.patch(
+                    "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+                    **kwargs,
+                ), mock.patch.object(
+                    codex_hook,
+                    "read_input",
+                    side_effect=fault.get("read"),
+                    return_value=fault.get("payload", {"hook_event_name": "PreToolUse"}),
+                ), redirect_stdout(output):
+                    self.assertEqual(codex_hook.main(), 0)
+                self.assertEqual(json.loads(output.getvalue()), fixed_deny)
+
+    def test_main_current_v6ish_invalid_definitions_probe_and_fence_mutation(self) -> None:
+        argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "6",
+            "--project-root",
+            str(self.root),
+            "--provenance-sha256",
+            "a" * 64,
+        ]
+        fixed_deny = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": codex_hook.PRETOOL_FAIL_CLOSED_DENY_MESSAGE,
+            }
+        }
+        invalid_argvs = (
+            argv,
+            [item for index, item in enumerate(argv) if index not in {1, 2}],
+            [item for index, item in enumerate(argv) if index not in {3, 4}],
+            [item for index, item in enumerate(argv) if index not in {5, 6}],
+            [*argv, "--hook-version", "6"],
+            [*argv, "--project-root", str(self.root)],
+            [*argv, "--provenance-sha256", "b" * 64],
+            [*argv, "--expected-event", "Stop", "--expected-event", "Stop"],
+            [*argv, "--expected-event", "Unknown"],
+            [*argv, "--expected-event"],
+        )
+        for invalid_argv in invalid_argvs:
+            with self.subTest(argv=invalid_argv):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", invalid_argv), mock.patch(
+                    "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+                    return_value={},
+                ), mock.patch.object(
+                    codex_hook,
+                    "read_input",
+                    return_value={"hook_event_name": "PreToolUse"},
+                ) as read_mock, redirect_stdout(output):
+                    self.assertEqual(codex_hook.main(), 0)
+                read_mock.assert_called_once()
+                self.assertEqual(json.loads(output.getvalue()), fixed_deny)
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+            return_value={},
+        ), mock.patch.object(
+            codex_hook, "read_input", return_value={"hook_event_name": "Stop"}
+        ) as read_mock, redirect_stdout(output):
+            self.assertEqual(codex_hook.main(), 0)
+        read_mock.assert_called_once()
+        self.assertEqual(json.loads(output.getvalue()), {"continue": True})
+
+    def test_main_ambiguous_v6_definition_denies_unproven_mutation(self) -> None:
+        base_argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "6",
+            "--project-root",
+            str(self.root),
+            "--provenance-sha256",
+            "a" * 64,
+        ]
+        fixed_deny = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": codex_hook.PRETOOL_FAIL_CLOSED_DENY_MESSAGE,
+            }
+        }
+        cases = (
+            {"argv": base_argv, "payload": {"hook_event_name": "PreToolUse"}},
+            {
+                "argv": [*base_argv, "--expected-event", "Unknown"],
+                "payload": {"hook_event_name": "PreToolUse"},
+            },
+            {
+                "argv": [*base_argv, "--expected-event"],
+                "payload": {"hook_event_name": "PreToolUse"},
+            },
+            {"argv": base_argv, "read": ValueError("malformed stdin")},
+            {"argv": base_argv, "payload": {"hook_event_name": "unknown"}},
+            {"argv": base_argv, "verify": ValueError("invalid provenance")},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", case["argv"]), mock.patch(
+                    "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+                    side_effect=case.get("verify"),
+                    return_value={} if "verify" not in case else mock.DEFAULT,
+                ), mock.patch.object(
+                    codex_hook,
+                    "read_input",
+                    side_effect=case.get("read"),
+                    return_value=case.get("payload", {"hook_event_name": "Stop"}),
+                ), redirect_stdout(output):
+                    self.assertEqual(codex_hook.main(), 0)
+                self.assertEqual(json.loads(output.getvalue()), fixed_deny)
+
+    def test_main_valid_nonmutation_provenance_failure_probes_pretool_route(self) -> None:
+        argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "6",
+            "--project-root",
+            str(self.root),
+            "--provenance-sha256",
+            "a" * 64,
+            "--expected-event",
+            "Stop",
+        ]
+        fixed_deny = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": codex_hook.PRETOOL_FAIL_CLOSED_DENY_MESSAGE,
+            }
+        }
+        for payload, expected in (
+            ({"hook_event_name": "PreToolUse"}, fixed_deny),
+            ({"hook_event_name": "Stop"}, {"continue": True}),
+            ({"hook_event_name": "unknown"}, fixed_deny),
+        ):
+            with self.subTest(payload=payload):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), mock.patch(
+                    "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+                    side_effect=ValueError("invalid provenance"),
+                ), mock.patch.object(
+                    codex_hook, "read_input", return_value=payload
+                ) as read_mock, redirect_stdout(output):
+                    self.assertEqual(codex_hook.main(), 0)
+                read_mock.assert_called_once()
+                self.assertEqual(json.loads(output.getvalue()), expected)
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+            side_effect=ValueError("invalid provenance"),
+        ), mock.patch.object(
+            codex_hook, "read_input", side_effect=ValueError("malformed stdin")
+        ) as read_mock, redirect_stdout(output):
+            self.assertEqual(codex_hook.main(), 0)
+        read_mock.assert_called_once()
+        self.assertEqual(json.loads(output.getvalue()), fixed_deny)
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+            return_value={},
+        ), mock.patch.object(
+            codex_hook, "read_input", return_value={"hook_event_name": "PreToolUse"}
+        ) as read_mock, redirect_stdout(output):
+            self.assertEqual(codex_hook.main(), 0)
+        read_mock.assert_called_once()
+        self.assertEqual(json.loads(output.getvalue()), fixed_deny)
+
+    def test_main_true_pre_v6_nonmutation_hook_remains_fail_open(self) -> None:
+        argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "5",
+        ]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            codex_hook, "read_input"
+        ) as read_mock, redirect_stdout(output):
+            self.assertEqual(codex_hook.main(), 0)
+        read_mock.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), {"continue": True})
+
+    def test_main_valid_nonmutation_bootstrap_fault_remains_fail_open(self) -> None:
+        argv = [
+            str(_launcher(self.root, "aoi-codex-hook")),
+            "--hook-version",
+            "6",
+            "--project-root",
+            str(self.root),
+            "--provenance-sha256",
+            "a" * 64,
+            "--expected-event",
+            "Stop",
+        ]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+            return_value={},
+        ), mock.patch.object(
+            codex_hook, "read_input", side_effect=ValueError("malformed stdin")
+        ), redirect_stdout(output):
+            self.assertEqual(codex_hook.main(), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"continue": True})
+
+        for payload in ({}, {"hook_event_name": 7}):
+            with self.subTest(payload=payload):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), mock.patch(
+                    "aoi_orgware.codex_install_provenance.verify_runtime_hook_provenance",
+                    return_value={},
+                ), mock.patch.object(
+                    codex_hook, "read_input", return_value=payload
+                ), redirect_stdout(output):
+                    self.assertEqual(codex_hook.main(), 0)
+                self.assertEqual(json.loads(output.getvalue()), {"continue": True})
 
 
 def test_read_input_rejects_duplicate_authority_fields(monkeypatch: pytest.MonkeyPatch) -> None:

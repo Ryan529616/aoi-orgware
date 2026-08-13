@@ -18,7 +18,13 @@ from pathlib import Path, PurePosixPath
 from typing import Sequence
 
 
-CONSOLE_SCRIPTS = ("aoi", "aoi-codex-hook", "aoi-codex-bridge", "aoi-claude-hook")
+CONSOLE_SCRIPTS = (
+    "aoi",
+    "aoi-codex-hook",
+    "aoi-codex-bridge",
+    "aoi-claude-hook",
+    "aoi-ic-pack",
+)
 BUILD_FRONTEND_VERSION = "1.5.0"
 HATCHLING_VERSION = "1.27.0"
 REQUIRED_PACKAGE_FILES = (
@@ -26,6 +32,12 @@ REQUIRED_PACKAGE_FILES = (
     "aoi_orgware/resources/policy.md",
     "aoi_orgware/resources/codex/SKILL.md",
     "aoi_orgware/resources/claude/SKILL.md",
+    "aoi_orgware/ic_pack.py",
+    "aoi_orgware/ic_pack_cli.py",
+    "aoi_orgware/ic_pack_terminal.py",
+    "aoi_orgware/ic_pack_worker.py",
+    "aoi_orgware/resources/ic_pack/tiny_vcs/tiny_tb.sv",
+    "aoi_orgware/resources/ic_pack/tiny_vcs/tiny_top.sv",
     "aoi_orgware/resources/pilot/run-record.template.json",
     "aoi_orgware/resources/codex_app_server/0.145.0/runtime-pin.json",
     "aoi_orgware/resources/codex_app_server/0.145.0/schema-manifest.json",

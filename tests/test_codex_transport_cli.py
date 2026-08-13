@@ -37,6 +37,7 @@ from aoi_orgware.codex_app_server_stdio import (
     RuntimeDisconnected,
     RuntimeEvent,
     TurnObservation,
+    VersionProbeJournalEntry,
 )
 from aoi_orgware.config import default_config_text
 
@@ -421,6 +422,8 @@ def _runtime_event(method: str, params: Mapping[str, Any]) -> RuntimeEvent:
 class FakeAdapter:
     def __init__(self, mode: str = "completed") -> None:
         self.mode = mode
+        self.on_version_probe_pending: Any = None
+        self.on_version_probe_observed: Any = None
         self.on_process_start_pending: Any = None
         self.on_process_started: Any = None
         self.on_send_pending: Any = None
@@ -438,7 +441,60 @@ class FakeAdapter:
         ).encode("ascii")
         return ProcessJournalEntry(phase, raw, hashlib.sha256(raw).hexdigest(), pid)
 
+    @staticmethod
+    def _version_probe(phase: str) -> VersionProbeJournalEntry:
+        argv = ("codex", "--version")
+        if phase == "version_probe_pending":
+            stdout = None
+            stderr = None
+            returncode = None
+            payload: dict[str, Any] = {"phase": phase, "argv": list(argv)}
+        else:
+            stdout = b"codex-app-server 0.145.0\n"
+            stderr = b""
+            returncode = 0
+            payload = {
+                "phase": phase,
+                "argv": list(argv),
+                "stdout_hex": stdout.hex(),
+                "stderr_hex": stderr.hex(),
+                "returncode": returncode,
+            }
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        return VersionProbeJournalEntry(
+            phase,
+            argv,
+            stdout,
+            stderr,
+            returncode,
+            raw,
+            hashlib.sha256(raw).hexdigest(),
+        )
+
+    def _start_version_probe(self) -> None:
+        try:
+            self.on_version_probe_pending(
+                self._version_probe("version_probe_pending")
+            )
+        except BaseException:
+            raise AppServerError(
+                "version_probe_pending journal callback failed; "
+                "version probe was not executed"
+            ) from None
+        try:
+            self.on_version_probe_observed(
+                self._version_probe("version_probe_observed")
+            )
+        except BaseException:
+            raise AppServerError(
+                "version_probe_observed journal callback failed; "
+                "version probe effect is unknown"
+            ) from None
+
     def start(self) -> None:
+        self._start_version_probe()
         self.on_process_start_pending(self._process("process_start_pending", None))
         self.on_process_started(self._process("process_started", 42))
 
@@ -587,6 +643,7 @@ class CallbackWrappingAdapter(FakeAdapter):
     """Match the production adapter's callback failure boundary."""
 
     def start(self) -> None:
+        self._start_version_probe()
         try:
             self.on_process_start_pending(
                 self._process("process_start_pending", None)
@@ -606,6 +663,7 @@ class StartedCallbackWrappingAdapter(FakeAdapter):
         self.physically_started = False
 
     def start(self) -> None:
+        self._start_version_probe()
         self.on_process_start_pending(self._process("process_start_pending", None))
         self.physically_started = True
         try:
@@ -1074,6 +1132,69 @@ def test_cli_read_only_rechecks_full_claim_scope_before_reserve(
     )
 
 
+def test_cli_revalidates_before_version_probe_and_long_lived_process(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    value = _fixture(tmp_path)
+    assert bridge.main(_issue_args(value)) == 0
+    capsys.readouterr()
+    calls = {"confidentiality": 0, "pre_git": 0, "authority": 0}
+    authority_boundaries: list[tuple[str, str]] = []
+    original_confidentiality = bridge._confidentiality_preflight
+    original_pre_git = bridge._require_fresh_pre_git_endpoint
+    original_authority = runtime.require_codex_process_start_authority
+
+    def confidentiality(*args: Any, **kwargs: Any) -> Any:
+        calls["confidentiality"] += 1
+        return original_confidentiality(*args, **kwargs)
+
+    def pre_git(*args: Any, **kwargs: Any) -> Any:
+        calls["pre_git"] += 1
+        return original_pre_git(*args, **kwargs)
+
+    def authority(*args: Any, **kwargs: Any) -> Any:
+        calls["authority"] += 1
+        checked = contracts.validate_transport_journal(kwargs["journal"])
+        authority_boundaries.append(
+            (kwargs["effect_event_type"], checked.last_event_type)
+        )
+        return original_authority(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "_confidentiality_preflight", confidentiality)
+    monkeypatch.setattr(bridge, "_require_fresh_pre_git_endpoint", pre_git)
+    monkeypatch.setattr(
+        runtime, "require_codex_process_start_authority", authority
+    )
+    monkeypatch.setattr(
+        bridge,
+        "CodexAppServerStdio",
+        lambda *args, **kwargs: FakeAdapter(),
+    )
+    assert bridge.main(_run_args(value, value.prompt_path)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["terminal_state"] == "completed"
+    assert calls["authority"] == 2
+    assert calls["confidentiality"] >= 2
+    assert calls["pre_git"] >= 2
+    assert authority_boundaries == [
+        ("version_probe_pending", "reserved"),
+        ("process_start_pending", "version_probe_observed"),
+    ]
+    launch = runtime.load_codex_transport_launch(
+        value.paths,
+        "task-1",
+        "launch-1",
+        store.load_semantic_events(value.paths, "task-1"),
+    )
+    assert [row["event_type"] for row in launch["journal"][:5]] == [
+        "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
+        "process_start_pending",
+        "process_started",
+    ]
+
+
 def test_cli_read_only_rechecks_source_at_process_pending(
     tmp_path: Path, monkeypatch: Any, capsys: Any
 ) -> None:
@@ -1390,6 +1511,7 @@ def test_concurrent_run_uses_one_controller_and_one_process_owner(
 
     class BlockingAdapter(FakeAdapter):
         def start(self) -> None:
+            self._start_version_probe()
             self.on_process_start_pending(
                 self._process("process_start_pending", None)
             )

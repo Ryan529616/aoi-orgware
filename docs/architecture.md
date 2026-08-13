@@ -3,6 +3,13 @@
 AOI separates organization policy from agent execution. It can sit above Codex,
 an Agents SDK application, a custom supervisor, or a human-operated workflow.
 
+Its governance authority is deliberately not a natural-language skill: the
+installed deterministic CLI/runtime, ledger and lock domain enforce it, while
+`aoi.toml`, the AOI-managed `POLICY.md`, and repository instructions define the
+reviewed project contract. A Codex skill may only be a versioned distribution
+client adapter for discovery and CLI use; it cannot hold Chief authority,
+create/consume claims, authorize mutations, or validate evidence.
+
 ## Planes
 
 | Plane | Responsibility | Authority |
@@ -297,8 +304,8 @@ separate evidence and boundaries.
 
 ## Integrations
 
-The core has no provider dependency. Optional protocol-v6 `aoi-codex-hook`
-integration translates Codex lifecycle events into checkpoint reminders and
+The core has no provider dependency. The current event-bound protocol-v6 Codex
+hook integration translates Codex lifecycle events into checkpoint reminders and
 guardrails. On `SubagentStart`, it also performs one narrow state mutation: it
 atomically consumes one exact Chief-issued packet arm or records an unmanaged
 start incident. The hook never receives a Chief secret and cannot create a
@@ -310,20 +317,30 @@ stop-without-work instruction rather than claiming a pre-spawn hard block.
 Manual dispatch remains available as explicit `manual_unverified` provenance,
 but a schema-v5 fallback must consume a permit that was armed before the CLI
 registration and is still current for expiry, Chief epoch, plan, packet,
-topology, lane/Steward, and skill authority. Direct ready-to-dispatched
+topology, lane/Steward, and qualified skill-canary state. Direct ready-to-dispatched
 registration is rejected. A native-v5 marker is sealed into the packet contract,
 so changing only state schema to v4 cannot invoke the legacy exception; the task
 must also carry pre-marker legacy provenance. Other runtimes should integrate
 through equivalent observed-event adapters or the CLI/JSON contract without
 bypassing AOI authority rules.
 
-The `aoi codex-init` composition path keeps project integration repository-local
-while installing the generic AOI operating skill once at Codex user scope. It
-non-destructively merges hook definitions and the stable hook feature under
-`.codex/`, installs the skill under `$HOME/.agents/skills/`, and enables the AOI
+The `aoi codex-init` composition path keeps project integration
+repository-local while installing one transitional Codex client adapter at
+`$HOME/.agents/skills/aoi/SKILL.md`. Schema-v3 provenance binds that exact file
+to the installed AOI distribution's `RECORD` and version; `doctor` reports
+`not_configured`, `exact`, `missing`, `drifted`, `uninspectable`, or
+`legacy_unbound`. Only `exact` is the current bound form when Codex hooks are
+enabled. The adapter is
+not a fourth authority plane and cannot act as Chief, claim, mutation, or
+evidence authority. `codex-init` non-destructively merges event-bound hook
+definitions and the stable hook feature under `.codex/`, and enables the AOI
 policy flag only when no active task binds the previous digest. Project-specific
 instructions remain in that repository. It never edits global `CODEX_HOME`
-settings or bypasses Codex's exact-definition `/hooks` trust review.
+settings or bypasses Codex's exact-definition `/hooks` trust review. This
+release does not claim equivalent client-adapter binding or telemetry coverage
+for Claude or other providers. With hooks disabled, missing, drifted, or
+user-path-uninspectable adapter state is warning/status only; receipt/schema,
+package, and wheel-provenance corruption remain blocking integrity faults.
 
 The optional codebase-memory Phase 1 adapter is a second, deliberately narrower
 integration. A Chief-fenced command imports an exact reviewed receipt into a
@@ -343,27 +360,34 @@ Steward-brief, and close-gate error. See
 
 ### Codex hook provenance and mutation receipts (v0.4)
 
-The optional Codex adapter records bounded, sealed observations and can deny a
-governed request on supported `PreToolUse` handlers; it does not turn hook
-delivery into a security boundary. Installation provenance binds the
-resolved hook launcher, package version and distribution metadata, the promoted
-wheel identity, generated launcher, and a bounded manifest of every non-cache
-runtime package file checked against `RECORD`. The unpublished local schema-v2
-route additionally requires and rechecks the installed `aoi-codex-bridge`
-entry point, launcher, optional generated script, and transport CLI module.
-Its clean source manifest includes ordinary tracked dotfiles and
-dot-directories; safe leading-dot paths are not confused with traversal or
-absolute paths.
-Pip-generated, hashless
-`__pycache__/*.pyc` files are an explicit cooperative-runtime exclusion; other
-files under `__pycache__` are rejected. At hook execution, AOI's provenance
-validator rechecks that receipt against the invoked launcher and current
-installed package bytes, and `doctor` reports any mismatch.
-Editable/source-checkout installs, link traversal, `.pth` shadows, mixed
-site-package resolution, entry-point mismatch, and any covered package or
-launcher drift are rejected by that validator. Any internal `PreToolUse` fault
-returns the fixed deny response (fail-closed); only non-`PreToolUse` lifecycle
-adapters remain fail-open. This is not a pre-import or OS security boundary. A
+This unpublished ARISE Operational Alpha candidate is not a complete v0.5
+release. The optional schema-v3 Codex adapter records bounded, sealed
+observations and can deny a governed request on supported `PreToolUse` handlers.
+It may be created only from a reviewed local-v2 exact-wheel proof. Public
+schema-v1 receipts remain readable and historically upgradable, but cannot
+newly enable current hooks; the public current-hook route is deferred.
+
+Schema-v3 uses the receipt-recorded absolute venv Python with
+`-I -B -m aoi_orgware.codex_hook`, not the pip `aoi-codex-hook` launcher. Its
+receipt binds the Python invocation/resolved hash/prefix/cache tag, exact
+wheel-bound hook module and `RECORD` hash, and argv prefix. Local-v2 records of
+the console, bridge, or old launcher are historical/diagnostic evidence only:
+they do not establish active-hook authority, and the Bridge has its own
+launch/receipt boundary. Pip-generated hashless `__pycache__/*.pyc` files are
+an explicit cooperative-runtime exclusion; other files under `__pycache__` are
+rejected.
+
+Once AOI `main` has entered, the validator rechecks the v3 receipt and those
+post-import runtime facts. Editable/source checkouts, link traversal, `.pth`
+shadows, mixed site-package resolution, and covered package/module drift are
+rejected within that cooperative boundary. It does not protect against
+interpreter, site/import, same-user-host, or pre-import tampering. The hook
+argument/event matcher and `doctor` separately recheck the immutable
+per-handler `--expected-event` command binding. An unbound protocol-v6 handler
+is upgradeable legacy only and cannot process a mutation event. Any bootstrap,
+provenance, payload, event-dispatch, or receipt fault on a trusted event-bound
+`PreToolUse` handler returns the fixed deny response (fail-closed); only
+non-mutation lifecycle adapters remain fail-open. A
 `RECORD`/installed-package comparison is not always a
 cryptographic proof that the original wheel archive was installed: without a
 matching `direct_url` archive digest the receipt reports only its weaker

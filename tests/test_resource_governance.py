@@ -244,6 +244,8 @@ class ResourceCommandRegistryTests(unittest.TestCase):
         "override_revoke",
         "codex_config_plan",
         "codex_config_apply",
+        "codex_config_migrate_legacy_plan",
+        "codex_config_migrate_legacy",
         "codex_config_rollback",
         "codex_session_register",
         "codex_startup_receipt_show",
@@ -284,6 +286,40 @@ class ResourceCommandRegistryTests(unittest.TestCase):
         self.assertEqual(args.max_depth, AOI_MAX_DELEGATION_DEPTH)
         self.assertEqual(args.role, ["explorer"])
         self.assertTrue(args.json)
+
+        migration = parser.parse_args(
+            [
+                "codex-config-migrate-legacy",
+                "--task",
+                "task",
+                "--event-id",
+                "event",
+                "--expected-event-sha256",
+                "a" * 64,
+                "--expected-resource-receipt-sha256",
+                "b" * 64,
+                "--reason",
+                "Exact rolled-back legacy history",
+                "--session-id",
+                "root-session",
+            ]
+        )
+        self.assertIs(
+            migration.handler, handlers["codex_config_migrate_legacy"]
+        )
+        migration_plan = parser.parse_args(
+            [
+                "codex-config-migrate-legacy-plan",
+                "--task",
+                "task",
+                "--event-id",
+                "event",
+            ]
+        )
+        self.assertIs(
+            migration_plan.handler,
+            handlers["codex_config_migrate_legacy_plan"],
+        )
 
     def test_registry_rejects_incomplete_or_extra_handler_maps(self) -> None:
         parser = argparse.ArgumentParser()

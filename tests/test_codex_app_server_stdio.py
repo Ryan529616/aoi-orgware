@@ -3,20 +3,29 @@ from __future__ import annotations
 import io
 import json
 import hashlib
+import math
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping, NoReturn, cast
 
 import pytest
 
 from aoi_orgware import codex_app_server_stdio as stdio
 from aoi_orgware import codex_transport_contracts as contracts
+from aoi_orgware.company.codex_adapter import (
+    ThreadTokenUsageUpdated,
+    parse_codex_notification,
+)
 from aoi_orgware.codex_app_server_stdio import (
     AppServerError,
+    AppServerLaunchSpec,
     AppServerResponseError,
+    ClientNotificationJournalEntry,
+    ClientNotificationPhase,
     CodexAppServerStdio,
     ProcessJournalEntry,
     ProtocolViolation,
@@ -32,8 +41,10 @@ from aoi_orgware.codex_app_server_stdio import (
     RuntimePin,
     SealedLaunchIntent,
     ServerRequestDenied,
+    VersionProbeJournalEntry,
     scrub_aoi_secret_env,
 )
+from aoi_orgware.codex_transport_controller import CodexTransportController
 
 
 SHA_A = "a" * 64
@@ -232,7 +243,8 @@ if scenario == "model_rerouted_live":
     raise SystemExit(0)
 if scenario == "auxiliary_notifications":
     send({"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"not persisted by AOI"}})
-    send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","tokenUsage":{"totalTokens":1}}})
+    token_vector = {"inputTokens":1,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":3}
+    send({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":token_vector,"last":token_vector}}})
 if scenario == "interrupt_active":
     interrupt = read()
     assert "jsonrpc" not in interrupt
@@ -317,6 +329,13 @@ def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwarg
         _fake_runtime_pin(),
     )
     max_line_bytes = int(kwargs.pop("max_line_bytes", 1024))
+    version_args = cast(
+        tuple[str, ...],
+        kwargs.pop(
+            "_test_version_args",
+            ("-c", "print('fake-app-server 0.145.0')"),
+        ),
+    )
     return CodexAppServerStdio(
         Path(sys.executable).resolve(),
         cwd=tmp_path,
@@ -324,7 +343,7 @@ def _client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwarg
         max_line_bytes=max_line_bytes,
         runtime_pin=runtime_pin,  # type: ignore[arg-type]
         _test_launch_args=("-u", str(fake_server)),
-        _test_version_args=("-c", "print('fake-app-server 0.145.0')"),
+        _test_version_args=version_args,
         **kwargs,
     )
 
@@ -415,6 +434,74 @@ def _intent(
     return SealedLaunchIntent.from_sealed_mapping(
         sealed, expected_sha256=str(sealed["intent_sha256"])
     )
+
+
+def _version_probe_controller(
+    tmp_path: Path,
+) -> tuple[CodexTransportController, list[dict[str, Any]]]:
+    intent = contracts.seal_launch_intent(_intent_payload(tmp_path))
+    reservation = contracts.seal_reservation(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_RESERVATION_V1,
+            "reservation_id": "version-probe-boundary",
+            "launch_intent_sha256": intent["intent_sha256"],
+            "permit_sha256": SHA_C,
+            "runtime_pin": intent["runtime_pin"],
+            "state": "reserved",
+            "correlation": {
+                "thread_id": None,
+                "turn_id": None,
+                "item_id": None,
+            },
+        }
+    )
+    reserved = contracts.seal_journal_event(
+        {
+            "contract_type": contracts.CODEX_TRANSPORT_JOURNAL_EVENT_V1,
+            "event_id": "version-probe-boundary:1:reserved",
+            "sequence": 1,
+            "prev_event_sha256": contracts.ZERO_SHA256,
+            "launch_intent_sha256": intent["intent_sha256"],
+            "reservation_sha256": reservation["reservation_sha256"],
+            "event_type": "reserved",
+            "state": "reserved",
+            "wire_method": "aoi/reservation",
+            "wire_event_sha256": None,
+            "payload_size_bytes": 0,
+            "item_type": None,
+            "status": "observed",
+            "request_id": None,
+            "request_bytes_sha256": None,
+            "response_sha256": None,
+            "fault_kind": None,
+            "fault_evidence_sha256": None,
+            "fault_evidence_size_bytes": None,
+            "correlation": {
+                "thread_id": None,
+                "turn_id": None,
+                "item_id": None,
+            },
+        }
+    )
+    durable = [reserved]
+
+    def persist(event: Mapping[str, Any]) -> list[dict[str, Any]]:
+        durable[:] = contracts.append_transport_journal_event(durable, event)
+        return list(durable)
+
+    controller = CodexTransportController(
+        intent=intent,
+        reservation=reservation,
+        journal=durable,
+        persist_milestone=persist,
+        publish_terminal=lambda receipt: dict(receipt),
+        persist_fault_evidence=lambda data, _label: {
+            "path": "local-cas",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+        },
+    )
+    return controller, durable
 
 
 def _initialized_client(fake_server: Path, tmp_path: Path, scenario: str = "normal", **kwargs: Any) -> CodexAppServerStdio:
@@ -536,8 +623,7 @@ def test_local_files_policy_is_rechecked_after_version_probe_before_popen(
     monkeypatch.setattr(client, "_verify_runtime_version", mutate_after_pending)
     with pytest.raises(AppServerError, match="local_files"):
         client.start()
-    assert len(pending) == 1
-    assert pending[0].phase == "process_start_pending"
+    assert pending == []
 
 
 def test_constructor_rejects_symlinked_executable(tmp_path: Path) -> None:
@@ -701,7 +787,714 @@ def test_lifecycle_buffers_event_before_response_and_records_aggregate(fake_serv
         client.close()
 
 
+def test_transport_neutral_launch_spec_uses_the_legacy_adapter_flow(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    prompt = "hello"
+    spec = AppServerLaunchSpec(
+        cwd=tmp_path.resolve().as_posix(),
+        model="gpt-5.6-terra",
+        effort="medium",
+        sandbox="readOnly",
+        prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        prompt_size_bytes=len(prompt.encode("utf-8")),
+        executable_path=Path(sys.executable).resolve().as_posix(),
+    )
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        thread_id = client.start_thread_from_intent(intent=spec)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt=prompt, intent=spec
+        )
+        assert client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        ).terminal_status == "completed"
+    finally:
+        client.close()
+
+
+def test_observe_turn_event_callback_receives_accepted_exact_wire_bytes(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    accepted: list[RuntimeEvent] = []
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        observation = client.observe_turn(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            timeout_seconds=3,
+            on_event=accepted.append,
+        )
+        assert accepted == list(observation.events)
+        assert [event.wire_bytes for event in accepted] == [
+            event.wire_bytes for event in observation.events
+        ]
+        assert all(
+            hashlib.sha256(event.wire_bytes).hexdigest() == event.sha256
+            for event in accepted
+        )
+    finally:
+        client.close()
+
+
+def test_observe_turn_rejects_before_event_callback() -> None:
+    invalid_events = (
+        RuntimeEvent(
+            "turn/started",
+            {"threadId": "other", "turn": {"id": "turn-1", "items": [], "status": "inProgress"}},
+            "a" * 64,
+            b'{"method":"turn/started"}\n',
+        ),
+        RuntimeEvent(
+            "item/started",
+            {"threadId": "thread-1", "turnId": "turn-1", "item": {"id": "item-1", "type": "agentMessage", "text": "ok"}},
+            "b" * 64,
+            b'{"method":"item/started"}\n',
+        ),
+    )
+    for event in invalid_events:
+        client = object.__new__(CodexAppServerStdio)
+        client._notifications = [event]
+        accepted: list[RuntimeEvent] = []
+        with pytest.raises(ProtocolViolation):
+            client.observe_turn(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                timeout_seconds=1,
+                on_event=accepted.append,
+            )
+        assert accepted == []
+
+
+def test_observe_turn_event_callback_failure_fails_closed(fake_server: Path, tmp_path: Path) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def fail_callback(_event: RuntimeEvent) -> None:
+            raise RuntimeError("callback-secret")
+
+        with pytest.raises(AppServerError, match="event callback failed") as caught:
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=3,
+                on_event=fail_callback,
+            )
+        assert "callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert client._turn_terminal is False
+        assert client._terminal_stream_phase.value == "aborted"
+        assert type(client._reader_error) is AppServerError
+        assert str(client._reader_error) == "observe_turn event callback failed"
+        with pytest.raises(AppServerError, match="event callback failed"):
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=3,
+            )
+        with pytest.raises(RuntimeDisconnected, match="not eligible for a clean seal"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+    finally:
+        client.close()
+
+
+def test_observe_turn_base_exception_callback_failure_fails_closed(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def interrupt_callback(_event: RuntimeEvent) -> None:
+            raise KeyboardInterrupt("callback-secret")
+
+        with pytest.raises(AppServerError, match="event callback failed") as caught:
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=3,
+                on_event=interrupt_callback,
+            )
+        assert "callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert client._turn_terminal is False
+        assert client._terminal_stream_phase.value == "aborted"
+        with pytest.raises(AppServerError, match="event callback failed"):
+            client.observe_turn(
+                thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+            )
+        with pytest.raises(RuntimeDisconnected, match="not eligible for a clean seal"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("late_method", ["turn/started", "turn/completed"])
+def test_observe_turn_late_callback_aborts_terminal_eligibility(
+    fake_server: Path, tmp_path: Path, late_method: str
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callbacks: list[str] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def late_callback(event: RuntimeEvent) -> None:
+            callbacks.append(event.method)
+            if event.method == late_method:
+                time.sleep(0.08)
+
+        with pytest.raises(
+            RuntimeDisconnected, match="turn observation deadline expired"
+        ):
+            client.observe_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                timeout_seconds=0.02,
+                on_event=late_callback,
+            )
+
+        assert late_method in callbacks
+        assert client._turn_terminal is False
+        assert client._terminal_stream_phase.value == "aborted"
+        with pytest.raises(RuntimeDisconnected, match="not eligible for a clean seal"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+    finally:
+        client.close()
+
+
+def test_observe_and_terminal_seal_serialize_callback_abort(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observer_errors: list[BaseException] = []
+    seal_errors: list[BaseException] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def fail_after_barrier(_event: RuntimeEvent) -> None:
+            callback_entered.set()
+            assert release_callback.wait(timeout=3)
+            raise RuntimeError("callback-secret")
+
+        def observe() -> None:
+            try:
+                client.observe_turn(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    timeout_seconds=3,
+                    on_event=fail_after_barrier,
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        def seal() -> None:
+            try:
+                client.seal_reader_for_terminal_commit(timeout_seconds=3)
+            except BaseException as exc:
+                seal_errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert callback_entered.wait(timeout=2)
+        sealer = threading.Thread(target=seal)
+        sealer.start()
+        time.sleep(0.1)
+        assert client._terminal_stream_phase.value == "open"
+        assert sealer.is_alive()
+
+        release_callback.set()
+        observer.join(timeout=3)
+        sealer.join(timeout=3)
+
+        assert not observer.is_alive()
+        assert not sealer.is_alive()
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], AppServerError)
+        assert len(seal_errors) == 1
+        assert isinstance(seal_errors[0], RuntimeDisconnected)
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def test_lifecycle_serialization_timeout_aborts_stalled_callback(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observer_errors: list[BaseException] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def stall_callback(_event: RuntimeEvent) -> None:
+            callback_entered.set()
+            assert release_callback.wait(timeout=3)
+
+        def observe() -> None:
+            try:
+                client.observe_turn(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    timeout_seconds=3,
+                    on_event=stall_callback,
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert callback_entered.wait(timeout=2)
+
+        started = time.monotonic()
+        with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+            client.observe_turn(
+                thread_id=thread_id, turn_id=turn_id, timeout_seconds=0.1
+            )
+        assert time.monotonic() - started < 0.5
+
+        started = time.monotonic()
+        with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=0.1)
+        assert time.monotonic() - started < 0.5
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
+
+        release_callback.set()
+        observer.join(timeout=3)
+        assert not observer.is_alive()
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], RuntimeDisconnected)
+        assert client._terminal_stream_phase.value == "aborted"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("abort_mode", ["contender", "reentrant"])
+def test_global_abort_preserves_later_buffered_events_after_callback(
+    abort_mode: str,
+) -> None:
+    client = object.__new__(CodexAppServerStdio)
+    first = RuntimeEvent(
+        "item/started",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "startedAtMs": 1,
+            "item": {"id": "item-1", "type": "agentMessage", "text": "first"},
+        },
+        "a" * 64,
+        b"first\n",
+    )
+    later = RuntimeEvent(
+        "item/started",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "startedAtMs": 2,
+            "item": {"id": "item-2", "type": "agentMessage", "text": "later"},
+        },
+        "b" * 64,
+        b"later\n",
+    )
+    client._notifications = [first, later]
+    client._turn_lifecycle_lock = threading.Lock()
+    client._reader_condition = threading.Condition()
+    client._terminal_stream_phase = stdio._TerminalStreamPhase.OPEN
+    client._turn_terminal = False
+    client._reader_error = None
+    client._event_callback_failed = False
+    callbacks: list[RuntimeEvent] = []
+
+    if abort_mode == "reentrant":
+
+        def callback(event: RuntimeEvent) -> None:
+            callbacks.append(event)
+            with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+                client.observe_turn(
+                    thread_id="thread-1", turn_id="turn-1", timeout_seconds=0.01
+                )
+
+        with pytest.raises(RuntimeDisconnected, match="not eligible after terminal stream transition"):
+            client.observe_turn(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                timeout_seconds=1,
+                on_event=callback,
+            )
+    else:
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        observer_errors: list[BaseException] = []
+
+        def callback(event: RuntimeEvent) -> None:
+            callbacks.append(event)
+            callback_entered.set()
+            assert release_callback.wait(timeout=3)
+
+        def observe() -> None:
+            try:
+                client.observe_turn(
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                    timeout_seconds=1,
+                    on_event=callback,
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        assert callback_entered.wait(timeout=1)
+        with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+            client.observe_turn(thread_id="thread-1", turn_id="turn-1", timeout_seconds=0.01)
+        release_callback.set()
+        observer.join(timeout=1)
+        assert not observer.is_alive()
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], RuntimeDisconnected)
+
+    assert callbacks == [first]
+    assert client._notifications == [later]
+    assert client._terminal_stream_phase.value == "aborted"
+
+
+def test_global_abort_preserves_live_event_waiting_in_next_incoming() -> None:
+    entered_get = threading.Event()
+    release_event = threading.Event()
+    params: dict[str, Any] = {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "startedAtMs": 1,
+        "item": {"id": "item-1", "type": "agentMessage", "text": "live"},
+    }
+    message = {
+        "method": "item/started",
+        "params": params,
+    }
+    raw = b'{"method":"item/started"}\n'
+
+    class IncomingAfterAbort:
+        def get(self, *, timeout: float) -> tuple[str, object]:
+            entered_get.set()
+            assert release_event.wait(timeout=3)
+            return ("notification", (message, raw))
+
+    client = object.__new__(CodexAppServerStdio)
+    client._notifications = []
+    client._turn_lifecycle_lock = threading.Lock()
+    client._reader_condition = threading.Condition()
+    client._terminal_stream_phase = stdio._TerminalStreamPhase.OPEN
+    client._turn_terminal = False
+    client._reader_error = None
+    client._event_callback_failed = False
+    client._reroute_persistence_inflight = 0
+    client._incoming = IncomingAfterAbort()  # type: ignore[assignment]
+    client._seen_events = {}
+    client.max_events = 8
+    callbacks: list[RuntimeEvent] = []
+    observer_errors: list[BaseException] = []
+
+    def observe() -> None:
+        try:
+            client.observe_turn(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                timeout_seconds=1,
+                on_event=callbacks.append,
+            )
+        except BaseException as exc:
+            observer_errors.append(exc)
+
+    observer = threading.Thread(target=observe)
+    observer.start()
+    assert entered_get.wait(timeout=1)
+    with pytest.raises(RuntimeDisconnected, match="lifecycle serialization"):
+        client.observe_turn(thread_id="thread-1", turn_id="turn-1", timeout_seconds=0.01)
+    release_event.set()
+    observer.join(timeout=1)
+
+    assert not observer.is_alive()
+    assert len(observer_errors) == 1
+    assert isinstance(observer_errors[0], RuntimeDisconnected)
+    assert callbacks == []
+    assert client._notifications == [
+        RuntimeEvent("item/started", params, hashlib.sha256(raw).hexdigest(), raw)
+    ]
+    assert client._terminal_stream_phase.value == "aborted"
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [math.nan, math.inf, -math.inf, 0.0, -1.0, True, "1", threading.TIMEOUT_MAX * 2, 10**10000],
+    ids=[
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "zero",
+        "negative",
+        "bool",
+        "non-numeric",
+        "over-timeout-max",
+        "conversion-overflow",
+    ],
+)
+@pytest.mark.parametrize("operation", ["observe", "seal"])
+def test_public_lifecycle_timeouts_reject_invalid_or_unwaitable_before_lock(
+    timeout_seconds: object, operation: str
+) -> None:
+    class LockMustNotRun:
+        def acquire(self, *args: object, **kwargs: object) -> bool:
+            raise AssertionError("platform lifecycle lock was called")
+
+        def release(self) -> None:
+            raise AssertionError("platform lifecycle lock was released")
+
+    client = object.__new__(CodexAppServerStdio)
+    client._turn_lifecycle_lock = LockMustNotRun()  # type: ignore[assignment]
+    client._terminal_stream_phase = stdio._TerminalStreamPhase.OPEN
+    client._turn_terminal = False
+    client._reader_error = None
+    with pytest.raises(ValueError, match="finite positive number"):
+        if operation == "observe":
+            client.observe_turn(
+                thread_id="thread-1", turn_id="turn-1", timeout_seconds=timeout_seconds  # type: ignore[arg-type]
+            )
+        else:
+            client.seal_reader_for_terminal_commit(timeout_seconds=timeout_seconds)  # type: ignore[arg-type]
+    assert client._terminal_stream_phase is stdio._TerminalStreamPhase.OPEN
+    assert client._turn_terminal is False
+    assert client._reader_error is None
+
+
+def test_concurrent_observers_cannot_accept_after_terminal_observation(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    observations: list[object] = []
+    observer_errors: list[BaseException] = []
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+
+        def pause_first_callback(_event: RuntimeEvent) -> None:
+            if not callback_entered.is_set():
+                callback_entered.set()
+                assert release_callback.wait(timeout=3)
+
+        def first_observer() -> None:
+            observations.append(
+                client.observe_turn(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    timeout_seconds=3,
+                    on_event=pause_first_callback,
+                )
+            )
+
+        def second_observer() -> None:
+            try:
+                client.observe_turn(
+                    thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+                )
+            except BaseException as exc:
+                observer_errors.append(exc)
+
+        first = threading.Thread(target=first_observer)
+        first.start()
+        assert callback_entered.wait(timeout=2)
+        second = threading.Thread(target=second_observer)
+        second.start()
+        time.sleep(0.1)
+        assert second.is_alive()
+
+        release_callback.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(observations) == 1
+        assert len(observer_errors) == 1
+        assert isinstance(observer_errors[0], AppServerError)
+        assert "after terminal completion" in str(observer_errors[0])
+        assert client._turn_terminal is True
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("reroute_first", [False, True])
+def test_callback_abort_preserves_reroute_evidence_precedence(
+    fake_server: Path, tmp_path: Path, reroute_first: bool
+) -> None:
+    client = _client(fake_server, tmp_path)
+    client._model_intent = _intent(tmp_path)
+    persisted: list[bytes] = []
+    def persist_rejected(
+        observed: RuntimeEvent | RejectedNotificationWire,
+    ) -> dict[str, object]:
+        persisted.append(observed.wire_bytes)
+        return {
+            "sha256": hashlib.sha256(observed.wire_bytes).hexdigest(),
+            "size_bytes": len(observed.wire_bytes),
+        }
+
+    def fail_callback(_event: RuntimeEvent) -> None:
+        raise RuntimeError("callback-secret")
+
+    client.on_rejected_notification = persist_rejected
+    raw = (
+        b'{"method":"item/started","params":{"threadId":"thread-1",'
+        b'"turnId":"turn-1","startedAtMs":2,"item":{"id":"item-1",'
+        b'"type":"agentMessage","text":"ok"}}}\n'
+    )
+    client._notifications.append(
+        RuntimeEvent(
+            "item/started",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 2,
+                "item": {"id": "item-1", "type": "agentMessage", "text": "ok"},
+            },
+            hashlib.sha256(raw).hexdigest(),
+            raw,
+        )
+    )
+    reroute, reroute_raw = _reroute_wire()
+
+    if reroute_first:
+        client._classify_incoming(reroute, reroute_raw)
+
+    with pytest.raises(AppServerError, match="event callback failed"):
+        client.observe_turn(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            timeout_seconds=1,
+            on_event=fail_callback,
+        )
+
+    if not reroute_first:
+        client._classify_incoming(reroute, reroute_raw)
+
+    assert persisted == [reroute_raw]
+    assert isinstance(client._reader_error, ModelReroutedViolation)
+    assert client._reader_error.evidence_sha256 == hashlib.sha256(reroute_raw).hexdigest()
+    assert client._reader_error.evidence_size_bytes == len(reroute_raw)
+    assert client._event_callback_failed is True
+    assert client._terminal_stream_phase.value == "aborted"
+    with pytest.raises(ModelReroutedViolation) as caught:
+        client.observe_turn(thread_id="thread-1", turn_id="turn-1", timeout_seconds=1)
+    assert caught.value.evidence_sha256 == hashlib.sha256(reroute_raw).hexdigest()
+    assert caught.value.evidence_size_bytes == len(reroute_raw)
+
+
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_runtime_event_json_payload_bytes_is_company_parser_outer_framing_equivalent(
+    line_ending: bytes,
+) -> None:
+    payload = (
+        b'{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1",'
+        b'"turnId":"turn-1","tokenUsage":{"total":{"inputTokens":1,'
+        b'"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,'
+        b'"totalTokens":3},"last":{"inputTokens":1,"cachedInputTokens":0,'
+        b'"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":3}}}}'
+    )
+    wire = payload + line_ending
+    event = RuntimeEvent(
+        "thread/tokenUsage/updated",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+                "last": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+            },
+        },
+        hashlib.sha256(wire).hexdigest(),
+        wire,
+    )
+    assert event.json_payload_bytes == payload
+    parsed = parse_codex_notification(event.json_payload_bytes)
+    assert isinstance(parsed, ThreadTokenUsageUpdated)
+    assert parsed.total.total_tokens == 3
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b' {"method":"warning","params":{}}',
+        b'{"method":"warning","params":{}} ',
+        b'{"method":"warning","params":{},"extra":true}',
+        b'{"method":"warning","method":"warning","params":{}}',
+    ],
+    ids=("leading-whitespace", "trailing-whitespace", "extra-envelope", "duplicate-key"),
+)
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_runtime_event_json_payload_bytes_rejects_non_parser_equivalent_outer_framing(
+    payload: bytes, line_ending: bytes
+) -> None:
+    wire = payload + line_ending
+    event = RuntimeEvent(
+        "warning",
+        {},
+        hashlib.sha256(wire).hexdigest(),
+        wire,
+    )
+    with pytest.raises(ProtocolViolation):
+        _ = event.json_payload_bytes
+
+
 def test_pinned_auxiliary_notifications_do_not_break_lifecycle(fake_server: Path, tmp_path: Path) -> None:
+    accepted: list[RuntimeEvent] = []
     client = _initialized_client(fake_server, tmp_path, "auxiliary_notifications")
     try:
         intent = _intent(tmp_path)
@@ -710,7 +1503,10 @@ def test_pinned_auxiliary_notifications_do_not_break_lifecycle(fake_server: Path
             thread_id=thread_id, prompt="hello", intent=intent
         )
         observation = client.observe_turn(
-            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+            thread_id=thread_id,
+            turn_id=turn_id,
+            timeout_seconds=3,
+            on_event=accepted.append,
         )
         assert observation.terminal_status == "completed"
         assert "item/agentMessage/delta" in {
@@ -719,6 +1515,45 @@ def test_pinned_auxiliary_notifications_do_not_break_lifecycle(fake_server: Path
         assert "thread/tokenUsage/updated" in {
             event.method for event in observation.events
         }
+        token_events = [
+            event for event in accepted if event.method == "thread/tokenUsage/updated"
+        ]
+        assert len(token_events) == 1
+        assert token_events[0].wire_bytes == next(
+            event.wire_bytes
+            for event in observation.events
+            if event.method == "thread/tokenUsage/updated"
+        )
+        assert json.loads(token_events[0].wire_bytes)["params"] == {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+                "last": {
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 3,
+                },
+            },
+        }
+        token_event = token_events[0]
+        assert token_event.wire_bytes.endswith(b"\n")
+        assert hashlib.sha256(token_event.wire_bytes).hexdigest() == token_event.sha256
+        expected_payload = token_event.wire_bytes.removesuffix(b"\n").removesuffix(b"\r")
+        assert token_event.json_payload_bytes == expected_payload
+        assert hashlib.sha256(token_event.json_payload_bytes).hexdigest() != token_event.sha256
+        parsed = parse_codex_notification(token_event.json_payload_bytes)
+        assert isinstance(parsed, ThreadTokenUsageUpdated)
+        assert parsed.total.total_tokens == 3
+        assert parsed.last.total_tokens == 3
     finally:
         client.close()
 
@@ -986,6 +1821,94 @@ def test_terminal_stream_seal_drains_reroute_emitted_after_stdin_eof(
         assert client._terminal_stream_phase.value == "aborted"
         assert client._stdout_reader_done is True
         assert client._process is None
+    finally:
+        client.close()
+
+
+_TERMINAL_SEAL_LATE_QUEUE_CASES: list[tuple[str, Any]] = [
+    (
+        "notification",
+        (
+            {"method": "warning", "params": {"message": "late"}},
+            b'{"method":"warning","params":{"message":"late"}}\n',
+        ),
+    ),
+    (
+        "notification",
+        (
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "items": [], "status": "failed"},
+                },
+            },
+            b'{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"failed"}}}\n',
+        ),
+    ),
+    ("response", ({"id": 99, "result": {}}, b'{"id":99,"result":{}}\n')),
+    ("server_request", {"id": 99, "method": "tool/requestUserInput", "params": {}}),
+    ("eof", None),
+]
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    _TERMINAL_SEAL_LATE_QUEUE_CASES,
+    ids=("late-notification", "conflicting-terminal", "late-response", "late-request", "duplicate-eof"),
+)
+def test_terminal_stream_seal_rejects_every_late_or_duplicate_queue_entry(
+    fake_server: Path, tmp_path: Path, kind: str, payload: Any
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        assert client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        ).terminal_status == "completed"
+        client._incoming.put_nowait((kind, payload))
+
+        with pytest.raises(RuntimeDisconnected, match="late protocol data or invalid EOF"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
+    finally:
+        client.close()
+
+
+def test_terminal_stream_seal_rejects_buffered_ordinary_notification(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _initialized_client(fake_server, tmp_path)
+    try:
+        intent = _intent(tmp_path)
+        thread_id = client.start_thread_from_intent(intent=intent)
+        turn_id = client.start_turn_from_intent(
+            thread_id=thread_id, prompt="hello", intent=intent
+        )
+        assert client.observe_turn(
+            thread_id=thread_id, turn_id=turn_id, timeout_seconds=3
+        ).terminal_status == "completed"
+        raw = b'{"method":"warning","params":{"message":"buffered"}}\n'
+        client._notifications.append(
+            RuntimeEvent(
+                "warning",
+                {"message": "buffered"},
+                hashlib.sha256(raw).hexdigest(),
+                raw,
+            )
+        )
+
+        with pytest.raises(RuntimeDisconnected, match="late protocol data or invalid EOF"):
+            client.seal_reader_for_terminal_commit(timeout_seconds=3)
+
+        assert client._terminal_stream_phase.value == "aborted"
+        assert client._turn_terminal is False
     finally:
         client.close()
 
@@ -1682,6 +2605,8 @@ def test_send_pending_precedes_write_and_error_response_uses_rejected_sink(
     try:
         with pytest.raises(AppServerError, match="request was not written"):
             client.initialize()
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
         assert len(pending) == 1
         assert client.last_receipt is not None and client.last_receipt.phase is RequestPhase.BEFORE_SEND
     finally:
@@ -1713,54 +2638,1024 @@ def test_send_pending_precedes_write_and_error_response_uses_rejected_sink(
         error_client.close()
 
 
-def test_process_callbacks_bracket_every_child_process_and_fail_closed(
+def test_initialized_notification_is_journaled_before_and_after_the_exact_write(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    order: list[tuple[str, object]] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_send_pending=lambda entry: order.append(("request", entry)),
+        on_client_notification_send_pending=lambda entry: order.append(
+            ("notification_pending", entry)
+        ),
+        on_client_notification_written=lambda entry: order.append(
+            ("notification_written", entry)
+        ),
+    )
+    client.start()
+    try:
+        client.initialize()
+        assert [kind for kind, _entry in order] == [
+            "request",
+            "notification_pending",
+            "notification_written",
+        ]
+        pending = order[1][1]
+        written = order[2][1]
+        assert isinstance(pending, ClientNotificationJournalEntry)
+        assert isinstance(written, ClientNotificationJournalEntry)
+        assert pending.phase is ClientNotificationPhase.SEND_PENDING
+        assert written.phase is ClientNotificationPhase.WRITE_COMPLETED
+        assert pending.method == written.method == "initialized"
+        assert pending.wire_bytes == written.wire_bytes == b'{"method":"initialized"}\n'
+        assert pending.sha256 == written.sha256 == hashlib.sha256(
+            pending.wire_bytes
+        ).hexdigest()
+    finally:
+        client.close()
+
+
+def test_initialized_notification_pre_callback_failure_writes_no_notification_bytes(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    class RecordingStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.flushes = 0
+
+        def write(self, payload: bytes) -> None:
+            self.writes.append(payload)
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    entries: list[ClientNotificationJournalEntry] = []
+    failure = KeyboardInterrupt("pending-callback-secret")
+
+    def reject_pending(entry: ClientNotificationJournalEntry) -> None:
+        entries.append(entry)
+        raise failure
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_client_notification_send_pending=reject_pending,
+    )
+    client.start()
+    actual_process = client._process
+    assert actual_process is not None
+    recording_stdin = RecordingStdin()
+    client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=recording_stdin))
+    try:
+        with pytest.raises(AppServerError, match="notification was not written") as caught:
+            client._send_notification("initialized")
+        assert "pending-callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert len(entries) == 1
+        assert entries[0].phase is ClientNotificationPhase.SEND_PENDING
+        assert recording_stdin.writes == []
+        assert recording_stdin.flushes == 0
+    finally:
+        client._process = actual_process
+        client.close()
+
+
+def test_initialize_post_write_callback_failure_is_one_shot_and_never_resends(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    requests: list[RequestJournalEntry] = []
+    notifications: list[ClientNotificationJournalEntry] = []
+    failure = ValueError("written-callback-secret")
+
+    def reject_written(entry: ClientNotificationJournalEntry) -> None:
+        notifications.append(entry)
+        raise failure
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_send_pending=requests.append,
+        on_client_notification_send_pending=notifications.append,
+        on_client_notification_written=reject_written,
+    )
+    client.start()
+    try:
+        with pytest.raises(AppServerError, match="notification may have been written") as caught:
+            client.initialize()
+        assert "written-callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
+        assert [entry.method for entry in requests] == ["initialize"]
+        assert [entry.phase for entry in notifications] == [
+            ClientNotificationPhase.SEND_PENDING,
+            ClientNotificationPhase.WRITE_COMPLETED,
+        ]
+        assert notifications[0].wire_bytes == notifications[1].wire_bytes
+        assert notifications[0].sha256 == notifications[1].sha256
+    finally:
+        client.close()
+
+
+def test_initialize_write_failure_is_one_shot_and_never_resends(
     fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pending: list[ProcessJournalEntry] = []
+    class FailingStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.flushes = 0
+
+        def write(self, payload: bytes) -> None:
+            self.writes.append(payload)
+            raise OSError("injected notification write failure")
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    request_methods: list[str] = []
+
+    def successful_initialize_request(
+        method: str, params: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        request_methods.append(method)
+        assert params["clientInfo"] == {"name": "aoi-orgware", "version": "0.4"}
+        assert "validate_result" in kwargs
+        return {"model": "gpt-5.6"}
+
+    client = _client(fake_server, tmp_path)
+    failing_stdin = FailingStdin()
+    client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=failing_stdin))
+    monkeypatch.setattr(client, "request", successful_initialize_request)
+
+    with pytest.raises(RuntimeDisconnected, match="notification may have been written") as caught:
+        client.initialize()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    with pytest.raises(AppServerError, match="initialize may be called only once"):
+        client.initialize()
+
+    assert request_methods == ["initialize"]
+    assert failing_stdin.writes == [b'{"method":"initialized"}\n']
+    assert failing_stdin.flushes == 0
+
+
+def test_initialize_short_or_invalid_notification_write_is_ambiguous_and_never_resends(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ShortWritingStdin:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.flushes = 0
+
+        def write(self, payload: bytes) -> object:
+            self.writes.append(payload)
+            return write_result
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    for write_result in (0, 5, 24, None, "write-result-secret"):
+        request_methods: list[str] = []
+
+        def successful_initialize_request(
+            method: str, _params: dict[str, Any], **_kwargs: Any
+        ) -> dict[str, Any]:
+            request_methods.append(method)
+            return {"model": "gpt-5.6"}
+
+        notifications: list[ClientNotificationJournalEntry] = []
+        client = _client(
+            fake_server,
+            tmp_path,
+            on_client_notification_send_pending=notifications.append,
+            on_client_notification_written=notifications.append,
+        )
+        stdin = ShortWritingStdin()
+        client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=stdin))
+        monkeypatch.setattr(client, "request", successful_initialize_request)
+
+        with pytest.raises(RuntimeDisconnected, match="notification may have been written") as caught:
+            client.initialize()
+        assert "write-result-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
+        assert request_methods == ["initialize"]
+        assert stdin.writes == [b'{"method":"initialized"}\n']
+        assert stdin.flushes == 0
+        assert [entry.phase for entry in notifications] == [ClientNotificationPhase.SEND_PENDING]
+
+
+def test_initialize_notification_io_value_error_is_redacted_and_never_resends(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for operation in ("write", "flush"):
+        class ValueErrorStdin:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.flushes = 0
+
+            def write(self, payload: bytes) -> int:
+                self.writes.append(payload)
+                if operation == "write":
+                    raise ValueError("write-io-secret")
+                return len(payload)
+
+            def flush(self) -> None:
+                self.flushes += 1
+                if operation == "flush":
+                    raise ValueError("flush-io-secret")
+
+        request_methods: list[str] = []
+
+        def successful_initialize_request(
+            method: str, _params: dict[str, Any], **_kwargs: Any
+        ) -> dict[str, Any]:
+            request_methods.append(method)
+            return {"model": "gpt-5.6"}
+
+        notifications: list[ClientNotificationJournalEntry] = []
+        client = _client(
+            fake_server,
+            tmp_path,
+            on_client_notification_send_pending=notifications.append,
+            on_client_notification_written=notifications.append,
+        )
+        stdin = ValueErrorStdin()
+        client._process = cast(subprocess.Popen[bytes], SimpleNamespace(stdin=stdin))
+        monkeypatch.setattr(client, "request", successful_initialize_request)
+
+        with pytest.raises(RuntimeDisconnected, match="notification may have been written") as caught:
+            client.initialize()
+        assert "io-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        with pytest.raises(AppServerError, match="initialize may be called only once"):
+            client.initialize()
+        assert request_methods == ["initialize"]
+        assert stdin.writes == [b'{"method":"initialized"}\n']
+        assert stdin.flushes == (0 if operation == "write" else 1)
+        assert [entry.phase for entry in notifications] == [ClientNotificationPhase.SEND_PENDING]
+
+
+def test_initialize_first_attempt_consumption_is_atomic_without_deadlock(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    requests: list[RequestJournalEntry] = []
+    notifications: list[ClientNotificationJournalEntry] = []
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_send_pending=requests.append,
+        on_client_notification_send_pending=notifications.append,
+        on_client_notification_written=notifications.append,
+    )
+    client.start()
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def call_initialize() -> None:
+        barrier.wait(timeout=2)
+        try:
+            client.initialize()
+        except AppServerError as exc:
+            outcome = str(exc)
+        else:
+            outcome = "success"
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    first = threading.Thread(target=call_initialize)
+    second = threading.Thread(target=call_initialize)
+    first.start()
+    second.start()
+    try:
+        barrier.wait(timeout=2)
+        first.join(timeout=3)
+        second.join(timeout=3)
+        assert first.is_alive() is False
+        assert second.is_alive() is False
+        assert sorted(outcomes) == ["initialize may be called only once", "success"]
+        assert [entry.method for entry in requests] == ["initialize"]
+        assert [entry.phase for entry in notifications] == [
+            ClientNotificationPhase.SEND_PENDING,
+            ClientNotificationPhase.WRITE_COMPLETED,
+        ]
+    finally:
+        client.close()
+
+
+def test_version_probe_and_process_callbacks_are_separate_exact_effects(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    order: list[str] = []
+    probes: list[VersionProbeJournalEntry] = []
+    processes: list[ProcessJournalEntry] = []
     version_probe_called = False
 
-    original_run = stdio.subprocess.run
+    def record_probe(entry: VersionProbeJournalEntry) -> None:
+        order.append(entry.phase)
+        probes.append(entry)
 
-    def observed_run(*args: Any, **kwargs: Any) -> Any:
+    def record_process(entry: ProcessJournalEntry) -> None:
+        order.append(entry.phase)
+        processes.append(entry)
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_version_probe_pending=record_probe,
+        on_version_probe_observed=record_probe,
+        on_process_start_pending=record_process,
+        on_process_started=record_process,
+    )
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
         nonlocal version_probe_called
         version_probe_called = True
-        return original_run(*args, **kwargs)
+        return original_capture(*args, **kwargs)
 
-    monkeypatch.setattr(stdio.subprocess, "run", observed_run)
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
+    client.start()
+    try:
+        assert version_probe_called is True
+        assert order == [
+            "version_probe_pending",
+            "version_probe_observed",
+            "process_start_pending",
+            "process_started",
+        ]
+        assert len(probes) == 2
+        pending, observed = probes
+        assert pending.argv == observed.argv == (
+            str(Path(sys.executable).resolve()),
+            "-c",
+            "print('fake-app-server 0.145.0')",
+        )
+        assert json.loads(pending.payload_bytes) == {
+            "argv": list(pending.argv),
+            "phase": "version_probe_pending",
+        }
+        assert pending.stdout_bytes is None
+        assert pending.stderr_bytes is None
+        assert pending.returncode is None
+        assert observed.stdout_bytes is not None
+        assert observed.stdout_bytes.rstrip(b"\r\n") == b"fake-app-server 0.145.0"
+        assert observed.stderr_bytes == b""
+        assert observed.returncode == 0
+        assert json.loads(observed.payload_bytes) == {
+            "argv": list(observed.argv),
+            "phase": "version_probe_observed",
+            "returncode": 0,
+            "stderr_hex": "",
+            "stdout_hex": observed.stdout_bytes.hex(),
+        }
+        assert [entry.phase for entry in processes] == [
+            "process_start_pending",
+            "process_started",
+        ]
+        assert json.loads(processes[0].payload_bytes)["argv"] == list(client.argv)
+        assert processes[0].pid is None
+        assert isinstance(processes[1].pid, int)
+    finally:
+        client.close()
 
-    def reject_before_popen(entry: ProcessJournalEntry) -> None:
-        pending.append(entry)
-        raise RuntimeError("journal unavailable")
 
-    before = _client(
+def test_version_probe_capture_drains_both_pipes_with_exact_aggregate_bound(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    stdout_size = 70_000
+    stderr_size = 70_000
+    script = (
+        "import sys\n"
+        f"sys.stdout.buffer.write(b'a' * {stdout_size})\n"
+        "sys.stdout.buffer.flush()\n"
+        f"sys.stderr.buffer.write(b'b' * {stderr_size})\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    client = _client(
         fake_server,
         tmp_path,
-        on_process_start_pending=reject_before_popen,
+        max_line_bytes=300_000,
+        _test_version_args=("-u", "-c", script),
     )
-    with pytest.raises(AppServerError, match="process was not started"):
-        before.start()
-    assert len(pending) == 1
-    assert pending[0].phase == "process_start_pending"
-    assert pending[0].pid is None
-    assert version_probe_called is False
 
-    started: list[ProcessJournalEntry] = []
+    stdout_bytes, stderr_bytes, returncode = (
+        client._capture_version_probe_output()
+    )
 
-    def reject_after_popen(entry: ProcessJournalEntry) -> None:
-        started.append(entry)
-        raise RuntimeError("journal unavailable")
+    assert stdout_bytes == b"a" * stdout_size
+    assert stderr_bytes == b"b" * stderr_size
+    assert returncode == 0
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
 
-    after = _client(
+
+@pytest.mark.parametrize("distribution", ["stdout", "stderr", "split"])
+@pytest.mark.parametrize("over_budget", [False, True])
+def test_version_probe_capture_uses_one_combined_raw_byte_budget(
+    fake_server: Path,
+    tmp_path: Path,
+    distribution: str,
+    over_budget: bool,
+) -> None:
+    script = (
+        "import os,sys\n"
+        "stdout_size=int(os.environ['SAFE_STDOUT_SIZE'])\n"
+        "stderr_size=int(os.environ['SAFE_STDERR_SIZE'])\n"
+        "sys.stdout.buffer.write(b'v' + b'a' * (stdout_size - 1))\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stderr.buffer.write(b'b' * stderr_size)\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    planner = _client(
         fake_server,
         tmp_path,
-        on_process_started=reject_after_popen,
+        max_line_bytes=1024,
+        environment={"SAFE_STDOUT_SIZE": "1", "SAFE_STDERR_SIZE": "0"},
+        _test_version_args=("-u", "-c", script),
     )
-    with pytest.raises(AppServerError, match="process was terminated"):
-        after.start()
-    assert len(started) == 1
-    assert started[0].phase == "process_started"
-    assert isinstance(started[0].pid, int)
-    after.close()
+    raw_budget = planner._version_probe_raw_capture_budget()
+    planner.close()
+    total_size = raw_budget + int(over_budget)
+    if distribution == "stdout":
+        stdout_size, stderr_size = total_size, 0
+    elif distribution == "stderr":
+        stdout_size, stderr_size = 1, total_size - 1
+    else:
+        stdout_size = 1 + ((total_size - 1) // 2)
+        stderr_size = total_size - stdout_size
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        environment={
+            "SAFE_STDOUT_SIZE": str(stdout_size),
+            "SAFE_STDERR_SIZE": str(stderr_size),
+        },
+        _test_version_args=("-u", "-c", script),
+    )
+    assert client._version_probe_raw_capture_budget() == raw_budget
+    if not over_budget:
+        stdout_bytes, stderr_bytes, returncode = (
+            client._capture_version_probe_output()
+        )
+        assert (len(stdout_bytes), len(stderr_bytes), returncode) == (
+            stdout_size,
+            stderr_size,
+            0,
+        )
+    else:
+        with pytest.raises(AppServerError, match="bounded version probe"):
+            client._capture_version_probe_output()
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_overflow_after_pending_ack_is_not_retried(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    script = (
+        "import sys\n"
+        "sys.stdout.write('fake-app-server 0.145.0\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.buffer.write(b'x' * 8192)\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        _test_version_args=("-u", "-c", script),
+    )
+
+    with pytest.raises(AppServerError, match="could not execute"):
+        client.start()
+
+    assert client._version_probe_effect_phase.value == "effect_pending"
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+
+
+@pytest.mark.parametrize("distribution", ["stdout", "stderr", "split"])
+def test_version_probe_capture_budget_closes_controller_observed_journal(
+    fake_server: Path,
+    tmp_path: Path,
+    distribution: str,
+) -> None:
+    script = (
+        "import os,sys\n"
+        "stdout_size=int(os.environ['SAFE_STDOUT_SIZE'])\n"
+        "stderr_size=int(os.environ['SAFE_STDERR_SIZE'])\n"
+        "sys.stdout.buffer.write(b'v' + b'a' * (stdout_size - 1))\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stderr.buffer.write(b'b' * stderr_size)\n"
+        "sys.stderr.buffer.flush()\n"
+    )
+    planner = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        environment={"SAFE_STDOUT_SIZE": "1", "SAFE_STDERR_SIZE": "0"},
+        _test_version_args=("-u", "-c", script),
+    )
+    raw_budget = planner._version_probe_raw_capture_budget()
+    planner.close()
+
+    for over_budget in (False, True):
+        total_size = raw_budget + int(over_budget)
+        if distribution == "stdout":
+            stdout_size, stderr_size = total_size, 0
+        elif distribution == "stderr":
+            stdout_size, stderr_size = 1, total_size - 1
+        else:
+            stdout_size = 1 + ((total_size - 1) // 2)
+            stderr_size = total_size - stdout_size
+        expected_version = "v" + ("a" * (stdout_size - 1))
+        controller, durable = _version_probe_controller(tmp_path)
+        client = _client(
+            fake_server,
+            tmp_path,
+            max_line_bytes=1024,
+            environment={
+                "SAFE_STDOUT_SIZE": str(stdout_size),
+                "SAFE_STDERR_SIZE": str(stderr_size),
+            },
+            runtime_pin=_fake_runtime_pin(app_server_version=expected_version),
+            _test_version_args=("-u", "-c", script),
+            on_version_probe_pending=controller._on_version_probe_pending,
+            on_version_probe_observed=controller._on_version_probe_observed,
+        )
+        try:
+            if over_budget:
+                with pytest.raises(AppServerError, match="bounded version probe"):
+                    client._verify_runtime_version()
+                assert client._version_probe_effect_phase.value == "effect_pending"
+                assert [row["event_type"] for row in durable] == [
+                    "reserved",
+                    "version_probe_pending",
+                ]
+            else:
+                client._verify_runtime_version()
+                assert client._version_probe_effect_phase.value == "observed"
+                assert [row["event_type"] for row in durable] == [
+                    "reserved",
+                    "version_probe_pending",
+                    "version_probe_observed",
+                ]
+                observed_size = int(durable[-1]["payload_size_bytes"])
+                assert observed_size <= client.max_line_bytes
+        finally:
+            client.close()
+
+
+def test_version_probe_capture_budget_reserves_worst_case_returncode_and_argv(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        _test_version_args=("--version", "--long-argument"),
+    )
+    raw_budget = client._version_probe_raw_capture_budget()
+    for returncode in (-2_147_483_648, 4_294_967_295):
+        accepted = client._version_probe_journal_entry(
+            "version_probe_observed",
+            stdout_bytes=b"a" * raw_budget,
+            stderr_bytes=b"",
+            returncode=returncode,
+        )
+        assert len(accepted.payload_bytes) <= client.max_line_bytes
+    with pytest.raises(AppServerError, match="journal entry exceeds"):
+        client._version_probe_journal_entry(
+            "version_probe_observed",
+            stdout_bytes=b"a" * (raw_budget + 1),
+            stderr_bytes=b"",
+            returncode=-2_147_483_648,
+        )
+
+
+def test_version_probe_pending_callback_cannot_mutate_frozen_effect_plan(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    controller, durable = _version_probe_controller(tmp_path)
+    pending_entries: list[VersionProbeJournalEntry] = []
+    observed_entries: list[VersionProbeJournalEntry] = []
+    client: CodexAppServerStdio
+
+    def persist_then_mutate(entry: VersionProbeJournalEntry) -> None:
+        controller._on_version_probe_pending(entry)
+        pending_entries.append(entry)
+        client.max_line_bytes = 128
+        client._version_args = ("-c", "raise SystemExit(37)")
+
+    def persist_observed(entry: VersionProbeJournalEntry) -> None:
+        controller._on_version_probe_observed(entry)
+        observed_entries.append(entry)
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        on_version_probe_pending=persist_then_mutate,
+        on_version_probe_observed=persist_observed,
+    )
+
+    client._verify_runtime_version()
+
+    assert [row["event_type"] for row in durable] == [
+        "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
+    ]
+    assert len(pending_entries) == len(observed_entries) == 1
+    assert pending_entries[0].argv == observed_entries[0].argv
+    assert pending_entries[0].argv != (
+        str(client.executable),
+        *client._version_args,
+    )
+    assert len(observed_entries[0].payload_bytes) > client.max_line_bytes
+    assert len(observed_entries[0].payload_bytes) <= 1024
+    assert client._version_probe_effect_phase.value == "observed"
+
+
+def test_version_probe_observed_journal_reuses_plan_after_capture_mutation(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    controller, durable = _version_probe_controller(tmp_path)
+    entries: list[VersionProbeJournalEntry] = []
+
+    def persist(entry: VersionProbeJournalEntry) -> None:
+        entries.append(entry)
+        if entry.phase == "version_probe_pending":
+            controller._on_version_probe_pending(entry)
+        else:
+            controller._on_version_probe_observed(entry)
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        max_line_bytes=1024,
+        on_version_probe_pending=persist,
+        on_version_probe_observed=persist,
+    )
+    original_capture = client._capture_version_probe_output
+
+    def capture_then_mutate(
+        *args: Any, **kwargs: Any
+    ) -> tuple[bytes, bytes, int]:
+        result = original_capture(*args, **kwargs)
+        client.max_line_bytes = 128
+        client._version_args = ("-c", "raise SystemExit(38)")
+        return result
+
+    client._capture_version_probe_output = capture_then_mutate  # type: ignore[method-assign]
+
+    client._verify_runtime_version()
+
+    assert [entry.phase for entry in entries] == [
+        "version_probe_pending",
+        "version_probe_observed",
+    ]
+    assert entries[0].argv == entries[1].argv
+    assert len(entries[1].payload_bytes) > client.max_line_bytes
+    assert [row["event_type"] for row in durable] == [
+        "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
+    ]
+    assert client._version_probe_effect_phase.value == "observed"
+
+
+def test_version_probe_timeout_kills_and_reaps_owned_direct_child(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stdio, "_VERSION_PROBE_TIMEOUT_SECONDS", 0.2)
+    script = "import time; time.sleep(30)\n"
+    client = _client(
+        fake_server,
+        tmp_path,
+        _test_version_args=("-u", "-c", script),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(AppServerError, match="could not execute"):
+        client.start()
+
+    assert time.monotonic() - started < 3
+    assert client._version_probe_effect_phase.value == "effect_pending"
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+
+
+def test_version_probe_second_reader_start_failure_cleans_first_reader_and_child(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(
+        fake_server,
+        tmp_path,
+        _test_version_args=("-u", "-c", "import time; time.sleep(30)\n"),
+    )
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_second_start(thread: threading.Thread) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            raise RuntimeError("synthetic second reader start failure")
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    with pytest.raises(AppServerError, match="bounded version probe"):
+        client._capture_version_probe_output()
+
+    assert starts == 2
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_baseexception_during_poll_still_cleans_owned_child(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    child: subprocess.Popen[bytes] | None = None
+
+    class InterruptingPoll:
+        def __init__(self, process: subprocess.Popen[bytes]) -> None:
+            self._process = process
+            self.stdout = process.stdout
+            self.stderr = process.stderr
+
+        def poll(self) -> int | None:
+            raise KeyboardInterrupt("synthetic poll interrupt")
+
+        def kill(self) -> None:
+            self._process.kill()
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self._process.wait(timeout=timeout)
+
+    def interrupting_popen(*args: Any, **kwargs: Any) -> InterruptingPoll:
+        nonlocal child
+        child = real_popen(*args, **kwargs)
+        return InterruptingPoll(child)
+
+    monkeypatch.setattr(stdio.subprocess, "Popen", interrupting_popen)
+    client = _client(
+        fake_server,
+        tmp_path,
+        _test_version_args=("-u", "-c", "import time; time.sleep(30)\n"),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic poll interrupt"):
+        client._capture_version_probe_output()
+
+    assert child is not None
+    assert child.poll() is not None
+    assert client._version_probe_process is None
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_unconfirmed_cleanup_retains_separate_process_handle(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnconfirmableProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+
+        def poll(self) -> int | None:
+            raise OSError("synthetic poll failure")
+
+        def kill(self) -> None:
+            raise OSError("synthetic kill failure")
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise OSError("synthetic wait failure")
+
+    process = UnconfirmableProcess()
+    monkeypatch.setattr(stdio.subprocess, "Popen", lambda *args, **kwargs: process)
+    client = _client(fake_server, tmp_path)
+
+    with pytest.raises(AppServerError, match="cleanup is unconfirmed"):
+        client._capture_version_probe_output()
+
+    assert client._version_probe_process is process
+    assert client._version_probe_threads == ()
+
+
+def test_version_probe_pending_callback_prevents_the_probe_without_consuming_start(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    called = False
+    entries: list[VersionProbeJournalEntry] = []
+
+    def reject_pending(entry: VersionProbeJournalEntry) -> None:
+        entries.append(entry)
+        raise KeyboardInterrupt("pending-callback-secret")
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_version_probe_pending=reject_pending,
+    )
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal called
+        called = True
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
+    with pytest.raises(AppServerError, match="probe was not executed") as caught:
+        client.start()
+    assert "pending-callback-secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert called is False
+    assert client._process is None
+    assert [entry.phase for entry in entries] == ["version_probe_pending"]
+    client.on_version_probe_pending = None
+    client.start()
+    client.close()
+
+
+def test_version_probe_observed_callback_preserves_unknown_effect_without_retry(
+    fake_server: Path, tmp_path: Path
+) -> None:
+    calls = 0
+    entries: list[VersionProbeJournalEntry] = []
+
+    def reject_observed(entry: VersionProbeJournalEntry) -> None:
+        entries.append(entry)
+        raise SystemExit("observed-callback-secret")
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_version_probe_observed=reject_observed,
+    )
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal calls
+        calls += 1
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
+    with pytest.raises(AppServerError, match="effect is unknown") as caught:
+        client.start()
+    assert "observed-callback-secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert calls == 1
+    assert client._process is None
+    assert [entry.phase for entry in entries] == ["version_probe_observed"]
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        OSError("injected version probe launch failure"),
+        subprocess.TimeoutExpired(["codex", "--version"], timeout=10),
+    ],
+)
+def test_version_probe_run_failure_is_non_retryable_after_pending_ack(
+    fake_server: Path,
+    tmp_path: Path,
+    raised: BaseException,
+) -> None:
+    calls = 0
+
+    def fail_capture(*_args: Any, **_kwargs: Any) -> NoReturn:
+        nonlocal calls
+        calls += 1
+        raise raised
+
+    client = _client(fake_server, tmp_path)
+    client._capture_version_probe_output = fail_capture  # type: ignore[method-assign]
+    with pytest.raises(AppServerError, match="could not execute"):
+        client.start()
+    assert calls == 1
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+    assert calls == 1
+
+
+@pytest.mark.parametrize("later_failure", ["process_pending", "popen"])
+def test_observed_version_probe_is_not_resent_after_later_start_failure(
+    fake_server: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    later_failure: str,
+) -> None:
+    calls = 0
+    kwargs: dict[str, Any] = {}
+    if later_failure == "process_pending":
+        def reject_process_pending(_entry: ProcessJournalEntry) -> None:
+            raise RuntimeError("process pending journal unavailable")
+
+        kwargs["on_process_start_pending"] = reject_process_pending
+    else:
+        def reject_popen(*_args: Any, **_kwargs: Any) -> NoReturn:
+            raise OSError("injected Popen failure")
+
+        def install_popen_failure(_entry: VersionProbeJournalEntry) -> None:
+            monkeypatch.setattr(stdio.subprocess, "Popen", reject_popen)
+
+        kwargs["on_version_probe_observed"] = install_popen_failure
+    client = _client(fake_server, tmp_path, **kwargs)
+    original_capture = client._capture_version_probe_output
+
+    def observed_capture(*args: Any, **kwargs: Any) -> tuple[bytes, bytes, int]:
+        nonlocal calls
+        calls += 1
+        return original_capture(*args, **kwargs)
+
+    client._capture_version_probe_output = observed_capture  # type: ignore[method-assign]
+    with pytest.raises(AppServerError, match="process was not started|could not start"):
+        client.start()
+    assert calls == 1
+    assert client._process is None
+    with pytest.raises(AppServerError, match="retry is forbidden"):
+        client.start()
+    assert calls == 1
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_process_started_baseexception_runs_cleanup_without_claiming_clean_exit(
+    fake_server: Path, tmp_path: Path, failure_type: type[BaseException]
+) -> None:
+    def interrupt_after_popen(_entry: ProcessJournalEntry) -> None:
+        raise failure_type("process-callback-secret")
+
+    client = _client(
+        fake_server,
+        tmp_path,
+        on_process_started=interrupt_after_popen,
+    )
+    with pytest.raises(AppServerError, match="process exited during cleanup") as caught:
+        client.start()
+    assert "process-callback-secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert client._process is None
+
+
+def test_process_started_callback_preserves_unconfirmed_exit_when_cleanup_cannot_prove_it(
+    fake_server: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process: subprocess.Popen[bytes] | None = None
+
+    def refuse_cleanup(_entry: ProcessJournalEntry) -> None:
+        nonlocal process
+        process = client._process
+        assert process is not None
+
+        def fail_cleanup(*_args: Any, **_kwargs: Any) -> NoReturn:
+            raise OSError("injected cleanup failure")
+
+        monkeypatch.setattr(process, "poll", fail_cleanup)
+        monkeypatch.setattr(process, "terminate", fail_cleanup)
+        monkeypatch.setattr(process, "kill", fail_cleanup)
+        monkeypatch.setattr(process, "wait", fail_cleanup)
+        raise KeyboardInterrupt("process-callback-secret")
+
+    client = _client(fake_server, tmp_path, on_process_started=refuse_cleanup)
+    try:
+        with pytest.raises(AppServerError, match="exit is unconfirmed") as caught:
+            client.start()
+        assert "process-callback-secret" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert process is not None
+        assert client._process is process
+    finally:
+        monkeypatch.undo()
+        client.close()
 
 
 def test_runtime_pin_version_and_intent_validation_fail_closed(fake_server: Path, tmp_path: Path) -> None:
@@ -1784,6 +3679,8 @@ def test_runtime_pin_version_and_intent_validation_fail_closed(fake_server: Path
         runtime_pin=_fake_runtime_pin(app_server_version="different"),
     )
     with pytest.raises(AppServerError, match="--version"):
+        bad_version.start()
+    with pytest.raises(AppServerError, match="retry is forbidden"):
         bad_version.start()
     tampered = contracts.seal_launch_intent(_intent_payload(tmp_path))
     tampered["prompt_size_bytes"] = 1

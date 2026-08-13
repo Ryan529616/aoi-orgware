@@ -40,6 +40,7 @@ from .harnesslib import (
     sha256_file,
     task_dir,
 )
+from .packet_integrity import normalize_exact_command_bytes
 from .state_lookup import execution_selection_by_id
 
 
@@ -127,8 +128,17 @@ def validate_source_receipt(
     tool = payload.get("tool")
     if not isinstance(tool, dict):
         raise HarnessError("source receipt requires a tool object")
-    expected_tool = {"path": tool_path, "version": tool_version, "command": command}
-    if {key: tool.get(key) for key in expected_tool} != expected_tool:
+    receipt_command = tool.get("command")
+    if not isinstance(receipt_command, str) or not isinstance(command, str):
+        raise HarnessError("source receipt tool command must be text")
+    command_matches = normalize_exact_command_bytes(
+        receipt_command.encode("utf-8")
+    ) == normalize_exact_command_bytes(command.encode("utf-8"))
+    if (
+        tool.get("path") != tool_path
+        or tool.get("version") != tool_version
+        or not command_matches
+    ):
         raise HarnessError("source receipt tool path/version/command differ from job arguments")
     components = payload.get("components")
     if not isinstance(components, dict):

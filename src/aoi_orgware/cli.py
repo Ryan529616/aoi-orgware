@@ -34,6 +34,7 @@ from . import codex_install_provenance as codex_install_provenance_impl
 from . import confidentiality as confidentiality_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
+from .delivery_lineage import remote_tip_error
 from . import evidence_artifacts as evidence_artifacts_impl
 from .agent_identity import AgentIdentityError, AGENT_ID_RE, validate_agent_id
 from . import execution_topology as execution_topology_impl
@@ -118,6 +119,16 @@ from .commands.context_memory import (
     cmd_context_receipt_record,
     register_context_memory_commands,
 )
+from .commands.company_init import cmd_company_init, register_company_commands
+from .commands.legacy_bridge_runtime import cmd_legacy_bridge_ingest_v04, register_legacy_bridge_runtime_commands
+from .commands.company_runtime import (
+    CompanyRuntimeCommandError,
+    cmd_dashboard_open,
+    cmd_dashboard_url,
+    cmd_supervisor_ensure,
+    cmd_supervisor_status,
+    cmd_supervisor_stop,
+)
 from .commands.coordination import (
     CoordinationCmdServices,
     cmd_baseline_freeze,
@@ -187,6 +198,8 @@ from .commands.offboard import cmd_offboard, register_offboard_commands
 from .commands.resource import (
     ResourceCmdServices,
     cmd_codex_config_apply,
+    cmd_codex_config_migrate_legacy,
+    cmd_codex_config_migrate_legacy_plan,
     cmd_codex_config_plan,
     cmd_codex_config_rollback,
     cmd_codex_session_register,
@@ -215,18 +228,8 @@ from .commands.status import (
     register_status_commands,
     resolve_resume_task,
 )
-from .commands.semantic import (
-    cmd_cohort_round_prepare,
-    cmd_cohort_round_preview,
-    cmd_cohort_show,
-    cmd_packet_arm_prepare,
-    cmd_permit_consume,
-    cmd_permit_issue,
-    cmd_semantic_head,
-    cmd_semantic_migrate,
-    cmd_semantic_migration_rollback,
-    register_semantic_commands,
-)
+from .commands import semantic as semcmd
+from .commands.semantic_workflow import register_ic_phase1
 from .commands.temporary_recovery import (
     TemporaryRecoveryServices,
     cmd_recover_temporaries,
@@ -521,13 +524,7 @@ VERIFICATION_CATEGORIES = {
 def _require_codex_transport_packet_terminal_status(
     launch_state: str, packet_status: str
 ) -> None:
-    """Keep runtime terminal meaning distinct from the packet lifecycle.
-
-    Unknown launch/runtime outcomes require explicit reconciliation and cannot
-    be collapsed into any terminal packet verdict.  Known outcomes have one
-    exact packet-status mapping; a technical result such as rejection belongs
-    in ``typed_outcome`` rather than by contradicting the runtime state.
-    """
+    """Keep runtime terminal truth distinct from packet lifecycle verdicts."""
 
     if launch_state in _CODEX_TRANSPORT_UNRESOLVED_TERMINAL_STATES:
         raise HarnessError(
@@ -716,6 +713,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "check-locks",
     "codebase-memory-benchmark-validate",
     "codex-config-plan",
+    "codex-config-migrate-legacy-plan",
     "codex-startup-receipt-show",
     "confidentiality-git-push-preflight",
     "confidentiality-policy-snapshot",
@@ -725,6 +723,8 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "cohort-show",
     "inspect-legacy",
     "integrity-show",
+    "ic-rag-query",
+    "legacy-bridge",
     "release-manifest-observe",
     "release-show",
     "release-tag-push-preflight",
@@ -732,13 +732,11 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "reconcile",
     "resume",
     "semantic-head",
+    "semantic-workflow-show",
     "status",
     "verify-backup",
     "doctor",
 }
-# Permit consumption is an explicit no-Chief project mutation.  It is not
-# read-only: the command may publish one already Chief-issued exact semantic
-# transition, and its handler therefore owns the normal project state lock.
 CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS = {
     "external-export-permit-consume",
     "permit-consume",
@@ -751,8 +749,14 @@ CHIEF_STANDALONE_WRITER_COMMANDS = {
     "pilot-init",
     "pilot-summary",
 }
+CHIEF_STANDALONE_RUNTIME_COMMANDS = {
+    "dashboard",
+    "supervisor",
+}
 CHIEF_STANDALONE_COMMANDS = (
-    CHIEF_STANDALONE_READ_ONLY_COMMANDS | CHIEF_STANDALONE_WRITER_COMMANDS
+    CHIEF_STANDALONE_READ_ONLY_COMMANDS
+    | CHIEF_STANDALONE_WRITER_COMMANDS
+    | CHIEF_STANDALONE_RUNTIME_COMMANDS
 )
 KNOWN_MANAGED_POLICY_SHA256 = {
     # AOI v0.1.3 packaged policy; safe one-way replacement during authenticated init.
@@ -763,7 +767,7 @@ KNOWN_MANAGED_POLICY_SHA256 = {
 
 
 class AOIArgumentParser(argparse.ArgumentParser):
-    """Disable ambiguous long-option abbreviation on every parser level."""
+    """Disable long-option abbreviation."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("allow_abbrev", False)
@@ -771,7 +775,7 @@ class AOIArgumentParser(argparse.ArgumentParser):
 
 
 def command_requires_chief(command: str, *, initialized: bool) -> bool:
-    """Default-fence every project command not explicitly proven exempt."""
+    """Fence project commands unless exempt."""
 
     if command in {"init", "claude-init", "codex-init"}:
         return initialized
@@ -780,6 +784,7 @@ def command_requires_chief(command: str, *, initialized: bool) -> bool:
         | CHIEF_PROJECT_READ_ONLY_COMMANDS
         | CHIEF_PROJECT_PERMIT_CONSUMER_COMMANDS
         | CHIEF_STANDALONE_READ_ONLY_COMMANDS
+        | CHIEF_STANDALONE_RUNTIME_COMMANDS
     )
 
 
@@ -850,6 +855,11 @@ def read_regular_artifact(
     return evidence_artifacts_impl.read_regular_artifact(
         value, label, max_bytes=max_bytes, require_utf8=require_utf8
     )
+
+
+def _registered_terminal_log_paths(value: Any) -> tuple[str, Path]:
+    origin_path = str(value)
+    return origin_path, Path(origin_path)
 
 
 def snapshot_evidence_artifact(
@@ -1178,10 +1188,16 @@ def override_integrity_errors(state: dict[str, Any]) -> list[str]:
 
 
 def resource_config_integrity_errors(
-    paths: HarnessPaths, state: dict[str, Any]
+    paths: HarnessPaths,
+    state: dict[str, Any],
+    *,
+    allow_unmigrated_legacy_event_id: str = "",
 ) -> list[str]:
     return resource_governance_impl.resource_config_integrity_errors(
-        paths, state, policy=_resource_governance_policy()
+        paths,
+        state,
+        policy=_resource_governance_policy(),
+        allow_unmigrated_legacy_event_id=allow_unmigrated_legacy_event_id,
     )
 
 
@@ -1660,14 +1676,12 @@ def delivery_integrity_errors(
             errors.append(str(exc))
         else:
             expected_tip = current["head_sha"] if terminal else commit
-            if actual_tip != expected_tip and not (
-                terminal and allow_terminal_remote_advance
+            if error := remote_tip_error(
+                state_worktree(paths, state), expected_tip, actual_tip, remote,
+                remote_ref, "terminal task worktree HEAD" if terminal else
+                "delivery commit", terminal and allow_terminal_remote_advance,
             ):
-                errors.append(
-                    f"remote {remote} {remote_ref} points to {actual_tip}, "
-                    f"not the {'terminal task worktree HEAD' if terminal else 'delivery commit'} "
-                    f"{expected_tip}"
-                )
+                errors.append(error)
     return errors
 
 
@@ -2120,6 +2134,7 @@ def _enable_codex_hook_policy(
 
 _CODEX_PROVENANCE_HISTORY_DIRECTORY = "codex-install-provenance-history-v1"
 _CODEX_PROVENANCE_HISTORY_MAX = 16
+_CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES = 64 * 1024
 
 
 def _codex_provenance_bytes(receipt: dict[str, Any]) -> bytes:
@@ -2129,6 +2144,90 @@ def _codex_provenance_bytes(receipt: dict[str, Any]) -> bytes:
         )
     )
     return canonical_json_bytes(validated, max_bytes=64 * 1024)
+
+
+def _read_codex_provenance_history_entry(path: Path) -> bytes:
+    """Read one immutable private receipt archive without following links."""
+
+    label = f"Codex install provenance history archive {path.name}"
+    try:
+        if canonicalize_no_link_traversal(path, label) != path:
+            raise HarnessError(f"{label} is not canonical")
+        before = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect {label}: {exc}") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or path.is_symlink()
+        or int(before.st_nlink) != 1
+    ):
+        raise HarnessError(f"{label} must be a private regular non-linked file")
+    if before.st_size > _CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES:
+        raise HarnessError(f"{label} exceeds the bounded receipt size")
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            raw = stream.read(_CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES + 1)
+            finished = os.fstat(stream.fileno())
+        after = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"cannot read {label}: {exc}") from exc
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_nlink",
+    )
+    if (
+        any(
+            getattr(before, field) != getattr(opened, field)
+            or getattr(opened, field) != getattr(finished, field)
+            or getattr(finished, field) != getattr(after, field)
+            for field in identity_fields
+        )
+        or not stat.S_ISREG(opened.st_mode)
+        or int(opened.st_nlink) != 1
+        or len(raw) != before.st_size
+        or len(raw) > _CODEX_PROVENANCE_HISTORY_ENTRY_MAX_BYTES
+    ):
+        raise HarnessError(f"{label} changed while being read")
+    if canonicalize_no_link_traversal(path, label) != path:
+        raise HarnessError(f"{label} changed path identity while being read")
+    return raw
+
+
+def _codex_provenance_history_inventory(history: Path) -> dict[str, bytes]:
+    """Validate the bounded history directory and return exact archive bytes."""
+
+    if canonicalize_no_link_traversal(
+        history, "Codex install provenance history"
+    ) != history:
+        raise HarnessError("Codex install provenance history is not canonical")
+    metadata = history.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or history.is_symlink():
+        raise HarnessError(
+            "Codex install provenance history must be a non-linked directory"
+        )
+    entries: list[Path] = []
+    for item in history.iterdir():
+        if len(entries) >= _CODEX_PROVENANCE_HISTORY_MAX:
+            raise HarnessError(
+                "Codex install provenance history exceeds its bounded entry cap"
+            )
+        entries.append(item)
+    entries.sort(key=lambda item: item.name)
+    if any(
+        not re.fullmatch(r"[0-9a-f]{64}\.json", item.name)
+        for item in entries
+    ):
+        raise HarnessError(
+            "Codex install provenance history has an unexpected entry"
+        )
+    return {
+        item.name: _read_codex_provenance_history_entry(item)
+        for item in entries
+    }
 
 
 def _codex_provenance_preflight(
@@ -2164,32 +2263,14 @@ def _codex_provenance_preflight(
 
     history = paths.harness / _CODEX_PROVENANCE_HISTORY_DIRECTORY
     if history.exists() or history.is_symlink():
-        if canonicalize_no_link_traversal(
-            history, "Codex install provenance history"
-        ) != history:
-            raise HarnessError("Codex install provenance history is not canonical")
-        metadata = history.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or history.is_symlink():
-            raise HarnessError(
-                "Codex install provenance history must be a non-linked directory"
-            )
-        entries = sorted(history.iterdir(), key=lambda item: item.name)
-        if any(
-            not re.fullmatch(r"[0-9a-f]{64}\.json", item.name)
-            for item in entries
-        ):
-            raise HarnessError(
-                "Codex install provenance history has an unexpected entry"
-            )
-        old_archive = history / (
-            f"{existing['provenance_receipt_sha256']}.json"
-        )
-        if old_archive.exists():
-            if old_archive.read_bytes() != existing_bytes:
+        inventory = _codex_provenance_history_inventory(history)
+        old_archive_name = f"{existing['provenance_receipt_sha256']}.json"
+        if old_archive_name in inventory:
+            if inventory[old_archive_name] != existing_bytes:
                 raise HarnessError(
                     "Codex install provenance history conflicts with current receipt"
                 )
-        elif len(entries) >= _CODEX_PROVENANCE_HISTORY_MAX:
+        elif len(inventory) >= _CODEX_PROVENANCE_HISTORY_MAX:
             raise HarnessError(
                 "Codex install provenance history reached its bounded entry cap"
             )
@@ -2225,24 +2306,27 @@ def _install_codex_provenance_receipt(
         )
         existing_bytes = _codex_provenance_bytes(existing)
         history = paths.harness / _CODEX_PROVENANCE_HISTORY_DIRECTORY
-        if not history.exists():
+        if not history.exists() and not history.is_symlink():
             history.mkdir(mode=0o700)
             if os.name != "nt":
                 history.chmod(0o700)
-        if canonicalize_no_link_traversal(
-            history, "Codex install provenance history"
-        ) != history or not stat.S_ISDIR(history.lstat().st_mode):
-            raise HarnessError(
-                "Codex install provenance history is not a safe directory"
-            )
+        inventory = _codex_provenance_history_inventory(history)
         history_path = history / f"{existing['provenance_receipt_sha256']}.json"
-        if history_path.exists():
-            if history_path.read_bytes() != existing_bytes:
+        if history_path.name in inventory:
+            if inventory[history_path.name] != existing_bytes:
                 raise HarnessError(
                     "Codex install provenance history archive is divergent"
                 )
         else:
+            if len(inventory) >= _CODEX_PROVENANCE_HISTORY_MAX:
+                raise HarnessError(
+                    "Codex install provenance history reached its bounded entry cap"
+                )
             atomic_create_bytes(history_path, existing_bytes)
+            if _read_codex_provenance_history_entry(history_path) != existing_bytes:
+                raise HarnessError(
+                    "Codex install provenance history archive did not persist exactly"
+                )
         atomic_write_bytes(receipt_path, candidate_bytes)
     else:
         atomic_create_bytes(receipt_path, candidate_bytes)
@@ -2256,6 +2340,46 @@ def _install_codex_provenance_receipt(
         "provenance_receipt_sha256": candidate["provenance_receipt_sha256"],
         "history_path": str(history_path) if history_path is not None else None,
     }
+
+
+def _codex_hook_commands_for_receipt(
+    receipt: Mapping[str, Any],
+    project_root: str | os.PathLike[str],
+) -> tuple[str, str]:
+    """Render the exact hook pair for one persisted receipt generation.
+
+    Schema-v3 makes the recorded Python/module runtime the active bootstrap.
+    Raw schema-v1/v2 receipts retain their pip launcher grammar only so an
+    interrupted upgrade can recognize and replace the historical pair.
+    """
+
+    validated = (
+        codex_install_provenance_impl.validate_codex_install_provenance_receipt(
+            receipt
+        )
+    )
+    digest = cast(str, validated["provenance_receipt_sha256"])
+    if validated.get("schema_version") == (
+        codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+    ):
+        if validated.get("install_provenance_schema_version") != 2:
+            raise HarnessError(
+                "current schema-v3 Codex hook command requires "
+                "local-v2 exact-wheel proof"
+            )
+        runtime = cast(Mapping[str, Any], validated["codex_hook_runtime"])
+        return codex_onboarding_impl.build_codex_python_hook_commands(
+            cast(str, runtime["python_invocation"]),
+            project_root,
+            digest,
+        )
+    hook = cast(Mapping[str, Any], validated["codex_hook_entry_point"])
+    return codex_onboarding_impl.build_codex_hook_commands(
+        cast(str, hook["path"]),
+        project_root,
+        digest,
+    )
+
 
 def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
     """Initialize AOI, wire project hooks, and install the user AOI skill."""
@@ -2302,6 +2426,11 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "Codex install provenance preflight failed before mutation: supply "
             "exactly one complete proof pair: promoted release or reviewed local install"
         )
+    user_skills_root = (
+        Path(args.user_skills_root).expanduser()
+        if args.user_skills_root
+        else Path.home() / ".agents" / "skills"
+    )
     try:
         if public_complete:
             if (
@@ -2309,7 +2438,7 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or expected_promotion_bundle_sha256 is None
             ):
                 raise AssertionError("complete public proof pair was not present")
-            provenance_receipt = (
+            install_provenance_receipt = (
                 codex_install_provenance_impl.validate_codex_install_provenance(
                     promotion_bundle_file,
                     expected_promotion_bundle_sha256,
@@ -2322,19 +2451,32 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 or expected_local_artifact_bundle_sha256 is None
             ):
                 raise AssertionError("complete local proof pair was not present")
-            provenance_receipt = (
+            install_provenance_receipt = (
                 codex_install_provenance_impl.validate_codex_local_install_provenance(
                     local_artifact_bundle_file,
                     expected_local_artifact_bundle_sha256,
                     Path(sys.argv[0]).resolve(),
                 )
             )
-        hook_command, hook_command_windows = (
-            codex_onboarding_impl.build_codex_hook_commands(
-                provenance_receipt["codex_hook_entry_point"]["path"],
-                paths.root,
-                provenance_receipt["provenance_receipt_sha256"],
+        codex_skill_text = (
+            codex_install_provenance_impl.read_recorded_codex_client_skill(
+                install_provenance_receipt
             )
+        )
+        skill_preflight = codex_onboarding_impl.preflight_codex_user_skill(
+            user_skills_root,
+            codex_skill_text,
+            replace_sha256=args.replace_user_skill_sha256,
+        )
+        provenance_receipt = (
+            codex_install_provenance_impl.bind_codex_client_skill(
+                install_provenance_receipt,
+                skill_preflight["skill_path"],
+            )
+        )
+        hook_command, hook_command_windows = _codex_hook_commands_for_receipt(
+            provenance_receipt,
+            paths.root,
         )
         provenance_preflight = _codex_provenance_preflight(
             paths, provenance_receipt
@@ -2350,12 +2492,10 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     paths.root
                 )
             )
-            previous_hook = previous_receipt["codex_hook_entry_point"]
             previous_hook_command, previous_hook_command_windows = (
-                codex_onboarding_impl.build_codex_hook_commands(
-                    previous_hook["path"],
+                _codex_hook_commands_for_receipt(
+                    previous_receipt,
                     paths.root,
-                    previous_receipt["provenance_receipt_sha256"],
                 )
             )
     except (
@@ -2378,18 +2518,7 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "cannot enable hooks.codex while active AOI tasks bind the current "
                 f"configuration digest: {sorted(active_tasks)}"
             )
-    user_skills_root = (
-        Path(args.user_skills_root).expanduser()
-        if args.user_skills_root
-        else Path.home() / ".agents" / "skills"
-    )
     try:
-        codex_skill_text = _resource_text("codex/SKILL.md")
-        skill_preflight = codex_onboarding_impl.preflight_codex_user_skill(
-            user_skills_root,
-            codex_skill_text,
-            replace_sha256=args.replace_user_skill_sha256,
-        )
         preflight = codex_onboarding_impl.preflight_codex_onboarding(
             paths.root,
             command=hook_command,
@@ -2501,9 +2630,11 @@ def cmd_codex_init(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "hooks": hooks_result,
         "skill": skill_result,
         "next_steps": [
-            "Keep the promoted AOI installation and exact recorded hook launcher available.",
-            "The generic AOI skill is installed once at user scope; keep "
-            "project-specific instructions in the repository AGENTS.md.",
+            "Keep the reviewed AOI installation and its recorded Python/module "
+            "runtime available.",
+            "The exact same-distribution/version-bound AOI client adapter is "
+            "installed at user scope as a transitional compatibility surface; "
+            "keep project-specific instructions in the repository AGENTS.md.",
             "Start a new Codex session in this trusted repo, open /hooks, and "
             "review/trust the exact absolute AOI hook definition and provenance digest.",
             "Run aoi doctor --json after hook trust; structural PASS does not prove "
@@ -5490,7 +5621,10 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
     if args.status != "queued":
         raise HarnessError("job-start must record status queued before any launch")
     tool_version = require_text(args.tool_version, "tool version")
-    command = require_text(args.command, "command")
+    command_supplied = require_text(args.command, "command")
+    command_bytes = packet_integrity_impl.normalize_exact_command_bytes(
+        command_supplied.encode("utf-8"))
+    command = command_bytes.decode("utf-8")
     registered_at = now_iso()
     observed_start_at: str | None = None
     registration_lag_seconds: float | None = None
@@ -5530,7 +5664,7 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         source_sha,
         tool_path=tool_path,
         tool_version=tool_version,
-        command=command,
+        command=command_supplied,
     )
     with state_lock(paths):
         state = load_task(paths, args.task)
@@ -5564,17 +5698,18 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "external job cannot start during the sequential Steward synthesis phase: "
                 + ", ".join(active_synthesis_packets)
             )
-        owner_packet = (
-            _packet_by_id(state, args.owner_packet_id)
-            if args.owner_packet_id
-            else None
-        )
+        if not args.owner_packet_id:
+            raise HarnessError("job-start requires --owner-packet-id")
+        owner_packet = _packet_by_id(state, args.owner_packet_id)
+        if owner_packet.get("packet_mode") != "exact_command":
+            raise HarnessError("job owner must be exact-command")
+        owner_packet_sha = owner_packet.get("packet_contract_sha256", "")
         namespace = paths.project.external_lock_namespace
         required_output_locks = [
             f"{namespace}:tree:{work_root}",
             f"{namespace}:file:{log}",
         ]
-        command_authority_sha = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        command_sha = hashlib.sha256(command_bytes).hexdigest()
         _validate_job_activation_topology(
             state,
             {
@@ -5583,17 +5718,13 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 "execution_selection_id": selection.get("selection_id", "")
                 if selection
                 else "",
-                "owner_packet_id": args.owner_packet_id or "",
-                "owner_packet_contract_sha256": (
-                    owner_packet.get("packet_contract_sha256", "")
-                    if owner_packet is not None
-                    else ""
-                ),
+                "owner_packet_id": args.owner_packet_id,
+                "owner_packet_contract_sha256": owner_packet_sha,
                 "external_lock_namespace": namespace,
                 "required_output_locks": required_output_locks,
                 "work_root": work_root,
                 "log": log,
-                "command_sha256": command_authority_sha,
+                "command_sha256": command_sha,
             },
             selection,
             paths=paths,
@@ -5631,10 +5762,9 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
         command_snapshot = (
             task_dir(paths, args.task) / "results" / f"job-command-{run_id}.txt"
         )
-        atomic_write_text(command_snapshot, command)
+        atomic_write_bytes(command_snapshot, command_bytes)
         os.chmod(command_snapshot, 0o600)
-        command_sha = sha256_file(command_snapshot)
-        if command_sha != command_authority_sha:
+        if sha256_file(command_snapshot) != command_sha:
             raise HarnessError("external job command snapshot changed during copy")
         job = {
             "integrity_version": 1,
@@ -5647,12 +5777,8 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "execution_selection_id": selection.get("selection_id", "")
             if selection
             else "",
-            "owner_packet_id": args.owner_packet_id or "",
-            "owner_packet_contract_sha256": (
-                owner_packet.get("packet_contract_sha256", "")
-                if owner_packet is not None
-                else ""
-            ),
+            "owner_packet_id": args.owner_packet_id,
+            "owner_packet_contract_sha256": owner_packet_sha,
             "external_lock_namespace": namespace,
             "required_output_locks": required_output_locks,
             **(skill_binding or {}),
@@ -5673,8 +5799,9 @@ def cmd_job_start(args: argparse.Namespace, paths: HarnessPaths) -> int:
             "command_path": str(command_snapshot),
             "command_sha256": command_sha,
             "command_size_bytes": command_snapshot.stat().st_size,
+            "command_normalization": packet_integrity_impl.EXACT_COMMAND_NORMALIZATION_V1,
             "success_exit_code": args.success_exit_code,
-            "evidence": "queued before launch" if args.status == "queued" else "launch recorded",
+            "evidence": "queued before launch",
             "registered_at": registered_at,
             "started_at": now_iso(),
             "updated_at": now_iso(),
@@ -5759,8 +5886,9 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 raise HarnessError(
                     "--terminal-log-artifact and --terminal-log-sha256 must be provided together"
                 )
-            origin_path = Path(str(job.get("log", "")))
-            capture_source = origin_path
+            origin_path, capture_source = _registered_terminal_log_paths(
+                job.get("log", "")
+            )
             data: bytes | None = None
             if args.terminal_log_artifact:
                 capture_source, data = read_regular_artifact(
@@ -5771,7 +5899,7 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             else:
                 try:
                     capture_source, data = read_regular_artifact(
-                        origin_path,
+                        capture_source,
                         "terminal log artifact",
                         max_bytes=TERMINAL_ARTIFACT_MAX_BYTES,
                     )
@@ -5799,7 +5927,7 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     os.chmod(blob_path, 0o600)
                 artifact = {
                     "role": "primary_log",
-                    "origin_path": str(origin_path),
+                    "origin_path": origin_path,
                     "capture_source": str(capture_source),
                     "capture_status": "preserved",
                     "blob_path": str(blob_path),
@@ -5809,7 +5937,7 @@ def cmd_job_update(args: argparse.Namespace, paths: HarnessPaths) -> int:
             else:
                 artifact = {
                     "role": "primary_log",
-                    "origin_path": str(origin_path),
+                    "origin_path": origin_path,
                     "capture_source": str(capture_source),
                     "capture_status": "missing_at_capture",
                     "blob_path": "",
@@ -7376,8 +7504,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                     task,
                     verify_remote=True,
                     allow_terminal_remote_advance=(
-                        paths.project.confidentiality.selective_protection
-                        and task.get("status") in {"done", "cancelled"}
+                        task.get("status") in {"done", "cancelled"}
                     ),
                 )
             )
@@ -7496,28 +7623,140 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
     codex_provenance_report: dict[str, Any] | None = None
     codex_hook_receipt_report: dict[str, Any] | None = None
     codex_hook_delivery = "not_configured"
-    if paths.project.codex_hooks_enabled:
-        config_path = paths.root / ".codex" / "config.toml"
-        hook_path = paths.root / ".codex" / "hooks.json"
-        expected_hook_commands: dict[str, str] | None = None
+    codex_client_skill_report: dict[str, Any] = {
+        "status": "not_configured",
+        "provider": "codex",
+        "client_contract_version": None,
+        "role": None,
+        "package_version": None,
+        "package_resource_path": None,
+        "installed_path": None,
+        "expected_sha256": None,
+        "actual_sha256": None,
+        "reason": "no_persisted_codex_install_provenance",
+    }
+    codex_provenance_path = (
+        paths.root
+        / codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_RECEIPT
+    )
+    if codex_provenance_path.exists() or codex_provenance_path.is_symlink():
         try:
             codex_provenance_report = (
                 codex_install_provenance_impl.load_codex_install_provenance_receipt(
                     paths.root
                 )
             )
-            hook_entry = codex_provenance_report["codex_hook_entry_point"]
-            codex_install_provenance_impl.verify_runtime_hook_provenance(
-                paths.root,
-                codex_provenance_report["provenance_receipt_sha256"],
-                hook_entry["path"],
+            codex_client_skill_report = (
+                codex_install_provenance_impl.inspect_codex_client_skill(
+                    codex_provenance_report
+                )
             )
-            expected_native, expected_windows = (
-                codex_onboarding_impl.build_codex_hook_commands(
-                    hook_entry["path"],
+        except (
+            OSError,
+            codex_install_provenance_impl.CodexInstallProvenanceError,
+        ) as exc:
+            codex_client_skill_report = {
+                **codex_client_skill_report,
+                "status": "uninspectable",
+                "reason": (
+                    "codex_install_provenance_or_client_binding_invalid:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+            errors.append(f"Codex client skill binding is uninspectable: {exc}")
+    client_skill_status = codex_client_skill_report["status"]
+    client_skill_reason = str(codex_client_skill_report.get("reason") or "")
+    client_package_provenance_invalid = (
+        client_skill_status == "uninspectable"
+        and client_skill_reason.startswith(
+            "packaged_skill_provenance_uninspectable:"
+        )
+    )
+    client_user_adapter_invalid = (
+        client_skill_status in {"missing", "drifted", "uninspectable"}
+        and not client_package_provenance_invalid
+    )
+    client_binding_configured = (
+        codex_provenance_report is not None
+        or codex_provenance_path.exists()
+        or codex_provenance_path.is_symlink()
+    )
+    if client_binding_configured and (
+        client_package_provenance_invalid
+        or (
+            paths.project.codex_hooks_enabled
+            and client_user_adapter_invalid
+        )
+    ):
+        errors.append(
+            "Codex client skill binding is not exact: "
+            f"{client_skill_status} "
+            f"(expected={codex_client_skill_report['expected_sha256']}, "
+            f"actual={codex_client_skill_report['actual_sha256']})"
+        )
+    elif client_binding_configured and client_user_adapter_invalid:
+        warnings.append(
+            "Codex client adapter is not exact while Codex hooks are disabled: "
+            f"{client_skill_status} ({client_skill_reason or 'reason unavailable'})"
+        )
+    if (
+        paths.project.codex_hooks_enabled
+        and client_skill_status in {"legacy_unbound", "not_configured"}
+    ):
+        if client_skill_status == "legacy_unbound":
+            errors.append(
+                "Codex hooks are enabled but the installed client skill is "
+                "legacy_unbound; rerun provenance-qualified `aoi codex-init`"
+            )
+        else:
+            errors.append(
+                "Codex hooks are enabled but no Codex install provenance or "
+                "client-skill binding is configured; rerun provenance-qualified "
+                "`aoi codex-init`"
+            )
+    if paths.project.codex_hooks_enabled:
+        config_path = paths.root / ".codex" / "config.toml"
+        hook_path = paths.root / ".codex" / "hooks.json"
+        expected_hook_commands: dict[str, str] | None = None
+        try:
+            if codex_provenance_report is None:
+                codex_provenance_report = (
+                    codex_install_provenance_impl.load_codex_install_provenance_receipt(
+                        paths.root
+                    )
+                )
+            receipt_schema = codex_provenance_report.get("schema_version")
+            if receipt_schema == (
+                codex_install_provenance_impl.CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+            ):
+                hook_runtime = cast(
+                    Mapping[str, Any],
+                    codex_provenance_report["codex_hook_runtime"],
+                )
+                codex_install_provenance_impl.verify_runtime_hook_provenance(
                     paths.root,
                     codex_provenance_report["provenance_receipt_sha256"],
+                    None,
+                    runtime_python=Path(sys.executable),
+                    runtime_module_path=hook_runtime["module_path"],
+                    runtime_argv_prefix=(
+                        codex_install_provenance_impl
+                        .CODEX_HOOK_RUNTIME_ARGV_PREFIX
+                    ),
                 )
+            else:
+                hook_entry = cast(
+                    Mapping[str, Any],
+                    codex_provenance_report["codex_hook_entry_point"],
+                )
+                codex_install_provenance_impl.verify_runtime_hook_provenance(
+                    paths.root,
+                    codex_provenance_report["provenance_receipt_sha256"],
+                    hook_entry["path"],
+                )
+            expected_native, expected_windows = _codex_hook_commands_for_receipt(
+                codex_provenance_report,
+                paths.root,
             )
             expected_hook_commands = {
                 "command": expected_native,
@@ -7631,19 +7870,45 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                         current = False
                         if expected_hook_commands is not None:
                             assert codex_provenance_report is not None
-                            hook_entry = codex_provenance_report[
-                                "codex_hook_entry_point"
-                            ]
+                            current_identity: dict[str, Any]
+                            if codex_provenance_report.get("schema_version") == (
+                                codex_install_provenance_impl
+                                .CODEX_INSTALL_PROVENANCE_SCHEMA_VERSION
+                            ):
+                                runtime = cast(
+                                    Mapping[str, Any],
+                                    codex_provenance_report[
+                                        "codex_hook_runtime"
+                                    ],
+                                )
+                                current_identity = {
+                                    "expected_python": runtime[
+                                        "python_invocation"
+                                    ],
+                                }
+                            else:
+                                hook_entry = cast(
+                                    Mapping[str, Any],
+                                    codex_provenance_report[
+                                        "codex_hook_entry_point"
+                                    ],
+                                )
+                                current_identity = {
+                                    "expected_launcher": hook_entry["path"],
+                                }
                             current = (
                                 codex_onboarding_impl.is_aoi_codex_hook_command(
                                     command,
-                                    expected_launcher=hook_entry["path"],
+                                    **current_identity,
                                     expected_project_root=paths.root,
                                     expected_provenance_sha256=codex_provenance_report[
                                         "provenance_receipt_sha256"
                                     ],
                                 )
-                                and command == expected_hook_commands[key]
+                                and command
+                                == codex_onboarding_impl.bind_codex_hook_event(
+                                    expected_hook_commands[key], event
+                                )
                             )
                         if not current:
                             errors.append(
@@ -7753,6 +8018,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "context_provider_benchmarks": benchmark_reports,
         "release_promotions": release_reports,
         "codex_install_provenance": codex_provenance_report,
+        "codex_client_skill": codex_client_skill_report,
         "codex_hook_receipts": codex_hook_receipt_report,
         "codex_hook_delivery": codex_hook_delivery,
         "confidentiality": confidentiality_report,
@@ -7891,7 +8157,6 @@ def build_parser(
         },
         add_json_argument=add_json_argument,
     )
-
     task_lifecycle_services = _task_lifecycle_cmd_services()
     register_chief_commands(
         sub,
@@ -7922,6 +8187,19 @@ def build_parser(
         },
         add_json_argument=add_json_argument,
     )
+    register_company_commands(
+        sub,
+        runtime_handlers=(
+            cmd_supervisor_ensure,
+            cmd_supervisor_status,
+            cmd_supervisor_stop,
+            cmd_dashboard_url,
+            cmd_dashboard_open,
+        ),
+        init_handler=cmd_company_init,
+        add_json_argument=add_json_argument,
+    )
+    register_legacy_bridge_runtime_commands(sub, handler=cmd_legacy_bridge_ingest_v04, add_json_argument=add_json_argument)
 
     mini_completion_services = _mini_completion_services(task_lifecycle_services)
     register_task_lifecycle_commands(
@@ -7968,33 +8246,34 @@ def build_parser(
         add_json_argument=add_json_argument,
     )
 
-    argparse_subparsers = cast(
+    typed_sub = cast(
         "argparse._SubParsersAction[argparse.ArgumentParser]", sub
     )
-    register_semantic_commands(
-        argparse_subparsers,
+    semcmd.register_semantic_commands(
+        typed_sub,
         handlers={
-            "cohort_round_prepare": cmd_cohort_round_prepare,
-            "cohort_round_preview": cmd_cohort_round_preview,
-            "cohort_show": cmd_cohort_show,
-            "packet_arm_prepare": cmd_packet_arm_prepare,
+            "cohort_round_prepare": semcmd.cmd_cohort_round_prepare,
+            "cohort_round_preview": semcmd.cmd_cohort_round_preview,
+            "cohort_show": semcmd.cmd_cohort_show,
+            "packet_arm_prepare": semcmd.cmd_packet_arm_prepare,
             "permit_consume": functools.partial(
-                cmd_permit_consume,
+                semcmd.cmd_permit_consume,
                 validate_packet_arm_preimage=_validate_packet_arm_preimage,
             ),
             "permit_issue": functools.partial(
-                cmd_permit_issue,
+                semcmd.cmd_permit_issue,
                 validate_packet_arm_preimage=_validate_packet_arm_preimage,
             ),
-            "semantic_head": cmd_semantic_head,
-            "semantic_migrate": cmd_semantic_migrate,
-            "semantic_migration_rollback": cmd_semantic_migration_rollback,
+            "semantic_head": semcmd.cmd_semantic_head,
+            "semantic_migrate": semcmd.cmd_semantic_migrate,
+            "semantic_migration_rollback": semcmd.cmd_semantic_migration_rollback,
         },
         add_json_argument=add_json_argument,
     )
+    register_ic_phase1(typed_sub, add_json_argument=add_json_argument)
 
     register_confidentiality_commands(
-        argparse_subparsers,
+        typed_sub,
         handlers={
             "confidentiality_git_push_preflight": (
                 cmd_confidentiality_git_push_preflight
@@ -8012,7 +8291,7 @@ def build_parser(
     )
 
     register_integrity_commands(
-        argparse_subparsers,
+        typed_sub,
         handlers={
             "integrity_adopt": cmd_integrity_adopt,
             "integrity_snapshot": cmd_integrity_snapshot,
@@ -8027,7 +8306,7 @@ def build_parser(
     )
 
     register_release_commands(
-        argparse_subparsers,
+        typed_sub,
         handlers={
             "release_abandon_pending": cmd_release_abandon_pending,
             "release_manifest_observe": cmd_release_manifest_observe,
@@ -8155,6 +8434,13 @@ def build_parser(
             ),
             "codex_config_apply": functools.partial(
                 cmd_codex_config_apply, services=resource_services
+            ),
+            "codex_config_migrate_legacy": functools.partial(
+                cmd_codex_config_migrate_legacy, services=resource_services
+            ),
+            "codex_config_migrate_legacy_plan": functools.partial(
+                cmd_codex_config_migrate_legacy_plan,
+                services=resource_services,
             ),
             "codex_config_rollback": functools.partial(
                 cmd_codex_config_rollback, services=resource_services
@@ -8497,6 +8783,8 @@ _SEMANTIC_V2_STAGE1_TARGET_COMMANDS = {
     "release-tag-push-verify",
     "resume",
     "semantic-head",
+    "semantic-workflow-apply",
+    "semantic-workflow-show",
     "semantic-migrate",
     "semantic-migration-rollback",
     "status",
@@ -8619,7 +8907,7 @@ def main(argv: list[str] | None = None) -> int:
         if args._aoi_command != command:
             raise HarnessError("parsed command differs from normalized command routing")
         return _execute_project_command(args, paths, initialized=initialized)
-    except (HarnessError, PilotError) as exc:
+    except (HarnessError, PilotError, CompanyRuntimeCommandError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

@@ -14,6 +14,16 @@ import pytest
 from aoi_orgware import local_install_proof as proof
 
 
+CONSOLE_ENTRY_POINTS = (
+    "[console_scripts]\n"
+    "aoi = aoi_orgware.cli:main\n"
+    "aoi-codex-hook = aoi_orgware.codex_hook:main\n"
+    "aoi-codex-bridge = aoi_orgware.codex_transport_cli:main\n"
+    "aoi-claude-hook = aoi_orgware.claude_hook:main\n"
+    "aoi-ic-pack = aoi_orgware.ic_pack_cli:main\n"
+)
+
+
 def _git(root: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, check=True).stdout.strip()
 
@@ -34,11 +44,16 @@ def _write_report(source: Path, store: Path) -> None:
     (store / "evidence/rehearsal.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
-def _write_wheel(path: Path, *, with_record: bool = True) -> None:
+def _write_wheel(
+    path: Path,
+    *,
+    with_record: bool = True,
+    entry_points: str = CONSOLE_ENTRY_POINTS,
+) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         prefix = "aoi_orgware-0.4.0a1.dist-info"
         archive.writestr(f"{prefix}/METADATA", "Metadata-Version: 2.1\nName: aoi-orgware\nVersion: 0.4.0a1\n")
-        archive.writestr(f"{prefix}/entry_points.txt", "[console_scripts]\naoi = aoi_orgware.cli:main\naoi-codex-hook = aoi_orgware.codex_hook:main\naoi-codex-bridge = aoi_orgware.codex_transport_cli:main\naoi-claude-hook = aoi_orgware.claude_hook:main\n")
+        archive.writestr(f"{prefix}/entry_points.txt", entry_points)
         if with_record:
             archive.writestr(f"{prefix}/RECORD", "aoi_orgware/cli.py,,\n")
         archive.writestr("aoi_orgware/cli.py", 'HOOK_PROTOCOL_VERSION = "6"\n')
@@ -157,13 +172,44 @@ def test_report_raw_binding_and_wheel_interface_rejects_missing_record(prepared:
         proof.create_subject(source_root=source, store_root=store, inventory_path="evidence/inventory.json", rehearsal_path="evidence/rehearsal.json")
 
 
+@pytest.mark.parametrize(
+    "entry_points",
+    (
+        CONSOLE_ENTRY_POINTS.replace(
+            "aoi-ic-pack = aoi_orgware.ic_pack_cli:main\n", ""
+        ),
+        CONSOLE_ENTRY_POINTS.replace(
+            "aoi_orgware.ic_pack_cli:main", "aoi_orgware.ic_pack_cli:other"
+        ),
+        CONSOLE_ENTRY_POINTS + "unlisted = aoi_orgware.cli:main\n",
+    ),
+)
+def test_wheel_console_entry_points_are_exact(
+    prepared: tuple[Path, Path], entry_points: str
+) -> None:
+    source, store = prepared
+    _write_wheel(
+        store / "dist/aoi_orgware-0.4.0a1-py3-none-any.whl",
+        entry_points=entry_points,
+    )
+    _write_inventory(store)
+    _write_report(source, store)
+    with pytest.raises(proof.LocalInstallProofError, match="entry points are not exact"):
+        proof.create_subject(
+            source_root=source,
+            store_root=store,
+            inventory_path="evidence/inventory.json",
+            rehearsal_path="evidence/rehearsal.json",
+        )
+
+
 def test_wheel_interface_bounds_are_checked_before_extraction(prepared: tuple[Path, Path]) -> None:
     source, store = prepared
     wheel = store / "dist/aoi_orgware-0.4.0a1-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         prefix = "aoi_orgware-0.4.0a1.dist-info"
         archive.writestr(f"{prefix}/METADATA", "Metadata-Version: 2.1\nName: aoi-orgware\nVersion: 0.4.0a1\n")
-        archive.writestr(f"{prefix}/entry_points.txt", "[console_scripts]\naoi = aoi_orgware.cli:main\naoi-codex-hook = aoi_orgware.codex_hook:main\naoi-codex-bridge = aoi_orgware.codex_transport_cli:main\naoi-claude-hook = aoi_orgware.claude_hook:main\n")
+        archive.writestr(f"{prefix}/entry_points.txt", CONSOLE_ENTRY_POINTS)
         archive.writestr(f"{prefix}/RECORD", b"x" * (4 * 1024 * 1024 + 1))
         archive.writestr("aoi_orgware/cli.py", 'HOOK_PROTOCOL_VERSION = "6"\n')
     _write_inventory(store)

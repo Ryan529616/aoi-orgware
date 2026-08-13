@@ -53,6 +53,8 @@ _TERMINAL_STATES = frozenset(
 _EVENT_TYPES = frozenset(
     {
         "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
         "process_start_pending",
         "process_started",
         "initialize_send_pending",
@@ -91,6 +93,7 @@ _SANDBOXES = frozenset({"readOnly", "workspaceWrite"})
 _WIRE_METHODS = frozenset(
     {
         "aoi/reservation",
+        "process/version-probe",
         "process/start",
         "process/started",
         "initialize",
@@ -126,6 +129,8 @@ _FAULT_KINDS = frozenset(
 )
 _EVENT_WIRE_METHOD = {
     "reserved": "aoi/reservation",
+    "version_probe_pending": "process/version-probe",
+    "version_probe_observed": "process/version-probe",
     "process_start_pending": "process/start",
     "process_started": "process/started",
     "initialize_send_pending": "initialize",
@@ -148,6 +153,8 @@ _EVENT_WIRE_METHOD = {
 }
 _EVENT_WIRE_STATUS = {
     "reserved": "observed",
+    "version_probe_pending": "observed",
+    "version_probe_observed": "observed",
     "process_start_pending": "observed",
     "process_started": "observed",
     "initialize_send_pending": "observed",
@@ -756,9 +763,16 @@ def _event_base(value: Any) -> dict[str, Any]:
     if not isinstance(status, str) or status not in _WIRE_STATUSES:
         _fail("journal wire status is invalid")
     if event_type == "launch_unknown":
-        expected_methods = {"process/start", "thread/start", "turn/start"}
+        expected_methods = {
+            "process/version-probe",
+            "process/start",
+            "thread/start",
+            "turn/start",
+        }
     elif event_type == "failed":
         expected_methods = {
+            "process/version-probe",
+            "process/start",
             "process/exited",
             "initialize",
             "model/list",
@@ -835,6 +849,7 @@ def _event_base(value: Any) -> dict[str, Any]:
         "interrupt_observed",
     }
     wire_only_events = {
+        "version_probe_observed",
         "process_started",
         "item_started",
         "item_completed",
@@ -953,6 +968,8 @@ def _required_correlation(event_type: str, correlation: Mapping[str, str | None]
     thread, turn, item = (correlation["thread_id"], correlation["turn_id"], correlation["item_id"])
     if event_type in {
         "reserved",
+        "version_probe_pending",
+        "version_probe_observed",
         "process_start_pending",
         "process_started",
         "initialize_send_pending",
@@ -996,7 +1013,12 @@ def _transition(previous: JournalState | None, event: Mapping[str, Any]) -> Jour
         if previous.state in _TERMINAL_STATES:
             _fail("terminal journal state cannot transition")
         allowed: dict[str, set[str]] = {
-            "reserved": {"process_start_pending", "failed"},
+            # Historical v0.4 journals start directly with process/start.
+            # New controllers first journal the independent ``--version``
+            # child effect without reinterpreting those older bytes.
+            "reserved": {"version_probe_pending", "process_start_pending", "failed"},
+            "version_probe_pending": {"version_probe_observed", "launch_unknown"},
+            "version_probe_observed": {"process_start_pending", "failed"},
             "process_start_pending": {"process_started", "launch_unknown", "failed"},
             "process_started": {"initialize_send_pending", "failed"},
             "initialize_send_pending": {"initialized", "failed"},
@@ -1033,8 +1055,18 @@ def _transition(previous: JournalState | None, event: Mapping[str, Any]) -> Jour
         if event_type in {"failed", "runtime_unknown"} and correlation != old:
             _fail(f"{event_type} must preserve the last known runtime correlation")
         if event_type == "launch_unknown":
-            if previous.last_event_type in {"process_start_pending", "thread_start_send_pending"} and correlation != {"thread_id": None, "turn_id": None, "item_id": None}:
-                _fail("process/thread start launch_unknown must have no runtime identity")
+            if previous.last_event_type in {
+                "version_probe_pending",
+                "process_start_pending",
+                "thread_start_send_pending",
+            } and correlation != {
+                "thread_id": None,
+                "turn_id": None,
+                "item_id": None,
+            }:
+                _fail(
+                    "version/process/thread start launch_unknown must have no runtime identity"
+                )
             if previous.last_event_type == "turn_start_send_pending" and correlation != old:
                 _fail("turn/start launch_unknown must preserve only the known thread identity")
             if event["wire_method"] != previous_event_method(previous.last_event_type):
@@ -1056,6 +1088,8 @@ def _transition(previous: JournalState | None, event: Mapping[str, Any]) -> Jour
             _fail("turn_started may occur only once")
     expected_state = {
         "reserved": "reserved",
+        "version_probe_pending": "reserved",
+        "version_probe_observed": "reserved",
         "process_start_pending": "reserved",
         "process_started": "reserved",
         "initialize_send_pending": "reserved",
