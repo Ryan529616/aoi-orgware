@@ -115,6 +115,7 @@ _MAX_CONTROL_LENGTH_DIGITS = len(str(_MAX_CONTROL_BODY_BYTES))
 _MAX_CONTROL_QUEUE = 64
 _CONTROL_QUEUE_RESERVE = 4
 _CONTROL_OPERATION_TIMEOUT_SECONDS = 30.0
+_WINDOWS_ACL_PROBE_TIMEOUT_SECONDS, _SERVICE_READINESS_TIMEOUT_SECONDS = 30.0, 60.0
 _MAX_CONTROL_JSON_DEPTH = 16
 _LBC = _legacy_bridge_control
 _CHIEF_TAKEOVER_PREPARE_ROUTE = "/control/v1/chief-takeover/prepare"
@@ -775,7 +776,7 @@ def _verify_windows_private_directory(path: Path) -> None:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30.0,
+            timeout=_WINDOWS_ACL_PROBE_TIMEOUT_SECONDS,
             check=False,
             env=environment,
             **options,
@@ -4076,14 +4077,12 @@ def ensure_service(
     slot_root: str | os.PathLike[str],
     *,
     runtime_root: str | os.PathLike[str] | None = None,
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float = _SERVICE_READINESS_TIMEOUT_SECONDS,
     expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Ensure one resident service exists without ever killing a PID.
 
-    The child command is intentionally isolated and exact.  Source-checkout
-    callers should use :func:`run_service_foreground`; packaging tests must use
-    an installed distribution because ``-I`` ignores ``PYTHONPATH``.
+    Isolated children require an install because ``-I`` ignores ``PYTHONPATH``.
     """
 
     timeout_seconds = _bounded_seconds(

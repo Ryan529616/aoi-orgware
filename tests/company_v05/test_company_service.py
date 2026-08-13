@@ -53,6 +53,8 @@ from aoi_orgware.company.supervisor import (
 
 T = "2026-07-27T00:00:00Z"
 EXPIRY = "2026-07-28T00:00:00Z"
+AT = "2026-07-27T00:01:00Z"
+_READY = service_module._SERVICE_READINESS_TIMEOUT_SECONDS
 
 
 def _manifest() -> dict[str, Any]:
@@ -90,24 +92,41 @@ def _await_status(
     runtime: Path,
     process: subprocess.Popen[bytes],
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _READY
     while time.monotonic() < deadline:
         value = service_status(slot, runtime_root=runtime, timeout_seconds=0.3)
         if value["state"] == "running":
             return value
         if process.poll() is not None:
             _stdout, stderr = process.communicate(timeout=1.0)
-            raise AssertionError(f"foreground service exited: {stderr.decode('utf-8', 'replace')}")
+            raise AssertionError(f"service exited: {stderr.decode('utf-8', 'replace')}")
         time.sleep(0.05)
-    raise AssertionError("foreground service did not become ready")
+    cleanup_error: BaseException | None = None
+    try:
+        if process.poll() is None:
+            process.terminate()
+        stderr = process.communicate(timeout=10)[1]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        cleanup_error = exc
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            stderr = process.communicate(timeout=10)[1]
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            cleanup_error, stderr = exc, b""
+    raise AssertionError(
+        f"{value!r}: {stderr.decode('utf-8', 'replace')}; "
+        f"cleanup_error={cleanup_error!r}",
+    )
 
 
 def _foreground_process(slot: Path, runtime: Path) -> subprocess.Popen[bytes]:
     source = Path(__file__).resolve().parents[2] / "src"
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(source)
-    code = (
-        "from aoi_orgware.company.service import run_service_foreground; "
+    code = "from aoi_orgware.company.service import run_service_foreground; " + (
         f"raise SystemExit(run_service_foreground({str(slot)!r}, runtime_root={str(runtime)!r}))"
     )
     return subprocess.Popen(
@@ -122,47 +141,33 @@ def _foreground_process(slot: Path, runtime: Path) -> subprocess.Popen[bytes]:
 def _get_json(url: str, *, token: str | None = None, method: str = "GET") -> tuple[int, dict[str, Any]]:
     headers = {} if token is None else {"Authorization": f"Bearer {token}"}
     request = Request(url, headers=headers, method=method)
-    with urlopen(request, timeout=2.0) as response:  # noqa: S310 - exact loopback descriptor endpoint
+    with urlopen(request, timeout=2.0) as response:  # noqa: S310
         return int(response.status), json.loads(response.read())
 
 
 def _descriptor(slot: Path, runtime: Path) -> dict[str, Any]:
-    value = json.loads(
-        runtime_descriptor_path(slot, runtime_root=runtime).read_text(
-            encoding="utf-8",
-        ),
-    )
+    path = runtime_descriptor_path(slot, runtime_root=runtime)
+    value = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
 
 
 def _raw_control_request(
-    control_url: str,
-    *,
-    method: str,
-    path: str,
-    headers: list[tuple[str, str]],
-    body: bytes = b"",
+    control_url: str, *, method: str, path: str,
+    headers: list[tuple[str, str]], body: bytes = b"",
 ) -> tuple[int, dict[str, Any]]:
-    """Issue an exact loopback request, including deliberately duplicate headers."""
-
     parsed = urlsplit(control_url)
-    assert parsed.scheme == "http"
-    assert parsed.hostname == "127.0.0.1"
-    assert parsed.port is not None
+    assert parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port
     request_headers = [("Host", parsed.netloc), *headers]
     if not any(name.lower() == "content-length" for name, _value in request_headers):
         request_headers.append(("Content-Length", str(len(body))))
-    request = b"\r\n".join(
-        [
-            f"{method} {path} HTTP/1.1".encode("ascii"),
-            *(f"{name}: {value}".encode("ascii") for name, value in request_headers),
-            b"",
-            body,
-        ],
-    )
+    request = b"\r\n".join([
+        f"{method} {path} HTTP/1.1".encode("ascii"),
+        *(f"{name}: {value}".encode("ascii") for name, value in request_headers),
+        b"", body,
+    ])
     response = bytearray()
-    with socket.create_connection(("127.0.0.1", parsed.port), timeout=2.0) as connection:
+    with socket.create_connection(("127.0.0.1", parsed.port), 2.0) as connection:
         connection.settimeout(2.0)
         connection.sendall(request)
         while True:
@@ -180,9 +185,7 @@ def _raw_control_request(
 
 
 def _telemetry_request_payload(
-    descriptor: dict[str, Any],
-    *,
-    source_class: str = "codex_app_server",
+    descriptor: dict[str, Any], *, source_class: str = "codex_app_server",
 ) -> dict[str, Any]:
     company = descriptor["company"]
     raw = b'{"method":"thread/tokenUsage/updated","params":{}}'
@@ -195,21 +198,19 @@ def _telemetry_request_payload(
         "manifest_sha256": company["manifest_sha256"],
         "provider": "codex" if source_class == "codex_app_server" else "claude",
         "source_class": source_class,
-        "adapter_instance_id": "adversarial-adapter-1",
-        "adapter_event_id": "adversarial-event-1",
+        "adapter_instance_id": "adapter-1",
+        "adapter_event_id": "event-1",
         "intake_sequence": 1,
-        "transaction_id": "adversarial-transaction-1",
-        "command_id": "adversarial-command-1",
-        "received_at": "2026-07-27T00:01:00Z",
+        "transaction_id": "transaction-1",
+        "command_id": "command-1",
+        "received_at": AT,
         "raw_base64": base64.b64encode(raw).decode("ascii"),
         "raw_sha256": hashlib.sha256(raw).hexdigest(),
     }
 
 
 def _telemetry_operation_result(
-    *,
-    service_instance_id: str = "service-expected",
-    cursor: object = 1,
+    *, service_instance_id: str = "service-expected", cursor: object = 1,
 ) -> dict[str, Any]:
     return {
         "schema_version": TELEMETRY_INGEST_RESULT_SCHEMA,
@@ -293,8 +294,6 @@ def test_foreground_service_discovers_dashboard_and_stops_without_pid_kill(tmp_p
         )
     finally:
         if process.poll() is None:
-            # Test cleanup does not assert product behavior; the test has
-            # already verified graceful authenticated shutdown above.
             stop_service(slot, runtime_root=runtime)
             process.wait(timeout=10.0)
 
@@ -564,7 +563,7 @@ def test_resident_owner_ingests_telemetry_idempotently_and_refreshes_dashboard(
                 intake_sequence=1,
                 transaction_id="tx-service-telemetry-1",
                 command_id="cmd-service-telemetry-1",
-                received_at="2026-07-27T00:01:00Z",
+                received_at=AT,
                 runtime_root=runtime,
             )
         assert first["schema_version"] == TELEMETRY_INGEST_RESULT_SCHEMA
@@ -603,7 +602,7 @@ def test_resident_owner_ingests_telemetry_idempotently_and_refreshes_dashboard(
             intake_sequence=1,
             transaction_id="tx-service-telemetry-1",
             command_id="cmd-service-telemetry-1",
-            received_at="2026-07-27T00:01:00Z",
+            received_at=AT,
             runtime_root=runtime,
         )
         assert replay["cursor"] == first["cursor"]
@@ -621,7 +620,7 @@ def test_resident_owner_ingests_telemetry_idempotently_and_refreshes_dashboard(
                 intake_sequence=1,
                 transaction_id="tx-service-telemetry-1",
                 command_id="cmd-service-telemetry-1",
-                received_at="2026-07-27T00:01:00Z",
+                received_at=AT,
                 runtime_root=runtime,
             )
         assert conflict.value.status == 409
@@ -685,7 +684,7 @@ def test_committed_telemetry_refresh_failure_reports_effect_and_reconciles(
     thread = threading.Thread(target=run)
     thread.start()
     try:
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _READY
         while time.monotonic() < deadline:
             running = service_status(
                 slot,
@@ -748,7 +747,7 @@ def test_committed_telemetry_refresh_failure_reports_effect_and_reconciles(
                 intake_sequence=1,
                 transaction_id="tx-refresh-effect",
                 command_id="cmd-refresh-effect",
-                received_at="2026-07-27T00:01:00Z",
+                received_at=AT,
                 runtime_root=runtime,
             )
         assert committed.value.status == 500
@@ -784,7 +783,7 @@ def test_committed_telemetry_refresh_failure_reports_effect_and_reconciles(
             intake_sequence=1,
             transaction_id="tx-refresh-effect",
             command_id="cmd-refresh-effect",
-            received_at="2026-07-27T00:01:00Z",
+            received_at=AT,
             runtime_root=runtime,
         )
         assert replay["cursor"] == committed.value.cursor
@@ -841,7 +840,7 @@ def test_client_timeout_after_enqueue_is_effect_unknown_and_exact_retry_replays(
     thread = threading.Thread(target=run)
     thread.start()
     try:
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _READY
         while time.monotonic() < deadline:
             running = service_status(
                 slot,
@@ -885,7 +884,7 @@ def test_client_timeout_after_enqueue_is_effect_unknown_and_exact_retry_replays(
                 intake_sequence=1,
                 transaction_id="tx-client-timeout",
                 command_id="cmd-client-timeout",
-                received_at="2026-07-27T00:01:00Z",
+                received_at=AT,
                 runtime_root=runtime,
                 timeout_seconds=0.05,
             )
@@ -918,7 +917,7 @@ def test_client_timeout_after_enqueue_is_effect_unknown_and_exact_retry_replays(
             intake_sequence=1,
             transaction_id="tx-client-timeout",
             command_id="cmd-client-timeout",
-            received_at="2026-07-27T00:01:00Z",
+            received_at=AT,
             runtime_root=runtime,
         )
         assert replay["cursor"] == baseline + 1
@@ -1193,7 +1192,7 @@ def test_untrusted_operation_result_binding_is_effect_unknown(
             intake_sequence=1,
             transaction_id="tx-result-binding",
             command_id="cmd-result-binding",
-            received_at="2026-07-27T00:01:00Z",
+            received_at=AT,
             runtime_root=tmp_path / "runtime",
         )
     assert unknown.value.status == 502
@@ -1285,7 +1284,7 @@ def test_post_commit_result_conversion_fault_is_effect_unknown_and_replays(
     thread = threading.Thread(target=run)
     thread.start()
     try:
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _READY
         while time.monotonic() < deadline:
             running = service_status(
                 slot,
@@ -1343,7 +1342,7 @@ def test_post_commit_result_conversion_fault_is_effect_unknown_and_replays(
                 intake_sequence=1,
                 transaction_id="tx-result-conversion",
                 command_id="cmd-result-conversion",
-                received_at="2026-07-27T00:01:00Z",
+                received_at=AT,
                 runtime_root=runtime,
             )
         assert unknown.value.status == 409
@@ -1380,7 +1379,7 @@ def test_post_commit_result_conversion_fault_is_effect_unknown_and_replays(
             intake_sequence=1,
             transaction_id="tx-result-conversion",
             command_id="cmd-result-conversion",
-            received_at="2026-07-27T00:01:00Z",
+            received_at=AT,
             runtime_root=runtime,
         )
         assert replay["cursor"] == baseline + 1
@@ -1995,7 +1994,7 @@ def test_malformed_descriptor_cannot_skip_supervisor_shutdown(
 
     thread = threading.Thread(target=run)
     thread.start()
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _READY
     while time.monotonic() < deadline and not runtime_descriptor_path(
         slot,
         runtime_root=runtime,
@@ -2044,7 +2043,7 @@ def test_descriptor_remains_stopping_until_company_lock_is_released(
     thread = threading.Thread(target=run)
     thread.start()
     path = runtime_descriptor_path(slot, runtime_root=runtime)
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _READY
     while time.monotonic() < deadline and not path.is_file():
         time.sleep(0.02)
     assert path.is_file()

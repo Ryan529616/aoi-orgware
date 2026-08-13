@@ -118,7 +118,7 @@ def _await_descriptor(
     slot: Path,
     runtime: Path,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + service_module._SERVICE_READINESS_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if runtime_descriptor_path(slot, runtime_root=runtime).exists():
             status = service_status(slot, runtime_root=runtime, timeout_seconds=0.3)

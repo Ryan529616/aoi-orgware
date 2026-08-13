@@ -30,7 +30,11 @@ from aoi_orgware.company.identity import (
     observed_remote_fingerprint,
 )
 from aoi_orgware.company.process_lock import CompanyProcessLock
-from aoi_orgware.company.service import service_status, stop_service
+from aoi_orgware.company.service import (
+    _SERVICE_READINESS_TIMEOUT_SECONDS,
+    service_status,
+    stop_service,
+)
 from aoi_orgware.company.supervisor import CompanySupervisor
 
 
@@ -116,7 +120,7 @@ def _resident_process(slot: Path) -> subprocess.Popen[bytes]:
 
 
 def _await_running(slot: Path, process: subprocess.Popen[bytes]) -> None:
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + _SERVICE_READINESS_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if service_status(slot, timeout_seconds=0.3).get("state") == "running":
             return
