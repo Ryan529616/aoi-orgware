@@ -53,3 +53,46 @@ tuple, but secret-at-rest cleanup remains a separate follow-up.
 
 This bounded cleanup addresses process-crash residue; it is not evidence of
 power-loss durability or automatic bootstrap repair.
+
+## Resume an interrupted hook-receipt generation rotation
+
+Do not delete, move, rewrite, compact, or copy receipts out of the managed
+store to clear a full-capacity error. First quiesce every hook writer and pin
+the repository to one reviewed v2-capable AOI runtime. Then inspect and verify
+the existing bytes:
+
+```bash
+aoi codex-hook-receipts-status --json
+aoi codex-hook-receipts-verify --json
+aoi codex-hook-receipts-rotation-preview \
+  --mode adopt-v1 \
+  --operation-id <approved-operation-id> \
+  --json
+```
+
+The preview is read-only. A current Chief may apply only that exact preview:
+
+```bash
+aoi codex-hook-receipts-rotate \
+  --mode adopt-v1 \
+  --operation-id <approved-operation-id> \
+  --expected-preview-sha256 <preview-sha256> \
+  --json
+```
+
+Use `--mode rotate-v2` for a later active-generation rotation. If the command
+is interrupted before the atomic control commit, ordinary receipt writes remain
+denied and the same mode, operation ID, preview SHA-256, and Chief-bound intent
+must be resumed. Do not choose a replacement operation. If the caller loses the
+response after control publication, the exact command replays the committed
+result without another generation. A different operation, authority, preview,
+legacy inventory, or active inventory fails closed.
+Renewing the same logical Chief keeps its session ID and epoch, so the durable
+intent remains resumable; a takeover or different epoch is different authority.
+
+After apply or exact replay, run both read-only verification and `doctor`.
+Doctor reports active capacity separately from retained generation totals. A
+sealed-manifest mismatch, duplicate identity, pending operation, legacy drift,
+missing generation, link, or unexpected member remains an error and requires
+an evidence-preserving audit; it is never auto-repaired. This procedure proves
+bounded process-crash/reopen recovery only, not filesystem power-loss behavior.
