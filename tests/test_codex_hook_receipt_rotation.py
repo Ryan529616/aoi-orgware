@@ -189,11 +189,11 @@ class CodexHookReceiptRotationTests(HarnessTestCase):
             authority=self.authority,
             expected_control_sha256=expected["control_sha256"],
         )
-        operation_dir = receipts.codex_hook_receipts_v2_dir(self.paths) / "operations" / "rotate-1"
-        operation_dir.mkdir()
-        h.atomic_create_bytes(operation_dir / "intent.json", canonical_json_bytes(intent))
+        op_dir = receipts.codex_hook_receipts_v2_dir(self.paths) / "operations" / "rotate-1"
+        op_dir.mkdir(mode=0o700)
+        h.atomic_create_bytes(op_dir / "intent.json", canonical_json_bytes(intent))
         (receipts.codex_hook_receipts_v2_dir(self.paths) / "generations" /
-         str(preview["successor_generation_id"])).mkdir()
+         str(preview["successor_generation_id"])).mkdir(mode=0o700)
         with self.assertRaisesRegex(receipts.CodexHookReceiptError, "pending"):
             receipts.store_codex_hook_receipt(self.paths, self.receipt("blocked"))
         result = receipts.apply_codex_hook_receipt_rotation(
