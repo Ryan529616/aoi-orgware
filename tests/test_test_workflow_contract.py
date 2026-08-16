@@ -26,10 +26,10 @@ WINDOWS_PRIVATE_TEMP_STEP_SHA256 = (
     "394add889ece766707f918e1b42d55f63bdf14953f2363ccd8c4622a6093faa1"
 )
 UNIT_JOB_SHA256 = (
-    "cd259fe1ffd819c4cd1590daaba5a75b13039964fb0e587da84aae2374e4c6db"
+    "1f0b84e2732ca38045d3aebf54ea760b8520995c3d765a62e5427ce48570dc67"
 )
 WORKFLOW_SHA256 = (
-    "c0a6094677725ad08d1585d86f81eae3108f659f86a300eccc5cd29a97ee888e"
+    "f0af010943093147c13351ca4fdb800e198af59d13015579f367381091ec5020"
 )
 
 
@@ -135,7 +135,7 @@ def _assert_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain(
         r"^    timeout-minutes:\s*(\d+)\s*(?:#.*)?$",
         unit,
         flags=re.MULTILINE,
-    ) == ["180"]
+    ) == ["210"]
     assert re.findall(
         r"^        os:\s*(\[[^]\n]+\])\s*(?:#.*)?$",
         unit,
@@ -229,13 +229,13 @@ def test_unit_matrix_uses_the_hash_locked_offline_pytest_toolchain() -> None:
 def test_unit_job_contract_rejects_comment_spoofing_and_failure_masking() -> None:
     workflow = _workflow()
     timeout_spoof = workflow.replace(
-        "    timeout-minutes: 180",
-        "    timeout-minutes: 90  # timeout-minutes: 180",
+        "    timeout-minutes: 210",
+        "    timeout-minutes: 90  # timeout-minutes: 210",
         1,
     )
     timeout_omission = workflow.replace(
-        "    timeout-minutes: 180",
-        "    # timeout-minutes: 180",
+        "    timeout-minutes: 210",
+        "    # timeout-minutes: 210",
         1,
     )
     matrix_spoof = workflow.replace(
@@ -256,8 +256,8 @@ def test_unit_job_contract_rejects_comment_spoofing_and_failure_masking() -> Non
         1,
     )
     job_skip = workflow.replace(
-        "    timeout-minutes: 180",
-        "    if: false\n    timeout-minutes: 180",
+        "    timeout-minutes: 210",
+        "    if: false\n    timeout-minutes: 210",
         1,
     )
     step_skip = workflow.replace(
