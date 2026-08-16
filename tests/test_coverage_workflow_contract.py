@@ -476,19 +476,26 @@ def _prepare_fake_combine(monkeypatch, tmp_path: Path):
 
 def test_combine_stages_own_output_outside_frozen_fragment_set(monkeypatch, tmp_path: Path) -> None:
     fragments, raw, calls = _prepare_fake_combine(monkeypatch, tmp_path)
-    coverage_verifier.combine_fragments(fragments)
+    expected = coverage_verifier._fragment_set_receipt(
+        coverage_verifier._snapshot_fragments(fragments)
+    )
+    receipt = coverage_verifier.combine_fragments(fragments)
     assert raw.read_bytes() == b"raw"
     assert (fragments / ".coverage").read_bytes() == b"combined"
     assert calls() == 1
+    assert receipt == expected
 
 
 def test_combine_retries_one_raw_mutation_then_publishes(monkeypatch, tmp_path: Path) -> None:
     fragments, raw, calls = _prepare_fake_combine(monkeypatch, tmp_path)
     _FakeCoverageData.mutation = lambda: raw.write_bytes(raw.read_bytes() + b"x")
-    coverage_verifier.combine_fragments(fragments)
+    receipt = coverage_verifier.combine_fragments(fragments)
     assert raw.read_bytes() == b"rawx"
     assert (fragments / ".coverage").read_bytes() == b"combined"
     assert calls() == 2
+    assert receipt == coverage_verifier._fragment_set_receipt(
+        {raw: coverage_verifier._fragment_identity(raw)}
+    )
 
 
 def test_combine_classifies_update_errors_by_raw_identity(monkeypatch, tmp_path: Path) -> None:
@@ -521,3 +528,45 @@ def test_combine_fails_closed_after_bounded_continuous_mutation(monkeypatch, tmp
         coverage_verifier.combine_fragments(fragments)
     assert not (fragments / ".coverage").exists()
     assert calls() == 3
+
+
+def test_main_prints_exact_sanitized_combine_receipt(monkeypatch, capsys) -> None:
+    receipt = coverage_verifier.FragmentSetReceipt(
+        4609,
+        123456,
+        "cooperative_lstat_metadata_v1",
+        "a" * 64,
+    )
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_arguments",
+        lambda: SimpleNamespace(combine_fragments=Path("covdata")),
+    )
+    monkeypatch.setattr(coverage_verifier, "combine_fragments", lambda _root: receipt)
+
+    assert coverage_verifier.main() == 0
+    assert capsys.readouterr().out == (
+        "coverage fragments verified and combined "
+        "(member_count=4609, total_bytes=123456, "
+        "identity_semantics=cooperative_lstat_metadata_v1, "
+        f"metadata_snapshot_sha256={'a' * 64})\n"
+    )
+
+
+def test_main_prints_no_success_receipt_on_combine_failure(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        coverage_verifier,
+        "_arguments",
+        lambda: SimpleNamespace(combine_fragments=Path("covdata")),
+    )
+
+    def fail(_root: Path):
+        raise CoveragePathMappingError("synthetic terminal failure")
+
+    monkeypatch.setattr(coverage_verifier, "combine_fragments", fail)
+    assert coverage_verifier.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "coverage path mapping verification failed: synthetic terminal failure\n"
+    )
