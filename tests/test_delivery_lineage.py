@@ -20,7 +20,7 @@ def _error(*, allow_descendant: bool) -> str:
         ACTUAL,
         "origin",
         "refs/heads/main",
-        "terminal task worktree HEAD",
+        "delivery commit",
         allow_descendant,
     )
 
@@ -48,7 +48,7 @@ def test_rewind_or_divergent_tip_is_rejected() -> None:
     with mock.patch.object(delivery_lineage, "git_is_ancestor", return_value=False):
         assert _error(allow_descendant=True) == (
             f"remote origin refs/heads/main points to {ACTUAL}, not the "
-            f"terminal task worktree HEAD {EXPECTED}"
+            f"delivery commit {EXPECTED}"
         )
 
 
@@ -68,3 +68,23 @@ def test_unknown_remote_object_fails_closed() -> None:
             "cannot verify terminal pushed-delivery remote ancestry: "
             "remote tip object is unavailable"
         )
+
+
+def test_terminal_feature_advance_only_needs_delivery_commit_ancestry() -> None:
+    with mock.patch.object(
+        delivery_lineage,
+        "git_is_ancestor",
+        return_value=True,
+    ) as ancestry:
+        assert _error(allow_descendant=True) == ""
+    ancestry.assert_called_once_with(WORKTREE, EXPECTED, ACTUAL)
+
+
+def test_active_remote_advance_remains_exact_only() -> None:
+    with mock.patch.object(delivery_lineage, "git_is_ancestor") as ancestry:
+        error = _error(allow_descendant=False)
+    assert error == (
+        f"remote origin refs/heads/main points to {ACTUAL}, not the "
+        f"delivery commit {EXPECTED}"
+    )
+    ancestry.assert_not_called()

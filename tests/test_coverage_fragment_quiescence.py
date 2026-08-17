@@ -569,18 +569,22 @@ def test_empty_set_can_publish_a_complete_fragment_within_budget() -> None:
 
 
 def test_fragment_count_bound_is_fail_closed() -> None:
+    assert MAX_FRAGMENT_FILES == 8192
+    assert MAX_FRAGMENT_FILES & (MAX_FRAGMENT_FILES - 1) == 0
+    reads: list[Path] = []
     over = {
         Path(f".coverage.{index:05d}"): _identity(index + 1)
         for index in range(MAX_FRAGMENT_FILES + 1)
     }
     with pytest.raises(CoveragePathMappingError, match="fragment_count_oversize"):
-        _read(_sequence(over), attempts=1)
+        _read(_sequence(over), lambda path: reads.append(path) or (), attempts=1)
+    assert reads == []
 
 
-def test_near_limit_fragment_set_is_feasible_and_fully_read() -> None:
+def test_at_limit_fragment_set_is_feasible_and_fully_read() -> None:
     fragments = {
         Path(f".coverage.{index:04d}"): _identity(index + 1)
-        for index in range(3908)
+        for index in range(MAX_FRAGMENT_FILES)
     }
     reads: list[Path] = []
 
@@ -590,14 +594,14 @@ def test_near_limit_fragment_set_is_feasible_and_fully_read() -> None:
         attempts=1,
     )
 
-    assert len(sealed) == 3908
-    assert len(measured) == 3908
+    assert len(sealed) == MAX_FRAGMENT_FILES
+    assert len(measured) == MAX_FRAGMENT_FILES
     assert identities == fragments
     assert reads == list(sealed)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux coverage.py scale receipt")
-def test_real_coverage_data_near_limit_fragment_set_is_fully_read(
+def test_real_coverage_data_large_representative_set_is_fully_read(
     tmp_path: Path,
 ) -> None:
     coverage = pytest.importorskip("coverage")

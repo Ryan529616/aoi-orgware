@@ -6250,7 +6250,7 @@ class HardeningTests(HarnessTestCase):
             timeout=20,
         )
         self.assertEqual(rewound.returncode, 1, rewound.stderr)
-        self.assertIn("not the terminal task worktree HEAD", rewound.stdout)
+        self.assertIn("not the delivery commit", rewound.stdout)
         self.assertNotEqual(base_commit, terminal_head)
 
     def test_non_git_worktree_is_rejected_without_state(self) -> None:
@@ -14896,7 +14896,7 @@ class BytecodeHygieneTests(HarnessTestCase):
             self.assertIn("--hook-version", hook_help.stdout)
 
     def test_clean_status_and_hook_leave_no_bytecode(self) -> None:
-        clean_root = self.root / "clean-bytecode-root"
+        clean_root = self.root / "bytecode-root"
         clean_root.mkdir()
         subprocess.run(
             ["git", "init", "-b", "main", str(clean_root)],
@@ -14912,7 +14912,7 @@ class BytecodeHygieneTests(HarnessTestCase):
         clean_env.pop("PYTHONPYCACHEPREFIX", None)
 
         initialized = subprocess.run(
-            [sys.executable, "-m", CLI_MODULE, "init", "--project-name", "Bytecode Test"],
+            [sys.executable, "-B", "-m", CLI_MODULE, "init", "--project-name", "Bytecode Test"],
             cwd=clean_root,
             env=clean_env,
             text=True,
@@ -14923,7 +14923,7 @@ class BytecodeHygieneTests(HarnessTestCase):
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
 
         status = subprocess.run(
-            [sys.executable, "-m", CLI_MODULE, "status", "--json"],
+            [sys.executable, "-B", "-m", CLI_MODULE, "status", "--json"],
             cwd=clean_root,
             env=clean_env,
             text=True,
@@ -14939,9 +14939,7 @@ class BytecodeHygieneTests(HarnessTestCase):
         ).encode("utf-8")
         hook = subprocess.run(
             [
-                sys.executable,
-                "-m",
-                HOOK_MODULE,
+                sys.executable, "-B", "-m", HOOK_MODULE,
                 "--hook-version",
                 "6",
             ],
@@ -14958,8 +14956,8 @@ class BytecodeHygieneTests(HarnessTestCase):
         json.loads(hook.stdout.decode("utf-8"))
 
         artifacts = sorted(
-            path.relative_to(clean_root).as_posix()
-            for path in clean_root.rglob("*")
+            path.name
+            for path in (*clean_root.rglob("*"), *SRC.rglob("*"))
             if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
         )
         self.assertEqual(artifacts, [])

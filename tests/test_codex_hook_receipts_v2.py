@@ -271,6 +271,43 @@ class CodexHookReceiptStoreTests(HarnessTestCase):
             report["errors"],
         )
 
+    @mock.patch.object(receipts, "MAX_CODEX_HOOK_RECEIPT_ENTRIES", 1)
+    def test_doctor_uses_active_generation_capacity_after_adoption(self) -> None:
+        receipts.store_codex_hook_receipt(self.paths, self.receipt())
+        preview = receipts.preview_codex_hook_receipt_rotation(
+            self.paths, mode="adopt-v1", operation_id="doctor-adoption-1"
+        )
+        receipts.apply_codex_hook_receipt_rotation(
+            self.paths,
+            mode="adopt-v1",
+            operation_id="doctor-adoption-1",
+            expected_preview_sha256=preview["preview_sha256"],
+            authority={
+                "session_id": "doctor-session-1",
+                "epoch": 1,
+                "authority_record_sha256": "a" * 64,
+            },
+        )
+        report = self.doctor_report()
+        store = report["codex_hook_receipts"]
+        self.assertEqual(store["capacity_status"], "available")
+        self.assertEqual(store["entry_count"], 0)
+        self.assertEqual(store["generations"]["retained_entry_count"], 1)
+        self.assertEqual(store["generations"]["active_entry_count"], 0)
+        self.assertEqual(
+            store["generations"]["retained_receipt_type_counts"],
+            {"post_tool_use": 1},
+        )
+        self.assertEqual(report["codex_hook_delivery"], "adapter_receipt_observed")
+        self.assertNotIn(
+            "Codex hook configuration has no live adapter receipt evidence yet",
+            report["warnings"],
+        )
+        self.assertNotIn(
+            "Codex hook receipt store is full; PreToolUse denies until receipts are preserved or rotated.",
+            report["errors"],
+        )
+
     @mock.patch.object(receipts, "MAX_CODEX_HOOK_RECEIPT_ENTRIES", 10)
     def test_doctor_warns_when_receipt_capacity_is_near_full(self) -> None:
         for index in range(9):
@@ -342,6 +379,7 @@ class CodexHookReceiptStoreTests(HarnessTestCase):
             report,
             {
                 "entry_count": 2,
+                "retained_entry_count": 2,
                 "aggregate_bytes": expected_bytes,
                 "entry_capacity": receipts.MAX_CODEX_HOOK_RECEIPT_ENTRIES,
                 "aggregate_byte_capacity": receipts.MAX_CODEX_HOOK_RECEIPT_STORE_BYTES,

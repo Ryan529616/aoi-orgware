@@ -290,12 +290,12 @@ def _record(dist_info: Path, site_root: Path) -> dict[Path, tuple[str, int]]:
                 if digest or size:
                     _fail("wheel RECORD self-row must omit digest and size")
                 continue
-            # pip may append imported bytecode caches to RECORD after install.
-            # Admit only a real, canonical PEP 3147/488 cache file; a broader
-            # ``__pycache__`` exemption would hide arbitrary package payloads.
-            if not digest and not size and _is_cache_path(candidate.relative_to(site_root)):
-                _canonical_existing(candidate, "wheel RECORD bytecode cache")
-                continue
+            # Admit only canonical in-prefix bytecode; external hashless rows fail closed.
+            if not digest and not size:
+                try: relative = candidate.relative_to(site_root)
+                except ValueError: _fail("wheel RECORD hashless entry lies outside site-packages")
+                if _is_cache_path(relative):
+                    _canonical_existing(candidate, "wheel RECORD bytecode cache"); continue
             if not digest.startswith("sha256=") or not size.isdecimal():
                 _fail("wheel RECORD row lacks a verifiable SHA-256 and size")
             rows[candidate] = (digest[7:], int(size))

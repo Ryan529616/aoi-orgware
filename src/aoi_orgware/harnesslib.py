@@ -3426,9 +3426,6 @@ def validate_task_state(
         raise HarnessError(
             f"unsupported resource session registration schema{where}"
         )
-    # Adoption is one-way but legacy projections intentionally remain readable.
-    # Keep versioned integrity-record imports local: their pure schema layers
-    # must not create a harness import cycle.
     if "integrity_contract" in state:
         contract = state["integrity_contract"]
         if (
@@ -3466,11 +3463,14 @@ def validate_task_state(
                     f"compact-v2-capable task validation requires harness paths{where}"
                 )
             source_v1_contract = _compact_v2_source_contract(paths, state, contract)
+        from . import empty_semantic_supersession as empty
         validation_kwargs: dict[str, Any] = {
             "task_id": state.get("task_id"),
             "worktree": state.get("worktree"),
             "require_complete": (
-                state.get("status") == "done" or contract.get("seal") is not None
+                state.get("status") == "done"
+                and not empty.is_empty_native_semantic_terminal_supersession(paths, state, contract)
+                or contract.get("seal") is not None
             ),
         }
         if contract["schema_version"] == 2 and contract["mode"] == "required_v2":
