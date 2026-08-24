@@ -22,8 +22,10 @@ from scripts.coverage_fragment_quiescence import (  # noqa: E402
     CoverageFragmentReadError,
     CoveragePathMappingError,
     FragmentIdentity,
+    FragmentSetReceipt,
     _assert_fragment_snapshot,
     _fragment_identity,
+    _fragment_set_receipt,
     _FragmentSetChanged,
     _read_stable_fragment_set,
     _snapshot_fragments,
@@ -378,8 +380,9 @@ def verify_fragments(
     return tuple(children), mapped_paths, identities
 
 
-def _combine_fragment_attempt(fragment_directory: Path) -> None:
+def _combine_fragment_attempt(fragment_directory: Path) -> FragmentSetReceipt:
     fragments, mapped_paths, identities = verify_fragments(fragment_directory)
+    receipt = _fragment_set_receipt(identities)
     fragments_root = fragment_directory.resolve(strict=True)
     expected_data_file = ROOT.resolve(strict=True) / "covdata" / ".coverage"
     if expected_data_file.exists():
@@ -453,16 +456,16 @@ def _combine_fragment_attempt(fragment_directory: Path) -> None:
                     "combined coverage output rollback failed"
                 ) from exc
             raise
+        return receipt
 
 
-def combine_fragments(fragment_directory: Path) -> None:
+def combine_fragments(fragment_directory: Path) -> FragmentSetReceipt:
     """Combine an exact raw snapshot with bounded retry on cooperative churn."""
 
     last_change: _FragmentSetChanged | None = None
     for _ in range(MAX_COMBINE_ATTEMPTS):
         try:
-            _combine_fragment_attempt(fragment_directory)
-            return
+            return _combine_fragment_attempt(fragment_directory)
         except _FragmentSetChanged as exc:
             last_change = exc
     assert last_change is not None
@@ -633,11 +636,12 @@ def _arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = _arguments()
+    combine_receipt: FragmentSetReceipt | None = None
     try:
         if arguments.combine_fragments is None:
             verify()
         else:
-            combine_fragments(arguments.combine_fragments)
+            combine_receipt = combine_fragments(arguments.combine_fragments)
     except CoveragePathMappingError as exc:
         print(f"coverage path mapping verification failed: {exc}", file=sys.stderr)
         return 1
@@ -647,11 +651,17 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(
-        "coverage fragments verified and combined"
-        if arguments.combine_fragments is not None
-        else "coverage path mapping verified"
-    )
+    if combine_receipt is None:
+        print("coverage path mapping verified")
+    else:
+        print(
+            "coverage fragments verified and combined "
+            f"(member_count={combine_receipt.member_count}, "
+            f"total_bytes={combine_receipt.total_bytes}, "
+            f"identity_semantics={combine_receipt.identity_semantics}, "
+            "metadata_snapshot_sha256="
+            f"{combine_receipt.metadata_snapshot_sha256})"
+        )
     return 0
 
 

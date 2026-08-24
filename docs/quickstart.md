@@ -162,6 +162,27 @@ For a WSL-governed project used by Windows Codex, also exercise the installed
 adapter receipt appears in that same WSL `.aoi` state tree. This is separate
 from `/hooks` trust and from the App Server Transport Bridge canary.
 
+### If the hook receipt store is full
+
+Do not remove receipt files or switch to an older executable. Quiesce the hook
+writers, retain the exact store inventory, and use the same reviewed candidate
+for read-only status, verification, and preview:
+
+```bash
+aoi codex-hook-receipts-status --json
+aoi codex-hook-receipts-verify --json
+aoi codex-hook-receipts-rotation-preview \
+  --mode adopt-v1 --operation-id <approved-operation-id> --json
+```
+
+After reviewing the preview SHA-256, the current Chief may run exactly one
+matching `codex-hook-receipts-rotate`. Existing v1 receipt files remain
+byte-identical and new receipts use the new active generation. Verify again and
+run `aoi doctor --json` before re-enabling hooks. If apply is interrupted, only
+the same operation may resume; never delete staging or invent a replacement
+operation. See [Recovery](recovery.md#resume-an-interrupted-hook-receipt-generation-rotation)
+for the exact command and evidence boundary.
+
 ## 3. Run one mini task
 
 `start-mini` is only for a low-risk change to one through three exact files.

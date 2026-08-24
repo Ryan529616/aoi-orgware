@@ -329,9 +329,29 @@ or rolls back a mutation.
 
 Hook receipts are stored as bounded, canonical, create-only state records. A
 divergent replay for one event identity, corrupted/linked record, or exhausted
-64 KiB-per-record / 1,024-record / 16 MiB aggregate budget is an error: AOI
-does not evict old evidence or silently continue with partial accounting. Only
-supported parseable paths can be cooperatively gated. An unavailable MCP
+64 KiB-per-record / 1,024-record / 16 MiB active-generation budget is an error:
+AOI does not evict old evidence or silently continue with partial accounting.
+A full immutable `codex-hook-receipts-v1` store can be adopted explicitly into
+the v2 generation overlay. Existing v1 receipt bytes and names remain in place;
+new receipts append only to the control-selected active generation. At most 16
+generations are retained. Every sealed generation binds its sorted filename,
+size and SHA-256 inventory, and duplicate event identity across any retained
+location is corruption even when the bytes match.
+
+`codex-hook-receipts-status`, `codex-hook-receipts-verify`, and
+`codex-hook-receipts-rotation-preview` are read-only. The Chief-fenced
+`codex-hook-receipts-rotate` command requires the exact preview SHA-256 and one
+operation ID. Its append-once intent, metadata and seals are staging; one atomic
+`control.json` replacement is the active-head commit. Before that commit,
+novel receipt writes fail closed and only the same operation can resume. After
+commit, exact replay returns the same generation and control identity without
+appending. This is process-crash/reopen behavior, not Windows power-loss or
+hostile same-user durability. Before adoption, quiesce every old hook writer
+and pin all hooks to the exact v2-capable candidate. An old binary may replay an
+already-known v1 identity, but its novel writes fail after the adoption marker;
+it cannot safely operate the v2 store.
+
+Only supported parseable paths can be cooperatively gated. An unavailable MCP
 registry, unsupported tool, or ambiguous target is `uncovered`, never treated
 as a covered integration.
 

@@ -670,6 +670,81 @@ def test_concurrent_same_bytes_publication_is_single_immutable_member(tmp_path: 
     assert list((tmp_path / "company-blobs").rglob(".aoi-blob-v1.*.tmp")) == []
 
 
+def test_concurrent_publisher_cleanup_during_recovery_settles_to_one_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "company-blobs"
+    publisher = BlobStore(root)
+    recovering = BlobStore(root)
+    payload = b"cooperative cleanup during verified recovery"
+    digest = hashlib.sha256(payload).hexdigest()
+    publication_ready = threading.Event()
+    allow_cleanup = threading.Event()
+    cleanup_complete = threading.Event()
+    publisher_results: list[str] = []
+    publisher_failures: list[BaseException] = []
+    original_cleanup = publisher._cleanup_private_temporary
+    original_read = recovering._read_verified
+
+    def delayed_cleanup(
+        temporary: Path,
+        expected: os.stat_result,
+        *,
+        linked_destination: bool,
+    ) -> None:
+        if linked_destination:
+            publication_ready.set()
+            if not allow_cleanup.wait(timeout=5):
+                raise AssertionError("recovery did not reach the two-link read")
+        try:
+            original_cleanup(
+                temporary,
+                expected,
+                linked_destination=linked_destination,
+            )
+        finally:
+            if linked_destination:
+                cleanup_complete.set()
+
+    def read_after_publisher_cleanup(
+        path: Path,
+        observed_digest: str,
+        *,
+        expected_links: int = 1,
+    ) -> bytes:
+        if expected_links == 2:
+            allow_cleanup.set()
+            if not cleanup_complete.wait(timeout=5):
+                raise AssertionError("publisher did not complete private cleanup")
+        return original_read(path, observed_digest, expected_links=expected_links)
+
+    monkeypatch.setattr(publisher, "_cleanup_private_temporary", delayed_cleanup)
+    monkeypatch.setattr(recovering, "_read_verified", read_after_publisher_cleanup)
+    monkeypatch.setattr(blobs_module, "_EXISTING_MEMBER_RETRIES", 1)
+
+    def publish_first() -> None:
+        try:
+            publisher_results.append(publisher.put(payload).sha256)
+        except BaseException as exc:  # pragma: no cover - checked below
+            publisher_failures.append(exc)
+
+    worker = threading.Thread(target=publish_first)
+    worker.start()
+    assert publication_ready.wait(timeout=5)
+
+    recovered = recovering.put(payload)
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert publisher_failures == []
+    assert publisher_results == [digest]
+    assert recovered.sha256 == digest
+    assert recovered.path.stat().st_nlink == 1
+    assert recovering.read(digest) == payload
+    assert list(root.rglob(".aoi-blob-v1.*.tmp")) == []
+
+
 def test_private_temporary_name_is_never_a_valid_blob_member(tmp_path: Path) -> None:
     store = BlobStore(tmp_path / "company-blobs")
     metadata = store.put(b"complete only")

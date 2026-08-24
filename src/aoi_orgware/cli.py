@@ -34,7 +34,8 @@ from . import codex_install_provenance as codex_install_provenance_impl
 from . import confidentiality as confidentiality_impl
 from . import codex_hook_receipts as codex_hook_receipts_impl
 from . import dispatch_protocol as dispatch_protocol_impl
-from .delivery_lineage import remote_tip_error
+from .delivery_lineage import delivery_worktree_lineage_errors, remote_tip_error
+from .empty_semantic_supersession import prepare_empty_native_semantic_supersession as _prepare_empty_native_semantic_supersession
 from . import evidence_artifacts as evidence_artifacts_impl
 from .agent_identity import AgentIdentityError, AGENT_ID_RE, validate_agent_id
 from . import execution_topology as execution_topology_impl
@@ -715,6 +716,7 @@ CHIEF_PROJECT_READ_ONLY_COMMANDS = {
     "codex-config-plan",
     "codex-config-migrate-legacy-plan",
     "codex-startup-receipt-show",
+    *codex_hook_receipts_impl.READ_ONLY_COMMANDS,
     "confidentiality-git-push-preflight",
     "confidentiality-policy-snapshot",
     "confidentiality-publication-preflight",
@@ -1545,28 +1547,12 @@ def delivery_integrity_errors(
     if not FULL_COMMIT_RE.fullmatch(commit):
         errors.append("pushed delivery commit is missing or invalid")
         return errors
-    worktree_errors, current = worktree_integrity_errors(paths, state)
+    worktree_errors, current, terminal = delivery_worktree_lineage_errors(
+        paths, state, commit
+    )
     errors.extend(worktree_errors)
     if current is None:
         return errors
-    terminal = state.get("status") in {"done", "cancelled"}
-    if terminal:
-        try:
-            commit_is_ancestor = git_is_ancestor(
-                state_worktree(paths, state), commit, current["head_sha"]
-            )
-        except HarnessError as exc:
-            errors.append(str(exc))
-        else:
-            if not commit_is_ancestor:
-                errors.append(
-                    f"pushed delivery commit {commit} is not an ancestor of the "
-                    f"terminal task worktree HEAD {current['head_sha']}"
-                )
-    elif current["head_sha"] != commit:
-        errors.append(
-            f"pushed delivery commit {commit} is not the task worktree HEAD {current['head_sha']}"
-        )
     if remote_sha != commit:
         errors.append("recorded pushed remote SHA differs from delivery commit")
     preflight_sha256 = str(
@@ -1675,11 +1661,11 @@ def delivery_integrity_errors(
         except HarnessError as exc:
             errors.append(str(exc))
         else:
-            expected_tip = current["head_sha"] if terminal else commit
+            expected_tip = commit
             if error := remote_tip_error(
                 state_worktree(paths, state), expected_tip, actual_tip, remote,
-                remote_ref, "terminal task worktree HEAD" if terminal else
-                "delivery commit", terminal and allow_terminal_remote_advance,
+                remote_ref, "delivery commit",
+                terminal and allow_terminal_remote_advance,
             ):
                 errors.append(error)
     return errors
@@ -6853,7 +6839,10 @@ def cmd_close_task(
                     "--blockers-disposition accounting for: "
                     + "; ".join(str(item) for item in state.get("blockers", []))
                 )
-        failures = close_gate(paths, state, intended_outcome=outcome)
+        empty_supersession = semantic_v2 and _prepare_empty_native_semantic_supersession(
+            paths, state, intended_outcome=outcome
+        )
+        failures = [] if empty_supersession else close_gate(paths, state, intended_outcome=outcome)
         if failures:
             raise HarnessError("close gate failed:\n- " + "\n- ".join(failures))
         state["status"] = "done"
@@ -7621,7 +7610,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
                 )
 
     codex_provenance_report: dict[str, Any] | None = None
-    codex_hook_receipt_report: dict[str, Any] | None = None
+    receipt_report: dict[str, Any] | None = None
     codex_hook_delivery = "not_configured"
     codex_client_skill_report: dict[str, Any] = {
         "status": "not_configured",
@@ -7769,17 +7758,15 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         ) as exc:
             errors.append(f"Codex install provenance is invalid: {exc}")
         try:
-            codex_hook_receipt_report = (
-                codex_hook_receipts_impl.inspect_codex_hook_receipt_store(paths)
-            )
-            if codex_hook_receipt_report["entry_count"]:
+            receipt_report = codex_hook_receipts_impl.inspect_codex_hook_receipt_store(paths)
+            if receipt_report["retained_entry_count"]:
                 codex_hook_delivery = "adapter_receipt_observed"
             else:
                 codex_hook_delivery = "no_adapter_receipt_observed"
                 warnings.append(
                     "Codex hook configuration has no live adapter receipt evidence yet"
                 )
-            capacity_status = codex_hook_receipt_report["capacity_status"]
+            capacity_status = receipt_report["capacity_status"]
             if capacity_status == "full":
                 errors.append(
                     "Codex hook receipt store is full; PreToolUse denies until receipts are preserved or rotated."
@@ -8019,7 +8006,7 @@ def cmd_doctor(args: argparse.Namespace, paths: HarnessPaths) -> int:
         "release_promotions": release_reports,
         "codex_install_provenance": codex_provenance_report,
         "codex_client_skill": codex_client_skill_report,
-        "codex_hook_receipts": codex_hook_receipt_report,
+        "codex_hook_receipts": receipt_report,
         "codex_hook_delivery": codex_hook_delivery,
         "confidentiality": confidentiality_report,
         "temporary_files": [
@@ -8201,6 +8188,7 @@ def build_parser(
     )
     register_legacy_bridge_runtime_commands(sub, handler=cmd_legacy_bridge_ingest_v04, add_json_argument=add_json_argument)
 
+    codex_hook_receipts_impl.register_commands(sub, add_json_argument=add_json_argument)
     mini_completion_services = _mini_completion_services(task_lifecycle_services)
     register_task_lifecycle_commands(
         sub,

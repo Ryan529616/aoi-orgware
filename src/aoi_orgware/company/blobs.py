@@ -562,9 +562,19 @@ class BlobStore:
                 "blob recovery temporary does not have the expected link count"
             )
         current_destination = _lstat_regular(destination, "blob member")
-        current_temporary = _lstat_regular(
-            temporary, "blob recovery temporary",
-        )
+        try:
+            current_temporary = _lstat_regular(
+                temporary, "blob recovery temporary",
+            )
+        except FileNotFoundError:
+            self._read_cooperatively_settled_publication(
+                destination,
+                temporary,
+                destination_stat,
+                digest,
+                expected_data=expected_data,
+            )
+            return
         if (
             not _same_identity(destination_stat, current_destination)
             or not _same_identity(destination_stat, current_temporary)
@@ -572,7 +582,17 @@ class BlobStore:
             or current_temporary.st_nlink != 2
         ):
             raise BlobPathError("blob recovery pair changed during verification")
-        recovered = self._read_verified(destination, digest, expected_links=2)
+        try:
+            recovered = self._read_verified(destination, digest, expected_links=2)
+        except BlobPathError:
+            self._read_cooperatively_settled_publication(
+                destination,
+                temporary,
+                destination_stat,
+                digest,
+                expected_data=expected_data,
+            )
+            return
         if expected_data is not None and recovered != expected_data:
             raise BlobIntegrityError(
                 "existing blob digest collides with different bytes"
@@ -589,6 +609,54 @@ class BlobStore:
             raise BlobIntegrityError(
                 "existing blob digest collides with different bytes"
             )
+
+    def _read_cooperatively_settled_publication(
+        self,
+        destination: Path,
+        temporary: Path,
+        expected_destination: os.stat_result,
+        digest: str,
+        *,
+        expected_data: bytes | None,
+    ) -> bytes:
+        """Verify the exact two-link publication after its owner removes the temp."""
+
+        self._assert_member_fanout(digest)
+        current_destination = _lstat_regular(destination, "blob member")
+        if (
+            not _same_identity(expected_destination, current_destination)
+            or current_destination.st_nlink != 1
+        ):
+            raise BlobPathError(
+                "blob recovery pair did not settle to the original one-link member"
+            )
+        try:
+            _lstat_regular(temporary, "blob recovery temporary")
+        except FileNotFoundError:
+            pass
+        else:
+            raise BlobPathError(
+                "blob recovery temporary still exists after cooperative cleanup"
+            )
+
+        # The original publisher may have unlinked its private name but not yet
+        # completed the parent-directory sync.  Repeating it is idempotent and
+        # keeps this recovery path at the same durability boundary.
+        self._fsync_directory(destination.parent)
+        verified = self._read_verified(destination, digest, expected_links=1)
+        try:
+            _lstat_regular(temporary, "blob recovery temporary")
+        except FileNotFoundError:
+            pass
+        else:
+            raise BlobPathError(
+                "blob recovery temporary reappeared during cooperative cleanup"
+            )
+        if expected_data is not None and verified != expected_data:
+            raise BlobIntegrityError(
+                "existing blob digest collides with different bytes"
+            )
+        return verified
 
     def _metadata_from_verified(self, path: Path, digest: str) -> BlobMetadata:
         payload = self._read_verified(path, digest)

@@ -21,6 +21,7 @@ from aoi_orgware import codex_install_provenance as provenance
 from aoi_orgware import local_install_proof
 from aoi_orgware._version import __version__
 from aoi_orgware.semantic_events import canonical_json_bytes, canonical_sha256
+from tests.provenance_subprocess import create_pth_clean_pip_venv as _create_pth_clean_pip_venv, run_python_checked as _run_python_checked
 
 
 def _row(path: Path, root: Path) -> list[str]:
@@ -57,39 +58,6 @@ def _site_packages(prefix: Path) -> Path:
 
 def _scripts(prefix: Path) -> Path:
     return prefix / ("Scripts" if os.name == "nt" else "bin")
-
-
-def _create_pth_clean_pip_venv(prefix: Path) -> Path:
-    """Create the dedicated AOI tool venv used by provenance-qualified installs."""
-
-    venv.EnvBuilder(with_pip=True).create(prefix)
-    python = prefix / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    subprocess.run(
-        [str(python), "-m", "pip", "uninstall", "--yes", "setuptools"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    probe = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-c",
-            (
-                "import json, pathlib, sysconfig; "
-                "root=pathlib.Path(sysconfig.get_paths()['purelib']); "
-                "bad=[p.name for p in root.glob('*.pth') "
-                "if any(line.strip().startswith(('import ', 'import\\t')) "
-                "for line in p.read_text(encoding='utf-8').splitlines())]; "
-                "print(json.dumps(sorted(bad)))"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert json.loads(probe.stdout) == []
-    return python
 
 
 def _launcher(prefix: Path, name: str) -> Path:
@@ -1273,41 +1241,29 @@ def test_real_built_wheel_isolated_pip_install_emits_runtime_receipt(tmp_path: P
     repository = Path(__file__).resolve().parents[1]
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--isolated",
-            "--no-deps",
-            "--wheel-dir",
-            str(wheelhouse),
-            str(repository),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    evidence_root = tmp_path / "child-evidence"
+    _run_python_checked(
+        sys.executable, "-m", "pip", "wheel", "--isolated", "--no-deps",
+        "--wheel-dir", str(wheelhouse), str(repository), cache_root=tmp_path / "python-cache" / "wheel-build",
+        evidence_root=evidence_root, label="wheel-build",
     )
     wheels = list(wheelhouse.glob("aoi_orgware-*.whl"))
     assert len(wheels) == 1
     wheel = wheels[0]
     prefix = tmp_path / "isolated"
     python = _create_pth_clean_pip_venv(prefix)
-    subprocess.run(
-        [
-            str(python),
-            "-m",
-            "pip",
-            "install",
-            "--isolated",
-            "--no-index",
-            "--no-deps",
-            str(wheel),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    _run_python_checked(
+        python,
+        "-m",
+        "pip",
+        "install",
+        "--isolated",
+        "--no-index",
+        "--no-deps", "--no-compile",
+        str(wheel),
+        cache_root=tmp_path / "python-cache" / "wheel-install",
+        evidence_root=evidence_root,
+        label="wheel-install",
     )
     bundle_file = tmp_path / "bundle.json"
     bundle_file.write_text("{}", encoding="utf-8")
@@ -1346,11 +1302,17 @@ scripts = Path(sys.prefix) / ('Scripts' if __import__('os').name == 'nt' else 'b
 receipt = provenance.validate_codex_install_provenance(bundle_file, expected, scripts / ('aoi.exe' if __import__('os').name == 'nt' else 'aoi'))
 print(json.dumps(receipt, sort_keys=True))
 """
-    completed = subprocess.run(
-        [str(python), "-I", "-c", script, str(wheel), str(bundle_file), expected],
-        check=True,
-        capture_output=True,
-        text=True,
+    completed = _run_python_checked(
+        python,
+        "-I",
+        "-c",
+        script,
+        str(wheel),
+        str(bundle_file),
+        expected,
+        cache_root=tmp_path / "python-cache" / "runtime-receipt",
+        evidence_root=evidence_root,
+        label="runtime-receipt",
         cwd=tmp_path,
     )
     receipt = json.loads(completed.stdout)
@@ -1374,7 +1336,21 @@ def test_real_isolated_wheel_install_emits_local_v2_receipt(tmp_path: Path) -> N
     """Exercise the local proof loader against pip's real direct_url/RECORD."""
     repository = Path(__file__).resolve().parents[1]
     wheelhouse = tmp_path / "wheelhouse"; wheelhouse.mkdir()
-    subprocess.run([sys.executable, "-m", "pip", "wheel", "--isolated", "--no-deps", "--wheel-dir", str(wheelhouse), str(repository)], check=True, capture_output=True, text=True)
+    evidence_root = tmp_path / "child-evidence"
+    _run_python_checked(
+        sys.executable,
+        "-m",
+        "pip",
+        "wheel",
+        "--isolated",
+        "--no-deps",
+        "--wheel-dir",
+        str(wheelhouse),
+        str(repository),
+        cache_root=tmp_path / "python-cache" / "wheel-build",
+        evidence_root=evidence_root,
+        label="wheel-build",
+    )
     built = next(wheelhouse.glob("aoi_orgware-*.whl"))
     version = built.name.removeprefix("aoi_orgware-").split("-", 1)[0]
     source = tmp_path / "source"; store = tmp_path / "store"; (source / "src/aoi_orgware").mkdir(parents=True); (source / "requirements").mkdir(); (store / "dist").mkdir(parents=True); (store / "evidence").mkdir()
@@ -1405,7 +1381,19 @@ def test_real_isolated_wheel_install_emits_local_v2_receipt(tmp_path: Path) -> N
     bundle_file = store / "evidence/local-install-bundle.json"; bundle_file.write_bytes(local_install_proof._canonical(bundle))
     prefix = tmp_path / "isolated"
     python = _create_pth_clean_pip_venv(prefix)
-    subprocess.run([str(python), "-m", "pip", "install", "--isolated", "--no-index", "--no-deps", str(wheel)], check=True, capture_output=True, text=True)
+    _run_python_checked(
+        python,
+        "-m",
+        "pip",
+        "install",
+        "--isolated",
+        "--no-index",
+        "--no-deps", "--no-compile",
+        str(wheel),
+        cache_root=tmp_path / "python-cache" / "wheel-install",
+        evidence_root=evidence_root,
+        label="wheel-install",
+    )
     script = """
 import base64
 import hashlib
@@ -1447,7 +1435,18 @@ else:
 print(json.dumps(receipt, sort_keys=True))
 """
     expected_file = tmp_path / "expected.txt"; expected_file.write_text(bundle["bundle_sha256"], encoding="utf-8")
-    completed = subprocess.run([str(python), "-I", "-c", script, str(bundle_file), str(expected_file), str(tmp_path / "project")], check=True, capture_output=True, text=True)
+    completed = _run_python_checked(
+        python,
+        "-I",
+        "-c",
+        script,
+        str(bundle_file),
+        str(expected_file),
+        str(tmp_path / "project"),
+        cache_root=tmp_path / "python-cache" / "local-v2-receipt",
+        evidence_root=evidence_root,
+        label="local-v2-receipt",
+    )
     receipt = json.loads(completed.stdout)
     assert receipt["schema_version"] == 2
     assert receipt["install_wheel_artifact"]["path"] == str(wheel)

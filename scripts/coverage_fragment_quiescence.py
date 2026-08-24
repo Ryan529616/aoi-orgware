@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 
-MAX_FRAGMENT_FILES = 4096
+MAX_FRAGMENT_FILES = 8192
 MAX_FRAGMENT_BYTES = 64 * 1024 * 1024
 MAX_FRAGMENT_SET_BYTES = 4 * 1024 * 1024 * 1024
 MAX_FRAGMENT_NAME_BYTES = 1024
@@ -72,6 +72,15 @@ class FragmentIdentity(NamedTuple):
     inode: int
     size: int
     mtime_ns: int
+
+
+class FragmentSetReceipt(NamedTuple):
+    """Sanitized exact metadata for one accepted raw fragment set."""
+
+    member_count: int
+    total_bytes: int
+    identity_semantics: str
+    metadata_snapshot_sha256: str
 
 
 class _SnapshotProblem(NamedTuple):
@@ -187,12 +196,26 @@ def _snapshot_diagnostic(
     *,
     reason: str,
 ) -> str:
-    total_bytes = sum(max(0, identity.size) for identity in snapshot.values())
+    receipt = _fragment_set_receipt(snapshot)
     return (
-        f"reason={reason}, member_count={len(snapshot)}, "
-        f"total_bytes={total_bytes}, "
-        f"identity_semantics={FRAGMENT_IDENTITY_SEMANTICS}, "
-        f"metadata_snapshot_sha256={_snapshot_digest(snapshot)}"
+        f"reason={reason}, member_count={receipt.member_count}, "
+        f"total_bytes={receipt.total_bytes}, "
+        f"identity_semantics={receipt.identity_semantics}, "
+        f"metadata_snapshot_sha256={receipt.metadata_snapshot_sha256}"
+    )
+
+
+def _fragment_set_receipt(
+    snapshot: dict[Path, FragmentIdentity],
+) -> FragmentSetReceipt:
+    """Bind a successful receipt to the same validated snapshot semantics."""
+
+    _validate_snapshot_shape(snapshot)
+    return FragmentSetReceipt(
+        len(snapshot),
+        sum(max(0, identity.size) for identity in snapshot.values()),
+        FRAGMENT_IDENTITY_SEMANTICS,
+        _snapshot_digest(snapshot),
     )
 
 
