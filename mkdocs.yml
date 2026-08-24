@@ -41,6 +41,7 @@ nav:
   - Legacy bridge terminal truth: legacy-bridge-job-terminal.md
   - Configuration: configuration.md
   - Operating policy: POLICY.md
+  - Unpublished internal adoption: v0.5-internal-adoption.md
   - Resource control: resource_control.md
   - Codebase memory: codebase-memory.md
   - Runbooks:
